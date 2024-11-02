@@ -1,3 +1,4 @@
+//@ build-pass
 // ICE: assertion failed: !value.has_infer()
 // issue: rust-lang/rust#115806
 #![feature(associated_const_equality)]
@@ -5,15 +6,16 @@
 
 pub struct NoPin;
 
-impl<TA> Pins<TA> for NoPin {}
+impl<T> Pins<T> for NoPin {}
 
 pub trait PinA<PER> {
     const A: &'static () = &();
 }
 
-pub trait Pins<USART> {}
+pub trait Pins<T> {}
 
-impl<USART, T> Pins<USART> for T where T: PinA<USART, A = { &() }> {}
-//~^ ERROR conflicting implementations of trait `Pins<_>` for type `NoPin`
+// Disallowed by standard Rust, allowed by Unchained Rust since there are no conflicts here
+// NoPin doesn't implement PinA, so no impls for Pins overlap
+impl<U, T> Pins<U> for T where T: PinA<U, A = { &() }> {}
 
 pub fn main() {}

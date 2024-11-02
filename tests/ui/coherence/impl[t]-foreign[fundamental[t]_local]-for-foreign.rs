@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,12 +8,10 @@ use std::rc::Rc;
 
 struct Local;
 
-impl<T> Remote2<Box<T>, Local> for u32 {
-    //~^ ERROR type parameter `T` must be covered by another type
-}
+// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+impl<T> Remote2<Box<T>, Local> for u32 {}
 
-impl<'a, T> Remote2<&'a T, Local> for u32 {
-    //~^ ERROR type parameter `T` must be covered by another type
-}
+// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+impl<'a, T> Remote2<&'a T, Local> for u32 {}
 
 fn main() {}

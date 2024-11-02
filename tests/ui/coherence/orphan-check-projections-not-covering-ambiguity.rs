@@ -9,7 +9,7 @@
 //@ revisions: classic next
 //@[next] compile-flags: -Znext-solver
 
-//@ check-pass
+//@ build-pass
 //@ compile-flags: --crate-type=lib
 //@ aux-crate:foreign=parametrized-trait.rs
 //@ edition:2021
@@ -22,8 +22,7 @@ impl<T> Project for T {
 
 struct Local;
 
+// Warning in standard Rust, allowed in Unchained
 impl<T> foreign::Trait1<Local, T> for <T as Project>::Output {}
-//~^ WARNING type parameter `T` must be covered by another type
-//~| WARNING this was previously accepted by the compiler
 
 fn main() {}

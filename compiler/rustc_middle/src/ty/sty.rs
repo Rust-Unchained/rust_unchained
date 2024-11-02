@@ -1981,7 +1981,7 @@ impl<'tcx> Ty<'tcx> {
 
 impl<'tcx> rustc_type_ir::inherent::Tys<TyCtxt<'tcx>> for &'tcx ty::List<Ty<'tcx>> {
     fn inputs(self) -> &'tcx [Ty<'tcx>] {
-        self.split_last().unwrap().1
+        if let Some((_, inputs)) = self.split_last() { inputs } else { &[] }
     }
 
     fn output(self) -> Ty<'tcx> {

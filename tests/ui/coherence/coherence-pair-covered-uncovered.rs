@@ -1,11 +1,11 @@
-//@ aux-build:coherence_lib.rs
+//@ aux-build:coherence_concrete_lib.rs
 
-extern crate coherence_lib as lib;
-use lib::{Remote, Pair};
+extern crate coherence_concrete_lib as lib;
+use lib::{Remote, Pair, RemoteStruct};
 
 struct Local<T>(T);
 
-impl<T,U> Remote for Pair<T,Local<U>> { }
-//~^ ERROR E0117
+impl<T,U> Remote for Pair<Local<U>, T> { }
+//~^ ERROR E0119
 
 fn main() { }

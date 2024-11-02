@@ -1,3 +1,4 @@
+//@ build-pass
 //@ revisions: re_a re_b re_c
 
 #![cfg_attr(any(), re_a, re_b, re_c)]
@@ -14,16 +15,14 @@ use lib::{Remote,Pair};
 
 pub struct Cover<T>(T);
 
+// These are all tested individually, so they don't conflict.
 #[cfg(any(re_a))]
 impl<T> Remote for Pair<T,Cover<T>> { }
-//[re_a]~^ ERROR E0117
 
 #[cfg(any(re_b))]
 impl<T> Remote for Pair<Cover<T>,T> { }
-//[re_b]~^ ERROR E0117
 
 #[cfg(any(re_c))]
 impl<T,U> Remote for Pair<Cover<T>,U> { }
-//[re_c]~^ ERROR E0117
 
 fn main() { }

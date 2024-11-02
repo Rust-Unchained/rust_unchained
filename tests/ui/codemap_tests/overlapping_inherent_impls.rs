@@ -26,11 +26,19 @@ impl Bar<u32> {
 struct Baz<T>(T);
 
 impl<T: Copy> Baz<T> {
-    fn baz(&self) {} //~ ERROR duplicate definitions
+    fn baz(&self) {} // Allowed with Rust Unchained, Vec cannot implement Copy so these impls don't overlap
 }
 
 impl<T> Baz<Vec<T>> {
     fn baz(&self) {}
+}
+
+impl<T: Clone> Baz<T> {
+    fn foo(&self) {} //~ ERROR duplicate definitions
+}
+
+impl<T> Baz<Vec<T>> {
+    fn foo(&self) {}
 }
 
 fn main() {}

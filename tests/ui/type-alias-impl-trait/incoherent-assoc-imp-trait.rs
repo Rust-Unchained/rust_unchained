@@ -8,7 +8,7 @@ trait MyTrait {}
 impl MyTrait for () {}
 
 impl<F> FnOnce<()> for &F {
-    //~^ ERROR type parameter `F` must be used
+    //~^ ERROR E0119
     type Output = impl MyTrait;
     extern "rust-call" fn call_once(self, _: ()) -> Self::Output {}
 }

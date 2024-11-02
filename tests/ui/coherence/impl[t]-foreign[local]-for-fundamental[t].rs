@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,12 +8,10 @@ use std::rc::Rc;
 
 struct Local;
 
-impl<T> Remote1<Local> for Box<T> {
-    //~^ ERROR type parameter `T` must be covered by another type
-}
+// Disallowed in standard Rust, okay in Unchained
+impl<T> Remote1<Local> for Box<T> {}
 
-impl<T> Remote1<Local> for &T {
-    //~^ ERROR type parameter `T` must be covered by another type
-}
+// Disallowed in standard Rust, okay in Unchained
+impl<T> Remote1<Local> for &T {}
 
 fn main() {}

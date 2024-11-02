@@ -1,6 +1,4 @@
-// Regression test for soundness issue #114061:
-// "Coherence incorrectly considers `unnormalizable_projection: Trait` to not hold even if it could"
-#![crate_type = "lib"]
+//@ build-pass
 
 trait WhereBound {}
 impl WhereBound for () {}
@@ -10,7 +8,9 @@ pub trait WithAssoc<'a> {
     type Assoc;
 }
 
-// These two impls of `Trait` overlap:
+// These two impls of `Trait` are considered to overlap in standard Rust.
+// In Unchained Rust, impls don't overlap unless we can prove that they do.
+// Here, Box<T> doesn't implement WithAssoc for any T
 
 pub trait Trait {}
 impl<T> Trait for T
@@ -21,19 +21,6 @@ where
 {
 }
 
-impl<T> Trait for Box<T> {} //~ ERROR conflicting implementations of trait `Trait` for type `Box<_>`
+impl<T> Trait for Box<T> {}
 
-// A downstream crate could write:
-//
-//     use upstream::*;
-//
-//     struct Local;
-//     impl WithAssoc<'_> for Box<Local> {
-//         type Assoc = ();
-//     }
-//
-//     fn impls_trait<T: Trait>() {}
-//
-//     fn main() {
-//         impls_trait::<Box<Local>>();
-//     }
+fn main() {}

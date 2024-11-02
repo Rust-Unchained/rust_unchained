@@ -21,9 +21,10 @@ const SHELL: &str = "sh";
 
 /// We have to run a few shell scripts, which choke quite a bit on both `\`
 /// characters and on `C:\` paths, so normalize both of them away.
+#[allow(dead_code)]
 fn sanitize_sh(path: &Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
-    return change_drive(unc_to_lfs(&path)).unwrap_or(path);
+    return path; //change_drive(unc_to_lfs(&path)).unwrap_or(path);
 
     fn unc_to_lfs(s: &str) -> &str {
         s.strip_prefix("//?/").unwrap_or(s)

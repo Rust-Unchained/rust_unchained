@@ -52,12 +52,16 @@ where
     I: Interner,
     E: Debug,
 {
+	let _ = orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?;
+	
+	/* Unchained Edit
     if orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?.is_ok()
     {
         // A downstream or cousin crate is allowed to implement some
         // generic parameters of this trait-ref.
         return Ok(Err(Conflict::Downstream));
     }
+	*/
 
     if trait_ref_is_local_or_fundamental(infcx.cx(), trait_ref) {
         // This is a local or fundamental trait, so future-compatibility
@@ -230,25 +234,32 @@ where
     }
 
     let mut checker = OrphanChecker::new(infcx, in_crate, lazily_normalize_ty);
-    Ok(match trait_ref.visit_with(&mut checker) {
-        ControlFlow::Continue(()) => Err(OrphanCheckErr::NonLocalInputType(checker.non_local_tys)),
+	
+    match trait_ref.visit_with(&mut checker) {
+        ControlFlow::Continue(()) => {
+            Ok(Err(OrphanCheckErr::NonLocalInputType(checker.non_local_tys)))
+        }
         ControlFlow::Break(residual) => match residual {
-            OrphanCheckEarlyExit::NormalizationFailure(err) => return Err(err),
-            OrphanCheckEarlyExit::UncoveredTyParam(ty) => {
+            OrphanCheckEarlyExit::NormalizationFailure(err) => Err(err),
+            OrphanCheckEarlyExit::UncoveredTyParam(_ty) => {
+                /*
                 // Does there exist some local type after the `ParamTy`.
                 checker.search_first_local_ty = true;
+
                 let local_ty = match trait_ref.visit_with(&mut checker) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(local_ty)) => Some(local_ty),
                     _ => None,
                 };
-                Err(OrphanCheckErr::UncoveredTyParams(UncoveredTyParams {
+
+                Ok(Err(OrphanCheckErr::UncoveredTyParams(UncoveredTyParams {
                     uncovered: ty,
                     local_ty,
-                }))
+                }))) */
+                Ok(Ok(()))
             }
-            OrphanCheckEarlyExit::LocalTy(_) => Ok(()),
+            OrphanCheckEarlyExit::LocalTy(_) => Ok(Ok(())),
         },
-    })
+    }
 }
 
 struct OrphanChecker<'a, Infcx, I: Interner, F> {

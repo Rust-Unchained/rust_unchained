@@ -1,4 +1,4 @@
-// Weak aliases might not cover type parameters.
+//@ build-pass
 
 //@ aux-crate:foreign=parametrized-trait.rs
 //@ edition:2021
@@ -10,7 +10,7 @@ type Identity<T> = T;
 
 struct Local;
 
+// Error in standard Rust, allowed in Unchained
 impl<T> foreign::Trait1<Local, T> for Identity<T> {}
-//~^ ERROR type parameter `T` must be covered by another type
 
 fn main() {}

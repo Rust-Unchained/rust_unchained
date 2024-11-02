@@ -14,4 +14,14 @@ impl<T: TraitB> Overlaps<Box<T>> for <T as TraitB>::Assoc {}
 impl<U: TraitB> Overlaps<U> for <U as TraitB>::Assoc {}
 //~^ ERROR conflicting implementations of trait
 
+// The two bellow are additional requirements for failure in Unchained Rust
+// Unchained Rust only forbids these impls if a conflict actually occurs.
+impl TraitB for Box<i32> {
+    type Assoc = i32;
+}
+
+impl TraitB for i32 {
+    type Assoc = i32;
+}
+
 fn main() {}

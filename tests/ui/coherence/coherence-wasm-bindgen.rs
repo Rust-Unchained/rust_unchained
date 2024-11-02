@@ -34,4 +34,7 @@ where
     //~| WARN the behavior may change in a future release
 }
 
+impl<'a, A> FromWasmAbi for &'a A {}
+impl RefFromWasmAbi for i32 {}
+
 fn main() {}

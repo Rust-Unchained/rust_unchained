@@ -16,7 +16,7 @@ impl<T: X> Z for A<T> {
 }
 
 // this impl is invalid, but causes an ICE anyway
-impl<T> From<<A<T> as Z>::Assoc> for T {}
-//~^ ERROR type parameter `T` must be used as the type parameter for some local type (e.g., `MyStruct<T>`)
+impl<T> From< <A<T> as Z>::Assoc > for T {}
+//~^ ERROR E0277
 
 fn main() {}

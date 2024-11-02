@@ -1,7 +1,7 @@
 //@ revisions: classic next
 //@[next] compile-flags: -Znext-solver
 
-//@ check-pass
+//@ build-pass
 //@ compile-flags: --crate-type=lib
 //@ aux-crate:foreign=parametrized-trait.rs
 //@ edition:2021
@@ -14,11 +14,8 @@ impl<T, U> Trait<T, U> for () {
 
 struct LocalTy;
 
+// Warning in standard Rust, allowed in Unchained
 impl<T, U> foreign::Trait0<LocalTy, T, U> for <() as Trait<T, U>>::Assoc {}
-//~^ WARNING type parameter `T` must be covered by another type
-//~| WARNING this was previously accepted by the compiler
-//~| WARNING type parameter `U` must be covered by another type
-//~| WARNING this was previously accepted by the compiler
 
 
 fn main() {}

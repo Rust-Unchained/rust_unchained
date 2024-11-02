@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -8,14 +9,10 @@ use std::sync::Arc;
 
 struct Local;
 
-impl Remote for Rc<Local> {
-    //~^ ERROR only traits defined in the current crate
-    // | can be implemented for arbitrary types [E0117]
-}
+// Not allowed in standard Rust, but okay in unchained.
+impl Remote for Rc<Local> {}
 
-impl<T> Remote for Arc<T> {
-    //~^ ERROR only traits defined in the current crate
-    // | can be implemented for arbitrary types [E0117]
-}
+// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+impl<T> Remote for Arc<T> {}
 
 fn main() {}

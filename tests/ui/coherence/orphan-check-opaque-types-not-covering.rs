@@ -1,5 +1,4 @@
-// Opaque types never cover type parameters.
-
+//@ build-pass
 //@ aux-crate:foreign=parametrized-trait.rs
 //@ edition:2021
 
@@ -11,8 +10,8 @@ fn define_identity<T>(x: T) -> Identity<T> {
     x
 }
 
+// Disallowed in standard Rust, allowed in Unchained
 impl<T> foreign::Trait0<Local, T, ()> for Identity<T> {}
-//~^ ERROR type parameter `T` must be covered by another type
 
 type Opaque<T> = impl Sized;
 
@@ -20,8 +19,8 @@ fn define_local<T>() -> Opaque<T> {
     Local
 }
 
+// Disallowed in standard Rust, allowed in Unchained
 impl<T> foreign::Trait1<Local, T> for Opaque<T> {}
-//~^ ERROR type parameter `T` must be covered by another type
 
 struct Local;
 

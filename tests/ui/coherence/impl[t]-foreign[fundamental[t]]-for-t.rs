@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,11 +8,10 @@ use std::rc::Rc;
 
 struct Local;
 
-impl<T> Remote1<Box<T>> for T {
-    //~^ ERROR type parameter `T` must be used as the type parameter for some local type
-}
-impl<'a, T> Remote1<&'a T> for T {
-    //~^ ERROR type parameter `T` must be used as the type parameter for some local type
-}
+// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+impl<T> Remote1<Box<T>> for T {}
+
+// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+impl<'a, T> Remote1<&'a T> for T {}
 
 fn main() {}
