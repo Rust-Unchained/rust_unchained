@@ -24,7 +24,7 @@ const SHELL: &str = "sh";
 #[allow(dead_code)]
 fn sanitize_sh(path: &Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
-    return path; //change_drive(unc_to_lfs(&path)).unwrap_or(path);
+    return change_drive(unc_to_lfs(&path)).unwrap_or(path);
 
     fn unc_to_lfs(s: &str) -> &str {
         s.strip_prefix("//?/").unwrap_or(s)
@@ -85,11 +85,11 @@ fn install_sh(
     } else {
         assert!(
             is_dir_writable_for_user(&prefix),
-            "User doesn't have write access on `install.prefix` path in the `config.toml`.",
+            "User doesn't have write access on path \"{}\".", prefix.to_string_lossy(),
         );
         assert!(
             is_dir_writable_for_user(&sysconfdir),
-            "User doesn't have write access on `install.sysconfdir` path in `config.toml`."
+            "User doesn't have write access on \"{}\".", prefix.to_string_lossy()
         );
     }
 

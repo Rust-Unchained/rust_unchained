@@ -7,13 +7,18 @@ use lib::TheTrait;
 
 struct TheType;
 
-impl TheTrait<usize> for isize {}
-//~^ ERROR E0117
+impl TheTrait<usize> for isize {
+	fn the_fn(&self) {}
+}
 
-impl TheTrait<TheType> for isize {}
+impl TheTrait<TheType> for isize {
+	fn the_fn(&self) {}
+}
 
-impl TheTrait<isize> for TheType {}
+impl TheTrait<isize> for TheType {
+	fn the_fn(&self) {}
+}
 
-impl !Send for Vec<isize> {} //~ ERROR E0117
+impl !Send for Vec<isize> {} //~ ERROR E0321
 
 fn main() {}

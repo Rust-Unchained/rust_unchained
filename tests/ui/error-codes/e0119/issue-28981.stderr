@@ -1,12 +1,11 @@
-error[E0119]: conflicting implementations of trait `Deref` for type `ManuallyDrop<_>`
+error[E0119]: conflicting implementations of trait `Deref` for type `memchr::cow::CowBytes<'_>`
   --> $DIR/issue-28981.rs:5:1
    |
 LL | impl<Foo> Deref for Foo { }
    | ^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: conflicting implementation in crate `core`:
-           - impl<T> Deref for ManuallyDrop<T>
-             where T: ?Sized;
+   = note: conflicting implementation in crate `memchr`:
+           - impl<'a> Deref for memchr::cow::CowBytes<'a>;
 
 error: aborting due to 1 previous error
 

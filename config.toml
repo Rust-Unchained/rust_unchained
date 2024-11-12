@@ -1,0 +1,88 @@
+change-id = 131513
+
+# These defaults are meant for users and distro maintainers building from source, without intending to make multiple changes.
+[build]
+# When compiling from source, you almost always want a full stage 2 build,
+# which has all the latest optimizations from nightly.
+build-stage = 2
+test-stage = 2
+doc-stage = 2
+# When compiling from source, you usually want all tools.
+extended = true
+
+tools = [
+    "cargo",
+    "clippy",
+    "rustdoc",
+    "rustfmt",
+    "rust-analyzer",
+    "rust-analyzer-proc-macro-srv",
+    "analysis",
+    "src",
+    "wasm-component-ld",
+    "miri", 
+    "cargo-miri", # for dev/nightly channels
+    "rustup"
+]
+
+
+# Contributors working on the compiler will probably expect compiler docs to be generated.
+compiler-docs = true
+docs = true
+library-docs-private-items = true
+submodules = true
+
+[rust]
+# We have several defaults in bootstrap that depend on whether the channel is `dev` (e.g. `omit-git-hash` and `download-ci-llvm`).
+# Make sure they don't get set when installing from source.
+channel = "nightly"
+download-rustc = false
+lld = true
+# This greatly increases the speed of rebuilds, especially when there are only minor changes. However, it makes the initial build slightly slower.
+incremental = true
+backtrace = true
+# Print backtrace on internal compiler errors during bootstrap
+backtrace-on-ice = true
+lto = "off"
+optimize = true
+parallel-compiler = true
+dist-src = false
+llvm-bitcode-linker = true
+verify-llvm-ir = true
+description = "Rust Unchained"
+codegen-units-std = 1
+use-lld = true
+
+[llvm]
+download-ci-llvm = true
+# Having this set to true disrupts compiler development workflows for people who use `llvm.download-ci-llvm = true`
+# because we don't provide ci-llvm on the `rustc-alt-builds` server. Therefore, it is kept off by default.
+assertions = false
+
+[dist]
+# Use better compression when preparing tarballs.
+compression-profile = "balanced"
+
+
+[install]
+# Where to install the generated toolchain. Must be an absolute path.
+prefix = "/home/houtamelo/.rustup/toolchains/unchained"
+
+# Where to install system configuration files.
+# If this is a relative path, it will get installed in `prefix` above
+#sysconfdir = "sysconf"
+
+# Where to install documentation in `prefix` above
+#docdir = "share/doc/rust"
+
+# Where to install binaries in `prefix` above
+#bindir = "bin"
+
+# Where to install libraries in `prefix` above
+#libdir = "lib"
+
+# Where to install man pages in `prefix` above
+#mandir = "share/man"
+
+# Where to install data in `prefix` above
+#datadir = "share"

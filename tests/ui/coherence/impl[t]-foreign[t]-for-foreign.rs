@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 struct Local;
 
-// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+// Allowed in Unchained Rust, upstream doesn't provide any impls.
 impl<T> Remote1<T> for u32 {}
 
 fn main() {}

@@ -8,10 +8,9 @@ use std::rc::Rc;
 
 struct Local;
 
-// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
+// Allowed in Unchained Rust, no conflicts here.
 impl<T> Remote2<Box<T>, Local> for u32 {}
 
-// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
 impl<'a, T> Remote2<&'a T, Local> for u32 {}
 
 fn main() {}

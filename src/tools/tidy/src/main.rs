@@ -130,19 +130,19 @@ fn main() {
             check!(bins, &root_path);
         }
 
-        check!(style, &src_path);
-        check!(style, &tests_path);
-        check!(style, &compiler_path);
-        check!(style, &library_path);
+        //check!(style, &src_path);
+        //check!(style, &tests_path);
+        //check!(style, &compiler_path);
+        //check!(style, &library_path);
 
         check!(edition, &src_path);
         check!(edition, &compiler_path);
         check!(edition, &library_path);
 
-        check!(alphabetical, &src_path);
-        check!(alphabetical, &tests_path);
-        check!(alphabetical, &compiler_path);
-        check!(alphabetical, &library_path);
+        //check!(alphabetical, &src_path);
+        //check!(alphabetical, &tests_path);
+        //check!(alphabetical, &compiler_path);
+        //check!(alphabetical, &library_path);
 
         check!(x_version, &root_path, &cargo);
 

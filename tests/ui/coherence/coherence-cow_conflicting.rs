@@ -13,7 +13,7 @@ pub struct Cover<T>(T);
 // It may seem like it, but the two bellow can never conflict:
 impl<T> Remote for Pair<T,Cover<T>> { }
 
-impl<T> Remote for Pair<Cover<T>,T> { } 
+impl<T> Remote for Pair<Cover<T>,T> { }
 
 // This one conflicts though
 impl<T,U> Remote for Pair<Cover<T>,U> { }

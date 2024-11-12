@@ -14,7 +14,6 @@ use rustc_middle::bug;
 use rustc_middle::ty::fast_reject::{SimplifiedType, TreatParams, simplify_type};
 use rustc_middle::ty::{self, CrateInherentImpls, Ty, TyCtxt};
 use rustc_span::ErrorGuaranteed;
-use rustc_span::symbol::sym;
 
 use crate::errors;
 
@@ -49,7 +48,7 @@ pub(crate) fn crate_incoherent_impls(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &
 
 /// On-demand query: yields a vector of the inherent impls for a specific type.
 pub(crate) fn inherent_impls(tcx: TyCtxt<'_>, ty_def_id: LocalDefId) -> &[DefId] {
-    let (crate_map, _) = tcx.crate_inherent_impls(());
+	let (crate_map, _) = tcx.crate_inherent_impls(());
     match crate_map.inherent_impls.get(&ty_def_id) {
         Some(v) => &v[..],
         None => &[],
@@ -77,35 +76,13 @@ impl<'tcx> InherentCollect<'tcx> {
             return Ok(());
         }
 
-        if self.tcx.features().rustc_attrs() {
-            let items = self.tcx.associated_item_def_ids(impl_def_id);
-
-            if !self.tcx.has_attr(ty_def_id, sym::rustc_has_incoherent_inherent_impls) {
-                let impl_span = self.tcx.def_span(impl_def_id);
-                return Err(self.tcx.dcx().emit_err(errors::InherentTyOutside { span: impl_span }));
-            }
-
-            for &impl_item in items {
-                if !self.tcx.has_attr(impl_item, sym::rustc_allow_incoherent_impl) {
-                    let impl_span = self.tcx.def_span(impl_def_id);
-                    return Err(self.tcx.dcx().emit_err(errors::InherentTyOutsideRelevant {
-                        span: impl_span,
-                        help_span: self.tcx.def_span(impl_item),
-                    }));
-                }
-            }
-
-            if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer)
-            {
-                self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
-            } else {
-                bug!("unexpected self type: {:?}", self_ty);
-            }
-            Ok(())
-        } else {
-            let impl_span = self.tcx.def_span(impl_def_id);
-            Err(self.tcx.dcx().emit_err(errors::InherentTyOutsideNew { span: impl_span }))
-        }
+	    if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer) {
+		    self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
+	    } else {
+		    bug!("unexpected self type: {:?}", self_ty);
+	    }
+	    
+	    Ok(())
     }
 
     fn check_primitive_impl(
@@ -113,28 +90,6 @@ impl<'tcx> InherentCollect<'tcx> {
         impl_def_id: LocalDefId,
         ty: Ty<'tcx>,
     ) -> Result<(), ErrorGuaranteed> {
-        let items = self.tcx.associated_item_def_ids(impl_def_id);
-        if !self.tcx.hir().rustc_coherence_is_core() {
-            if self.tcx.features().rustc_attrs() {
-                for &impl_item in items {
-                    if !self.tcx.has_attr(impl_item, sym::rustc_allow_incoherent_impl) {
-                        let span = self.tcx.def_span(impl_def_id);
-                        return Err(self.tcx.dcx().emit_err(errors::InherentTyOutsidePrimitive {
-                            span,
-                            help_span: self.tcx.def_span(impl_item),
-                        }));
-                    }
-                }
-            } else {
-                let span = self.tcx.def_span(impl_def_id);
-                let mut note = None;
-                if let ty::Ref(_, subty, _) = ty.kind() {
-                    note = Some(errors::InherentPrimitiveTyNote { subty: *subty });
-                }
-                return Err(self.tcx.dcx().emit_err(errors::InherentPrimitiveTy { span, note }));
-            }
-        }
-
         if let Some(simp) = simplify_type(self.tcx, ty, TreatParams::InstantiateWithInfer) {
             self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
         } else {

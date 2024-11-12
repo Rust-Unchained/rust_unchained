@@ -12,7 +12,6 @@ struct Local;
 // Not allowed in standard Rust, but okay in unchained.
 impl Remote for Rc<Local> {}
 
-// UNCHAINED_TODO: This is currently allowed, but maybe it's too much
 impl<T> Remote for Arc<T> {}
 
 fn main() {}

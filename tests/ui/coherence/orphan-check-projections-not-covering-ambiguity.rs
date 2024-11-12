@@ -22,7 +22,7 @@ impl<T> Project for T {
 
 struct Local;
 
-// Warning in standard Rust, allowed in Unchained
+// Warning in standard Rust, allowed in Unchained: upstream doesn't provide any impls.
 impl<T> foreign::Trait1<Local, T> for <T as Project>::Output {}
 
 fn main() {}

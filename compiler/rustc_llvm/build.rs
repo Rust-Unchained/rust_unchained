@@ -48,12 +48,16 @@ fn detect_llvm_link() -> (&'static str, &'static str) {
 // the one we want to use. As such, we restore the environment to what bootstrap saw. This isn't
 // perfect -- we might actually want to see something from Cargo's added library paths -- but
 // for now it works.
-fn restore_library_path() {
-    let key = tracked_env_var_os("REAL_LIBRARY_PATH_VAR").expect("REAL_LIBRARY_PATH_VAR");
+fn restore_library_path() -> bool {
+    let Some(key) = tracked_env_var_os("REAL_LIBRARY_PATH_VAR")
+    else { return false };
+	
     if let Some(env) = tracked_env_var_os("REAL_LIBRARY_PATH") {
         env::set_var(&key, env);
+	    true
     } else {
         env::remove_var(&key);
+	    true
     }
 }
 
@@ -105,13 +109,15 @@ fn main() {
     for component in REQUIRED_COMPONENTS.iter().chain(OPTIONAL_COMPONENTS.iter()) {
         println!("cargo:rustc-check-cfg=cfg(llvm_component,values(\"{component}\"))");
     }
-
+	
     if tracked_env_var_os("RUST_CHECK").is_some() {
         // If we're just running `check`, there's no need for LLVM to be built.
         return;
     }
 
-    restore_library_path();
+    if !restore_library_path() {
+	    return;
+    }
 
     let llvm_config =
         PathBuf::from(tracked_env_var_os("LLVM_CONFIG").expect("LLVM_CONFIG was not set"));

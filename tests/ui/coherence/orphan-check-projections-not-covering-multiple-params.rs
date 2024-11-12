@@ -14,7 +14,7 @@ impl<T, U> Trait<T, U> for () {
 
 struct LocalTy;
 
-// Warning in standard Rust, allowed in Unchained
+// Warning in standard Rust, allowed in Unchained: upstream doesn't provide any impls.
 impl<T, U> foreign::Trait0<LocalTy, T, U> for <() as Trait<T, U>>::Assoc {}
 
 

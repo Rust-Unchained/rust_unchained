@@ -17,7 +17,7 @@ LL |     fn bar(&self) {}
    |     ------------- other definition for `bar`
 
 error[E0592]: duplicate definitions with name `foo`
-  --> $DIR/overlapping_inherent_impls.rs:37:5
+  --> $DIR/overlapping_inherent_impls.rs:38:5
    |
 LL |     fn foo(&self) {}
    |     ^^^^^^^^^^^^^ duplicate definitions for `foo`

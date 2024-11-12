@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,9 +8,8 @@ use std::rc::Rc;
 
 struct Local;
 
+// Allowed in Rust Unchained
 impl Remote1<u32> for f64 {
-    //~^ ERROR only traits defined in the current crate
-    // | can be implemented for arbitrary types [E0117]
 }
 
 fn main() {}

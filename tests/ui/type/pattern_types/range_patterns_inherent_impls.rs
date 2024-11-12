@@ -1,3 +1,5 @@
+//@ build-pass
+
 #![feature(pattern_types, rustc_attrs)]
 #![feature(core_pattern_type)]
 #![feature(core_pattern_types)]
@@ -11,7 +13,6 @@ use std::pat::pattern_type;
 type Y = pattern_type!(u32 is 1..);
 
 impl Y {
-    //~^ ERROR cannot define inherent `impl`
     fn foo() {}
 }
 

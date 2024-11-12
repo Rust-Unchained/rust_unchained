@@ -26,7 +26,8 @@ impl Bar<u32> {
 struct Baz<T>(T);
 
 impl<T: Copy> Baz<T> {
-    fn baz(&self) {} // Allowed with Rust Unchained, Vec cannot implement Copy so these impls don't overlap
+	// Allowed with Rust Unchained, Vec cannot implement Copy so these impls don't overlap
+    fn baz(&self) {}
 }
 
 impl<T> Baz<Vec<T>> {

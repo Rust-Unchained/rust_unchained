@@ -1,8 +1,10 @@
+//@ build-pass
+
 // Make sure that an invalid inherent impl doesn't totally clobber all of the
 // other inherent impls, which lead to mysterious method/assoc-item probing errors.
 
+// Allowed in Rust Unchained, no conflicts here.
 impl () {}
-//~^ ERROR cannot define inherent `impl` for primitive types
 
 struct W;
 impl W {

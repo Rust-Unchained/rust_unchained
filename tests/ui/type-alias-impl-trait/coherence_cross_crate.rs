@@ -1,3 +1,5 @@
+//@ build-pass
+
 //@ aux-build: coherence_cross_crate_trait_decl.rs
 // This test ensures that adding an `impl SomeTrait for i32` within
 // `coherence_cross_crate_trait_decl` is not a breaking change, by
@@ -19,6 +21,5 @@ fn constrain() -> Alias {
 
 impl OtherTrait for Alias {}
 impl OtherTrait for i32 {}
-//~^ ERROR: conflicting implementations of trait `OtherTrait` for type `Alias`
 
 fn main() {}

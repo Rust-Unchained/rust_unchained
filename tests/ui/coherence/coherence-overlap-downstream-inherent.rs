@@ -1,7 +1,7 @@
 struct Sweet<X>(X);
 pub trait Sugar {}
 pub trait Fruit {}
-// UNCHAINED_TODO: This should be allowed
+// UNCHAINED_FIXME: This should be allowed
 impl<T:Sugar> Sweet<T> { fn dummy(&self) { } }
 //~^ ERROR E0592
 impl<T:Fruit> Sweet<T> { fn dummy(&self) { } }

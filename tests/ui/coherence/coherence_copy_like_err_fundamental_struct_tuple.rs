@@ -1,6 +1,6 @@
 // Test that we are able to introduce a negative constraint that
 // `MyType: !MyTrait` along with other "fundamental" wrappers.
-
+//@ build-pass
 //@ aux-build:coherence_copy_like_lib.rs
 
 
@@ -12,9 +12,7 @@ trait MyTrait { fn foo() {} }
 
 impl<T: lib::MyCopy> MyTrait for T { }
 
-// Tuples are not fundamental.
 impl MyTrait for lib::MyFundamentalStruct<(MyType,)> { }
-//~^ ERROR E0119
 
 
 fn main() { }

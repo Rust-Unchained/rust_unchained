@@ -683,22 +683,16 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
 
                 self.assemble_inherent_candidates_from_object(generalized_self_ty);
                 self.assemble_inherent_impl_candidates_for_type(p.def_id());
-                if self.tcx.has_attr(p.def_id(), sym::rustc_has_incoherent_inherent_impls) {
-                    self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
-                }
+	            self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
             }
             ty::Adt(def, _) => {
                 let def_id = def.did();
                 self.assemble_inherent_impl_candidates_for_type(def_id);
-                if self.tcx.has_attr(def_id, sym::rustc_has_incoherent_inherent_impls) {
-                    self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
-                }
+	            self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
             }
             ty::Foreign(did) => {
                 self.assemble_inherent_impl_candidates_for_type(did);
-                if self.tcx.has_attr(did, sym::rustc_has_incoherent_inherent_impls) {
-                    self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
-                }
+	            self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty);
             }
             ty::Param(p) => {
                 self.assemble_inherent_candidates_from_param(p);
@@ -720,9 +714,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     }
 
     fn assemble_inherent_candidates_for_incoherent_ty(&mut self, self_ty: Ty<'tcx>) {
-        let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer) else {
-            bug!("unexpected incoherent type: {:?}", self_ty)
-        };
+        let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer)
+        else { bug!("unexpected incoherent type: {:?}", self_ty) };
+	    
         for &impl_def_id in self.tcx.incoherent_impls(simp).into_iter() {
             self.assemble_inherent_impl_probe(impl_def_id);
         }

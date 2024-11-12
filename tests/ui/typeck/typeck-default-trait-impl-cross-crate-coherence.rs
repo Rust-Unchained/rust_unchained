@@ -8,11 +8,11 @@ use lib::DefaultedTrait;
 
 struct A;
 
-impl DefaultedTrait for (A,) {} //~ ERROR E0117
+impl DefaultedTrait for (A,) {} //~ ERROR E0321
 
 struct B;
 
-impl !DefaultedTrait for (B,) {} //~ ERROR E0117
+impl !DefaultedTrait for (B,) {} //~ ERROR E0321
 
 struct C;
 struct D<T>(T);

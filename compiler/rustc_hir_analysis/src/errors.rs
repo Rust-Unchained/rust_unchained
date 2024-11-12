@@ -1,5 +1,5 @@
 //! Errors emitted by `rustc_hir_analysis`.
-
+#![allow(dead_code)]
 use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, MultiSpan,

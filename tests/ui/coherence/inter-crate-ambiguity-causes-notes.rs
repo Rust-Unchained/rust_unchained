@@ -1,3 +1,5 @@
+//@ build-pass
+
 struct S;
 
 impl From<()> for S {
@@ -6,8 +8,8 @@ impl From<()> for S {
     }
 }
 
+// Allowed in Rust Unchained, no conflicts here.
 impl<I> From<I> for S
-//~^ ERROR conflicting implementations of trait
 where
     I: Iterator<Item = ()>,
 {

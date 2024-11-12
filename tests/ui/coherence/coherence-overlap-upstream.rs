@@ -1,16 +1,17 @@
-// Tests that we consider `i16: Remote` to be ambiguous, even
-// though the upstream crate doesn't implement it for now.
+//@ build-pass
 
 //@ aux-build:coherence_lib.rs
-
 
 extern crate coherence_lib;
 
 use coherence_lib::Remote;
 
 trait Foo {}
+
+// Allowed in Rust Unchained, i16 does not implement `Remote`
 impl<T> Foo for T where T: Remote {}
+
 impl Foo for i16 {}
-//~^ ERROR E0119
+
 
 fn main() {}

@@ -1,3 +1,5 @@
+//@ build-pass
+
 #![feature(specialization)] //~ WARN the feature `specialization` is incomplete
 
 // Regression test for #52050: when inserting the blanket impl `I`
@@ -25,7 +27,7 @@ where
 {
 }
 
-impl IntoPyDictPointer for () //~ ERROR conflicting implementations
+impl IntoPyDictPointer for ()
 {
 }
 

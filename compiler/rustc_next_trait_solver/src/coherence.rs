@@ -52,46 +52,8 @@ where
     I: Interner,
     E: Debug,
 {
-	let _ = orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?;
-	
-	/* Unchained Edit
-    if orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?.is_ok()
-    {
-        // A downstream or cousin crate is allowed to implement some
-        // generic parameters of this trait-ref.
-        return Ok(Err(Conflict::Downstream));
-    }
-	*/
-
-    if trait_ref_is_local_or_fundamental(infcx.cx(), trait_ref) {
-        // This is a local or fundamental trait, so future-compatibility
-        // is no concern. We know that downstream/cousin crates are not
-        // allowed to implement a generic parameter of this trait ref,
-        // which means impls could only come from dependencies of this
-        // crate, which we already know about.
-        return Ok(Ok(()));
-    }
-
-    // This is a remote non-fundamental trait, so if another crate
-    // can be the "final owner" of the generic parameters of this trait-ref,
-    // they are allowed to implement it future-compatibly.
-    //
-    // However, if we are a final owner, then nobody else can be,
-    // and if we are an intermediate owner, then we don't care
-    // about future-compatibility, which means that we're OK if
-    // we are an owner.
-    if orphan_check_trait_ref(
-        infcx,
-        trait_ref,
-        InCrate::Local { mode: OrphanCheckMode::Proper },
-        &mut lazily_normalize_ty,
-    )?
-    .is_ok()
-    {
-        Ok(Ok(()))
-    } else {
-        Ok(Err(Conflict::Upstream))
-    }
+    let _ = orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?;
+	Ok(Ok(()))
 }
 
 pub fn trait_ref_is_local_or_fundamental<I: Interner>(tcx: I, trait_ref: ty::TraitRef<I>) -> bool {
@@ -234,30 +196,16 @@ where
     }
 
     let mut checker = OrphanChecker::new(infcx, in_crate, lazily_normalize_ty);
-	
+
     match trait_ref.visit_with(&mut checker) {
         ControlFlow::Continue(()) => {
             Ok(Err(OrphanCheckErr::NonLocalInputType(checker.non_local_tys)))
         }
         ControlFlow::Break(residual) => match residual {
             OrphanCheckEarlyExit::NormalizationFailure(err) => Err(err),
-            OrphanCheckEarlyExit::UncoveredTyParam(_ty) => {
-                /*
-                // Does there exist some local type after the `ParamTy`.
-                checker.search_first_local_ty = true;
-
-                let local_ty = match trait_ref.visit_with(&mut checker) {
-                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(local_ty)) => Some(local_ty),
-                    _ => None,
-                };
-
-                Ok(Err(OrphanCheckErr::UncoveredTyParams(UncoveredTyParams {
-                    uncovered: ty,
-                    local_ty,
-                }))) */
+            OrphanCheckEarlyExit::UncoveredTyParam(_) | OrphanCheckEarlyExit::LocalTy(_) => {
                 Ok(Ok(()))
             }
-            OrphanCheckEarlyExit::LocalTy(_) => Ok(Ok(())),
         },
     }
 }
@@ -268,6 +216,7 @@ struct OrphanChecker<'a, Infcx, I: Interner, F> {
     in_self_ty: bool,
     lazily_normalize_ty: F,
     /// Ignore orphan check failures and exclusively search for the first local type.
+    #[allow(dead_code)]
     search_first_local_ty: bool,
     non_local_tys: Vec<(I::Ty, IsFirstInputType)>,
 }
@@ -294,14 +243,6 @@ where
         ControlFlow::Continue(())
     }
 
-    fn found_uncovered_ty_param(&mut self, ty: I::Ty) -> ControlFlow<OrphanCheckEarlyExit<I, E>> {
-        if self.search_first_local_ty {
-            return ControlFlow::Continue(());
-        }
-
-        ControlFlow::Break(OrphanCheckEarlyExit::UncoveredTyParam(ty))
-    }
-
     fn def_id_is_local(&mut self, def_id: I::DefId) -> bool {
         match self.in_crate {
             InCrate::Local { .. } => def_id.is_local(),
@@ -312,6 +253,7 @@ where
 
 enum OrphanCheckEarlyExit<I: Interner, E> {
     NormalizationFailure(E),
+    #[allow(dead_code)]
     UncoveredTyParam(I::Ty),
     LocalTy(I::Ty),
 }
@@ -346,51 +288,37 @@ where
             | ty::FnDef(..)
             | ty::Pat(..)
             | ty::FnPtr(..)
-            | ty::Array(..)
-            | ty::Slice(..)
             | ty::RawPtr(..)
-            | ty::Never
-            | ty::Tuple(..) => self.found_non_local_ty(ty),
+            | ty::Never => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
 
             ty::Param(..) => panic!("unexpected ty param"),
 
             ty::Placeholder(..) | ty::Bound(..) | ty::Infer(..) => {
-                match self.in_crate {
-                    InCrate::Local { .. } => self.found_uncovered_ty_param(ty),
-                    // The inference variable might be unified with a local
-                    // type in that remote crate.
-                    InCrate::Remote => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
+                ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
+            }
+
+            ty::Slice(inner_ty) | ty::Array(inner_ty, _) => self.visit_ty(inner_ty),
+
+            ty::Tuple(tys) => {
+                for inner_ty in tys.inputs().iter() {
+                    self.visit_ty(inner_ty)?;
                 }
+
+                ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
             }
 
             // A rigid alias may normalize to anything.
             // * If it references an infer var, placeholder or bound ty, it may
             //   normalize to that, so we have to treat it as an uncovered ty param.
-            // * Otherwise it may normalize to any non-type-generic type
+            // * Otherwise, it may normalize to any non-type-generic type
             //   be it local or non-local.
-            ty::Alias(kind, _) => {
+            ty::Alias(_, _) => {
                 if ty.has_type_flags(
                     ty::TypeFlags::HAS_TY_PLACEHOLDER
                         | ty::TypeFlags::HAS_TY_BOUND
                         | ty::TypeFlags::HAS_TY_INFER,
                 ) {
-                    match self.in_crate {
-                        InCrate::Local { mode } => match kind {
-                            ty::Projection => {
-                                if let OrphanCheckMode::Compat = mode {
-                                    ControlFlow::Continue(())
-                                } else {
-                                    self.found_uncovered_ty_param(ty)
-                                }
-                            }
-                            _ => self.found_uncovered_ty_param(ty),
-                        },
-                        InCrate::Remote => {
-                            // The inference variable might be unified with a local
-                            // type in that remote crate.
-                            ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
-                        }
-                    }
+                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
                 } else {
                     // Regarding *opaque types* specifically, we choose to treat them as non-local,
                     // even those that appear within the same crate. This seems somewhat surprising
@@ -400,7 +328,7 @@ where
                     // observe anything about it other than the traits that it implements.
                     //
                     // The alternative would be to look at the underlying type to determine whether
-                    // or not the opaque type itself should be considered local.
+                    // the opaque type itself should be considered local.
                     //
                     // However, this could make it a breaking change to switch the underlying hidden
                     // type from a local type to a remote type. This would violate the rule that
@@ -418,10 +346,8 @@ where
             ty::Adt(def, args) => {
                 if self.def_id_is_local(def.def_id()) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
-                } else if def.is_fundamental() {
-                    args.visit_with(self)
                 } else {
-                    self.found_non_local_ty(ty)
+                    args.visit_with(self)
                 }
             }
             ty::Foreign(def_id) => {
@@ -440,12 +366,8 @@ where
                 }
             }
             ty::Error(_) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
-            ty::Closure(did, ..) | ty::CoroutineClosure(did, ..) | ty::Coroutine(did, ..) => {
-                if self.def_id_is_local(did) {
-                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
-                } else {
-                    self.found_non_local_ty(ty)
-                }
+            ty::Closure(_, ..) | ty::CoroutineClosure(_, ..) | ty::Coroutine(_, ..) => {
+                ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
             }
             // This should only be created when checking whether we have to check whether some
             // auto trait impl applies. There will never be multiple impls, so we can just

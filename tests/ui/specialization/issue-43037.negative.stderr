@@ -2,7 +2,7 @@ error[E0277]: the trait bound `T: X` is not satisfied
   --> $DIR/issue-43037.rs:19:15
    |
 LL | impl<T> From< <A<T> as Z>::Assoc > for T {}
-   |               ^^^^^^^^^^^^^^^^^^ the trait `X` is not implemented for `T`, which is required by `A<T>: Z`
+   |               ^^^^^^^^^^^^^^^^^^ the trait `X` is not implemented for `T`
    |
 note: required for `A<T>` to implement `Z`
   --> $DIR/issue-43037.rs:14:12
