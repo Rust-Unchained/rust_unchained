@@ -104,6 +104,9 @@ fn main() {
 }
 ```
 
+# Future Updates
+Aside from critical security patches, this project will pull commits from the official compiler at maximum every 2 months. 
+
 ## PS - 1
 Beware of false positives when using external analysis tools, such as Rust Analyzer and RustRover, 
 they are programmed to detect violations of the orphan rules and do not take into account the custom compiler. You may need to disable certain inspections in those tools.
