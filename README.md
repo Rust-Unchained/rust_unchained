@@ -43,6 +43,11 @@ issues the "conflicting implementations" error when you're violating the orphan 
 There is one exception, which may seem like an orphan rule but isn't:
 - You cannot implement cross-crate traits on foreign types (such as `Send`, `Sync`, `Drop`, etc.)
 
+If you're wondering how this was achieved, it was simpler than it may look. 
+The official compiler is already capable of detecting conflicting impls,
+the orphan rules are checks added merely to enforce a design philosophy (note how `std` violates the rules in a lot of places).
+If you check Unchained's commits, you'll notice that most of them don't add any code, just removes it.
+
 ## Inherent impls on foreign types are allowed
 Which means you can write extension methods without having to use extension traits.
 
