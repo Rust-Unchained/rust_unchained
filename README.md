@@ -1,77 +1,111 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-light.svg">
-    <img alt="The Rust Programming Language: A language empowering everyone to build reliable and efficient software"
-         src="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-light.svg"
-         width="50%">
-  </picture>
+# Rust Unchained
 
-[Website][Rust] | [Getting started] | [Learn] | [Documentation] | [Contributing]
-</div>
+This is a fork of the official [Rust](https://github.com/rust-lang) compiler.
 
-This is the main source code repository for [Rust]. It contains the compiler,
-standard library, and documentation.
+This README only lists the differences from the official one. For more information, see the official [README](https://github.com/rust-lang/rust).
 
-[Rust]: https://www.rust-lang.org/
-[Getting Started]: https://www.rust-lang.org/learn/get-started
-[Learn]: https://www.rust-lang.org/learn
-[Documentation]: https://www.rust-lang.org/learn#learn-use
-[Contributing]: CONTRIBUTING.md
+# Introduction
 
-## Why Rust?
+The goal of this fork is to increase the productivity of application developers. 
+We attempt to achieve this by disabling the orphan rules (many of which do not make sense when applied to binary crates).
 
-- **Performance:** Fast and memory-efficient, suitable for critical services, embedded devices, and easily integrate with other languages.
+There are ways to work around the orphan rules, but those are just workarounds, they waste development time.
 
-- **Reliability:** Our rich type system and ownership model ensure memory and thread safety, reducing bugs at compile-time.
+# Differences from the official compiler
 
-- **Productivity:** Comprehensive documentation, a compiler committed to providing great diagnostics, and advanced tooling including package manager and build tool ([Cargo]), auto-formatter ([rustfmt]), linter ([Clippy]) and editor support ([rust-analyzer]).
+## Orphan rules are disabled
+Which means you can implement foreign traits for foreign types.
 
-[Cargo]: https://github.com/rust-lang/cargo
-[rustfmt]: https://github.com/rust-lang/rustfmt
-[Clippy]: https://github.com/rust-lang/rust-clippy
-[rust-analyzer]: https://github.com/rust-lang/rust-analyzer
+Example:
+```rust
+use foreign::ForeignType;
+use serde::Serialize;
 
-## Quick Start
+impl Serialize for ForeignType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        todo!()
+    }
+}
 
-Read ["Installation"] from [The Book].
+impl i32 {
+    fn display_percentage(self) -> String {
+        format!("{self}%")
+    }
+}
+```
 
-["Installation"]: https://doc.rust-lang.org/book/ch01-01-installation.html
-[The Book]: https://doc.rust-lang.org/book/index.html
+Note that the compiler still checks for conflicts, and will not compile if there are any.
 
-## Installing from Source
+Expect conflicts to be much less frequent though, as the default compiler misleadingly 
+issues the "conflicting implementations" error when you're violating the orphan rules
+(despite no actual conflicts existing at present).
 
-If you really want to install from source (though this is not recommended), see
-[INSTALL.md](INSTALL.md).
+There is one exception, which may seem like an orphan rule but isn't:
+- You cannot implement cross-crate traits on foreign types (such as `Send`, `Sync`, `Drop`, etc.)
 
-## Getting Help
+## Inherent impls on foreign types are allowed
+Which means you can write extension methods without having to use extension traits.
 
-See https://www.rust-lang.org/community for a list of chat platforms and forums.
+Example:
+```rust
+impl<T: Display> Vec<T> {
+    fn join_str(&self, sep: &str) -> String {
+	    self.iter()
+		    .map(T::to_string)
+		    .intersperse(sep.to_string())
+		    .collect()
+    }
+}
+```
 
-## Contributing
+## `impl<T: Copy> Copy for Range<T> {}`
+See https://github.com/rust-lang/rust/issues/18045
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+# Installation
 
-## License
+Right now, the only way to install this custom toolchain is to build it from source.
 
-Rust is primarily distributed under the terms of both the MIT license and the
-Apache License (Version 2.0), with portions covered by various BSD-like
-licenses.
+The author is working on a more convenient way to install it, but there's no ETA yet.
+Speaking of which, if you are familiar with the setup, the author would very much appreciate your help.
 
-See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT), and
-[COPYRIGHT](COPYRIGHT) for details.
+Building from source is the same as building the official compiler, just clone this repository instead of the official one.
+See [INSTALL.md](INSTALL.md).
 
-## Trademark
+# Known issues
 
-[The Rust Foundation][rust-foundation] owns and protects the Rust and Cargo
-trademarks and logos (the "Rust Trademarks").
+Implementing operator traits (Add, Sub, Mul, Div, etc.) on fundamental types (i8, i32, usize, etc.) is allowed, 
+but the compiler is not capable of detecting your implementations when using the operator symbols (+, -, *, etc.). 
 
-If you want to use these names or brands, please read the
-[media guide][media-guide].
+Example:
+```rust
+// This compiles
+impl Add<u16> for i32 {
+    type Output = i32;
+    
+    fn add(self, rhs: u16) -> Self {
+        self + rhs as i32
+    }
+}
 
-Third-party logos may be subject to third-party copyrights and trademarks. See
-[Licenses][policies-licenses] for details.
+// The problem comes when using the `+` operator symbol:
+fn main() {
+	let a: i32 = 5;
+	let b: u16 = 10;
 
-[rust-foundation]: https://foundation.rust-lang.org/
-[media-guide]: https://foundation.rust-lang.org/policies/logo-policy-and-media-guide/
-[policies-licenses]: https://www.rust-lang.org/policies/licenses
+	let c = a + b; // Error, using the symbol doesn't work
+
+	let c = a.add(b); // Ok, the compiler is capable of detecting the implementation when using the method.
+}
+```
+
+## PS - 1
+Beware of false positives when using external analysis tools, such as Rust Analyzer and RustRover, 
+they are programmed to detect violations of the orphan rules and do not take into account the custom compiler. You may need to disable certain inspections in those tools.
+
+If you think you saw a false positive, run `cargo check` to be sure.
+
+Clippy works just fine since it's a wrapper around `cargo check`.
+
+## PS - 2
+Do not upload crates made with this compiler to crates.io, those crates won't compile on the official compiler -
+only users with the Unchained toolchain will be able to use them.
