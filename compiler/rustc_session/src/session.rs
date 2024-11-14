@@ -16,7 +16,9 @@ use rustc_data_structures::sync::{
 };
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::codes::*;
-use rustc_errors::emitter::{DynEmitter, HumanEmitter, HumanReadableErrorType, stderr_destination};
+use rustc_errors::emitter::{
+    DynEmitter, HumanEmitter, HumanReadableErrorType, OutputTheme, stderr_destination,
+};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
 use rustc_errors::{
@@ -32,7 +34,7 @@ use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{
     CodeModel, DebuginfoKind, PanicStrategy, RelocModel, RelroLevel, SanitizerSet,
     SmallDataThresholdSupport, SplitDebuginfo, StackProtector, SymbolVisibility, Target,
-    TargetTriple, TlsModel,
+    TargetTuple, TlsModel,
 };
 
 use crate::code_stats::CodeStats;
@@ -300,6 +302,7 @@ impl Session {
         self.opts.test
     }
 
+    /// `feature` must be a language feature.
     #[track_caller]
     pub fn create_feature_err<'a>(&'a self, err: impl Diagnostic<'a>, feature: Symbol) -> Diag<'a> {
         let mut err = self.dcx().create_err(err);
@@ -451,12 +454,12 @@ impl Session {
     /// directories are also returned, for example if `--sysroot` is used but tools are missing
     /// (#125246): we also add the bin directories to the sysroot where rustc is located.
     pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
-        let bin_path = filesearch::make_target_bin_path(&self.sysroot, config::host_triple());
+        let bin_path = filesearch::make_target_bin_path(&self.sysroot, config::host_tuple());
         let fallback_sysroot_paths = filesearch::sysroot_candidates()
             .into_iter()
             // Ignore sysroot candidate if it was the same as the sysroot path we just used.
             .filter(|sysroot| *sysroot != self.sysroot)
-            .map(|sysroot| filesearch::make_target_bin_path(&sysroot, config::host_triple()));
+            .map(|sysroot| filesearch::make_target_bin_path(&sysroot, config::host_tuple()));
         let search_paths = std::iter::once(bin_path).chain(fallback_sysroot_paths);
 
         if self_contained {
@@ -965,6 +968,11 @@ fn default_emitter(
                     .macro_backtrace(macro_backtrace)
                     .track_diagnostics(track_diagnostics)
                     .terminal_url(terminal_url)
+                    .theme(if let HumanReadableErrorType::Unicode = kind {
+                        OutputTheme::Unicode
+                    } else {
+                        OutputTheme::Ascii
+                    })
                     .ignored_directories_in_source_blocks(
                         sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
                     );
@@ -1023,7 +1031,7 @@ pub fn build_session(
     let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
 
-    let host_triple = TargetTriple::from_triple(config::host_triple());
+    let host_triple = TargetTuple::from_tuple(config::host_tuple());
     let (host, target_warnings) = Target::search(&host_triple, &sysroot).unwrap_or_else(|e| {
         early_dcx.early_fatal(format!("Error loading host specification: {e}"))
     });
@@ -1074,8 +1082,8 @@ pub fn build_session(
     let mut psess = ParseSess::with_dcx(dcx, source_map);
     psess.assume_incomplete_release = sopts.unstable_opts.assume_incomplete_release;
 
-    let host_triple = config::host_triple();
-    let target_triple = sopts.target_triple.triple();
+    let host_triple = config::host_tuple();
+    let target_triple = sopts.target_triple.tuple();
     let host_tlib_path = Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
     let target_tlib_path = if host_triple == target_triple {
         // Use the same `SearchPath` if host and target triple are identical to avoid unnecessary
@@ -1469,6 +1477,11 @@ fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
             let short = kind.short();
             Box::new(
                 HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
+                    .theme(if let HumanReadableErrorType::Unicode = kind {
+                        OutputTheme::Unicode
+                    } else {
+                        OutputTheme::Ascii
+                    })
                     .short_message(short),
             )
         }

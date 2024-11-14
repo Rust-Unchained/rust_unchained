@@ -336,6 +336,7 @@ declare_features! (
     (unstable, riscv_target_feature, "1.45.0", Some(44839)),
     (unstable, rtm_target_feature, "1.35.0", Some(44839)),
     (unstable, s390x_target_feature, "1.82.0", Some(44839)),
+    (unstable, sparc_target_feature, "CURRENT_RUSTC_VERSION", Some(132783)),
     (unstable, sse4a_target_feature, "1.27.0", Some(44839)),
     (unstable, tbm_target_feature, "1.27.0", Some(44839)),
     (unstable, wasm_target_feature, "1.30.0", Some(44839)),
@@ -462,8 +463,6 @@ declare_features! (
     (unstable, doc_masked, "1.21.0", Some(44027)),
     /// Allows `dyn* Trait` objects.
     (incomplete, dyn_star, "1.65.0", Some(102425)),
-    /// Uses generic effect parameters for ~const bounds
-    (incomplete, effects, "1.72.0", Some(102090)),
     /// Allows exhaustive pattern matching on types that contain uninhabited types.
     (unstable, exhaustive_patterns, "1.13.0", Some(51085)),
     /// Allows explicit tail calls via `become` expression.

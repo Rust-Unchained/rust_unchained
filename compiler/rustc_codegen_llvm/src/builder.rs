@@ -21,7 +21,7 @@ use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_sanitizers::{cfi, kcfi};
 use rustc_session::config::OptLevel;
 use rustc_span::Span;
-use rustc_target::abi::call::FnAbi;
+use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{HasTargetSpec, SanitizerSet, Target};
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
@@ -1574,6 +1574,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
                 cfi::typeid_for_fnabi(self.tcx, fn_abi, options)
             };
             let typeid_metadata = self.cx.typeid_metadata(typeid).unwrap();
+            let dbg_loc = self.get_dbg_loc();
 
             // Test whether the function pointer is associated with the type identifier.
             let cond = self.type_test(llfn, typeid_metadata);
@@ -1582,10 +1583,16 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             self.cond_br(cond, bb_pass, bb_fail);
 
             self.switch_to_block(bb_fail);
+            if let Some(dbg_loc) = dbg_loc {
+                self.set_dbg_loc(dbg_loc);
+            }
             self.abort();
             self.unreachable();
 
             self.switch_to_block(bb_pass);
+            if let Some(dbg_loc) = dbg_loc {
+                self.set_dbg_loc(dbg_loc);
+            }
         }
     }
 

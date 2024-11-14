@@ -82,7 +82,7 @@ pub(crate) fn get_clippy_rules_in_order(
     {
         item.iter().for_each(|v| {
             let rule = format!("{prefix}{v}");
-            let position = all_args.iter().position(|t| t == &rule).unwrap();
+            let position = all_args.iter().position(|t| t == &rule || t == v).unwrap();
             result.push((position, rule));
         });
     }
@@ -295,7 +295,7 @@ macro_rules! lint_any {
 
 lint_any!(
     Bootstrap, "src/bootstrap", "bootstrap";
-    BuildHelper, "src/tools/build_helper", "build_helper";
+    BuildHelper, "src/build_helper", "build_helper";
     BuildManifest, "src/tools/build-manifest", "build-manifest";
     CargoMiri, "src/tools/miri/cargo-miri", "cargo-miri";
     Clippy, "src/tools/clippy", "clippy";

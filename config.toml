@@ -1,4 +1,4 @@
-change-id = 131513
+change-id = 132494
 
 # These defaults are meant for users and distro maintainers building from source, without intending to make multiple changes.
 [build]
@@ -45,7 +45,6 @@ backtrace = true
 backtrace-on-ice = true
 lto = "off"
 optimize = true
-parallel-compiler = true
 dist-src = false
 llvm-bitcode-linker = true
 verify-llvm-ir = true

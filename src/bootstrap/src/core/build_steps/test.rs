@@ -800,7 +800,7 @@ impl Step for RustdocTheme {
             .arg(builder.src.join("src/librustdoc/html/static/css/rustdoc.css").to_str().unwrap())
             .env("RUSTC_STAGE", self.compiler.stage.to_string())
             .env("RUSTC_SYSROOT", builder.sysroot(self.compiler))
-            .env("RUSTDOC_LIBDIR", builder.sysroot_libdir(self.compiler, self.compiler.host))
+            .env("RUSTDOC_LIBDIR", builder.sysroot_target_libdir(self.compiler, self.compiler.host))
             .env("CFG_RELEASE_CHANNEL", &builder.config.channel)
             .env("RUSTDOC_REAL", builder.rustdoc(self.compiler))
             .env("RUSTC_BOOTSTRAP", "1");
@@ -1334,7 +1334,7 @@ impl Step for CrateBuildHelper {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/tools/build_helper")
+        run.path("src/build_helper")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1352,7 +1352,7 @@ impl Step for CrateBuildHelper {
             Mode::ToolBootstrap,
             host,
             Kind::Test,
-            "src/tools/build_helper",
+            "src/build_helper",
             SourceType::InTree,
             &[],
         );
@@ -1702,7 +1702,7 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
         // of them!
 
         cmd.arg("--compile-lib-path").arg(builder.rustc_libdir(compiler));
-        cmd.arg("--run-lib-path").arg(builder.sysroot_libdir(compiler, target));
+        cmd.arg("--run-lib-path").arg(builder.sysroot_target_libdir(compiler, target));
         cmd.arg("--rustc-path").arg(builder.rustc(compiler));
 
         // Minicore auxiliary lib for `no_core` tests that need `core` stubs in cross-compilation
@@ -1918,9 +1918,13 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
 
         cmd.arg("--json");
 
-        if builder.config.rust_debug_assertions_std {
-            cmd.arg("--with-debug-assertions");
-        };
+        if builder.config.rustc_debug_assertions {
+            cmd.arg("--with-rustc-debug-assertions");
+        }
+
+        if builder.config.std_debug_assertions {
+            cmd.arg("--with-std-debug-assertions");
+        }
 
         let mut llvm_components_passed = false;
         let mut copts_passed = false;
@@ -2563,7 +2567,7 @@ fn prepare_cargo_test(
     // by `Cargo::new` and that actually makes things go wrong.
     if builder.kind != Kind::Miri {
         let mut dylib_path = dylib_path();
-        dylib_path.insert(0, PathBuf::from(&*builder.sysroot_libdir(compiler, target)));
+        dylib_path.insert(0, PathBuf::from(&*builder.sysroot_target_libdir(compiler, target)));
         cargo.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
     }
 
@@ -2798,7 +2802,7 @@ impl Step for CrateRustdoc {
         let libdir = if builder.download_rustc() {
             builder.rustc_libdir(compiler)
         } else {
-            builder.sysroot_libdir(compiler, target).to_path_buf()
+            builder.sysroot_target_libdir(compiler, target).to_path_buf()
         };
         let mut dylib_path = dylib_path();
         dylib_path.insert(0, PathBuf::from(&*libdir));
@@ -2923,7 +2927,7 @@ impl Step for RemoteCopyLibs {
         cmd.run(builder);
 
         // Push all our dylibs to the emulator
-        for f in t!(builder.sysroot_libdir(compiler, target).read_dir()) {
+        for f in t!(builder.sysroot_target_libdir(compiler, target).read_dir()) {
             let f = t!(f);
             let name = f.file_name().into_string().unwrap();
             if helpers::is_dylib(&name) {

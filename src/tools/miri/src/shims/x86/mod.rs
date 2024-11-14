@@ -1,12 +1,11 @@
 use rand::Rng as _;
+use rustc_abi::{ExternAbi, Size};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::Single;
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::LayoutOf as _;
 use rustc_middle::{mir, ty};
 use rustc_span::Symbol;
-use rustc_target::abi::Size;
-use rustc_target::spec::abi::Abi;
 
 use self::helpers::bool_to_simd_element;
 use crate::*;
@@ -29,7 +28,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: Abi,
+        abi: ExternAbi,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -47,7 +46,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     return interp_ok(EmulateItemResult::NotSupported);
                 }
 
-                let [cb_in, a, b] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
+                let [cb_in, a, b] = this.check_shim(abi, ExternAbi::Unadjusted, link_name, args)?;
 
                 let op = if unprefixed_name.starts_with("add") {
                     mir::BinOp::AddWithOverflow
@@ -71,7 +70,8 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     return interp_ok(EmulateItemResult::NotSupported);
                 }
 
-                let [c_in, a, b, out] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
+                let [c_in, a, b, out] =
+                    this.check_shim(abi, ExternAbi::Unadjusted, link_name, args)?;
                 let out = this.deref_pointer_as(
                     out,
                     if is_u64 { this.machine.layouts.u64 } else { this.machine.layouts.u32 },
@@ -88,18 +88,29 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // the instruction behaves like a no-op, so it is always safe to call the
             // intrinsic.
             "sse2.pause" => {
-                let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
                 // Only exhibit the spin-loop hint behavior when SSE2 is enabled.
                 if this.tcx.sess.unstable_target_features.contains(&Symbol::intern("sse2")) {
                     this.yield_active_thread();
                 }
             }
 
-            "pclmulqdq" => {
-                let [left, right, imm] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+            "pclmulqdq" | "pclmulqdq.256" | "pclmulqdq.512" => {
+                let mut len = 2; // in units of 64bits
+                this.expect_target_feature_for_intrinsic(link_name, "pclmulqdq")?;
+                if unprefixed_name.ends_with(".256") {
+                    this.expect_target_feature_for_intrinsic(link_name, "vpclmulqdq")?;
+                    len = 4;
+                } else if unprefixed_name.ends_with(".512") {
+                    this.expect_target_feature_for_intrinsic(link_name, "vpclmulqdq")?;
+                    this.expect_target_feature_for_intrinsic(link_name, "avx512f")?;
+                    len = 8;
+                }
 
-                pclmulqdq(this, left, right, imm, dest)?;
+                let [left, right, imm] =
+                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+
+                pclmulqdq(this, left, right, imm, dest, len)?;
             }
 
             name if name.starts_with("bmi.") => {
@@ -386,7 +397,6 @@ enum FloatUnaryOp {
 }
 
 /// Performs `which` scalar operation on `op` and returns the result.
-#[allow(clippy::arithmetic_side_effects)] // floating point operations without side effects
 fn unary_op_f32<'tcx>(
     this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatUnaryOp,
@@ -415,7 +425,7 @@ fn unary_op_f32<'tcx>(
 }
 
 /// Disturbes a floating-point result by a relative error on the order of (-2^scale, 2^scale).
-#[allow(clippy::arithmetic_side_effects)] // floating point arithmetic cannot panic
+#[expect(clippy::arithmetic_side_effects)] // floating point arithmetic cannot panic
 fn apply_random_float_error<F: rustc_apfloat::Float>(
     this: &mut crate::MiriInterpCx<'_>,
     val: F,
@@ -1122,7 +1132,7 @@ fn pmulhrsw<'tcx>(
 
         // The result of this operation can overflow a signed 16-bit integer.
         // When `left` and `right` are -0x8000, the result is 0x8000.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let res = res as i16;
 
         this.write_scalar(Scalar::from_i16(res), &dest)?;
@@ -1134,8 +1144,11 @@ fn pmulhrsw<'tcx>(
 /// Perform a carry-less multiplication of two 64-bit integers, selected from `left` and `right` according to `imm8`,
 /// and store the results in `dst`.
 ///
-/// `left` and `right` are both vectors of type 2 x i64. Only bits 0 and 4 of `imm8` matter;
+/// `left` and `right` are both vectors of type `len` x i64. Only bits 0 and 4 of `imm8` matter;
 /// they select the element of `left` and `right`, respectively.
+///
+/// `len` is the SIMD vector length (in counts of `i64` values). It is expected to be one of
+/// `2`, `4`, or `8`.
 ///
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_clmulepi64_si128>
 fn pclmulqdq<'tcx>(
@@ -1144,51 +1157,55 @@ fn pclmulqdq<'tcx>(
     right: &OpTy<'tcx>,
     imm8: &OpTy<'tcx>,
     dest: &MPlaceTy<'tcx>,
+    len: u64,
 ) -> InterpResult<'tcx, ()> {
     assert_eq!(left.layout, right.layout);
     assert_eq!(left.layout.size, dest.layout.size);
+    assert!([2u64, 4, 8].contains(&len));
 
-    // Transmute to `[u64; 2]`
+    // Transmute the input into arrays of `[u64; len]`.
+    // Transmute the output into an array of `[u128, len / 2]`.
 
-    let array_layout = this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u64, 2))?;
-    let left = left.transmute(array_layout, this)?;
-    let right = right.transmute(array_layout, this)?;
-    let dest = dest.transmute(array_layout, this)?;
+    let src_layout = this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u64, len))?;
+    let dest_layout = this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u128, len / 2))?;
+
+    let left = left.transmute(src_layout, this)?;
+    let right = right.transmute(src_layout, this)?;
+    let dest = dest.transmute(dest_layout, this)?;
 
     let imm8 = this.read_scalar(imm8)?.to_u8()?;
 
-    // select the 64-bit integer from left that the user specified (low or high)
-    let index = if (imm8 & 0x01) == 0 { 0 } else { 1 };
-    let left = this.read_scalar(&this.project_index(&left, index)?)?.to_u64()?;
+    for i in 0..(len / 2) {
+        let lo = i.strict_mul(2);
+        let hi = i.strict_mul(2).strict_add(1);
 
-    // select the 64-bit integer from right that the user specified (low or high)
-    let index = if (imm8 & 0x10) == 0 { 0 } else { 1 };
-    let right = this.read_scalar(&this.project_index(&right, index)?)?.to_u64()?;
+        // select the 64-bit integer from left that the user specified (low or high)
+        let index = if (imm8 & 0x01) == 0 { lo } else { hi };
+        let left = this.read_scalar(&this.project_index(&left, index)?)?.to_u64()?;
 
-    // Perform carry-less multiplication
-    //
-    // This operation is like long multiplication, but ignores all carries.
-    // That idea corresponds to the xor operator, which is used in the implementation.
-    //
-    // Wikipedia has an example https://en.wikipedia.org/wiki/Carry-less_product#Example
-    let mut result: u128 = 0;
+        // select the 64-bit integer from right that the user specified (low or high)
+        let index = if (imm8 & 0x10) == 0 { lo } else { hi };
+        let right = this.read_scalar(&this.project_index(&right, index)?)?.to_u64()?;
 
-    for i in 0..64 {
-        // if the i-th bit in right is set
-        if (right & (1 << i)) != 0 {
-            // xor result with `left` shifted to the left by i positions
-            result ^= u128::from(left) << i;
+        // Perform carry-less multiplication.
+        //
+        // This operation is like long multiplication, but ignores all carries.
+        // That idea corresponds to the xor operator, which is used in the implementation.
+        //
+        // Wikipedia has an example https://en.wikipedia.org/wiki/Carry-less_product#Example
+        let mut result: u128 = 0;
+
+        for i in 0..64 {
+            // if the i-th bit in right is set
+            if (right & (1 << i)) != 0 {
+                // xor result with `left` shifted to the left by i positions
+                result ^= u128::from(left) << i;
+            }
         }
+
+        let dest = this.project_index(&dest, i)?;
+        this.write_scalar(Scalar::from_u128(result), &dest)?;
     }
-
-    let result_low = (result & 0xFFFF_FFFF_FFFF_FFFF) as u64;
-    let result_high = (result >> 64) as u64;
-
-    let dest_low = this.project_index(&dest, 0)?;
-    this.write_scalar(Scalar::from_u64(result_low), &dest_low)?;
-
-    let dest_high = this.project_index(&dest, 1)?;
-    this.write_scalar(Scalar::from_u64(result_high), &dest_high)?;
 
     interp_ok(())
 }

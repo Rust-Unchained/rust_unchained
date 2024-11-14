@@ -6,6 +6,7 @@ use std::iter;
 use std::path::PathBuf;
 
 use itertools::{EitherOrBoth, Itertools};
+use rustc_abi::ExternAbi;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::codes::*;
@@ -38,7 +39,6 @@ use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{Ident, Symbol, kw, sym};
 use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, ExpnKind, MacroKind, Span};
-use rustc_target::spec::abi;
 use tracing::{debug, instrument};
 
 use super::{
@@ -1916,7 +1916,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         infcx.next_ty_var(DUMMY_SP),
                         false,
                         hir::Safety::Safe,
-                        abi::Abi::Rust,
+                        ExternAbi::Rust,
                     )
                 }
                 _ => infcx.tcx.mk_fn_sig(
@@ -1924,7 +1924,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     infcx.next_ty_var(DUMMY_SP),
                     false,
                     hir::Safety::Safe,
-                    abi::Abi::Rust,
+                    ExternAbi::Rust,
                 ),
             };
 
@@ -2953,6 +2953,22 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 // We hold the `DefId` of the item introducing the obligation, but displaying it
                 // doesn't add user usable information. It always point at an associated item.
             }
+            ObligationCauseCode::OpaqueTypeBound(span, definition_def_id) => {
+                err.span_note(span, "required by a bound in an opaque type");
+                if let Some(definition_def_id) = definition_def_id
+                    // If there are any stalled coroutine obligations, then this
+                    // error may be due to that, and not because the body has more
+                    // where-clauses.
+                    && self.tcx.typeck(definition_def_id).coroutine_stalled_predicates.is_empty()
+                {
+                    // FIXME(compiler-errors): We could probably point to something
+                    // specific here if we tried hard enough...
+                    err.span_note(
+                        tcx.def_span(definition_def_id),
+                        "this definition site has more where clauses than the opaque type",
+                    );
+                }
+            }
             ObligationCauseCode::Coercion { source, target } => {
                 let source =
                     tcx.short_ty_string(self.resolve_vars_if_possible(source), long_ty_file);
@@ -3563,17 +3579,34 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 )]);
             }
             ObligationCauseCode::OpaqueReturnType(expr_info) => {
-                if let Some((expr_ty, hir_id)) = expr_info {
-                    let expr_ty = self.tcx.short_ty_string(expr_ty, long_ty_file);
-                    let expr = self.infcx.tcx.hir().expect_expr(hir_id);
-                    err.span_label(
-                        expr.span,
-                        with_forced_trimmed_paths!(format!(
-                            "return type was inferred to be `{expr_ty}` here",
-                        )),
-                    );
-                    suggest_remove_deref(err, &expr);
-                }
+                let (expr_ty, expr) = if let Some((expr_ty, hir_id)) = expr_info {
+                    let expr_ty = tcx.short_ty_string(expr_ty, long_ty_file);
+                    let expr = tcx.hir().expect_expr(hir_id);
+                    (expr_ty, expr)
+                } else if let Some(body_id) = tcx.hir_node_by_def_id(body_id).body_id()
+                    && let body = tcx.hir().body(body_id)
+                    && let hir::ExprKind::Block(block, _) = body.value.kind
+                    && let Some(expr) = block.expr
+                    && let Some(expr_ty) = self
+                        .typeck_results
+                        .as_ref()
+                        .and_then(|typeck| typeck.node_type_opt(expr.hir_id))
+                    && let Some(pred) = predicate.as_clause()
+                    && let ty::ClauseKind::Trait(pred) = pred.kind().skip_binder()
+                    && self.can_eq(param_env, pred.self_ty(), expr_ty)
+                {
+                    let expr_ty = tcx.short_ty_string(expr_ty, long_ty_file);
+                    (expr_ty, expr)
+                } else {
+                    return;
+                };
+                err.span_label(
+                    expr.span,
+                    with_forced_trimmed_paths!(format!(
+                        "return type was inferred to be `{expr_ty}` here",
+                    )),
+                );
+                suggest_remove_deref(err, &expr);
             }
         }
     }
@@ -3680,6 +3713,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         err: &mut Diag<'_>,
         trait_pred: ty::PolyTraitPredicate<'tcx>,
     ) {
+        if trait_pred.polarity() == ty::PredicatePolarity::Negative {
+            return;
+        }
         let Some(diagnostic_name) = self.tcx.get_diagnostic_name(trait_pred.def_id()) else {
             return;
         };
@@ -3731,7 +3767,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     trait_pred.skip_binder().self_ty(),
                     diagnostic_name,
                 ),
-                // FIXME(effects, const_trait_impl) derive_const as suggestion?
+                // FIXME(const_trait_impl) derive_const as suggestion?
                 format!("#[derive({diagnostic_name})]\n"),
                 Applicability::MaybeIncorrect,
             );
@@ -3976,7 +4012,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             && let [self_ty, found_ty] = trait_ref.args.as_slice()
             && let Some(fn_ty) = self_ty.as_type().filter(|ty| ty.is_fn())
             && let fn_sig @ ty::FnSig {
-                abi: abi::Abi::Rust,
+                abi: ExternAbi::Rust,
                 c_variadic: false,
                 safety: hir::Safety::Safe,
                 ..
@@ -4429,6 +4465,41 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             } else {
                 err.span_help(span, msg);
             }
+        }
+    }
+
+    /// If the type failed selection but the trait is implemented for `(T,)`, suggest that the user
+    /// creates a unary tuple
+    ///
+    /// This is a common gotcha when using libraries that emulate variadic functions with traits for tuples.
+    pub(super) fn suggest_tuple_wrapping(
+        &self,
+        err: &mut Diag<'_>,
+        root_obligation: &PredicateObligation<'tcx>,
+        obligation: &PredicateObligation<'tcx>,
+    ) {
+        let ObligationCauseCode::FunctionArg { arg_hir_id, .. } = obligation.cause.code() else {
+            return;
+        };
+
+        let Some(root_pred) = root_obligation.predicate.as_trait_clause() else { return };
+
+        let trait_ref = root_pred.map_bound(|root_pred| {
+            root_pred
+                .trait_ref
+                .with_self_ty(self.tcx, Ty::new_tup(self.tcx, &[root_pred.trait_ref.self_ty()]))
+        });
+
+        let obligation =
+            Obligation::new(self.tcx, obligation.cause.clone(), obligation.param_env, trait_ref);
+
+        if self.predicate_must_hold_modulo_regions(&obligation) {
+            let arg_span = self.tcx.hir().span(*arg_hir_id);
+            err.multipart_suggestion_verbose(
+                format!("use a unary tuple instead"),
+                vec![(arg_span.shrink_to_lo(), "(".into()), (arg_span.shrink_to_hi(), ",)".into())],
+                Applicability::MaybeIncorrect,
+            );
         }
     }
 

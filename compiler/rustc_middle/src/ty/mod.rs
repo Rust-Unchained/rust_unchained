@@ -24,6 +24,7 @@ pub use assoc::*;
 pub use generic_args::{GenericArgKind, TermKind, *};
 pub use generics::*;
 pub use intrinsic::IntrinsicDef;
+use rustc_abi::{Align, FieldIdx, Integer, IntegerType, ReprFlags, ReprOptions, VariantIdx};
 use rustc_ast::expand::StrippedCfgItem;
 use rustc_ast::node_id::NodeMap;
 pub use rustc_ast_ir::{Movability, Mutability, try_visit};
@@ -48,21 +49,12 @@ pub use rustc_session::lint::RegisteredTools;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::symbol::{Ident, Symbol, kw, sym};
 use rustc_span::{ExpnId, ExpnKind, Span};
-use rustc_target::abi::{Align, FieldIdx, Integer, IntegerType, VariantIdx};
-pub use rustc_target::abi::{ReprFlags, ReprOptions};
-pub use rustc_type_ir::ConstKind::{
-    Bound as BoundCt, Error as ErrorCt, Expr as ExprCt, Infer as InferCt, Param as ParamCt,
-    Placeholder as PlaceholderCt, Unevaluated, Value,
-};
 pub use rustc_type_ir::relate::VarianceDiagInfo;
 pub use rustc_type_ir::*;
 use tracing::{debug, instrument};
 pub use vtable::*;
 use {rustc_ast as ast, rustc_attr as attr, rustc_hir as hir};
 
-pub use self::AssocItemContainer::*;
-pub use self::BorrowKind::*;
-pub use self::IntVarValue::*;
 pub use self::closure::{
     BorrowKind, CAPTURE_STRUCT_LOCAL, CaptureInfo, CapturedPlace, ClosureTypeInfo,
     MinCaptureInformationMap, MinCaptureList, RootVariableMinCaptureList, UpvarCapture, UpvarId,
@@ -92,7 +84,6 @@ pub use self::predicate::{
     RegionOutlivesPredicate, SubtypePredicate, ToPolyTraitRef, TraitPredicate, TraitRef,
     TypeOutlivesPredicate,
 };
-pub use self::region::BoundRegionKind::*;
 pub use self::region::{
     BoundRegion, BoundRegionKind, EarlyParamRegion, LateParamRegion, Region, RegionKind, RegionVid,
 };
@@ -496,12 +487,10 @@ impl<'tcx> rustc_type_ir::inherent::IntoKind for Term<'tcx> {
     }
 }
 
-#[cfg(parallel_compiler)]
 unsafe impl<'tcx> rustc_data_structures::sync::DynSend for Term<'tcx> where
     &'tcx (Ty<'tcx>, Const<'tcx>): rustc_data_structures::sync::DynSend
 {
 }
-#[cfg(parallel_compiler)]
 unsafe impl<'tcx> rustc_data_structures::sync::DynSync for Term<'tcx> where
     &'tcx (Ty<'tcx>, Const<'tcx>): rustc_data_structures::sync::DynSync
 {
@@ -903,7 +892,7 @@ impl rustc_type_ir::inherent::PlaceholderLike for PlaceholderRegion {
     }
 
     fn new(ui: UniverseIndex, var: BoundVar) -> Self {
-        Placeholder { universe: ui, bound: BoundRegion { var, kind: BoundRegionKind::BrAnon } }
+        Placeholder { universe: ui, bound: BoundRegion { var, kind: BoundRegionKind::Anon } }
     }
 }
 
@@ -1085,11 +1074,6 @@ impl<'tcx> ParamEnv<'tcx> {
         ty::ParamEnv { packed: CopyTaggedPtr::new(caller_bounds, ParamTag { reveal }) }
     }
 
-    pub fn with_user_facing(mut self) -> Self {
-        self.packed.set_tag(ParamTag { reveal: Reveal::UserFacing, ..self.packed.tag() });
-        self
-    }
-
     /// Returns a new parameter environment with the same clauses, but
     /// which "reveals" the true results of projections in all cases
     /// (even for associated types that are specializable). This is
@@ -1102,6 +1086,12 @@ impl<'tcx> ParamEnv<'tcx> {
     pub fn with_reveal_all_normalized(self, tcx: TyCtxt<'tcx>) -> Self {
         if self.packed.tag().reveal == traits::Reveal::All {
             return self;
+        }
+
+        // No need to reveal opaques with the new solver enabled,
+        // since we have lazy norm.
+        if tcx.next_trait_solver_globally() {
+            return ParamEnv::new(self.caller_bounds(), Reveal::All);
         }
 
         ParamEnv::new(tcx.reveal_opaque_types_in_bounds(self.caller_bounds()), Reveal::All)
@@ -2079,7 +2069,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let Some(item) = self.opt_associated_item(def_id) else {
             return false;
         };
-        if item.container != ty::AssocItemContainer::ImplContainer {
+        if item.container != ty::AssocItemContainer::Impl {
             return false;
         }
 
