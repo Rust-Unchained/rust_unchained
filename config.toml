@@ -48,7 +48,7 @@ optimize = true
 dist-src = false
 llvm-bitcode-linker = true
 verify-llvm-ir = true
-description = "Rust Unchained"
+description = "Rust-Unchained"
 codegen-units-std = 1
 use-lld = true
 
@@ -65,7 +65,7 @@ compression-profile = "balanced"
 
 [install]
 # Where to install the generated toolchain. Must be an absolute path.
-prefix = "/home/houtamelo/.rustup/toolchains/unchained"
+#prefix = "/home/houtamelo/.rustup/toolchains/unchained"
 
 # Where to install system configuration files.
 # If this is a relative path, it will get installed in `prefix` above
