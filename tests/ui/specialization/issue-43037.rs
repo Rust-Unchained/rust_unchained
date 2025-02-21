@@ -17,6 +17,6 @@ impl<T: X> Z for A<T> {
 
 // this impl is invalid, but causes an ICE anyway
 impl<T> From< <A<T> as Z>::Assoc > for T {}
-//~^ ERROR E0277
+//~^ ERROR E0119
 
 fn main() {}

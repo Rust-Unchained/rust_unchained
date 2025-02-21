@@ -5,7 +5,7 @@
 [submodule "src/tools/cargo"]
 	path = src/tools/cargo
 	url = https://github.com/rust-lang/cargo.git
-	shallow = true
+	shallow = false
 [submodule "src/doc/reference"]
 	path = src/doc/reference
 	url = https://github.com/rust-lang/reference.git

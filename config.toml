@@ -1,4 +1,4 @@
-change-id = 132494
+change-id = 137170
 
 # These defaults are meant for users and distro maintainers building from source, without intending to make multiple changes.
 [build]
@@ -9,7 +9,7 @@ test-stage = 2
 doc-stage = 2
 # When compiling from source, you usually want all tools.
 extended = true
-
+vendor = false
 tools = [
     "cargo",
     "clippy",

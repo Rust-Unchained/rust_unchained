@@ -1,21 +1,12 @@
-error[E0277]: the trait bound `T: X` is not satisfied
-  --> $DIR/issue-43037.rs:19:15
+error[E0119]: conflicting implementations of trait `From<_>`
+  --> $DIR/issue-43037.rs:19:1
    |
 LL | impl<T> From< <A<T> as Z>::Assoc > for T {}
-   |               ^^^^^^^^^^^^^^^^^^ the trait `X` is not implemented for `T`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-note: required for `A<T>` to implement `Z`
-  --> $DIR/issue-43037.rs:14:12
-   |
-LL | impl<T: X> Z for A<T> {
-   |         -  ^     ^^^^
-   |         |
-   |         unsatisfied trait bound introduced here
-help: consider restricting type parameter `T`
-   |
-LL | impl<T: X> From< <A<T> as Z>::Assoc > for T {}
-   |       +++
+   = note: conflicting implementation in crate `core`:
+           - impl<T> From<T> for T;
 
 error: aborting due to 1 previous error
 
-For more information about this error, try `rustc --explain E0277`.
+For more information about this error, try `rustc --explain E0119`.

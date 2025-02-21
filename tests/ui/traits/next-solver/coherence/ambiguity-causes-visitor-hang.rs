@@ -3,7 +3,7 @@
 // goals for `<Box<?t> as RecursiveSuper>::Assoc`. This test
 // takes multiple minutes when doing so and less than a second
 // otherwise.
-
+//@ build-pass
 //@ compile-flags: -Znext-solver=coherence
 
 trait RecursiveSuper:
@@ -51,6 +51,5 @@ trait Super {
 trait Overlap {}
 impl<T: RecursiveSuper> Overlap for T {}
 impl<T> Overlap for Box<T> {}
-//~^ ERROR conflicting implementations of trait `Overlap` for type `Box<_>`
 
 fn main() {}

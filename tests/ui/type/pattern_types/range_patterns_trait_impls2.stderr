@@ -1,5 +1,5 @@
 error[E0277]: can't compare `(u32) is 1..=` with `(u32) is 1..=`
-  --> $DIR/range_patterns_trait_impls2.rs:13:13
+  --> $DIR/range_patterns_trait_impls2.rs:12:13
    |
 LL | impl Eq for Y {}
    |             ^ no implementation for `(u32) is 1..= == (u32) is 1..=`
