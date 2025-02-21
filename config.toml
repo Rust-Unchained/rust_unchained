@@ -43,7 +43,7 @@ incremental = true
 backtrace = true
 # Print backtrace on internal compiler errors during bootstrap
 backtrace-on-ice = true
-lto = "off"
+lto = "fat"
 optimize = true
 dist-src = false
 llvm-bitcode-linker = true
@@ -61,11 +61,12 @@ assertions = false
 [dist]
 # Use better compression when preparing tarballs.
 compression-profile = "balanced"
+src-tarball = true
 
 
 [install]
 # Where to install the generated toolchain. Must be an absolute path.
-#prefix = "/home/houtamelo/.rustup/toolchains/unchained"
+prefix = "/home/houtamelo/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu-unchained"
 
 # Where to install system configuration files.
 # If this is a relative path, it will get installed in `prefix` above

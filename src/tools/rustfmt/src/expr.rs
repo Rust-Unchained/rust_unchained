@@ -14,7 +14,7 @@ use crate::comment::{
     recover_comment_removed, rewrite_comment, rewrite_missing_comment,
 };
 use crate::config::lists::*;
-use crate::config::{Config, ControlBraceStyle, HexLiteralCase, IndentStyle, StyleEdition};
+use crate::config::{Config, ControlBraceStyle, HexLiteralCase, IndentStyle, LetElseStyle, StyleEdition};
 use crate::lists::{
     ListFormatting, Separator, definitive_tactic, itemize_list, shape_for_tactic,
     struct_lit_formatting, struct_lit_shape, struct_lit_tactic, write_list,
@@ -1073,6 +1073,7 @@ impl<'a> ControlFlow<'a> {
 pub(crate) fn rewrite_else_kw_with_comments(
     force_newline_else: bool,
     is_last: bool,
+	is_let_else: bool,
     context: &RewriteContext<'_>,
     span: Span,
     shape: Shape,
@@ -1086,14 +1087,24 @@ pub(crate) fn rewrite_else_kw_with_comments(
     let after_else_kw_comment = extract_comment(after_else_kw, context, shape);
 
     let newline_sep = &shape.indent.to_string_with_newline(context.config);
-    let before_sep = match context.config.control_brace_style() {
+	
+	let brace_style = context.config.control_brace_style();
+	
+    let before_sep = match brace_style {
         _ if force_newline_else => newline_sep.as_ref(),
         ControlBraceStyle::AlwaysNextLine | ControlBraceStyle::ClosingNextLine => {
             newline_sep.as_ref()
         }
-        ControlBraceStyle::AlwaysSameLine => " ",
+        ControlBraceStyle::AlwaysSameLine if is_let_else => {
+	        match context.config.let_else_style() {
+		        LetElseStyle::ElseOnSameLine => " ",
+		        LetElseStyle::ElseOnNewLine => newline_sep.as_ref(),
+	        }
+        },
+	    ControlBraceStyle::AlwaysSameLine => " ",
     };
-    let after_sep = match context.config.control_brace_style() {
+	
+    let after_sep = match brace_style {
         ControlBraceStyle::AlwaysNextLine if is_last => newline_sep.as_ref(),
         _ => " ",
     };
@@ -1178,6 +1189,7 @@ impl<'a> Rewrite for ControlFlow<'a> {
             let else_kw = rewrite_else_kw_with_comments(
                 false,
                 last_in_chain,
+	            false,
                 context,
                 self.block.span.between(else_block.span),
                 shape,

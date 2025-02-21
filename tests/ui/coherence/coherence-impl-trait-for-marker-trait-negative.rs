@@ -19,7 +19,7 @@ impl !Marker2 for dyn Object + Marker2 {} //~ ERROR E0371
                                           //~^ ERROR 0321
 
 // A non-principal trait-object type is orphan even in its crate.
-impl !Send for dyn Marker2 {} //~ ERROR E0117
+impl !Send for dyn Marker2 {} //~ ERROR E0321
 
 // Implementing a marker for a local trait object is forbidden by a special
 // orphan-like rule.

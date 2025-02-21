@@ -764,7 +764,7 @@
 # (LTO within a single crate) is used (like for any Rust crate). You can also select
 # "thin" or "fat" to apply Thin/Fat LTO to the `rustc_driver` dylib, or "off" to disable
 # LTO entirely.
-#lto = "thin-local"
+#lto = "fat"
 
 # Build compiler with the optimization enabled and -Zvalidate-mir, currently only for `std`
 #validate-mir-opts = 3

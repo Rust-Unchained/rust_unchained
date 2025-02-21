@@ -37,7 +37,12 @@ pub(crate) fn orphan_check_impl(
                     bug!("orphanck: shouldn't've gotten non-local input tys in compat mode")
                 }
             },
-            Err(err) => return Err(emit_orphan_check_error(tcx, trait_ref, impl_def_id, err)),
+            Err(err) => {
+	            match err {
+		            OrphanCheckErr::NonLocalInputType(_) => {}
+		            OrphanCheckErr::UncoveredTyParams(_) => return Err(emit_orphan_check_error(tcx, trait_ref, impl_def_id, err)),
+	            }
+            },
         },
     }
 

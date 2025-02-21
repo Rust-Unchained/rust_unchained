@@ -1,5 +1,6 @@
 //@ aux-build:foreign-crate.rs
 //@ revisions: classic next
+//@ build-pass
 //@[next] compile-flags: -Znext-solver
 #![feature(type_alias_impl_trait)]
 
@@ -14,6 +15,5 @@ fn use_alias<T>(val: T) -> AliasOfForeignType<T> {
 }
 
 impl foreign_crate::ForeignTrait for AliasOfForeignType<()> {}
-//~^ ERROR only traits defined in the current crate can be implemented for arbitrary types
 
 fn main() {}

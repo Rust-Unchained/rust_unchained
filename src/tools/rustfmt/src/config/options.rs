@@ -12,9 +12,11 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::Config;
+use crate::config::config_type::ConfigType;
 use crate::config::file_lines::FileLines;
 use crate::config::lists::*;
 use crate::config::macro_names::MacroSelectors;
+use crate::config::style_edition::StyleEditionDefault;
 
 #[config_type]
 pub enum NewlineStyle {
@@ -216,6 +218,29 @@ pub enum Verbosity {
     Normal,
     /// Emit as little as possible.
     Quiet,
+}
+
+#[config_type]
+pub enum LetElseStyle {
+	/// ```rust
+	/// let Some(val) = None else {
+	///     return;
+	/// };
+	/// ```
+	ElseOnSameLine,
+	/// ```rust
+	/// let Some(val) = None
+	/// else { return };
+	/// ```
+	ElseOnNewLine,
+}
+
+impl StyleEditionDefault for LetElseStyle {
+	type ConfigType = LetElseStyle;
+
+	fn style_edition_default(_style_edition: StyleEdition) -> Self::ConfigType {
+		LetElseStyle::ElseOnSameLine
+	}
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -650,6 +675,7 @@ config_option_with_style_edition_default!(
     InlineAttributeWidth, usize, _ => 0;
     FormatGeneratedFiles, bool, _ => true;
     GeneratedMarkerLineSearchLimit, usize, _ => 5;
+	LetElseStyleConfig, LetElseStyle, _ => LetElseStyle::ElseOnSameLine;
 
     // Options that can change the source code beyond whitespace/blocks (somewhat linty things)
     MergeDerives, bool, _ => true;
