@@ -8,6 +8,38 @@
 #![warn(unreachable_pub)]
 // tidy-alphabetical-end
 
+/*! ABI handling for rustc
+
+## What is an "ABI"?
+
+Literally, "application binary interface", which means it is everything about how code interacts,
+at the machine level, with other code. This means it technically covers all of the following:
+- object binary format for e.g. relocations or offset tables
+- in-memory layout of types
+- procedure calling conventions
+
+When we discuss "ABI" in the context of rustc, we are probably discussing calling conventions.
+To describe those `rustc_abi` also covers type layout, as it must for values passed on the stack.
+Despite `rustc_abi` being about calling conventions, it is good to remember these usages exist.
+You will encounter all of them and more if you study target-specific codegen enough!
+Even in general conversation, when someone says "the Rust ABI is unstable", it may allude to
+either or both of
+- `repr(Rust)` types have a mostly-unspecified layout
+- `extern "Rust" fn(A) -> R` has an unspecified calling convention
+
+## Crate Goal
+
+ABI is a foundational concept, so the `rustc_abi` crate serves as an equally foundational crate.
+It cannot carry all details relevant to an ABI: those permeate code generation and linkage.
+Instead, `rustc_abi` is intended to provide the interface for reasoning about the binary interface.
+It should contain traits and types that other crates then use in their implementation.
+For example, a platform's `extern "C" fn` calling convention will be implemented in `rustc_target`
+but `rustc_abi` contains the types for calculating layout and describing register-passing.
+This makes it easier to describe things in the same way across targets, codegen backends, and
+even other Rust compilers, such as rust-analyzer!
+
+*/
+
 use std::fmt;
 #[cfg(feature = "nightly")]
 use std::iter::Step;
@@ -18,25 +50,20 @@ use std::str::FromStr;
 use bitflags::bitflags;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::StableOrd;
+use rustc_hashes::Hash64;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
-use rustc_macros::HashStable_Generic;
-#[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_Generic, Encodable_Generic};
+use rustc_macros::{Decodable_Generic, Encodable_Generic, HashStable_Generic};
 
 mod callconv;
 mod layout;
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "nightly")]
 mod extern_abi;
 
 pub use callconv::{Heterogeneous, HomogeneousAggregate, Reg, RegKind};
-#[cfg(feature = "nightly")]
-pub use extern_abi::{
-    AbiDisabled, AbiUnsupported, ExternAbi, all_names, enabled_names, is_enabled, is_stable, lookup,
-};
+pub use extern_abi::{ExternAbi, all_names};
 #[cfg(feature = "nightly")]
 pub use layout::{FIRST_VARIANT, FieldIdx, Layout, TyAbiInterface, TyAndLayout, VariantIdx};
 pub use layout::{LayoutCalculator, LayoutCalculatorError};
@@ -114,7 +141,7 @@ pub struct ReprOptions {
     /// hash without loss, but it does pay the price of being larger.
     /// Everything's a tradeoff, a 64-bit seed should be sufficient for our
     /// purposes (primarily `-Z randomize-layout`)
-    pub field_shuffle_seed: u64,
+    pub field_shuffle_seed: Hash64,
 }
 
 impl ReprOptions {
@@ -638,7 +665,7 @@ impl AddAssign for Size {
 #[cfg(feature = "nightly")]
 impl Step for Size {
     #[inline]
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
         u64::steps_between(&start.bytes(), &end.bytes())
     }
 
@@ -1152,10 +1179,13 @@ impl Scalar {
     #[inline]
     pub fn is_bool(&self) -> bool {
         use Integer::*;
-        matches!(self, Scalar::Initialized {
-            value: Primitive::Int(I8, false),
-            valid_range: WrappingRange { start: 0, end: 1 }
-        })
+        matches!(
+            self,
+            Scalar::Initialized {
+                value: Primitive::Int(I8, false),
+                valid_range: WrappingRange { start: 0, end: 1 }
+            }
+        )
     }
 
     /// Get the primitive representation of this type, ignoring the valid range and whether the
@@ -1213,6 +1243,15 @@ impl Scalar {
         match *self {
             Scalar::Initialized { .. } => false,
             Scalar::Union { .. } => true,
+        }
+    }
+
+    /// Returns `true` if this is a signed integer scalar
+    #[inline]
+    pub fn is_signed(&self) -> bool {
+        match self.primitive() {
+            Primitive::Int(_, signed) => signed,
+            _ => false,
         }
     }
 }
@@ -1401,10 +1440,7 @@ impl BackendRepr {
     #[inline]
     pub fn is_signed(&self) -> bool {
         match self {
-            BackendRepr::Scalar(scal) => match scal.primitive() {
-                Primitive::Int(_, signed) => signed,
-                _ => false,
-            },
+            BackendRepr::Scalar(scal) => scal.is_signed(),
             _ => panic!("`is_signed` on non-scalar ABI {self:?}"),
         }
     }
@@ -1498,8 +1534,14 @@ impl BackendRepr {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
 pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
+    /// A type with no valid variants. Must be uninhabited.
+    Empty,
+
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
-    Single { index: VariantIdx },
+    Single {
+        /// Always `0` for types that cannot have multiple variants.
+        index: VariantIdx,
+    },
 
     /// Enum-likes with more than one variant: each variant comes with
     /// a *discriminant* (usually the same as the variant index but the user can
@@ -1528,14 +1570,22 @@ pub enum TagEncoding<VariantIdx: Idx> {
     /// The variant `untagged_variant` contains a niche at an arbitrary
     /// offset (field `tag_field` of the enum), which for a variant with
     /// discriminant `d` is set to
-    /// `(d - niche_variants.start).wrapping_add(niche_start)`.
+    /// `(d - niche_variants.start).wrapping_add(niche_start)`
+    /// (this is wrapping arithmetic using the type of the niche field).
     ///
     /// For example, `Option<(usize, &T)>`  is represented such that
     /// `None` has a null pointer for the second tuple field, and
     /// `Some` is the identity function (with a non-null reference).
+    ///
+    /// Other variants that are not `untagged_variant` and that are outside the `niche_variants`
+    /// range cannot be represented; they must be uninhabited.
     Niche {
         untagged_variant: VariantIdx,
+        /// This range *may* contain `untagged_variant`; that is then just a "dead value" and
+        /// not used to encode anything.
         niche_variants: RangeInclusive<VariantIdx>,
+        /// This is inbounds of the type of the niche field
+        /// (not sign-extended, i.e., all bits beyond the niche field size are 0).
         niche_start: u128,
     },
 }
@@ -1667,6 +1717,18 @@ pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
     /// Only used on aarch64-linux, where the argument passing ABI ignores the requested alignment
     /// in some cases.
     pub unadjusted_abi_align: Align,
+
+    /// The randomization seed based on this type's own repr and its fields.
+    ///
+    /// Since randomization is toggled on a per-crate basis even crates that do not have randomization
+    /// enabled should still calculate a seed so that downstream uses can use it to distinguish different
+    /// types.
+    ///
+    /// For every T and U for which we do not guarantee that a repr(Rust) `Foo<T>` can be coerced or
+    /// transmuted to `Foo<U>` we aim to create probalistically distinct seeds so that Foo can choose
+    /// to reorder its fields based on that information. The current implementation is a conservative
+    /// approximation of this goal.
+    pub randomization_seed: Hash64,
 }
 
 impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
@@ -1687,6 +1749,30 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
         let largest_niche = Niche::from_scalar(cx, Size::ZERO, scalar);
         let size = scalar.size(cx);
         let align = scalar.align(cx);
+
+        let range = scalar.valid_range(cx);
+
+        // All primitive types for which we don't have subtype coercions should get a distinct seed,
+        // so that types wrapping them can use randomization to arrive at distinct layouts.
+        //
+        // Some type information is already lost at this point, so as an approximation we derive
+        // the seed from what remains. For example on 64-bit targets usize and u64 can no longer
+        // be distinguished.
+        let randomization_seed = size
+            .bytes()
+            .wrapping_add(
+                match scalar.primitive() {
+                    Primitive::Int(_, true) => 1,
+                    Primitive::Int(_, false) => 2,
+                    Primitive::Float(_) => 3,
+                    Primitive::Pointer(_) => 4,
+                } << 32,
+            )
+            // distinguishes references from pointers
+            .wrapping_add((range.start as u64).rotate_right(16))
+            // distinguishes char from u32 and bool from u8
+            .wrapping_add((range.end as u64).rotate_right(16));
+
         LayoutData {
             variants: Variants::Single { index: VariantIdx::new(0) },
             fields: FieldsShape::Primitive,
@@ -1696,6 +1782,7 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
             align,
             max_repr_align: None,
             unadjusted_abi_align: align.abi,
+            randomization_seed: Hash64::new(randomization_seed),
         }
     }
 }
@@ -1718,6 +1805,7 @@ where
             variants,
             max_repr_align,
             unadjusted_abi_align,
+            ref randomization_seed,
         } = self;
         f.debug_struct("Layout")
             .field("size", size)
@@ -1728,6 +1816,7 @@ where
             .field("variants", variants)
             .field("max_repr_align", max_repr_align)
             .field("unadjusted_abi_align", unadjusted_abi_align)
+            .field("randomization_seed", randomization_seed)
             .finish()
     }
 }

@@ -59,9 +59,7 @@ pub(super) fn check<'tcx>(
                 let output_ty = cx.tcx.fn_sig(def_id).instantiate(cx.tcx, args).skip_binder().output();
                 cx.tcx
                     .get_diagnostic_item(sym::Default)
-                    .map_or(false, |default_trait_id| {
-                        implements_trait(cx, output_ty, default_trait_id, &[])
-                    })
+                    .is_some_and(|default_trait_id| implements_trait(cx, output_ty, default_trait_id, &[]))
             } else {
                 false
             }
@@ -255,7 +253,7 @@ pub(super) fn check<'tcx>(
 
 fn closure_body_returns_empty_to_string(cx: &LateContext<'_>, e: &hir::Expr<'_>) -> bool {
     if let hir::ExprKind::Closure(&hir::Closure { body, .. }) = e.kind {
-        let body = cx.tcx.hir().body(body);
+        let body = cx.tcx.hir_body(body);
 
         if body.params.is_empty()
             && let hir::Expr { kind, .. } = &body.value

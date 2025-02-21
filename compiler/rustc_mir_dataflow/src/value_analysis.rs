@@ -6,8 +6,7 @@ use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet, StdEntry};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_index::IndexVec;
-use rustc_index::bit_set::BitSet;
-use rustc_middle::mir::tcx::PlaceTy;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -67,7 +66,7 @@ impl<V: Clone> Clone for StateData<V> {
     }
 }
 
-impl<V: JoinSemiLattice + Clone + HasBottom> JoinSemiLattice for StateData<V> {
+impl<V: JoinSemiLattice + Clone> JoinSemiLattice for StateData<V> {
     fn join(&mut self, other: &Self) -> bool {
         let mut changed = false;
         #[allow(rustc::potential_query_instability)]
@@ -342,7 +341,7 @@ impl<V: Clone + HasBottom> State<V> {
     }
 }
 
-impl<V: JoinSemiLattice + Clone + HasBottom> JoinSemiLattice for State<V> {
+impl<V: JoinSemiLattice + Clone> JoinSemiLattice for State<V> {
     fn join(&mut self, other: &Self) -> bool {
         match (&mut *self, other) {
             (_, State::Unreachable) => false,
@@ -399,7 +398,7 @@ impl<'tcx> Map<'tcx> {
         &mut self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
-        exclude: BitSet<Local>,
+        exclude: DenseBitSet<Local>,
         value_limit: Option<usize>,
     ) {
         // Start by constructing the places for each bare local.
@@ -462,7 +461,7 @@ impl<'tcx> Map<'tcx> {
         drop(assignments);
 
         // Create values for places whose type have scalar layout.
-        let param_env = tcx.param_env_reveal_all_normalized(body.source.def_id());
+        let typing_env = body.typing_env(tcx);
         for place_info in self.places.iter_mut() {
             // The user requires a bound on the number of created values.
             if let Some(value_limit) = value_limit
@@ -471,13 +470,13 @@ impl<'tcx> Map<'tcx> {
                 break;
             }
 
-            if let Ok(ty) = tcx.try_normalize_erasing_regions(param_env, place_info.ty) {
+            if let Ok(ty) = tcx.try_normalize_erasing_regions(typing_env, place_info.ty) {
                 place_info.ty = ty;
             }
 
             // Allocate a value slot if it doesn't have one, and the user requested one.
             assert!(place_info.value_index.is_none());
-            if let Ok(layout) = tcx.layout_of(param_env.and(place_info.ty))
+            if let Ok(layout) = tcx.layout_of(typing_env.as_query_input(place_info.ty))
                 && layout.backend_repr.is_scalar()
             {
                 place_info.value_index = Some(self.value_count.into());
@@ -874,7 +873,7 @@ impl<V, T> TryFrom<ProjectionElem<V, T>> for TrackElem {
 pub fn iter_fields<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     mut f: impl FnMut(Option<VariantIdx>, FieldIdx, Ty<'tcx>),
 ) {
     match ty.kind() {
@@ -892,29 +891,29 @@ pub fn iter_fields<'tcx>(
                 for (f_index, f_def) in v_def.fields.iter().enumerate() {
                     let field_ty = f_def.ty(tcx, args);
                     let field_ty = tcx
-                        .try_normalize_erasing_regions(param_env, field_ty)
+                        .try_normalize_erasing_regions(typing_env, field_ty)
                         .unwrap_or_else(|_| tcx.erase_regions(field_ty));
                     f(variant, f_index.into(), field_ty);
                 }
             }
         }
         ty::Closure(_, args) => {
-            iter_fields(args.as_closure().tupled_upvars_ty(), tcx, param_env, f);
+            iter_fields(args.as_closure().tupled_upvars_ty(), tcx, typing_env, f);
         }
         ty::Coroutine(_, args) => {
-            iter_fields(args.as_coroutine().tupled_upvars_ty(), tcx, param_env, f);
+            iter_fields(args.as_coroutine().tupled_upvars_ty(), tcx, typing_env, f);
         }
         ty::CoroutineClosure(_, args) => {
-            iter_fields(args.as_coroutine_closure().tupled_upvars_ty(), tcx, param_env, f);
+            iter_fields(args.as_coroutine_closure().tupled_upvars_ty(), tcx, typing_env, f);
         }
         _ => (),
     }
 }
 
 /// Returns all locals with projections that have their reference or address taken.
-pub fn excluded_locals(body: &Body<'_>) -> BitSet<Local> {
+pub fn excluded_locals(body: &Body<'_>) -> DenseBitSet<Local> {
     struct Collector {
-        result: BitSet<Local>,
+        result: DenseBitSet<Local>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector {
@@ -932,7 +931,7 @@ pub fn excluded_locals(body: &Body<'_>) -> BitSet<Local> {
         }
     }
 
-    let mut collector = Collector { result: BitSet::new_empty(body.local_decls.len()) };
+    let mut collector = Collector { result: DenseBitSet::new_empty(body.local_decls.len()) };
     collector.visit_body(body);
     collector.result
 }

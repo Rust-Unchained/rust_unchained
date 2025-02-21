@@ -37,8 +37,8 @@ use walkdir::WalkDir;
 
 use self::header::{EarlyProps, make_test_description};
 use crate::common::{
-    Config, Mode, PassMode, TestPaths, UI_EXTENSIONS, expected_output_path, output_base_dir,
-    output_relative_path,
+    CompareMode, Config, Debugger, Mode, PassMode, TestPaths, UI_EXTENSIONS, expected_output_path,
+    output_base_dir, output_relative_path,
 };
 use crate::header::HeadersCache;
 use crate::util::logv;
@@ -64,6 +64,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .reqopt("", "src-base", "directory to scan for test files", "PATH")
         .reqopt("", "build-base", "directory to deposit test outputs", "PATH")
         .reqopt("", "sysroot-base", "directory containing the compiler sysroot", "PATH")
+        .reqopt("", "stage", "stage number under test", "N")
         .reqopt("", "stage-id", "the target-stage identifier", "stageN-TARGET")
         .reqopt(
             "",
@@ -71,7 +72,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
             "which sort of compile tests to run",
             "pretty | debug-info | codegen | rustdoc \
             | rustdoc-json | codegen-units | incremental | run-make | ui \
-            | js-doc-test | mir-opt | assembly | crashes",
+            | rustdoc-js | mir-opt | assembly | crashes",
         )
         .reqopt(
             "",
@@ -159,7 +160,9 @@ pub fn parse_config(args: Vec<String>) -> Config {
         )
         .optflag("", "force-rerun", "rerun tests even if the inputs are unchanged")
         .optflag("", "only-modified", "only run tests that result been modified")
+        // FIXME: Temporarily retained so we can point users to `--no-capture`
         .optflag("", "nocapture", "")
+        .optflag("", "no-capture", "don't capture stdout/stderr of tests")
         .optflag("", "profiler-runtime", "is the profiler runtime enabled for this target")
         .optflag("h", "help", "show this message")
         .reqopt("", "channel", "current Rust channel", "CHANNEL")
@@ -183,7 +186,13 @@ pub fn parse_config(args: Vec<String>) -> Config {
             "What custom diff tool to use for displaying compiletest tests.",
             "COMMAND",
         )
-        .reqopt("", "minicore-path", "path to minicore aux library", "PATH");
+        .reqopt("", "minicore-path", "path to minicore aux library", "PATH")
+        .optopt(
+            "",
+            "debugger",
+            "only test a specific debugger in debuginfo tests",
+            "gdb | lldb | cdb",
+        );
 
     let (argv0, args_) = args.split_first().unwrap();
     if args.len() == 1 || args[1] == "-h" || args[1] == "--help" {
@@ -273,6 +282,24 @@ pub fn parse_config(args: Vec<String>) -> Config {
     } else {
         matches.free.clone()
     };
+    let compare_mode = matches.opt_str("compare-mode").map(|s| {
+        s.parse().unwrap_or_else(|_| {
+            let variants: Vec<_> = CompareMode::STR_VARIANTS.iter().copied().collect();
+            panic!(
+                "`{s}` is not a valid value for `--compare-mode`, it should be one of: {}",
+                variants.join(", ")
+            );
+        })
+    });
+    if matches.opt_present("nocapture") {
+        panic!("`--nocapture` is deprecated; please use `--no-capture`");
+    }
+
+    let stage = match matches.opt_str("stage") {
+        Some(stage) => stage.parse::<u32>().expect("expected `--stage` to be an unsigned integer"),
+        None => panic!("`--stage` is required"),
+    };
+
     Config {
         bless: matches.opt_present("bless"),
         compile_lib_path: make_absolute(opt_path(matches, "compile-lib-path")),
@@ -290,10 +317,17 @@ pub fn parse_config(args: Vec<String>) -> Config {
         src_base,
         build_base: opt_path(matches, "build-base"),
         sysroot_base: opt_path(matches, "sysroot-base"),
+
+        stage,
         stage_id: matches.opt_str("stage-id").unwrap(),
+
         mode,
         suite: matches.opt_str("suite").unwrap(),
-        debugger: None,
+        debugger: matches.opt_str("debugger").map(|debugger| {
+            debugger
+                .parse::<Debugger>()
+                .unwrap_or_else(|_| panic!("unknown `--debugger` option `{debugger}` given"))
+        }),
         run_ignored,
         with_rustc_debug_assertions,
         with_std_debug_assertions,
@@ -342,9 +376,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         only_modified: matches.opt_present("only-modified"),
         color,
         remote_test_client: matches.opt_str("remote-test-client").map(PathBuf::from),
-        compare_mode: matches
-            .opt_str("compare-mode")
-            .map(|s| s.parse().expect("invalid --compare-mode provided")),
+        compare_mode,
         rustfix_coverage: matches.opt_present("rustfix-coverage"),
         has_html_tidy,
         has_enzyme,
@@ -368,7 +400,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         target_cfgs: OnceLock::new(),
         builtin_cfg_names: OnceLock::new(),
 
-        nocapture: matches.opt_present("nocapture"),
+        nocapture: matches.opt_present("no-capture"),
 
         git_repository: matches.opt_str("git-repository").unwrap(),
         nightly_branch: matches.opt_str("nightly-branch").unwrap(),
@@ -392,6 +424,7 @@ pub fn log_config(config: &Config) {
     logv(c, format!("rustdoc_path: {:?}", config.rustdoc_path));
     logv(c, format!("src_base: {:?}", config.src_base.display()));
     logv(c, format!("build_base: {:?}", config.build_base.display()));
+    logv(c, format!("stage: {}", config.stage));
     logv(c, format!("stage_id: {}", config.stage_id));
     logv(c, format!("mode: {}", config.mode));
     logv(c, format!("run_ignored: {}", config.run_ignored));
@@ -468,9 +501,16 @@ pub fn run_tests(config: Arc<Config>) {
     if let Mode::DebugInfo = config.mode {
         // Debugging emscripten code doesn't make sense today
         if !config.target.contains("emscripten") {
-            configs.extend(debuggers::configure_cdb(&config));
-            configs.extend(debuggers::configure_gdb(&config));
-            configs.extend(debuggers::configure_lldb(&config));
+            match config.debugger {
+                Some(Debugger::Cdb) => configs.extend(debuggers::configure_cdb(&config)),
+                Some(Debugger::Gdb) => configs.extend(debuggers::configure_gdb(&config)),
+                Some(Debugger::Lldb) => configs.extend(debuggers::configure_lldb(&config)),
+                None => {
+                    configs.extend(debuggers::configure_cdb(&config));
+                    configs.extend(debuggers::configure_gdb(&config));
+                    configs.extend(debuggers::configure_lldb(&config));
+                }
+            }
         }
     } else {
         configs.push(config.clone());
@@ -591,10 +631,9 @@ pub fn collect_and_make_tests(config: Arc<Config>) -> Vec<test::TestDescAndFn> {
     let mut collector =
         TestCollector { tests: vec![], found_path_stems: HashSet::new(), poisoned: false };
 
-    collect_tests_from_dir(&cx, &mut collector, &cx.config.src_base, &PathBuf::new())
-        .unwrap_or_else(|reason| {
-            panic!("Could not read tests from {}: {reason}", cx.config.src_base.display())
-        });
+    collect_tests_from_dir(&cx, &mut collector, &cx.config.src_base, Path::new("")).unwrap_or_else(
+        |reason| panic!("Could not read tests from {}: {reason}", cx.config.src_base.display()),
+    );
 
     let TestCollector { tests, found_path_stems, poisoned } = collector;
 

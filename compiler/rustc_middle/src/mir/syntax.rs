@@ -10,17 +10,16 @@ use rustc_hir::CoroutineKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
-use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::Symbol;
+use rustc_span::{Span, Symbol};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use smallvec::SmallVec;
 
 use super::{BasicBlock, Const, Local, UserTypeProjection};
 use crate::mir::coverage::CoverageKind;
 use crate::ty::adjustment::PointerCoercion;
-use crate::ty::{self, GenericArgsRef, List, Region, Ty, TyCtxt, UserTypeAnnotationIndex};
+use crate::ty::{self, GenericArgsRef, List, Region, Ty, UserTypeAnnotationIndex};
 
 /// Represents the "flavors" of MIR.
 ///
@@ -98,13 +97,6 @@ impl MirPhase {
             MirPhase::Runtime(RuntimePhase::Initial) => "runtime",
             MirPhase::Runtime(RuntimePhase::PostCleanup) => "runtime-post-cleanup",
             MirPhase::Runtime(RuntimePhase::Optimized) => "runtime-optimized",
-        }
-    }
-
-    pub fn param_env<'tcx>(&self, tcx: TyCtxt<'tcx>, body_def_id: DefId) -> ty::ParamEnv<'tcx> {
-        match self {
-            MirPhase::Built | MirPhase::Analysis(_) => tcx.param_env(body_def_id),
-            MirPhase::Runtime(_) => tcx.param_env_reveal_all_normalized(body_def_id),
         }
     }
 }
@@ -186,6 +178,59 @@ pub enum BorrowKind {
 
     /// Data is mutable and not aliasable.
     Mut { kind: MutBorrowKind },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, TyEncodable, TyDecodable)]
+#[derive(Hash, HashStable)]
+pub enum RawPtrKind {
+    Mut,
+    Const,
+    /// Creates a raw pointer to a place that will only be used to access its metadata,
+    /// not the data behind the pointer. Note that this limitation is *not* enforced
+    /// by the validator.
+    ///
+    /// The borrow checker allows overlap of these raw pointers with references to the
+    /// data. This is sound even if the pointer is "misused" since any such use is anyway
+    /// unsafe. In terms of the operational semantics (i.e., Miri), this is equivalent
+    /// to `RawPtrKind::Mut`, but will never incur a retag.
+    FakeForPtrMetadata,
+}
+
+impl From<Mutability> for RawPtrKind {
+    fn from(other: Mutability) -> Self {
+        match other {
+            Mutability::Mut => RawPtrKind::Mut,
+            Mutability::Not => RawPtrKind::Const,
+        }
+    }
+}
+
+impl RawPtrKind {
+    pub fn is_fake(self) -> bool {
+        match self {
+            RawPtrKind::Mut | RawPtrKind::Const => false,
+            RawPtrKind::FakeForPtrMetadata => true,
+        }
+    }
+
+    pub fn to_mutbl_lossy(self) -> Mutability {
+        match self {
+            RawPtrKind::Mut => Mutability::Mut,
+            RawPtrKind::Const => Mutability::Not,
+
+            // We have no type corresponding to a fake borrow, so use
+            // `*const` as an approximation.
+            RawPtrKind::FakeForPtrMetadata => Mutability::Not,
+        }
+    }
+
+    pub fn ptr_str(self) -> &'static str {
+        match self {
+            RawPtrKind::Mut => "mut",
+            RawPtrKind::Const => "const",
+            RawPtrKind::FakeForPtrMetadata => "const (fake)",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, TyEncodable, TyDecodable)]
@@ -425,7 +470,14 @@ pub enum StatementKind<'tcx> {
     ///
     /// Interpreters and codegen backends that don't support coverage instrumentation
     /// can usually treat this as a no-op.
-    Coverage(CoverageKind),
+    Coverage(
+        // Coverage statements are unlikely to ever contain type information in
+        // the foreseeable future, so excluding them from TypeFoldable/TypeVisitable
+        // avoids some unhelpful derive boilerplate.
+        #[type_foldable(identity)]
+        #[type_visitable(ignore)]
+        CoverageKind,
+    ),
 
     /// Denotes a call to an intrinsic that does not require an unwind path and always returns.
     /// This avoids adding a new block and a terminator for simple intrinsics.
@@ -439,6 +491,18 @@ pub enum StatementKind<'tcx> {
 
     /// No-op. Useful for deleting instructions without affecting statement indices.
     Nop,
+
+    /// Marker statement indicating where `place` would be dropped.
+    /// This is semantically equivalent to `Nop`, so codegen and MIRI should interpret this
+    /// statement as such.
+    /// The only use case of this statement is for linting in MIR to detect temporary lifetime
+    /// changes.
+    BackwardIncompatibleDropHint {
+        /// Place to drop
+        place: Box<Place<'tcx>>,
+        /// Reason for backward incompatibility
+        reason: BackwardIncompatibleDropReason,
+    },
 }
 
 impl StatementKind<'_> {
@@ -459,6 +523,7 @@ impl StatementKind<'_> {
             StatementKind::Intrinsic(..) => "Intrinsic",
             StatementKind::ConstEvalCounter => "ConstEvalCounter",
             StatementKind::Nop => "Nop",
+            StatementKind::BackwardIncompatibleDropHint { .. } => "BackwardIncompatibleDropHint",
         }
     }
 }
@@ -816,6 +881,11 @@ pub enum TerminatorKind<'tcx> {
     /// continues at the `resume` basic block, with the second argument written to the `resume_arg`
     /// place. If the coroutine is dropped before then, the `drop` basic block is invoked.
     ///
+    /// Note that coroutines can be (unstably) cloned under certain conditions, which means that
+    /// this terminator can **return multiple times**! MIR optimizations that reorder code into
+    /// different basic blocks needs to be aware of that.
+    /// See <https://github.com/rust-lang/rust/issues/95360>.
+    ///
     /// Not permitted in bodies that are not coroutine bodies, or after coroutine lowering.
     ///
     /// **Needs clarification**: What about the evaluation order of the `resume_arg` and `value`?
@@ -904,6 +974,21 @@ pub enum TerminatorKind<'tcx> {
     },
 }
 
+#[derive(
+    Clone,
+    Debug,
+    TyEncodable,
+    TyDecodable,
+    Hash,
+    HashStable,
+    PartialEq,
+    TypeFoldable,
+    TypeVisitable
+)]
+pub enum BackwardIncompatibleDropReason {
+    Edition2024,
+}
+
 impl TerminatorKind<'_> {
     /// Returns a simple string representation of a `TerminatorKind` variant, independent of any
     /// values it might hold (e.g. `TerminatorKind::Call` always returns `"Call"`).
@@ -930,22 +1015,30 @@ impl TerminatorKind<'_> {
 
 #[derive(Debug, Clone, TyEncodable, TyDecodable, Hash, HashStable, PartialEq)]
 pub struct SwitchTargets {
-    /// Possible values. The locations to branch to in each case
-    /// are found in the corresponding indices from the `targets` vector.
+    /// Possible values. For each value, the location to branch to is found in
+    /// the corresponding element in the `targets` vector.
     pub(super) values: SmallVec<[Pu128; 1]>,
 
-    /// Possible branch sites. The last element of this vector is used
-    /// for the otherwise branch, so targets.len() == values.len() + 1
-    /// should hold.
+    /// Possible branch targets. The last element of this vector is used for
+    /// the "otherwise" branch, so `targets.len() == values.len() + 1` always
+    /// holds.
     //
-    // This invariant is quite non-obvious and also could be improved.
-    // One way to make this invariant is to have something like this instead:
+    // Note: This invariant is non-obvious and easy to violate. This would be a
+    // more rigorous representation:
     //
-    // branches: Vec<(ConstInt, BasicBlock)>,
-    // otherwise: Option<BasicBlock> // exhaustive if None
+    //   normal: SmallVec<[(Pu128, BasicBlock); 1]>,
+    //   otherwise: BasicBlock,
     //
-    // However we’ve decided to keep this as-is until we figure a case
-    // where some other approach seems to be strictly better than other.
+    // But it's important to have the targets in a sliceable type, because
+    // target slices show up elsewhere. E.g. `TerminatorKind::InlineAsm` has a
+    // boxed slice, and `TerminatorKind::FalseEdge` has a single target that
+    // can be converted to a slice with `slice::from_ref`.
+    //
+    // Why does this matter? In functions like `TerminatorKind::successors` we
+    // return `impl Iterator` and a non-slice-of-targets representation here
+    // causes problems because multiple different concrete iterator types would
+    // be involved and we would need a boxed trait object, which requires an
+    // allocation, which is expensive if done frequently.
     pub(super) targets: SmallVec<[BasicBlock; 2]>,
 }
 
@@ -991,6 +1084,7 @@ pub enum AssertKind<O> {
     ResumedAfterReturn(CoroutineKind),
     ResumedAfterPanic(CoroutineKind),
     MisalignedPointerDereference { required: O, found: O },
+    NullPointerDereference,
 }
 
 #[derive(Clone, Debug, PartialEq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -1039,7 +1133,7 @@ pub type AssertMessage<'tcx> = AssertKind<Operand<'tcx>>;
 ///
 ///  1. The address in memory that the place refers to.
 ///  2. The provenance with which the place is being accessed.
-///  3. The type of the place and an optional variant index. See [`PlaceTy`][super::tcx::PlaceTy].
+///  3. The type of the place and an optional variant index. See [`PlaceTy`][super::PlaceTy].
 ///  4. Optionally, some metadata. This exists if and only if the type of the place is not `Sized`.
 ///
 /// We'll give a description below of how all pieces of the place except for the provenance are
@@ -1190,6 +1284,10 @@ pub enum ProjectionElem<V, T> {
     /// requiring an intermediate variable.
     OpaqueCast(T),
 
+    /// A transmute from an unsafe binder to the type that it wraps. This is a projection
+    /// of a place, so it doesn't necessarily constitute a move out of the binder.
+    UnwrapUnsafeBinder(T),
+
     /// A `Subtype(T)` projection is applied to any `StatementKind::Assign` where
     /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
     /// explicit during optimizations and codegen.
@@ -1324,7 +1422,7 @@ pub enum Rvalue<'tcx> {
     ///
     /// Like with references, the semantics of this operation are heavily dependent on the aliasing
     /// model.
-    RawPtr(Mutability, Place<'tcx>),
+    RawPtr(RawPtrKind, Place<'tcx>),
 
     /// Yields the length of the place, as a `usize`.
     ///
@@ -1407,6 +1505,9 @@ pub enum Rvalue<'tcx> {
     /// optimizations and codegen backends that previously had to handle deref operations anywhere
     /// in a place.
     CopyForDeref(Place<'tcx>),
+
+    /// Wraps a value in an unsafe binder.
+    WrapUnsafeBinder(Operand<'tcx>, Ty<'tcx>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -1498,6 +1599,9 @@ pub enum NullOp<'tcx> {
     /// Returns whether we should perform some UB-checking at runtime.
     /// See the `ub_checks` intrinsic docs for details.
     UbChecks,
+    /// Returns whether we should perform contract-checking at runtime.
+    /// See the `contract_checks` intrinsic docs for details.
+    ContractChecks,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

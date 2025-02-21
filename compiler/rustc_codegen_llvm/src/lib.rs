@@ -13,10 +13,13 @@
 #![feature(extern_types)]
 #![feature(file_buffered)]
 #![feature(hash_raw_entry)]
+#![feature(if_let_guard)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(iter_intersperse)]
 #![feature(let_chains)]
 #![feature(rustdoc_internals)]
+#![feature(slice_as_array)]
+#![feature(try_blocks)]
 #![warn(unreachable_pub)]
 // tidy-alphabetical-end
 
@@ -26,9 +29,10 @@ use std::mem::ManuallyDrop;
 
 use back::owned_target_machine::OwnedTargetMachine;
 use back::write::{create_informational_target_machine, create_target_machine};
-use errors::ParseTargetMachineConfig;
-pub use llvm_util::target_features;
+use errors::{AutoDiffWithoutLTO, ParseTargetMachineConfig};
+pub(crate) use llvm_util::target_features_cfg;
 use rustc_ast::expand::allocator::AllocatorKind;
+use rustc_ast::expand::autodiff_attrs::AutoDiffItem;
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule};
 use rustc_codegen_ssa::back::write::{
     CodegenContext, FatLtoInput, ModuleConfig, TargetMachineFactoryConfig, TargetMachineFactoryFn,
@@ -36,14 +40,14 @@ use rustc_codegen_ssa::back::write::{
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleCodegen};
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed, FatalError};
+use rustc_errors::{DiagCtxtHandle, FatalError};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
-use rustc_session::config::{OptLevel, OutputFilenames, PrintKind, PrintRequest};
-use rustc_span::symbol::Symbol;
+use rustc_session::config::{Lto, OptLevel, OutputFilenames, PrintKind, PrintRequest};
+use rustc_span::Symbol;
 
 mod back {
     pub(crate) mod archive;
@@ -68,14 +72,9 @@ mod debuginfo;
 mod declare;
 mod errors;
 mod intrinsic;
-
-// The following is a workaround that replaces `pub mod llvm;` and that fixes issue 53912.
-#[path = "llvm/mod.rs"]
-mod llvm_;
-pub mod llvm {
-    pub use super::llvm_::*;
-}
-
+// FIXME(Zalathar): Fix all the unreachable-pub warnings that would occur if
+// this isn't pub, then make it not pub.
+pub mod llvm;
 mod llvm_util;
 mod mono_item;
 mod type_;
@@ -231,10 +230,20 @@ impl WriteBackendMethods for LlvmCodegenBackend {
     fn serialize_module(module: ModuleCodegen<Self::Module>) -> (String, Self::ModuleBuffer) {
         (module.name, back::lto::ModuleBuffer::new(module.module_llvm.llmod()))
     }
+    /// Generate autodiff rules
+    fn autodiff(
+        cgcx: &CodegenContext<Self>,
+        module: &ModuleCodegen<Self::Module>,
+        diff_fncs: Vec<AutoDiffItem>,
+        config: &ModuleConfig,
+    ) -> Result<(), FatalError> {
+        if cgcx.lto != Lto::Fat {
+            let dcx = cgcx.create_dcx();
+            return Err(dcx.handle().emit_almost_fatal(AutoDiffWithoutLTO));
+        }
+        builder::autodiff::differentiate(module, cgcx, diff_fncs, config)
+    }
 }
-
-unsafe impl Send for LlvmCodegenBackend {} // Llvm is on a per-thread basis
-unsafe impl Sync for LlvmCodegenBackend {}
 
 impl LlvmCodegenBackend {
     pub fn new() -> Box<dyn CodegenBackend> {
@@ -330,8 +339,8 @@ impl CodegenBackend for LlvmCodegenBackend {
         llvm_util::print_version();
     }
 
-    fn target_features(&self, sess: &Session, allow_unstable: bool) -> Vec<Symbol> {
-        target_features(sess, allow_unstable)
+    fn target_features_cfg(&self, sess: &Session, allow_unstable: bool) -> Vec<Symbol> {
+        target_features_cfg(sess, allow_unstable)
     }
 
     fn codegen_crate<'tcx>(
@@ -370,19 +379,14 @@ impl CodegenBackend for LlvmCodegenBackend {
         (codegen_results, work_products)
     }
 
-    fn link(
-        &self,
-        sess: &Session,
-        codegen_results: CodegenResults,
-        outputs: &OutputFilenames,
-    ) -> Result<(), ErrorGuaranteed> {
+    fn link(&self, sess: &Session, codegen_results: CodegenResults, outputs: &OutputFilenames) {
         use rustc_codegen_ssa::back::link::link_binary;
 
         use crate::back::archive::LlvmArchiveBuilderBuilder;
 
         // Run the linker on any artifacts that resulted from the LLVM run.
         // This should produce either a finished executable or library.
-        link_binary(sess, &LlvmArchiveBuilderBuilder, codegen_results, outputs)
+        link_binary(sess, &LlvmArchiveBuilderBuilder, codegen_results, outputs);
     }
 }
 

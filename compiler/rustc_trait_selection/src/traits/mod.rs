@@ -66,9 +66,9 @@ pub use self::specialize::{
 };
 pub use self::structural_normalize::StructurallyNormalizeExt;
 pub use self::util::{
-    BoundVarReplacer, PlaceholderReplacer, TraitAliasExpander, TraitAliasExpansionInfo, elaborate,
-    expand_trait_aliases, impl_item_is_final, supertraits,
-    transitive_bounds_that_define_assoc_item, upcast_choices, with_replaced_escaping_bound_vars,
+    BoundVarReplacer, PlaceholderReplacer, elaborate, expand_trait_aliases, impl_item_is_final,
+    supertrait_def_ids, supertraits, transitive_bounds_that_define_assoc_item, upcast_choices,
+    with_replaced_escaping_bound_vars,
 };
 use crate::error_reporting::InferCtxtErrorExt;
 use crate::infer::outlives::env::OutlivesEnvironment;
@@ -76,6 +76,7 @@ use crate::infer::{InferCtxt, TyCtxtInferExt};
 use crate::regions::InferCtxtRegionExt;
 use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 
+#[derive(Debug)]
 pub struct FulfillmentError<'tcx> {
     pub obligation: PredicateObligation<'tcx>,
     pub code: FulfillmentErrorCode<'tcx>,
@@ -104,12 +105,6 @@ impl<'tcx> FulfillmentError<'tcx> {
                 false
             }
         }
-    }
-}
-
-impl<'tcx> Debug for FulfillmentError<'tcx> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FulfillmentError({:?},{:?})", self.obligation, self.code)
     }
 }
 
@@ -290,12 +285,10 @@ fn do_normalize_predicates<'tcx>(
 
     // We can use the `elaborated_env` here; the region code only
     // cares about declarations like `'a: 'b`.
-    let outlives_env = OutlivesEnvironment::new(elaborated_env);
-
     // FIXME: It's very weird that we ignore region obligations but apparently
     // still need to use `resolve_regions` as we need the resolved regions in
     // the normalized predicates.
-    let errors = infcx.resolve_regions(&outlives_env);
+    let errors = infcx.resolve_regions(cause.body_id, elaborated_env, []);
     if !errors.is_empty() {
         tcx.dcx().span_delayed_bug(
             span,
@@ -423,7 +416,7 @@ pub fn normalize_param_env_or_error<'tcx>(
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}", predicates);
 
-    let elaborated_env = ty::ParamEnv::new(tcx.mk_clauses(&predicates), unnormalized_env.reveal());
+    let elaborated_env = ty::ParamEnv::new(tcx.mk_clauses(&predicates));
     if !elaborated_env.has_aliases() {
         return elaborated_env;
     }
@@ -447,7 +440,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     // This works fairly well because trait matching does not actually care about param-env
     // TypeOutlives predicates - these are normally used by regionck.
     let outlives_predicates: Vec<_> = predicates
-        .extract_if(|predicate| {
+        .extract_if(.., |predicate| {
             matches!(predicate.kind().skip_binder(), ty::ClauseKind::TypeOutlives(..))
         })
         .collect();
@@ -470,8 +463,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     // here. I believe they should not matter, because we are ignoring TypeOutlives param-env
     // predicates here anyway. Keeping them here anyway because it seems safer.
     let outlives_env = non_outlives_predicates.iter().chain(&outlives_predicates).cloned();
-    let outlives_env =
-        ty::ParamEnv::new(tcx.mk_clauses_from_iter(outlives_env), unnormalized_env.reveal());
+    let outlives_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(outlives_env));
     let Ok(outlives_predicates) =
         do_normalize_predicates(tcx, cause, outlives_env, outlives_predicates)
     else {
@@ -484,7 +476,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     let mut predicates = non_outlives_predicates;
     predicates.extend(outlives_predicates);
     debug!("normalize_param_env_or_error: final predicates={:?}", predicates);
-    ty::ParamEnv::new(tcx.mk_clauses(&predicates), unnormalized_env.reveal())
+    ty::ParamEnv::new(tcx.mk_clauses(&predicates))
 }
 
 #[derive(Debug)]
@@ -552,8 +544,18 @@ pub fn try_evaluate_const<'tcx>(
         | ty::ConstKind::Placeholder(_)
         | ty::ConstKind::Expr(_) => Err(EvaluateConstErr::HasGenericsOrInfers),
         ty::ConstKind::Unevaluated(uv) => {
-            // Postpone evaluation of constants that depend on generic parameters or inference variables.
-            let (args, param_env) = if tcx.features().generic_const_exprs()
+            // Postpone evaluation of constants that depend on generic parameters or
+            // inference variables.
+            //
+            // We use `TypingMode::PostAnalysis`  here which is not *technically* correct
+            // to be revealing opaque types here as borrowcheck has not run yet. However,
+            // CTFE itself uses `TypingMode::PostAnalysis` unconditionally even during
+            // typeck and not doing so has a lot of (undesirable) fallout (#101478, #119821).
+            // As a result we always use a revealed env when resolving the instance to evaluate.
+            //
+            // FIXME: `const_eval_resolve_for_typeck` should probably just modify the env itself
+            // instead of having this logic here
+            let (args, typing_env) = if tcx.features().generic_const_exprs()
                 && uv.has_non_region_infer()
             {
                 // `feature(generic_const_exprs)` causes anon consts to inherit all parent generics. This can cause
@@ -569,41 +571,51 @@ pub fn try_evaluate_const<'tcx>(
                             // the generic arguments provided for it, then we should *not* attempt to evaluate it.
                             return Err(EvaluateConstErr::HasGenericsOrInfers);
                         } else {
-                            (replace_param_and_infer_args_with_placeholder(tcx, uv.args), param_env)
+                            let args = replace_param_and_infer_args_with_placeholder(tcx, uv.args);
+                            let typing_env = infcx
+                                .typing_env(tcx.erase_regions(param_env))
+                                .with_post_analysis_normalized(tcx);
+                            (args, typing_env)
                         }
                     }
                     Err(_) | Ok(None) => {
                         let args = GenericArgs::identity_for_item(tcx, uv.def);
-                        let param_env = tcx.param_env(uv.def);
-                        (args, param_env)
+                        let typing_env = ty::TypingEnv::post_analysis(tcx, uv.def);
+                        (args, typing_env)
                     }
                 }
-            } else {
-                // FIXME: We don't check anything on stable as the only way we can wind up with
-                // an unevaluated constant containing generic parameters is through array repeat
-                // expression counts which have a future compat lint for usage of generic parameters
-                // instead of a hard error.
+            } else if tcx.def_kind(uv.def) == DefKind::AnonConst && uv.has_non_region_infer() {
+                // FIXME: remove this when `const_evaluatable_unchecked` is a hard error.
                 //
-                // This codepath is however also reachable by `generic_const_exprs` and some other
-                // feature gates which allow constants in the type system to use generic parameters.
-                // In theory we should be checking for generic parameters here and returning an error
-                // in such cases.
-                (uv.args, param_env)
+                // Diagnostics will sometimes replace the identity args of anon consts in
+                // array repeat expr counts with inference variables so we have to handle this
+                // even though it is not something we should ever actually encounter.
+                //
+                // Array repeat expr counts are allowed to syntactically use generic parameters
+                // but must not actually depend on them in order to evalaute successfully. This means
+                // that it is actually fine to evalaute them in their own environment rather than with
+                // the actually provided generic arguments.
+                tcx.dcx().delayed_bug(
+                    "Encountered anon const with inference variable args but no error reported",
+                );
+
+                let args = GenericArgs::identity_for_item(tcx, uv.def);
+                let typing_env = ty::TypingEnv::post_analysis(tcx, uv.def);
+                (args, typing_env)
+            } else {
+                // FIXME: This codepath is reachable under `associated_const_equality` and in the
+                // future will be reachable by `min_generic_const_args`. We should handle inference
+                // variables and generic parameters properly instead of doing nothing.
+                let typing_env = infcx
+                    .typing_env(tcx.erase_regions(param_env))
+                    .with_post_analysis_normalized(tcx);
+                (uv.args, typing_env)
             };
             let uv = ty::UnevaluatedConst::new(uv.def, args);
 
-            // It's not *technically* correct to be revealing opaque types here as we could still be
-            // before borrowchecking. However, CTFE itself uses `Reveal::All` unconditionally even during
-            // typeck and not doing so has a lot of (undesirable) fallout (#101478, #119821). As a result we
-            // always use a revealed env when resolving the instance to evaluate.
-            //
-            // FIXME: `const_eval_resolve_for_typeck` should probably just set the env to `Reveal::All`
-            // instead of having this logic here
-            let env = tcx.erase_regions(param_env).with_reveal_all_normalized(tcx);
             let erased_uv = tcx.erase_regions(uv);
-
             use rustc_middle::mir::interpret::ErrorHandled;
-            match tcx.const_eval_resolve_for_typeck(env, erased_uv, DUMMY_SP) {
+            match tcx.const_eval_resolve_for_typeck(typing_env, erased_uv, DUMMY_SP) {
                 Ok(Ok(val)) => Ok(ty::Const::new_value(
                     tcx,
                     val,
@@ -648,13 +660,16 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
                     self.idx += 1;
                     idx
                 };
-                Ty::new_placeholder(self.tcx, ty::PlaceholderType {
-                    universe: ty::UniverseIndex::ROOT,
-                    bound: ty::BoundTy {
-                        var: ty::BoundVar::from_u32(idx),
-                        kind: ty::BoundTyKind::Anon,
+                Ty::new_placeholder(
+                    self.tcx,
+                    ty::PlaceholderType {
+                        universe: ty::UniverseIndex::ROOT,
+                        bound: ty::BoundTy {
+                            var: ty::BoundVar::from_u32(idx),
+                            kind: ty::BoundTyKind::Anon,
+                        },
                     },
-                })
+                )
             } else {
                 t.super_fold_with(self)
             }
@@ -662,14 +677,17 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
 
         fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
             if let ty::ConstKind::Infer(_) = c.kind() {
-                ty::Const::new_placeholder(self.tcx, ty::PlaceholderConst {
-                    universe: ty::UniverseIndex::ROOT,
-                    bound: ty::BoundVar::from_u32({
-                        let idx = self.idx;
-                        self.idx += 1;
-                        idx
-                    }),
-                })
+                ty::Const::new_placeholder(
+                    self.tcx,
+                    ty::PlaceholderConst {
+                        universe: ty::UniverseIndex::ROOT,
+                        bound: ty::BoundVar::from_u32({
+                            let idx = self.idx;
+                            self.idx += 1;
+                            idx
+                        }),
+                    },
+                )
             } else {
                 c.super_fold_with(self)
             }
@@ -685,8 +703,8 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
 /// used during analysis.
 pub fn impossible_predicates<'tcx>(tcx: TyCtxt<'tcx>, predicates: Vec<ty::Clause<'tcx>>) -> bool {
     debug!("impossible_predicates(predicates={:?})", predicates);
-    let infcx = tcx.infer_ctxt().build(TypingMode::PostAnalysis);
-    let param_env = ty::ParamEnv::reveal_all();
+    let (infcx, param_env) =
+        tcx.infer_ctxt().build_with_typing_env(ty::TypingEnv::fully_monomorphized());
     let ocx = ObligationCtxt::new(&infcx);
     let predicates = ocx.normalize(&ObligationCause::dummy(), param_env, predicates);
     for predicate in predicates {
@@ -695,9 +713,18 @@ pub fn impossible_predicates<'tcx>(tcx: TyCtxt<'tcx>, predicates: Vec<ty::Clause
     }
     let errors = ocx.select_all_or_error();
 
-    let result = !errors.is_empty();
-    debug!("impossible_predicates = {:?}", result);
-    result
+    if !errors.is_empty() {
+        return true;
+    }
+
+    // Leak check for any higher-ranked trait mismatches.
+    // We only need to do this in the old solver, since the new solver already
+    // leak-checks.
+    if !infcx.next_trait_solver() && infcx.leak_check(ty::UniverseIndex::ROOT, None).is_err() {
+        return true;
+    }
+
+    false
 }
 
 fn instantiate_and_check_impossible_predicates<'tcx>(

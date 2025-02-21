@@ -7,17 +7,16 @@
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 
-use rustc_ast::{
-    AttrKind, AttrStyle, Attribute, LitKind, MetaItemInner, MetaItemKind, MetaItemLit, ast,
-};
+use rustc_abi::{ExternAbi, Size};
+use rustc_ast::{AttrStyle, LitKind, MetaItemInner, MetaItemKind, MetaItemLit, ast};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Applicability, DiagCtxtHandle, IntoDiagArg, MultiSpan, StashKey};
 use rustc_feature::{AttributeDuplicates, AttributeType, BUILTIN_ATTRIBUTE_MAP, BuiltinAttribute};
 use rustc_hir::def_id::LocalModDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
-    self as hir, self, AssocItemKind, CRATE_HIR_ID, CRATE_OWNER_ID, FnSig, ForeignItem, HirId,
-    Item, ItemKind, MethodKind, Safety, Target, TraitItem,
+    self as hir, self, AssocItemKind, AttrKind, Attribute, CRATE_HIR_ID, CRATE_OWNER_ID, FnSig,
+    ForeignItem, HirId, Item, ItemKind, MethodKind, Safety, Target, TraitItem,
 };
 use rustc_macros::LintDiagnostic;
 use rustc_middle::hir::nested_filter;
@@ -27,15 +26,13 @@ use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{self, TyCtxt, TypingMode};
 use rustc_middle::{bug, span_bug};
+use rustc_session::config::CrateType;
 use rustc_session::lint::builtin::{
     CONFLICTING_REPR_HINTS, INVALID_DOC_ATTRIBUTES, INVALID_MACRO_EXPORT_ARGUMENTS,
     UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES, UNUSED_ATTRIBUTES,
 };
 use rustc_session::parse::feature_err;
-use rustc_span::symbol::{Symbol, kw, sym};
-use rustc_span::{BytePos, DUMMY_SP, Span};
-use rustc_target::abi::Size;
-use rustc_target::spec::abi::Abi;
+use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, kw, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::infer::{TyCtxtInferExt, ValuePairs};
 use rustc_trait_selection::traits::ObligationCtxt;
@@ -118,7 +115,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         for attr in attrs {
             match attr.path().as_slice() {
                 [sym::diagnostic, sym::do_not_recommend, ..] => {
-                    self.check_do_not_recommend(attr.span, hir_id, target)
+                    self.check_do_not_recommend(attr.span, hir_id, target, attr, item)
                 }
                 [sym::diagnostic, sym::on_unimplemented, ..] => {
                     self.check_diagnostic_on_unimplemented(attr.span, hir_id, target)
@@ -126,10 +123,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 [sym::inline, ..] => self.check_inline(hir_id, attr, span, target),
                 [sym::coverage, ..] => self.check_coverage(attr, span, target),
                 [sym::optimize, ..] => self.check_optimize(hir_id, attr, span, target),
-                [sym::no_sanitize, ..] => {
-                    self.check_applied_to_fn_or_method(hir_id, attr, span, target)
-                }
-                [sym::non_exhaustive, ..] => self.check_non_exhaustive(hir_id, attr, span, target),
+                [sym::no_sanitize, ..] => self.check_no_sanitize(attr, span, target),
+                [sym::non_exhaustive, ..] => self.check_non_exhaustive(hir_id, attr, span, target, item),
                 [sym::marker, ..] => self.check_marker(hir_id, attr, span, target),
                 [sym::target_feature, ..] => {
                     self.check_target_feature(hir_id, attr, span, target, attrs)
@@ -162,6 +157,9 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     self.check_rustc_std_internal_symbol(attr, span, target)
                 }
                 [sym::naked, ..] => self.check_naked(hir_id, attr, span, target, attrs),
+                [sym::rustc_as_ptr, ..] => {
+                    self.check_applied_to_fn_or_method(hir_id, attr, span, target)
+                }
                 [sym::rustc_never_returns_null_ptr, ..] => {
                     self.check_applied_to_fn_or_method(hir_id, attr, span, target)
                 }
@@ -188,6 +186,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 [sym::rustc_coinductive, ..]
                 | [sym::rustc_must_implement_one_of, ..]
                 | [sym::rustc_deny_explicit_impl, ..]
+                | [sym::rustc_do_not_implement_via_object, ..]
                 | [sym::const_trait, ..] => self.check_must_be_applied_to_trait(attr, span, target),
                 [sym::collapse_debuginfo, ..] => self.check_collapse_debuginfo(attr, span, target),
                 [sym::must_not_suspend, ..] => self.check_must_not_suspend(attr, span, target),
@@ -248,7 +247,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     self.check_coroutine(attr, target);
                 }
                 [sym::linkage, ..] => self.check_linkage(attr, span, target),
-                [sym::rustc_pub_transparent, ..] => self.check_rustc_pub_transparent( attr.span, span, attrs),
+                [sym::rustc_pub_transparent, ..] => self.check_rustc_pub_transparent(attr.span, span, attrs),
                 [
                     // ok
                     sym::allow
@@ -276,7 +275,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     | sym::lang
                     | sym::needs_allocator
                     | sym::default_lib_allocator
-                    | sym::start
                     | sym::custom_mir,
                     ..
                 ] => {}
@@ -333,6 +331,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 
         self.check_repr(attrs, span, target, item, hir_id);
         self.check_used(attrs, target, span);
+        self.check_rustc_force_inline(hir_id, attrs, span, target);
     }
 
     fn inline_attr_str_error_with_macro_def(&self, hir_id: HirId, attr: &Attribute, sym: &str) {
@@ -345,18 +344,43 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     }
 
     fn inline_attr_str_error_without_macro_def(&self, hir_id: HirId, attr: &Attribute, sym: &str) {
-        self.tcx
-            .emit_node_span_lint(UNUSED_ATTRIBUTES, hir_id, attr.span, errors::IgnoredAttr { sym });
+        self.tcx.emit_node_span_lint(
+            UNUSED_ATTRIBUTES,
+            hir_id,
+            attr.span,
+            errors::IgnoredAttr { sym },
+        );
     }
 
     /// Checks if `#[diagnostic::do_not_recommend]` is applied on a trait impl.
-    fn check_do_not_recommend(&self, attr_span: Span, hir_id: HirId, target: Target) {
-        if !matches!(target, Target::Impl) {
+    fn check_do_not_recommend(
+        &self,
+        attr_span: Span,
+        hir_id: HirId,
+        target: Target,
+        attr: &Attribute,
+        item: Option<ItemLike<'_>>,
+    ) {
+        if !matches!(target, Target::Impl)
+            || matches!(
+                item,
+                Some(ItemLike::Item(hir::Item {  kind: hir::ItemKind::Impl(_impl),.. }))
+                    if _impl.of_trait.is_none()
+            )
+        {
             self.tcx.emit_node_span_lint(
                 UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES,
                 hir_id,
                 attr_span,
                 errors::IncorrectDoNotRecommendLocation,
+            );
+        }
+        if !attr.is_word() {
+            self.tcx.emit_node_span_lint(
+                UNKNOWN_OR_MALFORMED_DIAGNOSTIC_ATTRIBUTES,
+                hir_id,
+                attr_span,
+                errors::DoNotRecommendDoesNotExpectArgs,
             );
         }
     }
@@ -412,21 +436,34 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 
     /// Checks that `#[coverage(..)]` is applied to a function/closure/method,
     /// or to an impl block or module.
-    fn check_coverage(&self, attr: &Attribute, span: Span, target: Target) {
+    fn check_coverage(&self, attr: &Attribute, target_span: Span, target: Target) {
+        let mut not_fn_impl_mod = None;
+        let mut no_body = None;
+
         match target {
             Target::Fn
             | Target::Closure
             | Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent)
             | Target::Impl
-            | Target::Mod => {}
+            | Target::Mod => return,
+
+            // These are "functions", but they aren't allowed because they don't
+            // have a body, so the usual explanation would be confusing.
+            Target::Method(MethodKind::Trait { body: false }) | Target::ForeignFn => {
+                no_body = Some(target_span);
+            }
 
             _ => {
-                self.dcx().emit_err(errors::CoverageNotFnOrClosure {
-                    attr_span: attr.span,
-                    defn_span: span,
-                });
+                not_fn_impl_mod = Some(target_span);
             }
         }
+
+        self.dcx().emit_err(errors::CoverageAttributeNotAllowed {
+            attr_span: attr.span,
+            not_fn_impl_mod,
+            no_body,
+            help: (),
+        });
     }
 
     /// Checks that `#[optimize(..)]` is applied to a function/closure/method,
@@ -444,6 +481,39 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 defn_span: span,
                 on_crate: hir_id == CRATE_HIR_ID,
             });
+        }
+    }
+
+    fn check_no_sanitize(&self, attr: &Attribute, span: Span, target: Target) {
+        if let Some(list) = attr.meta_item_list() {
+            for item in list.iter() {
+                let sym = item.name_or_empty();
+                match sym {
+                    sym::address | sym::hwaddress => {
+                        let is_valid =
+                            matches!(target, Target::Fn | Target::Method(..) | Target::Static);
+                        if !is_valid {
+                            self.dcx().emit_err(errors::NoSanitize {
+                                attr_span: item.span(),
+                                defn_span: span,
+                                accepted_kind: "a function or static",
+                                attr_str: sym.as_str(),
+                            });
+                        }
+                    }
+                    _ => {
+                        let is_valid = matches!(target, Target::Fn | Target::Method(..));
+                        if !is_valid {
+                            self.dcx().emit_err(errors::NoSanitize {
+                                attr_span: item.span(),
+                                defn_span: span,
+                                accepted_kind: "a function",
+                                attr_str: sym.as_str(),
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -557,7 +627,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     fn check_object_lifetime_default(&self, hir_id: HirId) {
         let tcx = self.tcx;
         if let Some(owner_id) = hir_id.as_owner()
-            && let Some(generics) = tcx.hir().get_generics(owner_id.def_id)
+            && let Some(generics) = tcx.hir_get_generics(owner_id.def_id)
         {
             for p in generics.params {
                 let hir::GenericParamKind::Type { .. } = p.kind else { continue };
@@ -632,9 +702,30 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     }
 
     /// Checks if the `#[non_exhaustive]` attribute on an `item` is valid.
-    fn check_non_exhaustive(&self, hir_id: HirId, attr: &Attribute, span: Span, target: Target) {
+    fn check_non_exhaustive(
+        &self,
+        hir_id: HirId,
+        attr: &Attribute,
+        span: Span,
+        target: Target,
+        item: Option<ItemLike<'_>>,
+    ) {
         match target {
-            Target::Struct | Target::Enum | Target::Variant => {}
+            Target::Struct => {
+                if let Some(ItemLike::Item(hir::Item {
+                    kind: hir::ItemKind::Struct(hir::VariantData::Struct { fields, .. }, _),
+                    ..
+                })) = item
+                    && !fields.is_empty()
+                    && fields.iter().any(|f| f.default.is_some())
+                {
+                    self.dcx().emit_err(errors::NonExhaustiveWithDefaultFieldValues {
+                        attr_span: attr.span,
+                        defn_span: span,
+                    });
+                }
+            }
+            Target::Enum | Target::Variant => {}
             // FIXME(#80564): We permit struct fields, match arms and macro defs to have an
             // `#[non_exhaustive]` attribute with just a lint, because we previously
             // erroneously allowed it and some crates used it accidentally, to be compatible
@@ -681,7 +772,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         attrs: &[Attribute],
     ) {
         match target {
-            Target::Fn => {
+            Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent)
+            | Target::Fn => {
                 // `#[target_feature]` is not allowed in lang items.
                 if let Some((lang_item, _)) = hir::lang_items::extract(attrs)
                     // Calling functions with `#[target_feature]` is
@@ -698,7 +790,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     });
                 }
             }
-            Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent) => {}
             // FIXME: #[target_feature] was previously erroneously allowed on statements and some
             // crates used this, so only emit a warning.
             Target::Statement => {
@@ -880,6 +971,13 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     }
 
     fn check_doc_keyword(&self, meta: &MetaItemInner, hir_id: HirId) {
+        fn is_doc_keyword(s: Symbol) -> bool {
+            // FIXME: Once rustdoc can handle URL conflicts on case insensitive file systems, we
+            // can remove the `SelfTy` case here, remove `sym::SelfTy`, and update the
+            // `#[doc(keyword = "SelfTy")` attribute in `library/std/src/keyword_docs.rs`.
+            s <= kw::Union || s == sym::SelfTy
+        }
+
         let doc_keyword = meta.value_str().unwrap_or(kw::Empty);
         if doc_keyword == kw::Empty {
             self.doc_attr_str_error(meta, "keyword");
@@ -901,10 +999,10 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 return;
             }
         }
-        if !rustc_lexer::is_ident(doc_keyword.as_str()) {
-            self.dcx().emit_err(errors::DocKeywordInvalidIdent {
+        if !is_doc_keyword(doc_keyword) {
+            self.dcx().emit_err(errors::DocKeywordNotKeyword {
                 span: meta.name_value_literal_span().unwrap_or_else(|| meta.span()),
-                doc_keyword,
+                keyword: doc_keyword,
             });
         }
     }
@@ -1142,10 +1240,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         specified_inline: &mut Option<(bool, Span)>,
         aliases: &mut FxHashMap<String, Span>,
     ) {
-        if let Some(mi) = attr.meta()
-            && let Some(list) = mi.meta_item_list()
-        {
-            for meta in list {
+        if let Some(list) = attr.meta_item_list() {
+            for meta in &list {
                 if let Some(i_meta) = meta.meta_item() {
                     match i_meta.name_or_empty() {
                         sym::alias => {
@@ -1245,7 +1341,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                                             AttrStyle::Inner => "!",
                                             AttrStyle::Outer => "",
                                         },
-                                        sugg: (attr.meta().unwrap().span, applicability),
+                                        sugg: (attr.span, applicability),
                                     },
                                 );
                             } else if i_meta.has_name(sym::passes)
@@ -1335,37 +1431,48 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 
     /// Warns against some misuses of `#[must_use]`
     fn check_must_use(&self, hir_id: HirId, attr: &Attribute, target: Target) {
-        if !matches!(
+        if matches!(
             target,
             Target::Fn
                 | Target::Enum
                 | Target::Struct
                 | Target::Union
-                | Target::Method(_)
+                | Target::Method(MethodKind::Trait { body: false } | MethodKind::Inherent)
                 | Target::ForeignFn
                 // `impl Trait` in return position can trip
                 // `unused_must_use` if `Trait` is marked as
                 // `#[must_use]`
                 | Target::Trait
         ) {
-            let article = match target {
-                Target::ExternCrate
-                | Target::Enum
-                | Target::Impl
-                | Target::Expression
-                | Target::Arm
-                | Target::AssocConst
-                | Target::AssocTy => "an",
-                _ => "a",
-            };
-
-            self.tcx.emit_node_span_lint(
-                UNUSED_ATTRIBUTES,
-                hir_id,
-                attr.span,
-                errors::MustUseNoEffect { article, target },
-            );
+            return;
         }
+
+        // `#[must_use]` can be applied to a trait method definition with a default body
+        if let Target::Method(MethodKind::Trait { body: true }) = target
+            && let parent_def_id = self.tcx.hir().get_parent_item(hir_id).def_id
+            && let containing_item = self.tcx.hir().expect_item(parent_def_id)
+            && let hir::ItemKind::Trait(..) = containing_item.kind
+        {
+            return;
+        }
+
+        let article = match target {
+            Target::ExternCrate
+            | Target::Enum
+            | Target::Impl
+            | Target::Expression
+            | Target::Arm
+            | Target::AssocConst
+            | Target::AssocTy => "an",
+            _ => "a",
+        };
+
+        self.tcx.emit_node_span_lint(
+            UNUSED_ATTRIBUTES,
+            hir_id,
+            attr.span,
+            errors::MustUseNoEffect { article, target },
+        );
     }
 
     /// Checks if `#[must_not_suspend]` is applied to a struct, enum, union, or trait.
@@ -1413,10 +1520,12 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             _ => {
                 // FIXME: #[cold] was previously allowed on non-functions and some crates used
                 // this, so only emit a warning.
-                self.tcx.emit_node_span_lint(UNUSED_ATTRIBUTES, hir_id, attr.span, errors::Cold {
-                    span,
-                    on_crate: hir_id == CRATE_HIR_ID,
-                });
+                self.tcx.emit_node_span_lint(
+                    UNUSED_ATTRIBUTES,
+                    hir_id,
+                    attr.span,
+                    errors::Cold { span, on_crate: hir_id == CRATE_HIR_ID },
+                );
             }
         }
     }
@@ -1426,14 +1535,17 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         if target == Target::ForeignMod
             && let hir::Node::Item(item) = self.tcx.hir_node(hir_id)
             && let Item { kind: ItemKind::ForeignMod { abi, .. }, .. } = item
-            && !matches!(abi, Abi::Rust | Abi::RustIntrinsic)
+            && !matches!(abi, ExternAbi::Rust | ExternAbi::RustIntrinsic)
         {
             return;
         }
 
-        self.tcx.emit_node_span_lint(UNUSED_ATTRIBUTES, hir_id, attr.span, errors::Link {
-            span: (target != Target::ForeignMod).then_some(span),
-        });
+        self.tcx.emit_node_span_lint(
+            UNUSED_ATTRIBUTES,
+            hir_id,
+            attr.span,
+            errors::Link { span: (target != Target::ForeignMod).then_some(span) },
+        );
     }
 
     /// Checks if `#[link_name]` is applied to an item other than a foreign function or static.
@@ -1554,7 +1666,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         };
 
         let Some(ItemLike::Item(Item {
-            kind: ItemKind::Fn(FnSig { decl, .. }, generics, _), ..
+            kind: ItemKind::Fn { sig: FnSig { decl, .. }, generics, .. },
+            ..
         })) = item
         else {
             bug!("should be a function item");
@@ -1757,6 +1870,34 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         let mut is_simd = false;
         let mut is_transparent = false;
 
+        // catch `repr()` with no arguments, applied to an item (i.e. not `#![repr()]`)
+        if hints.is_empty() && item.is_some() {
+            for attr in attrs.iter().filter(|attr| attr.has_name(sym::repr)) {
+                match target {
+                    Target::Struct | Target::Union | Target::Enum => {}
+                    Target::Fn | Target::Method(_) => {
+                        feature_err(
+                            &self.tcx.sess,
+                            sym::fn_align,
+                            attr.span,
+                            fluent::passes_repr_align_function,
+                        )
+                        .emit();
+                    }
+                    _ => {
+                        self.dcx().emit_err(
+                            errors::AttrApplication::StructEnumFunctionMethodUnion {
+                                hint_span: attr.span,
+                                span,
+                            },
+                        );
+                    }
+                }
+            }
+
+            return;
+        }
+
         for hint in &hints {
             if !hint.is_meta_item() {
                 self.dcx().emit_err(errors::ReprIdent { span: hint.span() });
@@ -1789,24 +1930,19 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     }
                 }
                 sym::align => {
-                    if let (Target::Fn | Target::Method(MethodKind::Inherent), false) =
-                        (target, self.tcx.features().fn_align())
-                    {
-                        feature_err(
-                            &self.tcx.sess,
-                            sym::fn_align,
-                            hint.span(),
-                            fluent::passes_repr_align_function,
-                        )
-                        .emit();
-                    }
-
                     match target {
-                        Target::Struct
-                        | Target::Union
-                        | Target::Enum
-                        | Target::Fn
-                        | Target::Method(_) => {}
+                        Target::Struct | Target::Union | Target::Enum => {}
+                        Target::Fn | Target::Method(_) => {
+                            if !self.tcx.features().fn_align() {
+                                feature_err(
+                                    &self.tcx.sess,
+                                    sym::fn_align,
+                                    hint.span(),
+                                    fluent::passes_repr_align_function,
+                                )
+                                .emit();
+                            }
+                        }
                         _ => {
                             self.dcx().emit_err(
                                 errors::AttrApplication::StructEnumFunctionMethodUnion {
@@ -2107,10 +2243,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     fn check_confusables(&self, attr: &Attribute, target: Target) {
         match target {
             Target::Method(MethodKind::Inherent) => {
-                let Some(meta) = attr.meta() else {
-                    return;
-                };
-                let ast::MetaItem { kind: MetaItemKind::List(ref metas), .. } = meta else {
+                let Some(metas) = attr.meta_item_list() else {
                     return;
                 };
 
@@ -2237,16 +2370,54 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             && item.path == sym::reason
         {
             errors::UnusedNote::NoLints { name: attr.name_or_empty() }
+        } else if matches!(
+            attr.name_or_empty(),
+            sym::allow | sym::warn | sym::deny | sym::forbid | sym::expect
+        ) && let Some(meta) = attr.meta_item_list()
+            && meta.iter().any(|meta| {
+                meta.meta_item().map_or(false, |item| item.path == sym::linker_messages)
+            })
+        {
+            if hir_id != CRATE_HIR_ID {
+                match attr.style {
+                    ast::AttrStyle::Outer => self.tcx.emit_node_span_lint(
+                        UNUSED_ATTRIBUTES,
+                        hir_id,
+                        attr.span,
+                        errors::OuterCrateLevelAttr,
+                    ),
+                    ast::AttrStyle::Inner => self.tcx.emit_node_span_lint(
+                        UNUSED_ATTRIBUTES,
+                        hir_id,
+                        attr.span,
+                        errors::InnerCrateLevelAttr,
+                    ),
+                };
+                return;
+            } else {
+                let never_needs_link = self
+                    .tcx
+                    .crate_types()
+                    .iter()
+                    .all(|kind| matches!(kind, CrateType::Rlib | CrateType::Staticlib));
+                if never_needs_link {
+                    errors::UnusedNote::LinkerWarningsBinaryCrateOnly
+                } else {
+                    return;
+                }
+            }
         } else if attr.name_or_empty() == sym::default_method_body_is_const {
             errors::UnusedNote::DefaultMethodBodyConst
         } else {
             return;
         };
 
-        self.tcx.emit_node_span_lint(UNUSED_ATTRIBUTES, hir_id, attr.span, errors::Unused {
-            attr_span: attr.span,
-            note,
-        });
+        self.tcx.emit_node_span_lint(
+            UNUSED_ATTRIBUTES,
+            hir_id,
+            attr.span,
+            errors::Unused { attr_span: attr.span, note },
+        );
     }
 
     /// A best effort attempt to create an error for a mismatching proc macro signature.
@@ -2295,13 +2466,13 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             token_stream,
             false,
             Safety::Safe,
-            Abi::Rust,
+            ExternAbi::Rust,
         );
 
         if let Err(terr) = ocx.eq(&cause, param_env, expected_sig, sig) {
             let mut diag = tcx.dcx().create_err(errors::ProcMacroBadSig { span, kind });
 
-            let hir_sig = tcx.hir().fn_sig_by_hir_id(hir_id);
+            let hir_sig = tcx.hir_fn_sig_by_hir_id(hir_id);
             if let Some(hir_sig) = hir_sig {
                 #[allow(rustc::diagnostic_outside_of_impl)] // FIXME
                 match terr {
@@ -2344,6 +2515,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 }))),
                 terr,
                 false,
+                None,
             );
             diag.emit();
             self.abort.set(true);
@@ -2390,6 +2562,45 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         }
     }
 
+    fn check_rustc_force_inline(
+        &self,
+        hir_id: HirId,
+        attrs: &[Attribute],
+        span: Span,
+        target: Target,
+    ) {
+        let force_inline_attr = attrs.iter().find(|attr| attr.has_name(sym::rustc_force_inline));
+        match (target, force_inline_attr) {
+            (Target::Closure, None) => {
+                let is_coro = matches!(
+                    self.tcx.hir().expect_expr(hir_id).kind,
+                    hir::ExprKind::Closure(hir::Closure {
+                        kind: hir::ClosureKind::Coroutine(..)
+                            | hir::ClosureKind::CoroutineClosure(..),
+                        ..
+                    })
+                );
+                let parent_did = self.tcx.hir().get_parent_item(hir_id).to_def_id();
+                let parent_span = self.tcx.def_span(parent_did);
+                let parent_force_inline_attr =
+                    self.tcx.get_attr(parent_did, sym::rustc_force_inline);
+                if let Some(attr) = parent_force_inline_attr
+                    && is_coro
+                {
+                    self.dcx().emit_err(errors::RustcForceInlineCoro {
+                        attr_span: attr.span,
+                        span: parent_span,
+                    });
+                }
+            }
+            (Target::Fn, _) => (),
+            (_, Some(attr)) => {
+                self.dcx().emit_err(errors::RustcForceInline { attr_span: attr.span, span });
+            }
+            (_, None) => (),
+        }
+    }
+
     /// Checks if `#[autodiff]` is applied to an item other than a function item.
     fn check_autodiff(&self, _hir_id: HirId, _attr: &Attribute, span: Span, target: Target) {
         debug!("check_autodiff");
@@ -2406,8 +2617,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 impl<'tcx> Visitor<'tcx> for CheckAttrVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_item(&mut self, item: &'tcx Item<'tcx>) {
@@ -2525,7 +2736,6 @@ fn check_invalid_crate_level_attr(tcx: TyCtxt<'_>, attrs: &[Attribute]) {
         sym::repr,
         sym::path,
         sym::automatically_derived,
-        sym::start,
         sym::rustc_main,
         sym::derive,
         sym::test,
@@ -2541,9 +2751,8 @@ fn check_invalid_crate_level_attr(tcx: TyCtxt<'_>, attrs: &[Attribute]) {
             for attr_to_check in ATTRS_TO_CHECK {
                 if attr.has_name(*attr_to_check) {
                     let item = tcx
-                        .hir()
-                        .items()
-                        .map(|id| tcx.hir().item(id))
+                        .hir_free_items()
+                        .map(|id| tcx.hir_item(id))
                         .find(|item| !item.span.is_dummy()) // Skip prelude `use`s
                         .map(|item| errors::ItemFollowingInnerAttr {
                             span: item.ident.span,
@@ -2568,7 +2777,7 @@ fn check_invalid_crate_level_attr(tcx: TyCtxt<'_>, attrs: &[Attribute]) {
 
                     if let AttrKind::Normal(ref p) = attr.kind {
                         tcx.dcx().try_steal_replace_and_emit_err(
-                            p.item.path.span,
+                            p.path.span,
                             StashKey::UndeterminedMacroResolution,
                             err,
                         );
@@ -2593,10 +2802,10 @@ fn check_non_exported_macro_for_invalid_attrs(tcx: TyCtxt<'_>, item: &Item<'_>) 
 
 fn check_mod_attrs(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
     let check_attr_visitor = &mut CheckAttrVisitor { tcx, abort: Cell::new(false) };
-    tcx.hir().visit_item_likes_in_module(module_def_id, check_attr_visitor);
+    tcx.hir_visit_item_likes_in_module(module_def_id, check_attr_visitor);
     if module_def_id.to_local_def_id().is_top_level_module() {
         check_attr_visitor.check_attributes(CRATE_HIR_ID, DUMMY_SP, Target::Mod, None);
-        check_invalid_crate_level_attr(tcx, tcx.hir().krate_attrs());
+        check_invalid_crate_level_attr(tcx, tcx.hir_krate_attrs());
     }
     if check_attr_visitor.abort.get() {
         tcx.dcx().abort_if_errors()
@@ -2680,7 +2889,7 @@ fn doc_fake_variadic_is_allowed_self_ty(self_ty: &hir::Ty<'_>) -> bool {
             && let Some(&[hir::GenericArg::Type(ty)]) =
                 path.segments.last().map(|last| last.args().args)
         {
-            doc_fake_variadic_is_allowed_self_ty(ty)
+            doc_fake_variadic_is_allowed_self_ty(ty.as_unambig_ty())
         } else {
             false
         })

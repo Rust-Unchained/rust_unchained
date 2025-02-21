@@ -179,7 +179,7 @@ This informs `rustc` of the name of your crate.
 <a id="option-edition"></a>
 ## `--edition`: specify the edition to use
 
-This flag takes a value of `2015`, `2018` or `2021`. The default is `2015`. More
+This flag takes a value of `2015`, `2018`,`2021`, or `2024`. The default is `2015`. More
 information about editions may be found in the [edition guide].
 
 [edition guide]: ../edition-guide/introduction.html
@@ -308,7 +308,7 @@ A synonym for [`-C debuginfo=2`](codegen-options/index.md#debuginfo).
 <a id="option-o-optimize"></a>
 ## `-O`: optimize your code
 
-A synonym for [`-C opt-level=2`](codegen-options/index.md#opt-level).
+A synonym for [`-C opt-level=3`](codegen-options/index.md#opt-level).
 
 <a id="option-o-output"></a>
 ## `-o`: filename of the output

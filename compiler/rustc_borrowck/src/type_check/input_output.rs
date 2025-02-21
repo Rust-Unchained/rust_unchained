@@ -19,7 +19,7 @@ use tracing::{debug, instrument};
 
 use super::{Locations, TypeChecker};
 use crate::renumber::RegionCtxt;
-use crate::universal_regions::{DefiningTy, UniversalRegions};
+use crate::universal_regions::DefiningTy;
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     /// Check explicit closure signature annotation,
@@ -75,17 +75,20 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             let output_ty = Ty::new_coroutine(
                 self.tcx(),
                 self.tcx().coroutine_for_closure(mir_def_id),
-                ty::CoroutineArgs::new(self.tcx(), ty::CoroutineArgsParts {
-                    parent_args: args.parent_args(),
-                    kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
-                    return_ty: user_provided_sig.output(),
-                    tupled_upvars_ty,
-                    // For async closures, none of these can be annotated, so just fill
-                    // them with fresh ty vars.
-                    resume_ty: next_ty_var(),
-                    yield_ty: next_ty_var(),
-                    witness: next_ty_var(),
-                })
+                ty::CoroutineArgs::new(
+                    self.tcx(),
+                    ty::CoroutineArgsParts {
+                        parent_args: args.parent_args(),
+                        kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
+                        return_ty: user_provided_sig.output(),
+                        tupled_upvars_ty,
+                        // For async closures, none of these can be annotated, so just fill
+                        // them with fresh ty vars.
+                        resume_ty: next_ty_var(),
+                        yield_ty: next_ty_var(),
+                        witness: next_ty_var(),
+                    },
+                )
                 .args,
             );
 
@@ -110,7 +113,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         ) {
             self.ascribe_user_type_skip_wf(
                 arg_decl.ty,
-                ty::UserType::Ty(user_ty),
+                ty::UserType::new(ty::UserTypeKind::Ty(user_ty)),
                 arg_decl.source_info.span,
             );
         }
@@ -119,16 +122,15 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         let output_decl = &body.local_decls[RETURN_PLACE];
         self.ascribe_user_type_skip_wf(
             output_decl.ty,
-            ty::UserType::Ty(user_provided_sig.output()),
+            ty::UserType::new(ty::UserTypeKind::Ty(user_provided_sig.output())),
             output_decl.source_info.span,
         );
     }
 
-    #[instrument(skip(self, body, universal_regions), level = "debug")]
+    #[instrument(skip(self, body), level = "debug")]
     pub(super) fn equate_inputs_and_outputs(
         &mut self,
         body: &Body<'tcx>,
-        universal_regions: &UniversalRegions<'tcx>,
         normalized_inputs_and_output: &[Ty<'tcx>],
     ) {
         let (&normalized_output_ty, normalized_input_tys) =
@@ -161,7 +163,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         if let Some(mir_yield_ty) = body.yield_ty() {
             let yield_span = body.local_decls[RETURN_PLACE].source_info.span;
             self.equate_normalized_input_or_output(
-                universal_regions.yield_ty.unwrap(),
+                self.universal_regions.yield_ty.unwrap(),
                 mir_yield_ty,
                 yield_span,
             );
@@ -170,7 +172,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         if let Some(mir_resume_ty) = body.resume_ty() {
             let yield_span = body.local_decls[RETURN_PLACE].source_info.span;
             self.equate_normalized_input_or_output(
-                universal_regions.resume_ty.unwrap(),
+                self.universal_regions.resume_ty.unwrap(),
                 mir_resume_ty,
                 yield_span,
             );

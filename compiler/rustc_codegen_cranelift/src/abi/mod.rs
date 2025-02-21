@@ -65,7 +65,7 @@ pub(crate) fn conv_to_call_conv(sess: &Session, c: Conv, default_call_conv: Call
             sess.dcx().fatal("C-cmse-nonsecure-entry call conv is not yet implemented");
         }
 
-        Conv::Msp430Intr | Conv::PtxKernel | Conv::AvrInterrupt | Conv::AvrNonBlockingInterrupt => {
+        Conv::Msp430Intr | Conv::GpuKernel | Conv::AvrInterrupt | Conv::AvrNonBlockingInterrupt => {
             unreachable!("tried to use {c:?} call conv which only exists on an unsupported target");
         }
     }
@@ -80,7 +80,7 @@ pub(crate) fn get_function_sig<'tcx>(
     clif_sig_from_fn_abi(
         tcx,
         default_call_conv,
-        &RevealAllLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
+        &FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
     )
 }
 
@@ -122,11 +122,12 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         &mut self,
         name: &str,
         params: Vec<AbiParam>,
-        returns: Vec<AbiParam>,
+        mut returns: Vec<AbiParam>,
         args: &[Value],
     ) -> Cow<'_, [Value]> {
-        if self.tcx.sess.target.is_like_windows {
-            let (mut params, mut args): (Vec<_>, Vec<_>) = params
+        // Pass i128 arguments by-ref on Windows.
+        let (params, args): (Vec<_>, Cow<'_, [_]>) = if self.tcx.sess.target.is_like_windows {
+            let (params, args): (Vec<_>, Vec<_>) = params
                 .into_iter()
                 .zip(args)
                 .map(|(param, &arg)| {
@@ -140,29 +141,46 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 })
                 .unzip();
 
-            let indirect_ret_val = returns.len() == 1 && returns[0].value_type == types::I128;
+            (params, args.into())
+        } else {
+            (params, args.into())
+        };
 
-            if indirect_ret_val {
-                params.insert(0, AbiParam::new(self.pointer_type));
-                let ret_ptr = self.create_stack_slot(16, 16);
-                args.insert(0, ret_ptr.get_addr(self));
-                self.lib_call_unadjusted(name, params, vec![], &args);
-                return Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())]);
-            } else {
-                return self.lib_call_unadjusted(name, params, returns, &args);
-            }
+        let ret_single_i128 = returns.len() == 1 && returns[0].value_type == types::I128;
+        if ret_single_i128 && self.tcx.sess.target.is_like_windows {
+            // Return i128 using the vector ABI on Windows
+            returns[0].value_type = types::I64X2;
+
+            let ret = self.lib_call_unadjusted(name, params, returns, &args)[0];
+
+            // FIXME(bytecodealliance/wasmtime#6104) use bitcast instead of store to get from i64x2 to i128
+            let ret_ptr = self.create_stack_slot(16, 16);
+            ret_ptr.store(self, ret, MemFlags::trusted());
+            Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())])
+        } else if ret_single_i128 && self.tcx.sess.target.arch == "s390x" {
+            // Return i128 using a return area pointer on s390x.
+            let mut params = params;
+            let mut args = args.to_vec();
+
+            params.insert(0, AbiParam::new(self.pointer_type));
+            let ret_ptr = self.create_stack_slot(16, 16);
+            args.insert(0, ret_ptr.get_addr(self));
+
+            self.lib_call_unadjusted(name, params, vec![], &args);
+
+            Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())])
+        } else {
+            Cow::Borrowed(self.lib_call_unadjusted(name, params, returns, &args))
         }
-
-        self.lib_call_unadjusted(name, params, returns, args)
     }
 
-    pub(crate) fn lib_call_unadjusted(
+    fn lib_call_unadjusted(
         &mut self,
         name: &str,
         params: Vec<AbiParam>,
         returns: Vec<AbiParam>,
         args: &[Value],
-    ) -> Cow<'_, [Value]> {
+    ) -> &[Value] {
         let sig = Signature { params, returns, call_conv: self.target_config.default_call_conv };
         let func_id = self.module.declare_function(name, Linkage::Import, &sig).unwrap();
         let func_ref = self.module.declare_func_in_func(func_id, &mut self.bcx.func);
@@ -175,7 +193,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         }
         let results = self.bcx.inst_results(call_inst);
         assert!(results.len() <= 2, "{}", results.len());
-        Cow::Borrowed(results)
+        results
     }
 }
 
@@ -376,12 +394,11 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     let instance = if let ty::FnDef(def_id, fn_args) = *func.layout().ty.kind() {
         let instance = ty::Instance::expect_resolve(
             fx.tcx,
-            ty::ParamEnv::reveal_all(),
+            ty::TypingEnv::fully_monomorphized(),
             def_id,
             fn_args,
             source_info.span,
-        )
-        .polymorphize(fx.tcx);
+        );
 
         if is_call_from_compiler_builtins_to_upstream_monomorphization(fx.tcx, instance) {
             if target.is_some() {
@@ -438,9 +455,9 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         extra_args.iter().map(|op_arg| fx.monomorphize(op_arg.node.ty(fx.mir, fx.tcx))),
     );
     let fn_abi = if let Some(instance) = instance {
-        RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(instance, extra_args)
+        FullyMonomorphizedLayoutCx(fx.tcx).fn_abi_of_instance(instance, extra_args)
     } else {
-        RevealAllLayoutCx(fx.tcx).fn_abi_of_fn_ptr(fn_sig, extra_args)
+        FullyMonomorphizedLayoutCx(fx.tcx).fn_abi_of_fn_ptr(fn_sig, extra_args)
     };
 
     let is_cold = if fn_sig.abi() == ExternAbi::RustCold {
@@ -684,7 +701,7 @@ pub(crate) fn codegen_drop<'tcx>(
     target: BasicBlock,
 ) {
     let ty = drop_place.layout().ty;
-    let drop_instance = Instance::resolve_drop_in_place(fx.tcx, ty).polymorphize(fx.tcx);
+    let drop_instance = Instance::resolve_drop_in_place(fx.tcx, ty);
 
     if let ty::InstanceKind::DropGlue(_, None) | ty::InstanceKind::AsyncDropGlueCtorShim(_, None) =
         drop_instance.def
@@ -721,8 +738,8 @@ pub(crate) fn codegen_drop<'tcx>(
                     def: ty::InstanceKind::Virtual(drop_instance.def_id(), 0),
                     args: drop_instance.args,
                 };
-                let fn_abi =
-                    RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(virtual_drop, ty::List::empty());
+                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
+                    .fn_abi_of_instance(virtual_drop, ty::List::empty());
 
                 let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
                 let sig = fx.bcx.import_signature(sig);
@@ -764,8 +781,8 @@ pub(crate) fn codegen_drop<'tcx>(
                     def: ty::InstanceKind::Virtual(drop_instance.def_id(), 0),
                     args: drop_instance.args,
                 };
-                let fn_abi =
-                    RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(virtual_drop, ty::List::empty());
+                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
+                    .fn_abi_of_instance(virtual_drop, ty::List::empty());
 
                 let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
                 let sig = fx.bcx.import_signature(sig);
@@ -774,8 +791,8 @@ pub(crate) fn codegen_drop<'tcx>(
             _ => {
                 assert!(!matches!(drop_instance.def, InstanceKind::Virtual(_, _)));
 
-                let fn_abi =
-                    RevealAllLayoutCx(fx.tcx).fn_abi_of_instance(drop_instance, ty::List::empty());
+                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
+                    .fn_abi_of_instance(drop_instance, ty::List::empty());
 
                 let arg_value = drop_place.place_ref(
                     fx,

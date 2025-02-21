@@ -7,7 +7,6 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::DiagCtxtHandle;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self as hir};
-use rustc_interface::interface;
 use rustc_macros::{Decodable, Encodable};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, TyCtxt};
@@ -124,8 +123,8 @@ where
 {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.cx.tcx().hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.cx.tcx()
     }
 
     fn visit_expr(&mut self, ex: &'tcx hir::Expr<'tcx>) {
@@ -136,8 +135,7 @@ where
         // If we visit an item that contains an expression outside a function body,
         // then we need to exit before calling typeck (which will panic). See
         // test/run-make/rustdoc-scrape-examples-invalid-expr for an example.
-        let hir = tcx.hir();
-        if hir.maybe_body_owned_by(ex.hir_id.owner.def_id).is_none() {
+        if tcx.hir_maybe_body_owned_by(ex.hir_id.owner.def_id).is_none() {
             return;
         }
 
@@ -275,7 +273,7 @@ pub(crate) fn run(
     tcx: TyCtxt<'_>,
     options: ScrapeExamplesOptions,
     bin_crate: bool,
-) -> interface::Result<()> {
+) {
     let inner = move || -> Result<(), String> {
         // Generates source files for examples
         renderopts.no_emit_shared = true;
@@ -303,7 +301,7 @@ pub(crate) fn run(
         // Run call-finder on all items
         let mut calls = FxIndexMap::default();
         let mut finder = FindCalls { calls: &mut calls, cx, target_crates, bin_crate };
-        tcx.hir().visit_all_item_likes_in_crate(&mut finder);
+        tcx.hir_visit_all_item_likes_in_crate(&mut finder);
 
         // The visitor might have found a type error, which we need to
         // promote to a fatal error
@@ -329,8 +327,6 @@ pub(crate) fn run(
     if let Err(e) = inner() {
         tcx.dcx().fatal(e);
     }
-
-    Ok(())
 }
 
 // Note: the DiagCtxt must be passed in explicitly because sess isn't available while parsing

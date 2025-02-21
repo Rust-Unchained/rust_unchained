@@ -3,13 +3,13 @@ use std::ops::ControlFlow;
 
 use hir::intravisit::{self, Visitor};
 use hir::{GenericParamKind, HirId, Node};
-use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
+use rustc_hir::intravisit::VisitorExt;
+use rustc_hir::{self as hir, AmbigArg};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::lint;
-use rustc_span::Span;
-use rustc_span::symbol::{Symbol, kw};
+use rustc_span::{Span, Symbol, kw};
 use tracing::{debug, instrument};
 
 use crate::delegation::inherit_generics_for_delegation_item;
@@ -181,7 +181,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     // expressions' count (i.e. `N` in `[x; N]`), and explicit
                     // `enum` discriminants (i.e. `D` in `enum Foo { Bar = D }`),
                     // as they shouldn't be able to cause query cycle errors.
-                    Node::Expr(Expr { kind: ExprKind::Repeat(_, ArrayLen::Body(ct)), .. })
+                    Node::Expr(Expr { kind: ExprKind::Repeat(_, ct), .. })
                         if ct.anon_const_hir_id() == Some(hir_id) =>
                     {
                         Some(parent_did)
@@ -198,6 +198,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     {
                         Some(parent_did)
                     }
+                    Node::TyPat(_) => Some(parent_did),
                     _ => None,
                 }
             }
@@ -419,7 +420,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     if let Node::ConstBlock(_) = node {
         own_params.push(ty::GenericParamDef {
             index: next_index(),
-            name: Symbol::intern("<const_ty>"),
+            name: rustc_span::sym::const_ty_placeholder,
             def_id: def_id.to_def_id(),
             pure_wrt_drop: false,
             kind: ty::GenericParamDefKind::Type { has_default: false, synthetic: false },
@@ -462,9 +463,15 @@ fn has_late_bound_regions<'tcx>(tcx: TyCtxt<'tcx>, node: Node<'tcx>) -> Option<S
 
     impl<'tcx> Visitor<'tcx> for LateBoundRegionsDetector<'tcx> {
         type Result = ControlFlow<Span>;
-        fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx>) -> ControlFlow<Span> {
+        fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, AmbigArg>) -> ControlFlow<Span> {
             match ty.kind {
                 hir::TyKind::BareFn(..) => {
+                    self.outer_index.shift_in(1);
+                    let res = intravisit::walk_ty(self, ty);
+                    self.outer_index.shift_out(1);
+                    res
+                }
+                hir::TyKind::UnsafeBinder(_) => {
                     self.outer_index.shift_in(1);
                     let res = intravisit::walk_ty(self, ty);
                     self.outer_index.shift_out(1);
@@ -534,7 +541,7 @@ impl<'v> Visitor<'v> for AnonConstInParamTyDetector {
         if let GenericParamKind::Const { ty, default: _, synthetic: _ } = p.kind {
             let prev = self.in_param_ty;
             self.in_param_ty = true;
-            let res = self.visit_ty(ty);
+            let res = self.visit_ty_unambig(ty);
             self.in_param_ty = prev;
             res
         } else {

@@ -2,7 +2,7 @@ error: const `impl` for trait `FromResidual` which is not marked with `#[const_t
   --> $DIR/ice-119717-constant-lifetime.rs:6:15
    |
 LL | impl<T> const FromResidual for T {
-   |               ^^^^^^^^^^^^
+   |               ^^^^^^^^^^^^ this trait is not `const`
    |
    = note: marking a trait with `#[const_trait]` ensures all default method bodies are `const`
    = note: adding a non-const method body in the future would be a breaking change
@@ -25,8 +25,9 @@ LL |     fn from_residual(t: T) -> _ {
    |
 help: try replacing `_` with the type in the corresponding trait method signature
    |
-LL |     fn from_residual(t: T) -> T {
-   |                               ~
+LL -     fn from_residual(t: T) -> _ {
+LL +     fn from_residual(t: T) -> T {
+   |
 
 error: aborting due to 3 previous errors
 

@@ -32,8 +32,10 @@ impl<'tcx> InferCtxt<'tcx> {
     fn type_is_copy_modulo_regions(&self, param_env: ty::ParamEnv<'tcx>, ty: Ty<'tcx>) -> bool {
         let ty = self.resolve_vars_if_possible(ty);
 
+        // FIXME(#132279): This should be removed as it causes us to incorrectly
+        // handle opaques in their defining scope.
         if !(param_env, ty).has_infer() {
-            return ty.is_copy_modulo_regions(self.tcx, param_env);
+            return self.tcx.type_is_copy_modulo_regions(self.typing_env(param_env), ty);
         }
 
         let copy_def_id = self.tcx.require_lang_item(LangItem::Copy, None);
@@ -43,6 +45,12 @@ impl<'tcx> InferCtxt<'tcx> {
         // moves_by_default has a cache, which we want to use in other
         // cases.
         traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, copy_def_id)
+    }
+
+    fn type_is_clone_modulo_regions(&self, param_env: ty::ParamEnv<'tcx>, ty: Ty<'tcx>) -> bool {
+        let ty = self.resolve_vars_if_possible(ty);
+        let clone_def_id = self.tcx.require_lang_item(LangItem::Clone, None);
+        traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, clone_def_id)
     }
 
     fn type_is_sized_modulo_regions(&self, param_env: ty::ParamEnv<'tcx>, ty: Ty<'tcx>) -> bool {

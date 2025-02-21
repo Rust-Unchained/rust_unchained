@@ -13,8 +13,7 @@ use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::fold::FnMutDelegate;
 use rustc_middle::ty::relate::combine::{super_combine_consts, super_combine_tys};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
+use rustc_span::{Span, Symbol, sym};
 use tracing::{debug, instrument};
 
 use crate::constraints::OutlivesConstraint;
@@ -522,7 +521,7 @@ impl<'b, 'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for NllTypeRelating<'_
     }
 
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.type_checker.param_env
+        self.type_checker.infcx.param_env
     }
 
     fn register_predicates(

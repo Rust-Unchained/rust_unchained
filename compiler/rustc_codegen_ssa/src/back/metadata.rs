@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use itertools::Itertools;
 use object::write::{self, StandardSegment, Symbol, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, FileFlags, Object, ObjectSection, ObjectSymbol,
@@ -21,6 +22,7 @@ use rustc_middle::bug;
 use rustc_session::Session;
 use rustc_span::sym;
 use rustc_target::spec::{RelocModel, Target, ef_avr_arch};
+use tracing::debug;
 
 use super::apple;
 
@@ -53,6 +55,7 @@ fn load_metadata_with(
 
 impl MetadataLoader for DefaultMetadataLoader {
     fn get_rlib_metadata(&self, target: &Target, path: &Path) -> Result<OwnedSlice, String> {
+        debug!("getting rlib metadata for {}", path.display());
         load_metadata_with(path, |data| {
             let archive = object::read::archive::ArchiveFile::parse(&*data)
                 .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;
@@ -77,8 +80,26 @@ impl MetadataLoader for DefaultMetadataLoader {
     }
 
     fn get_dylib_metadata(&self, target: &Target, path: &Path) -> Result<OwnedSlice, String> {
+        debug!("getting dylib metadata for {}", path.display());
         if target.is_like_aix {
-            load_metadata_with(path, |data| get_metadata_xcoff(path, data))
+            load_metadata_with(path, |data| {
+                let archive = object::read::archive::ArchiveFile::parse(&*data).map_err(|e| {
+                    format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                })?;
+
+                match archive.members().exactly_one() {
+                    Ok(lib) => {
+                        let lib = lib.map_err(|e| {
+                            format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                        })?;
+                        let data = lib.data(data).map_err(|e| {
+                            format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                        })?;
+                        get_metadata_xcoff(path, data)
+                    }
+                    Err(e) => Err(format!("failed to parse aix dylib '{}': {}", path.display(), e)),
+                }
+            })
         } else {
             load_metadata_with(path, |data| search_for_section(path, data, ".rustc"))
         }
@@ -683,13 +704,17 @@ pub fn create_metadata_file_for_wasm(sess: &Session, data: &[u8], section_name: 
     let mut imports = wasm_encoder::ImportSection::new();
 
     if sess.target.pointer_width == 64 {
-        imports.import("env", "__linear_memory", wasm_encoder::MemoryType {
-            minimum: 0,
-            maximum: None,
-            memory64: true,
-            shared: false,
-            page_size_log2: None,
-        });
+        imports.import(
+            "env",
+            "__linear_memory",
+            wasm_encoder::MemoryType {
+                minimum: 0,
+                maximum: None,
+                memory64: true,
+                shared: false,
+                page_size_log2: None,
+            },
+        );
     }
 
     if imports.len() > 0 {

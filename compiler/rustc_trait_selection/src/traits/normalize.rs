@@ -7,6 +7,7 @@ use rustc_infer::traits::{
     FromSolverError, Normalized, Obligation, PredicateObligations, TraitEngine,
 };
 use rustc_macros::extension;
+use rustc_middle::span_bug;
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitable, TypeVisitableExt,
@@ -63,10 +64,18 @@ impl<'tcx> At<'_, 'tcx> {
         if self.infcx.next_trait_solver() {
             crate::solve::deeply_normalize(self, value)
         } else {
+            if fulfill_cx.has_pending_obligations() {
+                let pending_obligations = fulfill_cx.pending_obligations();
+                span_bug!(
+                    pending_obligations[0].cause.span,
+                    "deeply_normalize should not be called with pending obligations: \
+                    {pending_obligations:#?}"
+                );
+            }
             let value = self
                 .normalize(value)
                 .into_value_registering_obligations(self.infcx, &mut *fulfill_cx);
-            let errors = fulfill_cx.select_where_possible(self.infcx);
+            let errors = fulfill_cx.select_all_or_error(self.infcx);
             let value = self.infcx.resolve_vars_if_possible(value);
             if errors.is_empty() { Ok(value) } else { Err(errors) }
         }
@@ -111,17 +120,17 @@ where
 
 pub(super) fn needs_normalization<'tcx, T: TypeVisitable<TyCtxt<'tcx>>>(
     infcx: &InferCtxt<'tcx>,
-    param_env_for_debug_assertion: ty::ParamEnv<'tcx>,
     value: &T,
 ) -> bool {
     let mut flags = ty::TypeFlags::HAS_ALIAS;
 
-    // Opaques are treated as rigid with `Reveal::UserFacing`,
+    // Opaques are treated as rigid outside of `TypingMode::PostAnalysis`,
     // so we can ignore those.
-    match infcx.typing_mode(param_env_for_debug_assertion) {
-        TypingMode::Coherence | TypingMode::Analysis { defining_opaque_types: _ } => {
-            flags.remove(ty::TypeFlags::HAS_TY_OPAQUE)
-        }
+    match infcx.typing_mode() {
+        // FIXME(#132279): We likely want to reveal opaques during post borrowck analysis
+        TypingMode::Coherence
+        | TypingMode::Analysis { .. }
+        | TypingMode::PostBorrowckAnalysis { .. } => flags.remove(ty::TypeFlags::HAS_TY_OPAQUE),
         TypingMode::PostAnalysis => {}
     }
 
@@ -158,11 +167,7 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
             "Normalizing {value:?} without wrapping in a `Binder`"
         );
 
-        if !needs_normalization(self.selcx.infcx, self.param_env, &value) {
-            value
-        } else {
-            value.fold_with(self)
-        }
+        if !needs_normalization(self.selcx.infcx, &value) { value } else { value.fold_with(self) }
     }
 }
 
@@ -182,7 +187,7 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if !needs_normalization(self.selcx.infcx, self.param_env, &ty) {
+        if !needs_normalization(self.selcx.infcx, &ty) {
             return ty;
         }
 
@@ -217,10 +222,11 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
         match kind {
             ty::Opaque => {
                 // Only normalize `impl Trait` outside of type inference, usually in codegen.
-                match self.selcx.infcx.typing_mode(self.param_env) {
-                    TypingMode::Coherence | TypingMode::Analysis { defining_opaque_types: _ } => {
-                        ty.super_fold_with(self)
-                    }
+                match self.selcx.infcx.typing_mode() {
+                    // FIXME(#132279): We likely want to reveal opaques during post borrowck analysis
+                    TypingMode::Coherence
+                    | TypingMode::Analysis { .. }
+                    | TypingMode::PostBorrowckAnalysis { .. } => ty.super_fold_with(self),
                     TypingMode::PostAnalysis => {
                         let recursion_limit = self.cx().recursion_limit();
                         if !recursion_limit.value_within_limit(self.depth) {
@@ -407,8 +413,7 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
     #[instrument(skip(self), level = "debug")]
     fn fold_const(&mut self, constant: ty::Const<'tcx>) -> ty::Const<'tcx> {
         let tcx = self.selcx.tcx();
-        if tcx.features().generic_const_exprs()
-            || !needs_normalization(self.selcx.infcx, self.param_env, &constant)
+        if tcx.features().generic_const_exprs() || !needs_normalization(self.selcx.infcx, &constant)
         {
             constant
         } else {
@@ -426,7 +431,7 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
 
     #[inline]
     fn fold_predicate(&mut self, p: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
-        if p.allow_normalization() && needs_normalization(self.selcx.infcx, self.param_env, &p) {
+        if p.allow_normalization() && needs_normalization(self.selcx.infcx, &p) {
             p.super_fold_with(self)
         } else {
             p

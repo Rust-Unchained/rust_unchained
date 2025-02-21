@@ -21,6 +21,7 @@
 #![feature(auto_traits)]
 #![feature(cfg_match)]
 #![feature(core_intrinsics)]
+#![feature(dropck_eyepatch)]
 #![feature(extend_one)]
 #![feature(file_buffered)]
 #![feature(hash_raw_entry)]
@@ -75,13 +76,14 @@ pub mod sync;
 pub mod tagged_ptr;
 pub mod temp_dir;
 pub mod thinvec;
+pub mod thousands;
 pub mod transitive_relation;
 pub mod unhash;
 pub mod unord;
+pub mod vec_cache;
 pub mod work_queue;
 
 mod atomic_ref;
-mod hashes;
 
 /// This calls the passed function while ensuring it won't be inlined into the caller.
 #[inline(never)]

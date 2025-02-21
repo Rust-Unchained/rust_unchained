@@ -210,7 +210,7 @@ impl DebugContext {
 
         type_names::push_generic_params(
             tcx,
-            tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), args),
+            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), args),
             &mut name,
         );
 
@@ -275,8 +275,10 @@ impl DebugContext {
         let span = tcx.def_span(def_id);
         let (file_id, line, _column) = self.get_span_loc(tcx, span, span);
 
-        let static_type = Instance::mono(tcx, def_id).ty(tcx, ty::ParamEnv::reveal_all());
-        let static_layout = tcx.layout_of(ty::ParamEnv::reveal_all().and(static_type)).unwrap();
+        let static_type = Instance::mono(tcx, def_id).ty(tcx, ty::TypingEnv::fully_monomorphized());
+        let static_layout = tcx
+            .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(static_type))
+            .unwrap();
         // FIXME use the actual type layout
         let type_id = self.debug_type(tcx, type_dbg, static_type);
 
@@ -302,7 +304,7 @@ impl DebugContext {
         entry.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
         entry.set(gimli::DW_AT_decl_line, AttributeValue::Udata(line));
 
-        entry.set(gimli::DW_AT_alignment, AttributeValue::Udata(static_layout.align.pref.bytes()));
+        entry.set(gimli::DW_AT_alignment, AttributeValue::Udata(static_layout.align.abi.bytes()));
 
         let mut expr = Expression::new();
         expr.op_addr(address_for_data(data_id));

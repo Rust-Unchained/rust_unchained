@@ -3,17 +3,16 @@
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, Subdiagnostic};
 use rustc_hir::def_id::DefId;
-use rustc_hir::intravisit::{Visitor, walk_ty};
+use rustc_hir::intravisit::{Visitor, VisitorExt, walk_ty};
 use rustc_hir::{
-    self as hir, GenericBound, GenericParam, GenericParamKind, Item, ItemKind, Lifetime,
+    self as hir, AmbigArg, GenericBound, GenericParam, GenericParamKind, Item, ItemKind, Lifetime,
     LifetimeName, LifetimeParamKind, MissingLifetimeKind, Node, TyKind,
 };
 use rustc_middle::ty::{
     self, AssocItemContainer, StaticLifetimeVisitor, Ty, TyCtxt, TypeSuperVisitable, TypeVisitor,
 };
-use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::symbol::Ident;
+use rustc_span::{Ident, Span};
 use tracing::debug;
 
 use crate::error_reporting::infer::nice_region_error::NiceRegionError;
@@ -50,7 +49,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                     // This may have a closure and it would cause ICE
                     // through `find_param_with_region` (#78262).
                     let anon_reg_sup = tcx.is_suitable_region(self.generic_param_scope, *sup_r)?;
-                    let fn_returns = tcx.return_type_impl_or_dyn_traits(anon_reg_sup.def_id);
+                    let fn_returns = tcx.return_type_impl_or_dyn_traits(anon_reg_sup.scope);
                     if fn_returns.is_empty() {
                         return None;
                     }
@@ -148,13 +147,13 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             | ObligationCauseCode::BlockTailExpression(hir_id, ..) = cause.code()
             {
                 let parent_id = tcx.hir().get_parent_item(*hir_id);
-                if let Some(fn_decl) = tcx.hir().fn_decl_by_hir_id(parent_id.into()) {
+                if let Some(fn_decl) = tcx.hir_fn_decl_by_hir_id(parent_id.into()) {
                     let mut span: MultiSpan = fn_decl.output.span().into();
                     let mut spans = Vec::new();
                     let mut add_label = true;
                     if let hir::FnRetTy::Return(ty) = fn_decl.output {
                         let mut v = StaticLifetimeVisitor(vec![], tcx.hir());
-                        v.visit_ty(ty);
+                        v.visit_ty_unambig(ty);
                         if !v.0.is_empty() {
                             span = v.0.clone().into();
                             spans = v.0;
@@ -196,7 +195,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 
         let mut err = self.tcx().dcx().create_err(diag);
 
-        let fn_returns = tcx.return_type_impl_or_dyn_traits(anon_reg_sup.def_id);
+        let fn_returns = tcx.return_type_impl_or_dyn_traits(anon_reg_sup.scope);
 
         let mut override_error_code = None;
         if let SubregionOrigin::Subtype(box TypeTrace { cause, .. }) = &sup_origin
@@ -250,7 +249,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             Some(arg),
             captures,
             Some((param.param_ty_span, param.param_ty.to_string())),
-            Some(anon_reg_sup.def_id),
+            Some(anon_reg_sup.scope),
         );
 
         let reported = err.emit();
@@ -319,14 +318,17 @@ pub fn suggest_new_region_bound(
                 } else {
                     // get a lifetime name of existing named lifetimes if any
                     let existing_lt_name = if let Some(id) = scope_def_id
-                        && let Some(generics) = tcx.hir().get_generics(id)
+                        && let Some(generics) = tcx.hir_get_generics(id)
                         && let named_lifetimes = generics
                             .params
                             .iter()
                             .filter(|p| {
-                                matches!(p.kind, GenericParamKind::Lifetime {
-                                    kind: hir::LifetimeParamKind::Explicit
-                                })
+                                matches!(
+                                    p.kind,
+                                    GenericParamKind::Lifetime {
+                                        kind: hir::LifetimeParamKind::Explicit
+                                    }
+                                )
                             })
                             .map(|p| {
                                 if let hir::ParamName::Plain(name) = p.name {
@@ -347,7 +349,7 @@ pub fn suggest_new_region_bound(
                     // if there are more than one elided lifetimes in inputs, the explicit `'_` lifetime cannot be used.
                     // introducing a new lifetime `'a` or making use of one from existing named lifetimes if any
                     if let Some(id) = scope_def_id
-                        && let Some(generics) = tcx.hir().get_generics(id)
+                        && let Some(generics) = tcx.hir_get_generics(id)
                         && let mut spans_suggs =
                             make_elided_region_spans_suggs(name, generics.params.iter())
                         && spans_suggs.len() > 1
@@ -375,7 +377,7 @@ pub fn suggest_new_region_bound(
                     }
                 }
             }
-            TyKind::TraitObject(_, lt, _) => {
+            TyKind::TraitObject(_, lt) => {
                 if let LifetimeName::ImplicitObjectLifetimeDefault = lt.res {
                     err.span_suggestion_verbose(
                         fn_return.span.shrink_to_hi(),
@@ -421,8 +423,8 @@ fn make_elided_region_spans_suggs<'a>(
 
     let mut process_consecutive_brackets =
         |span: Option<Span>, spans_suggs: &mut Vec<(Span, String)>| {
-            if span
-                .is_some_and(|span| bracket_span.map_or(true, |bracket_span| span == bracket_span))
+            if let Some(span) = span
+                && bracket_span.is_none_or(|bracket_span| span == bracket_span)
             {
                 consecutive_brackets += 1;
             } else if let Some(bracket_span) = bracket_span.take() {
@@ -468,7 +470,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         def_id: DefId,
         trait_objects: &FxIndexSet<DefId>,
     ) -> Option<(Ident, &'tcx hir::Ty<'tcx>)> {
-        match tcx.hir().get_if_local(def_id)? {
+        match tcx.hir_get_if_local(def_id)? {
             Node::ImplItem(impl_item) => {
                 let impl_did = tcx.hir().get_parent_item(impl_item.hir_id());
                 if let hir::OwnerNode::Item(Item {
@@ -488,7 +490,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                 // obligation comes from the `impl`. Find that `impl` so that we can point
                 // at it in the suggestion.
                 let trait_did = trait_id.to_def_id();
-                tcx.hir().trait_impls(trait_did).iter().find_map(|&impl_did| {
+                tcx.hir_trait_impls(trait_did).iter().find_map(|&impl_did| {
                     if let Node::Item(Item {
                         kind: ItemKind::Impl(hir::Impl { self_ty, .. }), ..
                     }) = tcx.hir_node_by_def_id(impl_did)
@@ -501,7 +503,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                             // In that case, only the first one will get suggestions.
                             let mut traits = vec![];
                             let mut hir_v = HirTraitObjectVisitor(&mut traits, *did);
-                            hir_v.visit_ty(self_ty);
+                            hir_v.visit_ty_unambig(self_ty);
                             !traits.is_empty()
                         })
                     {
@@ -528,7 +530,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // Find the method being called.
         let Ok(Some(instance)) = ty::Instance::try_resolve(
             tcx,
-            ctxt.param_env,
+            self.cx.typing_env(ctxt.param_env),
             ctxt.assoc_item.def_id,
             self.cx.resolve_vars_if_possible(ctxt.args),
         ) else {
@@ -561,7 +563,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         for found_did in found_dids {
             let mut traits = vec![];
             let mut hir_v = HirTraitObjectVisitor(&mut traits, *found_did);
-            hir_v.visit_ty(self_ty);
+            hir_v.visit_ty_unambig(self_ty);
             for &span in &traits {
                 let subdiag = DynTraitConstraintSuggestion { span, ident };
                 subdiag.add_to_diag(err);
@@ -592,12 +594,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for TraitObjectVisitor {
 pub struct HirTraitObjectVisitor<'a>(pub &'a mut Vec<Span>, pub DefId);
 
 impl<'a, 'tcx> Visitor<'tcx> for HirTraitObjectVisitor<'a> {
-    fn visit_ty(&mut self, t: &'tcx hir::Ty<'tcx>) {
-        if let TyKind::TraitObject(
-            poly_trait_refs,
-            Lifetime { res: LifetimeName::ImplicitObjectLifetimeDefault, .. },
-            _,
-        ) = t.kind
+    fn visit_ty(&mut self, t: &'tcx hir::Ty<'tcx, AmbigArg>) {
+        if let TyKind::TraitObject(poly_trait_refs, lifetime_ptr) = t.kind
+            && let Lifetime { res: LifetimeName::ImplicitObjectLifetimeDefault, .. } =
+                lifetime_ptr.pointer()
         {
             for ptr in poly_trait_refs {
                 if Some(self.1) == ptr.trait_ref.trait_def_id() {

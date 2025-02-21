@@ -2,16 +2,16 @@ use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHas
 use rustc_span::def_id::DefPathHash;
 
 use crate::hir::{
-    AttributeMap, BodyId, Crate, ForeignItemId, ImplItemId, ItemId, OwnerNodes, TraitItemId,
+    Attribute, AttributeMap, BodyId, Crate, ForeignItemId, ImplItemId, ItemId, OwnerNodes,
+    TraitItemId,
 };
 use crate::hir_id::{HirId, ItemLocalId};
 
 /// Requirements for a `StableHashingContext` to be used in this crate.
 /// This is a hack to allow using the `HashStable_Generic` derive macro
 /// instead of implementing everything in `rustc_middle`.
-pub trait HashStableContext:
-    rustc_ast::HashStableContext + rustc_target::HashStableContext
-{
+pub trait HashStableContext: rustc_ast::HashStableContext + rustc_abi::HashStableContext {
+    fn hash_attr(&mut self, _: &Attribute, hasher: &mut StableHasher);
 }
 
 impl<HirCtx: crate::HashStableContext> ToStableHashKey<HirCtx> for HirId {
@@ -111,5 +111,11 @@ impl<HirCtx: crate::HashStableContext> HashStable<HirCtx> for Crate<'_> {
     fn hash_stable(&self, hcx: &mut HirCtx, hasher: &mut StableHasher) {
         let Crate { owners: _, opt_hir_hash } = self;
         opt_hir_hash.unwrap().hash_stable(hcx, hasher)
+    }
+}
+
+impl<HirCtx: crate::HashStableContext> HashStable<HirCtx> for Attribute {
+    fn hash_stable(&self, hcx: &mut HirCtx, hasher: &mut StableHasher) {
+        hcx.hash_attr(self, hasher)
     }
 }

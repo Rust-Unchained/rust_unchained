@@ -1,4 +1,5 @@
 //! Codegen of intrinsics. This includes `extern "rust-intrinsic"`,
+//! functions marked with the `#[rustc_intrinsic]` attribute
 //! and LLVM intrinsics that have symbol names starting with `llvm.`.
 
 macro_rules! intrinsic_args {
@@ -20,10 +21,10 @@ mod simd;
 use cranelift_codegen::ir::AtomicRmwOp;
 use rustc_middle::ty;
 use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::layout::{HasParamEnv, ValidityRequirement};
+use rustc_middle::ty::layout::ValidityRequirement;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{Symbol, sym};
+use rustc_span::{Symbol, sym};
 
 pub(crate) use self::llvm::codegen_llvm_intrinsic_call;
 use crate::cast::clif_intcast;
@@ -453,11 +454,6 @@ fn codegen_regular_intrinsic_call<'tcx>(
             fx.bcx.ins().trap(TrapCode::user(2).unwrap());
             return Ok(());
         }
-        sym::likely | sym::unlikely => {
-            intrinsic_args!(fx, args => (a); intrinsic);
-
-            ret.write_cvalue(fx, a);
-        }
         sym::breakpoint => {
             intrinsic_args!(fx, args => (); intrinsic);
 
@@ -687,7 +683,10 @@ fn codegen_regular_intrinsic_call<'tcx>(
             if let Some(requirement) = requirement {
                 let do_panic = !fx
                     .tcx
-                    .check_validity_requirement((requirement, fx.param_env().and(ty)))
+                    .check_validity_requirement((
+                        requirement,
+                        ty::TypingEnv::fully_monomorphized().as_query_input(ty),
+                    ))
                     .expect("expect to have layout during codegen");
 
                 if do_panic {
@@ -746,7 +745,11 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
             let const_val = fx
                 .tcx
-                .const_eval_instance(ParamEnv::reveal_all(), instance, source_info.span)
+                .const_eval_instance(
+                    ty::TypingEnv::fully_monomorphized(),
+                    instance,
+                    source_info.span,
+                )
                 .unwrap();
             let val = crate::constant::codegen_const_value(fx, const_val, ret.layout().ty);
             ret.write_cvalue(fx, val);
@@ -1265,6 +1268,10 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 source_info.span,
                 "Defining variadic functions is not yet supported by Cranelift",
             );
+        }
+
+        sym::cold_path => {
+            fx.bcx.set_cold_block(fx.bcx.current_block().unwrap());
         }
 
         // Unimplemented intrinsics must have a fallback body. The fallback body is obtained

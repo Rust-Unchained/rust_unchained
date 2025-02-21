@@ -1,5 +1,6 @@
-use rustc_abi::ExternAbi;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
+use rustc_target::callconv::{Conv, FnAbi};
 
 use crate::*;
 
@@ -8,7 +9,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_gfni_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: ExternAbi,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -29,16 +30,14 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // See `affine_transform` for details.
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=gf2p8affine_
             "vgf2p8affineqb.128" | "vgf2p8affineqb.256" | "vgf2p8affineqb.512" => {
-                let [left, right, imm8] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [left, right, imm8] = this.check_shim(abi, Conv::C, link_name, args)?;
                 affine_transform(this, left, right, imm8, dest, /* inverse */ false)?;
             }
             // Used to implement the `_mm{, 256, 512}_gf2p8affineinv_epi64_epi8` functions.
             // See `affine_transform` for details.
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=gf2p8affineinv
             "vgf2p8affineinvqb.128" | "vgf2p8affineinvqb.256" | "vgf2p8affineinvqb.512" => {
-                let [left, right, imm8] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [left, right, imm8] = this.check_shim(abi, Conv::C, link_name, args)?;
                 affine_transform(this, left, right, imm8, dest, /* inverse */ true)?;
             }
             // Used to implement the `_mm{, 256, 512}_gf2p8mul_epi8` functions.
@@ -47,9 +46,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // polynomial representation with the reduction polynomial x^8 + x^4 + x^3 + x + 1.
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=gf2p8mul
             "vgf2p8mulb.128" | "vgf2p8mulb.256" | "vgf2p8mulb.512" => {
-                let [left, right] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
-
+                let [left, right] = this.check_shim(abi, Conv::C, link_name, args)?;
                 let (left, left_len) = this.project_to_simd(left)?;
                 let (right, right_len) = this.project_to_simd(right)?;
                 let (dest, dest_len) = this.project_to_simd(dest)?;
@@ -75,21 +72,21 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 /// If `inverse` is set, then the inverse transformation with respect to the reduction polynomial
 /// x^8 + x^4 + x^3 + x + 1 is performed instead.
 fn affine_transform<'tcx>(
-    this: &mut MiriInterpCx<'tcx>,
+    ecx: &mut MiriInterpCx<'tcx>,
     left: &OpTy<'tcx>,
     right: &OpTy<'tcx>,
     imm8: &OpTy<'tcx>,
     dest: &MPlaceTy<'tcx>,
     inverse: bool,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.project_to_simd(left)?;
-    let (right, right_len) = this.project_to_simd(right)?;
-    let (dest, dest_len) = this.project_to_simd(dest)?;
+    let (left, left_len) = ecx.project_to_simd(left)?;
+    let (right, right_len) = ecx.project_to_simd(right)?;
+    let (dest, dest_len) = ecx.project_to_simd(dest)?;
 
     assert_eq!(dest_len, right_len);
     assert_eq!(dest_len, left_len);
 
-    let imm8 = this.read_scalar(imm8)?.to_u8()?;
+    let imm8 = ecx.read_scalar(imm8)?.to_u8()?;
 
     // Each 8x8 bit matrix gets multiplied with eight bit vectors.
     // Therefore, the iteration is done in chunks of eight.
@@ -98,13 +95,13 @@ fn affine_transform<'tcx>(
         let mut matrix = [0u8; 8];
         for j in 0..8 {
             matrix[usize::try_from(j).unwrap()] =
-                this.read_scalar(&this.project_index(&right, i.wrapping_add(j))?)?.to_u8()?;
+                ecx.read_scalar(&ecx.project_index(&right, i.wrapping_add(j))?)?.to_u8()?;
         }
 
         // Multiply the matrix with the vector and perform the addition.
         for j in 0..8 {
             let index = i.wrapping_add(j);
-            let left = this.read_scalar(&this.project_index(&left, index)?)?.to_u8()?;
+            let left = ecx.read_scalar(&ecx.project_index(&left, index)?)?.to_u8()?;
             let left = if inverse { TABLE[usize::from(left)] } else { left };
 
             let mut res = 0;
@@ -124,8 +121,8 @@ fn affine_transform<'tcx>(
             // Perform the addition.
             res ^= imm8;
 
-            let dest = this.project_index(&dest, index)?;
-            this.write_scalar(Scalar::from_u8(res), &dest)?;
+            let dest = ecx.project_index(&dest, index)?;
+            ecx.write_scalar(Scalar::from_u8(res), &dest)?;
         }
     }
 

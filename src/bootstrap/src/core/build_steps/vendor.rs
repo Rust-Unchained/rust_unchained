@@ -4,35 +4,41 @@ use crate::core::build_steps::tool::SUBMODULES_FOR_RUSTBOOK;
 use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
 use crate::utils::exec::command;
 
-/// List of default paths used for vendoring for `x vendor` and dist tarballs.
-pub fn default_paths_to_vendor(builder: &Builder<'_>) -> Vec<PathBuf> {
-    let mut paths = vec![];
-    for p in [
-        "src/tools/cargo/Cargo.toml",
-        "src/tools/rust-analyzer/Cargo.toml",
-        "compiler/rustc_codegen_cranelift/Cargo.toml",
-        "compiler/rustc_codegen_gcc/Cargo.toml",
-        "library/Cargo.toml",
-        "src/bootstrap/Cargo.toml",
-        "src/tools/rustbook/Cargo.toml",
-        "src/tools/rustc-perf/Cargo.toml",
-        "src/tools/opt-dist/Cargo.toml",
-    ] {
-        paths.push(builder.src.join(p));
-    }
+pub const VENDOR_DIR: &str = "vendor";
 
-    paths
+/// Returns the cargo workspaces to vendor for `x vendor` and dist tarballs.
+///
+/// Returns a `Vec` of `(path_to_manifest, submodules_required)` where
+/// `path_to_manifest` is the cargo workspace, and `submodules_required` is
+/// the set of submodules that must be available.
+pub fn default_paths_to_vendor(builder: &Builder<'_>) -> Vec<(PathBuf, Vec<&'static str>)> {
+    [
+        ("src/tools/cargo/Cargo.toml", vec!["src/tools/cargo"]),
+        ("src/tools/rust-analyzer/Cargo.toml", vec![]),
+        ("compiler/rustc_codegen_cranelift/Cargo.toml", vec![]),
+        ("compiler/rustc_codegen_gcc/Cargo.toml", vec![]),
+        ("library/Cargo.toml", vec![]),
+        ("src/bootstrap/Cargo.toml", vec![]),
+        ("src/tools/rustbook/Cargo.toml", SUBMODULES_FOR_RUSTBOOK.into()),
+        ("src/tools/rustc-perf/Cargo.toml", vec!["src/tools/rustc-perf"]),
+        ("src/tools/opt-dist/Cargo.toml", vec![]),
+        ("src/doc/book/packages/trpl/Cargo.toml", vec![]),
+    ]
+    .into_iter()
+    .map(|(path, submodules)| (builder.src.join(path), submodules))
+    .collect()
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct Vendor {
-    sync_args: Vec<PathBuf>,
-    versioned_dirs: bool,
-    root_dir: PathBuf,
+    pub(crate) sync_args: Vec<PathBuf>,
+    pub(crate) versioned_dirs: bool,
+    pub(crate) root_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
 }
 
 impl Step for Vendor {
-    type Output = ();
+    type Output = VendorOutput;
     const DEFAULT: bool = true;
     const ONLY_HOSTS: bool = true;
 
@@ -45,10 +51,13 @@ impl Step for Vendor {
             sync_args: run.builder.config.cmd.vendor_sync_args(),
             versioned_dirs: run.builder.config.cmd.vendor_versioned_dirs(),
             root_dir: run.builder.src.clone(),
+            output_dir: run.builder.src.join(VENDOR_DIR),
         });
     }
 
     fn run(self, builder: &Builder<'_>) -> Self::Output {
+        builder.info(&format!("Vendoring sources to {:?}", self.root_dir));
+
         let mut cmd = command(&builder.initial_cargo);
         cmd.arg("vendor");
 
@@ -56,13 +65,16 @@ impl Step for Vendor {
             cmd.arg("--versioned-dirs");
         }
 
+        let to_vendor = default_paths_to_vendor(builder);
         // These submodules must be present for `x vendor` to work.
-        for submodule in SUBMODULES_FOR_RUSTBOOK.iter().chain(["src/tools/cargo"].iter()) {
-            builder.build.require_submodule(submodule, None);
+        for (_, submodules) in &to_vendor {
+            for submodule in submodules {
+                builder.build.require_submodule(submodule, None);
+            }
         }
 
         // Sync these paths by default.
-        for p in default_paths_to_vendor(builder) {
+        for (p, _) in &to_vendor {
             cmd.arg("--sync").arg(p);
         }
 
@@ -75,8 +87,14 @@ impl Step for Vendor {
         // which uses the unstable `public-dependency` feature.
         cmd.env("RUSTC_BOOTSTRAP", "1");
 
-        cmd.current_dir(self.root_dir);
+        cmd.current_dir(self.root_dir).arg(&self.output_dir);
 
-        cmd.run(builder);
+        let config = cmd.run_capture_stdout(builder);
+        VendorOutput { config: config.stdout() }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VendorOutput {
+    pub(crate) config: String,
 }

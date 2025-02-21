@@ -1,10 +1,11 @@
-use crate::abi::Endian;
+use rustc_abi::Endian;
+
 use crate::spec::{Cc, CodeModel, LinkOutputKind, LinkerFlavor, TargetOptions, crt_objects, cvs};
 
 pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
         abi: "vec-extabi".into(),
-        code_model: Some(CodeModel::Small),
+        code_model: Some(CodeModel::Large),
         cpu: "pwr7".into(),
         os: "aix".into(),
         vendor: "ibm".into(),

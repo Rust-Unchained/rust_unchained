@@ -41,13 +41,12 @@ config.stamp
 no_llvm_build
 
 ## Build
-/vendor/
 /dl/
 /doc/
 /inst/
 /llvm/
 /mingw-build/
-/build/
+/build
 !/compiler/rustc_mir_build/src/build/
 /build-rust-analyzer/
 /dist/
@@ -56,6 +55,8 @@ no_llvm_build
 /library/target
 /src/bootstrap/target
 /src/tools/x/target
+# Created by `x vendor`
+/vendor
 # Created by default with `src/ci/docker/run.sh`
 /obj/
 # Created by nix dev shell / .envrc
@@ -85,17 +86,18 @@ __pycache__/
 node_modules
 package-lock.json
 package.json
+/src/doc/rustc-dev-guide/mermaid.min.js
 
 ## Rustdoc GUI tests
 tests/rustdoc-gui/src/**.lock
 
 ## direnv
-.envrc
-.direnv/
+/.envrc
+/.direnv/
 
 ## nix
-flake.nix
+/flake.nix
 flake.lock
-default.nix
+/default.nix
 
 # Before adding new lines, see the comment at the top.

@@ -289,7 +289,9 @@ where
             | ty::Pat(..)
             | ty::FnPtr(..)
             | ty::RawPtr(..)
-            | ty::Never => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
+            | ty::Never
+            | ty::UnsafeBinder(_)
+            => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
 
             ty::Param(..) => panic!("unexpected ty param"),
 

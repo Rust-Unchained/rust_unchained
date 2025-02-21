@@ -229,8 +229,7 @@ use rustc_session::cstore::CrateSource;
 use rustc_session::filesearch::FileSearch;
 use rustc_session::search_paths::PathKind;
 use rustc_session::utils::CanonicalizedPath;
-use rustc_span::Span;
-use rustc_span::symbol::Symbol;
+use rustc_span::{Span, Symbol};
 use rustc_target::spec::{Target, TargetTuple};
 use tracing::{debug, info};
 
@@ -253,16 +252,17 @@ pub(crate) struct CrateLocator<'a> {
     extra_filename: Option<&'a str>,
     pub target: &'a Target,
     pub tuple: TargetTuple,
-    pub filesearch: FileSearch<'a>,
+    pub filesearch: &'a FileSearch,
     pub is_proc_macro: bool,
 
+    pub path_kind: PathKind,
     // Mutable in-progress state or output.
     crate_rejections: CrateRejections,
 }
 
 #[derive(Clone)]
 pub(crate) struct CratePaths {
-    name: Symbol,
+    pub(crate) name: Symbol,
     source: CrateSource,
 }
 
@@ -339,7 +339,8 @@ impl<'a> CrateLocator<'a> {
             extra_filename,
             target: &sess.target,
             tuple: sess.opts.target_triple.clone(),
-            filesearch: sess.target_filesearch(path_kind),
+            filesearch: sess.target_filesearch(),
+            path_kind,
             is_proc_macro: false,
             crate_rejections: CrateRejections::default(),
         }
@@ -407,47 +408,49 @@ impl<'a> CrateLocator<'a> {
         // given that `extra_filename` comes from the `-C extra-filename`
         // option and thus can be anything, and the incorrect match will be
         // handled safely in `extract_one`.
-        for search_path in self.filesearch.search_paths() {
+        for search_path in self.filesearch.search_paths(self.path_kind) {
             debug!("searching {}", search_path.dir.display());
-            for spf in search_path.files.iter() {
-                debug!("testing {}", spf.path.display());
+            let spf = &search_path.files;
 
-                let f = &spf.file_name_str;
-                let (hash, kind) = if let Some(f) = f.strip_prefix(rlib_prefix)
-                    && let Some(f) = f.strip_suffix(rlib_suffix)
-                {
-                    (f, CrateFlavor::Rlib)
-                } else if let Some(f) = f.strip_prefix(rmeta_prefix)
-                    && let Some(f) = f.strip_suffix(rmeta_suffix)
-                {
-                    (f, CrateFlavor::Rmeta)
-                } else if let Some(f) = f.strip_prefix(dylib_prefix)
-                    && let Some(f) = f.strip_suffix(dylib_suffix.as_ref())
-                {
-                    (f, CrateFlavor::Dylib)
-                } else {
-                    if f.starts_with(staticlib_prefix) && f.ends_with(staticlib_suffix.as_ref()) {
-                        self.crate_rejections.via_kind.push(CrateMismatch {
-                            path: spf.path.clone(),
-                            got: "static".to_string(),
-                        });
+            let mut should_check_staticlibs = true;
+            for (prefix, suffix, kind) in [
+                (rlib_prefix.as_str(), rlib_suffix, CrateFlavor::Rlib),
+                (rmeta_prefix.as_str(), rmeta_suffix, CrateFlavor::Rmeta),
+                (dylib_prefix, dylib_suffix, CrateFlavor::Dylib),
+            ] {
+                if prefix == staticlib_prefix && suffix == staticlib_suffix {
+                    should_check_staticlibs = false;
+                }
+                if let Some(matches) = spf.query(prefix, suffix) {
+                    for (hash, spf) in matches {
+                        info!("lib candidate: {}", spf.path.display());
+
+                        let (rlibs, rmetas, dylibs) =
+                            candidates.entry(hash.to_string()).or_default();
+                        let path =
+                            try_canonicalize(&spf.path).unwrap_or_else(|_| spf.path.to_path_buf());
+                        if seen_paths.contains(&path) {
+                            continue;
+                        };
+                        seen_paths.insert(path.clone());
+                        match kind {
+                            CrateFlavor::Rlib => rlibs.insert(path, search_path.kind),
+                            CrateFlavor::Rmeta => rmetas.insert(path, search_path.kind),
+                            CrateFlavor::Dylib => dylibs.insert(path, search_path.kind),
+                        };
                     }
-                    continue;
-                };
-
-                info!("lib candidate: {}", spf.path.display());
-
-                let (rlibs, rmetas, dylibs) = candidates.entry(hash.to_string()).or_default();
-                let path = try_canonicalize(&spf.path).unwrap_or_else(|_| spf.path.clone());
-                if seen_paths.contains(&path) {
-                    continue;
-                };
-                seen_paths.insert(path.clone());
-                match kind {
-                    CrateFlavor::Rlib => rlibs.insert(path, search_path.kind),
-                    CrateFlavor::Rmeta => rmetas.insert(path, search_path.kind),
-                    CrateFlavor::Dylib => dylibs.insert(path, search_path.kind),
-                };
+                }
+            }
+            if let Some(static_matches) = should_check_staticlibs
+                .then(|| spf.query(staticlib_prefix, staticlib_suffix))
+                .flatten()
+            {
+                for (_, spf) in static_matches {
+                    self.crate_rejections.via_kind.push(CrateMismatch {
+                        path: spf.path.to_path_buf(),
+                        got: "static".to_string(),
+                    });
+                }
             }
         }
 
@@ -762,10 +765,10 @@ impl<'a> CrateLocator<'a> {
         self.extract_lib(rlibs, rmetas, dylibs).map(|opt| opt.map(|(_, lib)| lib))
     }
 
-    pub(crate) fn into_error(self, root: Option<CratePaths>) -> CrateError {
+    pub(crate) fn into_error(self, dep_root: Option<CratePaths>) -> CrateError {
         CrateError::LocatorCombined(Box::new(CombinedLocatorError {
             crate_name: self.crate_name,
-            root,
+            dep_root,
             triple: self.tuple,
             dll_prefix: self.target.dll_prefix.to_string(),
             dll_suffix: self.target.dll_suffix.to_string(),
@@ -843,7 +846,10 @@ fn get_metadata_section<'p>(
         )));
     };
     match blob.check_compatibility(cfg_version) {
-        Ok(()) => Ok(blob),
+        Ok(()) => {
+            debug!("metadata blob read okay");
+            Ok(blob)
+        }
         Err(None) => Err(MetadataError::LoadFailure(format!(
             "invalid metadata version found: {}",
             filename.display()
@@ -908,7 +914,7 @@ struct CrateRejections {
 /// otherwise they are ignored.
 pub(crate) struct CombinedLocatorError {
     crate_name: Symbol,
-    root: Option<CratePaths>,
+    dep_root: Option<CratePaths>,
     triple: TargetTuple,
     dll_prefix: String,
     dll_suffix: String,
@@ -981,7 +987,7 @@ impl CrateError {
             }
             CrateError::LocatorCombined(locator) => {
                 let crate_name = locator.crate_name;
-                let add_info = match &locator.root {
+                let add_info = match &locator.dep_root {
                     None => String::new(),
                     Some(r) => format!(" which `{}` depends on", r.name),
                 };
@@ -1006,7 +1012,7 @@ impl CrateError {
                             path.display()
                         ));
                     }
-                    if let Some(r) = locator.root {
+                    if let Some(r) = locator.dep_root {
                         for path in r.source.paths() {
                             found_crates.push_str(&format!(
                                 "\ncrate `{}`: {}",

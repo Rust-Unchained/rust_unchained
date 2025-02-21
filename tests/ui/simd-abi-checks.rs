@@ -4,6 +4,7 @@
 
 #![feature(avx512_target_feature)]
 #![feature(portable_simd)]
+#![feature(simd_ffi)]
 #![allow(improper_ctypes_definitions)]
 
 use std::arch::x86_64::*;
@@ -12,19 +13,19 @@ use std::arch::x86_64::*;
 struct Wrapper(__m256);
 
 unsafe extern "C" fn w(_: Wrapper) {
-    //~^ this function definition uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled
+    //~^ requires the `avx` target feature, which is not enabled
     //~| WARNING this was previously accepted by the compiler
     todo!()
 }
 
 unsafe extern "C" fn f(_: __m256) {
-    //~^ this function definition uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled
+    //~^ requires the `avx` target feature, which is not enabled
     //~| WARNING this was previously accepted by the compiler
     todo!()
 }
 
 unsafe extern "C" fn g() -> __m256 {
-    //~^ this function definition uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled
+    //~^ requires the `avx` target feature, which is not enabled
     //~| WARNING this was previously accepted by the compiler
     todo!()
 }
@@ -50,19 +51,27 @@ unsafe fn test() {
     as_f64x8(arg);
 }
 
+#[target_feature(enable = "avx")]
+unsafe fn in_closure() -> impl FnOnce() -> __m256 {
+    #[inline(always)] // this disables target-feature inheritance
+    || g()
+    //~^ WARNING requires the `avx` target feature, which is not enabled in the caller
+    //~| WARNING this was previously accepted by the compiler
+}
+
 fn main() {
     unsafe {
         f(g());
-        //~^ WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
-        //~| WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
+        //~^ WARNING requires the `avx` target feature, which is not enabled in the caller
+        //~| WARNING requires the `avx` target feature, which is not enabled in the caller
         //~| WARNING this was previously accepted by the compiler
         //~| WARNING this was previously accepted by the compiler
     }
 
     unsafe {
         gavx(favx());
-        //~^ WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
-        //~| WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
+        //~^ WARNING requires the `avx` target feature, which is not enabled in the caller
+        //~| WARNING requires the `avx` target feature, which is not enabled in the caller
         //~| WARNING this was previously accepted by the compiler
         //~| WARNING this was previously accepted by the compiler
     }
@@ -73,9 +82,29 @@ fn main() {
 
     unsafe {
         w(Wrapper(g()));
-        //~^ WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
-        //~| WARNING this function call uses a SIMD vector type that (with the chosen ABI) requires the `avx` target feature, which is not enabled in the caller
+        //~^ WARNING requires the `avx` target feature, which is not enabled in the caller
+        //~| WARNING requires the `avx` target feature, which is not enabled in the caller
         //~| WARNING this was previously accepted by the compiler
         //~| WARNING this was previously accepted by the compiler
     }
+
+    unsafe {
+        in_closure()();
+    }
+
+    unsafe {
+        #[expect(improper_ctypes)]
+        extern "C" {
+            fn some_extern() -> __m256;
+        }
+        some_extern();
+        //~^ WARNING requires the `avx` target feature, which is not enabled in the caller
+        //~| WARNING this was previously accepted by the compiler
+    }
+}
+
+#[no_mangle]
+#[target_feature(enable = "avx")]
+fn some_extern() -> __m256 {
+    todo!()
 }

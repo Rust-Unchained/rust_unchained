@@ -1,8 +1,7 @@
 //@ build-pass
 
 #![feature(pattern_types, rustc_attrs)]
-#![feature(core_pattern_type)]
-#![feature(core_pattern_types)]
+#![feature(pattern_type_macro)]
 #![allow(incomplete_features)]
 
 //! check that pattern types can have traits implemented for them if

@@ -27,7 +27,7 @@ pub fn mutated_variables<'tcx>(expr: &'tcx Expr<'_>, cx: &LateContext<'tcx>) -> 
 }
 
 pub fn is_potentially_mutated<'tcx>(variable: HirId, expr: &'tcx Expr<'_>, cx: &LateContext<'tcx>) -> bool {
-    mutated_variables(expr, cx).map_or(true, |mutated| mutated.contains(&variable))
+    mutated_variables(expr, cx).is_none_or(|mutated| mutated.contains(&variable))
 }
 
 pub fn is_potentially_local_place(local_id: HirId, place: &Place<'_>) -> bool {
@@ -133,8 +133,8 @@ impl<'tcx> Visitor<'tcx> for BindingUsageFinder<'_, 'tcx> {
         ControlFlow::Continue(())
     }
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.cx.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.cx.tcx
     }
 }
 

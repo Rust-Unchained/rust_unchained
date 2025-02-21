@@ -31,7 +31,7 @@ macro_rules! arena_types {
             [decode] borrowck_result: rustc_middle::mir::BorrowCheckResult<'tcx>,
             [] resolver: rustc_data_structures::steal::Steal<(
                 rustc_middle::ty::ResolverAstLowering,
-                rustc_data_structures::sync::Lrc<rustc_ast::Crate>,
+                std::sync::Arc<rustc_ast::Crate>,
             )>,
             [] crate_for_resolver: rustc_data_structures::steal::Steal<(rustc_ast::Crate, rustc_ast::AttrVec)>,
             [] resolutions: rustc_middle::ty::ResolverGlobalCtxt,
@@ -85,10 +85,12 @@ macro_rules! arena_types {
             [] upvars_mentioned: rustc_data_structures::fx::FxIndexMap<rustc_hir::HirId, rustc_hir::Upvar>,
             [] dyn_compatibility_violations: rustc_middle::traits::DynCompatibilityViolation,
             [] codegen_unit: rustc_middle::mir::mono::CodegenUnit<'tcx>,
-            [decode] attribute: rustc_ast::Attribute,
-            [] name_set: rustc_data_structures::unord::UnordSet<rustc_span::symbol::Symbol>,
-            [] ordered_name_set: rustc_data_structures::fx::FxIndexSet<rustc_span::symbol::Symbol>,
+            [decode] attribute: rustc_hir::Attribute,
+            [] name_set: rustc_data_structures::unord::UnordSet<rustc_span::Symbol>,
+            [] autodiff_item: rustc_ast::expand::autodiff_attrs::AutoDiffItem,
+            [] ordered_name_set: rustc_data_structures::fx::FxIndexSet<rustc_span::Symbol>,
             [] pats: rustc_middle::ty::PatternKind<'tcx>,
+            [] valtree: rustc_middle::ty::ValTreeKind<'tcx>,
 
             // Note that this deliberately duplicates items in the `rustc_hir::arena`,
             // since we need to allocate this type on both the `rustc_hir` arena

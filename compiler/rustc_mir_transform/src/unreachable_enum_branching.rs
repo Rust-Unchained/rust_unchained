@@ -3,7 +3,6 @@
 use rustc_abi::Variants;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::bug;
-use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, BasicBlocks, Body, Local, Operand, Rvalue, StatementKind,
     TerminatorKind,
@@ -11,6 +10,8 @@ use rustc_middle::mir::{
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{Ty, TyCtxt};
 use tracing::trace;
+
+use crate::patch::MirPatch;
 
 pub(super) struct UnreachableEnumBranching;
 
@@ -54,6 +55,10 @@ fn variant_discriminants<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> FxHashSet<u128> {
     match &layout.variants {
+        Variants::Empty => {
+            // Uninhabited, no valid discriminant.
+            FxHashSet::default()
+        }
         Variants::Single { index } => {
             let mut res = FxHashSet::default();
             res.insert(
@@ -92,9 +97,7 @@ impl<'tcx> crate::MirPass<'tcx> for UnreachableEnumBranching {
 
             let Some(discriminant_ty) = get_switched_on_type(bb_data, tcx, body) else { continue };
 
-            let layout = tcx.layout_of(
-                tcx.param_env_reveal_all_normalized(body.source.def_id()).and(discriminant_ty),
-            );
+            let layout = tcx.layout_of(body.typing_env(tcx).as_query_input(discriminant_ty));
 
             let mut allowed_variants = if let Ok(layout) = layout {
                 // Find allowed variants based on uninhabited.
@@ -205,5 +208,9 @@ impl<'tcx> crate::MirPass<'tcx> for UnreachableEnumBranching {
         }
 
         patch.apply(body);
+    }
+
+    fn is_required(&self) -> bool {
+        false
     }
 }

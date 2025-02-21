@@ -4,15 +4,14 @@
 //! but are not declared in one single location (unlike lang features), which means we need to
 //! collect them instead.
 
-use rustc_ast::Attribute;
-use rustc_attr::VERSION_PLACEHOLDER;
+use rustc_attr_parsing::VERSION_PLACEHOLDER;
+use rustc_hir::Attribute;
 use rustc_hir::intravisit::Visitor;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::lib_features::{FeatureStability, LibFeatures};
 use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::symbol::Symbol;
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Symbol, sym};
 
 use crate::errors::{FeaturePreviouslyDeclared, FeatureStableTwice};
 
@@ -130,8 +129,8 @@ impl<'tcx> LibFeatureCollector<'tcx> {
 impl<'tcx> Visitor<'tcx> for LibFeatureCollector<'tcx> {
     type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_attribute(&mut self, attr: &'tcx Attribute) {
@@ -149,7 +148,7 @@ fn lib_features(tcx: TyCtxt<'_>, LocalCrate: LocalCrate) -> LibFeatures {
     }
 
     let mut collector = LibFeatureCollector::new(tcx);
-    tcx.hir().walk_attributes(&mut collector);
+    tcx.hir_walk_attributes(&mut collector);
     collector.lib_features
 }
 

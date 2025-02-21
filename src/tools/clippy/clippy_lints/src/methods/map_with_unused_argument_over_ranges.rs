@@ -1,9 +1,9 @@
 use crate::methods::MAP_WITH_UNUSED_ARGUMENT_OVER_RANGES;
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::sugg::Sugg;
-use clippy_utils::{eager_or_lazy, higher, usage};
+use clippy_utils::{eager_or_lazy, higher, std_or_core, usage};
 use rustc_ast::LitKind;
 use rustc_ast::ast::RangeLimits;
 use rustc_data_structures::packed::Pu128;
@@ -19,7 +19,7 @@ fn extract_count_with_applicability(
 ) -> Option<String> {
     let start = range.start?;
     let end = range.end?;
-    // TODO: This doens't handle if either the start or end are negative literals, or if the start is
+    // TODO: This doesn't handle if either the start or end are negative literals, or if the start is
     // not a literal. In the first case, we need to be careful about how we handle computing the
     // count to avoid overflows. In the second, we may need to add parenthesis to make the
     // suggestion correct.
@@ -68,13 +68,14 @@ pub(super) fn check(
     let mut applicability = Applicability::MaybeIncorrect;
     if let Some(range) = higher::Range::hir(receiver)
         && let ExprKind::Closure(Closure { body, .. }) = arg.kind
-        && let body_hir = cx.tcx.hir().body(*body)
+        && let body_hir = cx.tcx.hir_body(*body)
         && let Body {
             params: [param],
             value: body_expr,
         } = body_hir
         && !usage::BindingUsageFinder::are_params_used(cx, body_hir)
         && let Some(count) = extract_count_with_applicability(cx, range, &mut applicability)
+        && let Some(exec_context) = std_or_core(cx)
     {
         let method_to_use_name;
         let new_span;
@@ -105,7 +106,7 @@ pub(super) fn check(
         let mut parts = vec![
             (
                 receiver.span.to(method_call_span),
-                format!("std::iter::{method_to_use_name}"),
+                format!("{exec_context}::iter::{method_to_use_name}"),
             ),
             new_span,
         ];

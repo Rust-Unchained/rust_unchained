@@ -105,7 +105,6 @@ impl<'tcx> Stable<'tcx> for callconv::Conv {
             Conv::CCmseNonSecureCall => CallConvention::CCmseNonSecureCall,
             Conv::CCmseNonSecureEntry => CallConvention::CCmseNonSecureEntry,
             Conv::Msp430Intr => CallConvention::Msp430Intr,
-            Conv::PtxKernel => CallConvention::PtxKernel,
             Conv::X86Fastcall => CallConvention::X86Fastcall,
             Conv::X86Intr => CallConvention::X86Intr,
             Conv::X86Stdcall => CallConvention::X86Stdcall,
@@ -113,6 +112,7 @@ impl<'tcx> Stable<'tcx> for callconv::Conv {
             Conv::X86VectorCall => CallConvention::X86VectorCall,
             Conv::X86_64SysV => CallConvention::X86_64SysV,
             Conv::X86_64Win64 => CallConvention::X86_64Win64,
+            Conv::GpuKernel => CallConvention::GpuKernel,
             Conv::AvrInterrupt => CallConvention::AvrInterrupt,
             Conv::AvrNonBlockingInterrupt => CallConvention::AvrNonBlockingInterrupt,
             Conv::RiscvInterrupt { .. } => CallConvention::RiscvInterrupt,
@@ -167,6 +167,7 @@ impl<'tcx> Stable<'tcx> for rustc_abi::Variants<rustc_abi::FieldIdx, rustc_abi::
             rustc_abi::Variants::Single { index } => {
                 VariantsShape::Single { index: index.stable(tables) }
             }
+            rustc_abi::Variants::Empty => VariantsShape::Empty,
             rustc_abi::Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
                 VariantsShape::Multiple {
                     tag: tag.stable(tables),

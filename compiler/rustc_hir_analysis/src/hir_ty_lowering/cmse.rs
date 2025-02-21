@@ -3,7 +3,7 @@ use rustc_errors::{DiagCtxtHandle, E0781, struct_span_code_err};
 use rustc_hir::{self as hir, HirId};
 use rustc_middle::bug;
 use rustc_middle::ty::layout::LayoutError;
-use rustc_middle::ty::{self, ParamEnv, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt};
 
 use crate::errors;
 
@@ -17,8 +17,6 @@ pub(crate) fn validate_cmse_abi<'tcx>(
     abi: ExternAbi,
     fn_sig: ty::PolyFnSig<'tcx>,
 ) {
-    let abi_name = abi.name();
-
     match abi {
         ExternAbi::CCmseNonSecureCall => {
             let hir_node = tcx.hir_node(hir_id);
@@ -56,7 +54,7 @@ pub(crate) fn validate_cmse_abi<'tcx>(
                         .to(bare_fn_ty.decl.inputs[index].span)
                         .to(bare_fn_ty.decl.inputs.last().unwrap().span);
                     let plural = bare_fn_ty.param_names.len() - index != 1;
-                    dcx.emit_err(errors::CmseInputsStackSpill { span, plural, abi_name });
+                    dcx.emit_err(errors::CmseInputsStackSpill { span, plural, abi });
                 }
                 Err(layout_err) => {
                     if should_emit_generic_error(abi, layout_err) {
@@ -69,7 +67,7 @@ pub(crate) fn validate_cmse_abi<'tcx>(
                 Ok(true) => {}
                 Ok(false) => {
                     let span = bare_fn_ty.decl.output.span();
-                    dcx.emit_err(errors::CmseOutputStackSpill { span, abi_name });
+                    dcx.emit_err(errors::CmseOutputStackSpill { span, abi });
                 }
                 Err(layout_err) => {
                     if should_emit_generic_error(abi, layout_err) {
@@ -92,7 +90,7 @@ pub(crate) fn validate_cmse_abi<'tcx>(
                     //                                      ^^^^^^
                     let span = decl.inputs[index].span.to(decl.inputs.last().unwrap().span);
                     let plural = decl.inputs.len() - index != 1;
-                    dcx.emit_err(errors::CmseInputsStackSpill { span, plural, abi_name });
+                    dcx.emit_err(errors::CmseInputsStackSpill { span, plural, abi });
                 }
                 Err(layout_err) => {
                     if should_emit_generic_error(abi, layout_err) {
@@ -105,7 +103,7 @@ pub(crate) fn validate_cmse_abi<'tcx>(
                 Ok(true) => {}
                 Ok(false) => {
                     let span = decl.output.span();
-                    dcx.emit_err(errors::CmseOutputStackSpill { span, abi_name });
+                    dcx.emit_err(errors::CmseOutputStackSpill { span, abi });
                 }
                 Err(layout_err) => {
                     if should_emit_generic_error(abi, layout_err) {
@@ -130,7 +128,7 @@ fn is_valid_cmse_inputs<'tcx>(
     let fn_sig = tcx.instantiate_bound_regions_with_erased(fn_sig);
 
     for (index, ty) in fn_sig.inputs().iter().enumerate() {
-        let layout = tcx.layout_of(ParamEnv::reveal_all().and(*ty))?;
+        let layout = tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(*ty))?;
 
         let align = layout.layout.align().abi.bytes();
         let size = layout.layout.size().bytes();
@@ -158,8 +156,10 @@ fn is_valid_cmse_output<'tcx>(
     // this type is only used for layout computation, which does not rely on regions
     let fn_sig = tcx.instantiate_bound_regions_with_erased(fn_sig);
 
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+
     let mut ret_ty = fn_sig.output();
-    let layout = tcx.layout_of(ParamEnv::reveal_all().and(ret_ty))?;
+    let layout = tcx.layout_of(typing_env.as_query_input(ret_ty))?;
     let size = layout.layout.size().bytes();
 
     if size <= 4 {
@@ -182,7 +182,7 @@ fn is_valid_cmse_output<'tcx>(
         for variant_def in adt_def.variants() {
             for field_def in variant_def.fields.iter() {
                 let ty = field_def.ty(tcx, args);
-                let layout = tcx.layout_of(ParamEnv::reveal_all().and(ty))?;
+                let layout = tcx.layout_of(typing_env.as_query_input(ty))?;
 
                 if !layout.layout.is_1zst() {
                     ret_ty = ty;
@@ -199,7 +199,7 @@ fn should_emit_generic_error<'tcx>(abi: ExternAbi, layout_err: &'tcx LayoutError
     use LayoutError::*;
 
     match layout_err {
-        Unknown(ty) => {
+        TooGeneric(ty) => {
             match abi {
                 ExternAbi::CCmseNonSecureCall => {
                     // prevent double reporting of this error
@@ -209,7 +209,11 @@ fn should_emit_generic_error<'tcx>(abi: ExternAbi, layout_err: &'tcx LayoutError
                 _ => bug!("invalid ABI: {abi}"),
             }
         }
-        SizeOverflow(..) | NormalizationFailure(..) | ReferencesError(..) | Cycle(..) => {
+        Unknown(..)
+        | SizeOverflow(..)
+        | NormalizationFailure(..)
+        | ReferencesError(..)
+        | Cycle(..) => {
             false // not our job to report these
         }
     }

@@ -14,9 +14,20 @@
 //! <https://github.com/rust-lang/rust/blob/c0b5cc9003f6464c11ae1c0662c6a7e06f6f5cab/compiler/rustc_codegen_cranelift/example/mini_core.rs>.
 // ignore-tidy-linelength
 
-#![feature(no_core, lang_items, rustc_attrs, decl_macro)]
+#![feature(
+    no_core,
+    lang_items,
+    auto_traits,
+    freeze_impls,
+    negative_impls,
+    rustc_attrs,
+    decl_macro,
+    naked_functions,
+    f16,
+    f128,
+    asm_experimental_arch
+)]
 #![allow(unused, improper_ctypes_definitions, internal_features)]
-#![feature(asm_experimental_arch)]
 #![no_std]
 #![no_core]
 
@@ -39,12 +50,27 @@ impl<T: ?Sized> LegacyReceiver for &mut T {}
 #[lang = "copy"]
 pub trait Copy: Sized {}
 
+#[lang = "bikeshed_guaranteed_no_drop"]
+pub trait BikeshedGuaranteedNoDrop {}
+
+#[lang = "freeze"]
+pub unsafe auto trait Freeze {}
+
+#[lang = "unpin"]
+pub auto trait Unpin {}
+
 impl_marker_trait!(
-    Copy => [ bool, char, isize, usize, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 ]
+    Copy => [
+        bool, char,
+        isize, i8, i16, i32, i64, i128,
+        usize, u8, u16, u32, u64, u128,
+        f16, f32, f64, f128,
+    ]
 );
 impl<'a, T: ?Sized> Copy for &'a T {}
 impl<T: ?Sized> Copy for *const T {}
 impl<T: ?Sized> Copy for *mut T {}
+impl<T: Copy, const N: usize> Copy for [T; N] {}
 
 #[lang = "phantom_data"]
 pub struct PhantomData<T: ?Sized>;
@@ -74,8 +100,32 @@ impl<T: Copy + ?Sized> Copy for ManuallyDrop<T> {}
 pub struct UnsafeCell<T: ?Sized> {
     value: T,
 }
+impl<T: ?Sized> !Freeze for UnsafeCell<T> {}
 
 #[rustc_builtin_macro]
 pub macro asm("assembly template", $(operands,)* $(options($(option),*))?) {
     /* compiler built-in */
+}
+#[rustc_builtin_macro]
+pub macro naked_asm("assembly template", $(operands,)* $(options($(option),*))?) {
+    /* compiler built-in */
+}
+#[rustc_builtin_macro]
+pub macro global_asm("assembly template", $(operands,)* $(options($(option),*))?) {
+    /* compiler built-in */
+}
+
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! concat {
+    ($($e:expr),* $(,)?) => {
+        /* compiler built-in */
+    };
+}
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! stringify {
+    ($($t:tt)*) => {
+        /* compiler built-in */
+    };
 }

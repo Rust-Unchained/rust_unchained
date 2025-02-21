@@ -15,7 +15,7 @@ use rustc_middle::ty::relate::{
     Relate, RelateResult, TypeRelation, structurally_relate_consts, structurally_relate_tys,
 };
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode,
+    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint::FutureIncompatibilityReason;
@@ -25,8 +25,8 @@ use rustc_span::{Span, Symbol};
 use rustc_trait_selection::errors::{
     AddPreciseCapturingForOvercapture, impl_trait_overcapture_suggestion,
 };
+use rustc_trait_selection::regions::OutlivesEnvironmentBuildExt;
 use rustc_trait_selection::traits::ObligationCtxt;
-use rustc_trait_selection::traits::outlives_bounds::InferCtxtExt;
 
 use crate::{LateContext, LateLintPass, fluent_generated as fluent};
 
@@ -99,7 +99,7 @@ declare_lint! {
     /// To fix this, remove the `use<'a>`, since the lifetime is already captured
     /// since it is in scope.
     pub IMPL_TRAIT_REDUNDANT_CAPTURES,
-    Warn,
+    Allow,
     "redundant precise-capturing `use<...>` syntax on an `impl Trait`",
 }
 
@@ -112,7 +112,7 @@ declare_lint_pass!(
 impl<'tcx> LateLintPass<'tcx> for ImplTraitOvercaptures {
     fn check_item(&mut self, cx: &LateContext<'tcx>, it: &'tcx hir::Item<'tcx>) {
         match &it.kind {
-            hir::ItemKind::Fn(..) => check_fn(cx.tcx, it.owner_id.def_id),
+            hir::ItemKind::Fn { .. } => check_fn(cx.tcx, it.owner_id.def_id),
             _ => {}
         }
     }
@@ -177,7 +177,7 @@ fn check_fn(tcx: TyCtxt<'_>, parent_def_id: LocalDefId) {
         // Lazily compute these two, since they're likely a bit expensive.
         variances: LazyCell::new(|| {
             let mut functional_variances = FunctionalVariances {
-                tcx: tcx,
+                tcx,
                 variances: FxHashMap::default(),
                 ambient_variance: ty::Covariant,
                 generics: tcx.generics_of(parent_def_id),
@@ -186,13 +186,11 @@ fn check_fn(tcx: TyCtxt<'_>, parent_def_id: LocalDefId) {
             functional_variances.variances
         }),
         outlives_env: LazyCell::new(|| {
-            let param_env = tcx.param_env(parent_def_id);
-            let infcx = tcx.infer_ctxt().build(TypingMode::from_param_env(param_env));
+            let typing_env = ty::TypingEnv::non_body_analysis(tcx, parent_def_id);
+            let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
             let ocx = ObligationCtxt::new(&infcx);
             let assumed_wf_tys = ocx.assumed_wf_types(param_env, parent_def_id).unwrap_or_default();
-            let implied_bounds =
-                infcx.implied_bounds_tys_compat(param_env, parent_def_id, &assumed_wf_tys, false);
-            OutlivesEnvironment::with_bounds(param_env, implied_bounds)
+            OutlivesEnvironment::new(&infcx, parent_def_id, param_env, assumed_wf_tys)
         }),
     });
 }
@@ -262,7 +260,11 @@ where
             // If it's owned by this function
             && let opaque =
                 self.tcx.hir_node_by_def_id(opaque_def_id).expect_opaque_ty()
-            && let hir::OpaqueTyOrigin::FnReturn { parent, .. } = opaque.origin
+            // We want to recurse into RPITs and async fns, even though the latter
+            // doesn't overcapture on its own, it may mention additional RPITs
+            // in its bounds.
+            && let hir::OpaqueTyOrigin::FnReturn { parent, .. }
+                | hir::OpaqueTyOrigin::AsyncFn { parent, .. } = opaque.origin
             && parent == self.parent_def_id
         {
             let opaque_span = self.tcx.def_span(opaque_def_id);
@@ -312,16 +314,14 @@ where
                     // We only computed variance of lifetimes...
                     debug_assert_matches!(self.tcx.def_kind(def_id), DefKind::LifetimeParam);
                     let uncaptured = match *kind {
-                        ParamKind::Early(name, index) => {
-                            ty::Region::new_early_param(self.tcx, ty::EarlyParamRegion {
-                                name,
-                                index,
-                            })
-                        }
+                        ParamKind::Early(name, index) => ty::Region::new_early_param(
+                            self.tcx,
+                            ty::EarlyParamRegion { name, index },
+                        ),
                         ParamKind::Free(def_id, name) => ty::Region::new_late_param(
                             self.tcx,
                             self.parent_def_id.to_def_id(),
-                            ty::BoundRegionKind::Named(def_id, name),
+                            ty::LateParamRegionKind::Named(def_id, name),
                         ),
                         // Totally ignore late bound args from binders.
                         ParamKind::Late => return true,
@@ -471,7 +471,7 @@ fn extract_def_id_from_arg<'tcx>(
             )
             | ty::ReLateParam(ty::LateParamRegion {
                 scope: _,
-                bound_region: ty::BoundRegionKind::Named(def_id, ..),
+                kind: ty::LateParamRegionKind::Named(def_id, ..),
             }) => def_id,
             _ => unreachable!(),
         },
@@ -540,7 +540,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for FunctionalVariances<'tcx> {
             )
             | ty::ReLateParam(ty::LateParamRegion {
                 scope: _,
-                bound_region: ty::BoundRegionKind::Named(def_id, ..),
+                kind: ty::LateParamRegionKind::Named(def_id, ..),
             }) => def_id,
             _ => {
                 return Ok(a);

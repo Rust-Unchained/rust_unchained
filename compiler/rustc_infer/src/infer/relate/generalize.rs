@@ -4,7 +4,6 @@ use rustc_data_structures::sso::SsoHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::def_id::DefId;
 use rustc_middle::bug;
-use rustc_middle::infer::unify_key::ConstVariableValue;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::visit::MaxUniverse;
 use rustc_middle::ty::{
@@ -18,6 +17,7 @@ use super::{
     PredicateEmittingRelation, Relate, RelateResult, StructurallyRelateAliases, TypeRelation,
 };
 use crate::infer::type_variable::TypeVariableValue;
+use crate::infer::unify_key::ConstVariableValue;
 use crate::infer::{InferCtxt, RegionVariableOrigin, relate};
 
 impl<'tcx> InferCtxt<'tcx> {
@@ -520,10 +520,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for Generalizer<'_, 'tcx> {
                             //
                             // cc trait-system-refactor-initiative#108
                             if self.infcx.next_trait_solver()
-                                && !matches!(
-                                    self.infcx.typing_mode_unchecked(),
-                                    TypingMode::Coherence
-                                )
+                                && !matches!(self.infcx.typing_mode(), TypingMode::Coherence)
                                 && self.in_alias
                             {
                                 inner.type_variables().equate(vid, new_var_id);
@@ -654,10 +651,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for Generalizer<'_, 'tcx> {
                             // See the comment for type inference variables
                             // for more details.
                             if self.infcx.next_trait_solver()
-                                && !matches!(
-                                    self.infcx.typing_mode_unchecked(),
-                                    TypingMode::Coherence
-                                )
+                                && !matches!(self.infcx.typing_mode(), TypingMode::Coherence)
                                 && self.in_alias
                             {
                                 variable_table.union(vid, new_var_id);

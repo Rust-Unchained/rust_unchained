@@ -1,6 +1,6 @@
 #![warn(clippy::missing_const_for_fn)]
 #![allow(incomplete_features, clippy::let_and_return, clippy::missing_transmute_annotations)]
-#![feature(const_trait_impl, abi_vectorcall)]
+#![feature(const_trait_impl)]
 
 use std::mem::transmute;
 
@@ -149,6 +149,7 @@ mod msrv {
         //~^ ERROR: this could be a `const fn`
 
         #[rustfmt::skip]
+        #[allow(missing_abi)]
         extern fn implicit_c() {}
         //~^ ERROR: this could be a `const fn`
 
@@ -211,8 +212,9 @@ mod extern_fn {
     //~^ ERROR: this could be a `const fn`
     extern "system-unwind" fn system_unwind() {}
     //~^ ERROR: this could be a `const fn`
-    pub extern "vectorcall" fn std_call() {}
+}
+
+fn mut_add(x: &mut i32) {
     //~^ ERROR: this could be a `const fn`
-    pub extern "vectorcall-unwind" fn std_call_unwind() {}
-    //~^ ERROR: this could be a `const fn`
+    *x += 1;
 }

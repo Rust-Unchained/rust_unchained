@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use rustc_ast::ptr::P;
 use rustc_ast::*;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
 use rustc_hir::def::Res;
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
-use rustc_span::symbol::Ident;
+use rustc_middle::span_bug;
+use rustc_span::source_map::{Spanned, respan};
+use rustc_span::{Ident, Span};
 
 use super::errors::{
     ArbitraryExpressionInPattern, ExtraDoubleDot, MisplacedDoubleDot, SubTupleBinding,
@@ -36,8 +38,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             lower_sub,
                         );
                     }
-                    PatKind::Lit(e) => {
-                        break hir::PatKind::Lit(self.lower_expr_within_pat(e, false));
+                    PatKind::Expr(e) => {
+                        break hir::PatKind::Expr(self.lower_expr_within_pat(e, false));
                     }
                     PatKind::TupleStruct(qself, path, pats) => {
                         let qpath = self.lower_qpath(
@@ -67,7 +69,16 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             ImplTraitContext::Disallowed(ImplTraitPosition::Path),
                             None,
                         );
-                        break hir::PatKind::Path(qpath);
+                        let kind = hir::PatExprKind::Path(qpath);
+                        let span = self.lower_span(pattern.span);
+                        let expr = hir::PatExpr { hir_id: pat_hir_id, span, kind };
+                        let expr = self.arena.alloc(expr);
+                        return hir::Pat {
+                            hir_id: self.next_id(),
+                            kind: hir::PatKind::Expr(expr),
+                            span,
+                            default_binding_modes: true,
+                        };
                     }
                     PatKind::Struct(qself, path, fields, etc) => {
                         let qpath = self.lower_qpath(
@@ -92,7 +103,14 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                                 span: self.lower_span(f.span),
                             }
                         }));
-                        break hir::PatKind::Struct(qpath, fs, *etc == ast::PatFieldsRest::Rest);
+                        break hir::PatKind::Struct(
+                            qpath,
+                            fs,
+                            matches!(
+                                etc,
+                                ast::PatFieldsRest::Rest | ast::PatFieldsRest::Recovered(_)
+                            ),
+                        );
                     }
                     PatKind::Tuple(pats) => {
                         let (pats, ddpos) = self.lower_pat_tuple(pats, "tuple");
@@ -113,6 +131,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             e2.as_deref().map(|e| self.lower_expr_within_pat(e, true)),
                             self.lower_range_end(end, e2.is_some()),
                         );
+                    }
+                    PatKind::Guard(inner, cond) => {
+                        break hir::PatKind::Guard(self.lower_pat(inner), self.lower_expr(cond));
                     }
                     PatKind::Slice(pats) => break self.lower_pat_slice(pats),
                     PatKind::Rest => {
@@ -292,16 +313,20 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 )
             }
             Some(res) => {
-                let hir_id = self.next_id();
                 let res = self.lower_res(res);
-                hir::PatKind::Path(hir::QPath::Resolved(
-                    None,
-                    self.arena.alloc(hir::Path {
-                        span: self.lower_span(ident.span),
-                        res,
-                        segments: arena_vec![self; hir::PathSegment::new(self.lower_ident(ident), hir_id, res)],
-                    }),
-            ))
+                let span = self.lower_span(ident.span);
+                hir::PatKind::Expr(self.arena.alloc(hir::PatExpr {
+                    kind: hir::PatExprKind::Path(hir::QPath::Resolved(
+                        None,
+                        self.arena.alloc(hir::Path {
+                            span,
+                            res,
+                            segments: arena_vec![self; hir::PathSegment::new(self.lower_ident(ident), self.next_id(), res)],
+                        }),
+                    )),
+                    hir_id: self.next_id(),
+                    span,
+                }))
             }
         }
     }
@@ -358,24 +383,69 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     // }
     // m!(S);
     // ```
-    fn lower_expr_within_pat(&mut self, expr: &Expr, allow_paths: bool) -> &'hir hir::Expr<'hir> {
-        match &expr.kind {
-            ExprKind::Lit(..)
-            | ExprKind::ConstBlock(..)
-            | ExprKind::IncludedBytes(..)
-            | ExprKind::Err(_)
-            | ExprKind::Dummy => {}
-            ExprKind::Path(..) if allow_paths => {}
-            ExprKind::Unary(UnOp::Neg, inner) if matches!(inner.kind, ExprKind::Lit(_)) => {}
+    fn lower_expr_within_pat(
+        &mut self,
+        expr: &Expr,
+        allow_paths: bool,
+    ) -> &'hir hir::PatExpr<'hir> {
+        let span = self.lower_span(expr.span);
+        let err = |guar| hir::PatExprKind::Lit {
+            lit: self.arena.alloc(respan(span, LitKind::Err(guar))),
+            negated: false,
+        };
+        let kind = match &expr.kind {
+            ExprKind::Lit(lit) => {
+                hir::PatExprKind::Lit { lit: self.lower_lit(lit, span), negated: false }
+            }
+            ExprKind::ConstBlock(c) => hir::PatExprKind::ConstBlock(self.lower_const_block(c)),
+            ExprKind::IncludedBytes(bytes) => hir::PatExprKind::Lit {
+                lit: self
+                    .arena
+                    .alloc(respan(span, LitKind::ByteStr(Arc::clone(bytes), StrStyle::Cooked))),
+                negated: false,
+            },
+            ExprKind::Err(guar) => err(*guar),
+            ExprKind::Dummy => span_bug!(span, "lowered ExprKind::Dummy"),
+            ExprKind::Path(qself, path) if allow_paths => hir::PatExprKind::Path(self.lower_qpath(
+                expr.id,
+                qself,
+                path,
+                ParamMode::Optional,
+                AllowReturnTypeNotation::No,
+                ImplTraitContext::Disallowed(ImplTraitPosition::Path),
+                None,
+            )),
+            ExprKind::Unary(UnOp::Neg, inner) if let ExprKind::Lit(lit) = &inner.kind => {
+                hir::PatExprKind::Lit { lit: self.lower_lit(lit, span), negated: true }
+            }
             _ => {
                 let pattern_from_macro = expr.is_approximately_pattern();
                 let guar = self.dcx().emit_err(ArbitraryExpressionInPattern {
-                    span: expr.span,
+                    span,
                     pattern_from_macro_note: pattern_from_macro,
                 });
-                return self.arena.alloc(self.expr_err(expr.span, guar));
+                err(guar)
             }
-        }
-        self.lower_expr(expr)
+        };
+        self.arena.alloc(hir::PatExpr { hir_id: self.lower_node_id(expr.id), span, kind })
+    }
+
+    pub(crate) fn lower_ty_pat(&mut self, pattern: &TyPat) -> &'hir hir::TyPat<'hir> {
+        self.arena.alloc(self.lower_ty_pat_mut(pattern))
+    }
+
+    fn lower_ty_pat_mut(&mut self, pattern: &TyPat) -> hir::TyPat<'hir> {
+        // loop here to avoid recursion
+        let pat_hir_id = self.lower_node_id(pattern.id);
+        let node = match &pattern.kind {
+            TyPatKind::Range(e1, e2, Spanned { node: end, .. }) => hir::TyPatKind::Range(
+                e1.as_deref().map(|e| self.lower_anon_const_to_const_arg(e)),
+                e2.as_deref().map(|e| self.lower_anon_const_to_const_arg(e)),
+                self.lower_range_end(end, e2.is_some()),
+            ),
+            TyPatKind::Err(guar) => hir::TyPatKind::Err(*guar),
+        };
+
+        hir::TyPat { hir_id: pat_hir_id, kind: node, span: self.lower_span(pattern.span) }
     }
 }

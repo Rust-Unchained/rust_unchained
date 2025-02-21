@@ -177,7 +177,7 @@ pub(crate) fn orphan_check_impl(
             // impl<T> AutoTrait for T {}
             // impl<T: ?Sized> AutoTrait for T {}
             ty::Param(..) => (
-                if self_ty.is_sized(tcx, tcx.param_env(impl_def_id)) {
+                if self_ty.is_sized(tcx, ty::TypingEnv::non_body_analysis(tcx, impl_def_id)) {
                     LocalImpl::Allow
                 } else {
                     LocalImpl::Disallow { problematic_kind: "generic type" }
@@ -230,7 +230,8 @@ pub(crate) fn orphan_check_impl(
             | ty::FnDef(..)
             | ty::FnPtr(..)
             | ty::Never
-            | ty::Tuple(..) => (LocalImpl::Allow, NonlocalImpl::DisallowOther),
+            | ty::Tuple(..)
+            | ty::UnsafeBinder(_) => (LocalImpl::Allow, NonlocalImpl::DisallowOther),
 
             ty::Closure(..)
             | ty::CoroutineClosure(..)
@@ -324,7 +325,7 @@ fn orphan_check<'tcx>(
         }
 
         let ty = if infcx.next_trait_solver() {
-            ocx.structurally_normalize(
+            ocx.structurally_normalize_ty(
                 &cause,
                 ty::ParamEnv::empty(),
                 infcx.resolve_vars_if_possible(ty),
@@ -469,8 +470,8 @@ fn emit_orphan_check_error<'tcx>(
         traits::OrphanCheckErr::UncoveredTyParams(UncoveredTyParams { uncovered, local_ty }) => {
             let mut reported = None;
             for param_def_id in uncovered {
-                let span = tcx.def_ident_span(param_def_id).unwrap();
-                let name = tcx.item_name(param_def_id);
+                let name = tcx.item_ident(param_def_id);
+                let span = name.span;
 
                 reported.get_or_insert(match local_ty {
                     Some(local_type) => tcx.dcx().emit_err(errors::TyParamFirstLocal {
@@ -496,7 +497,7 @@ fn lint_uncovered_ty_params<'tcx>(
 
     for param_def_id in uncovered {
         let span = tcx.def_ident_span(param_def_id).unwrap();
-        let name = tcx.item_name(param_def_id);
+        let name = tcx.item_ident(param_def_id);
 
         match local_ty {
             Some(local_type) => tcx.emit_node_span_lint(

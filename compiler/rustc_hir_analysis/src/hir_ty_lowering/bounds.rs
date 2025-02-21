@@ -8,18 +8,18 @@ use rustc_hir::HirId;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::bug;
-use rustc_middle::ty::{self as ty, IsSuggestable, Ty, TyCtxt};
-use rustc_span::symbol::Ident;
-use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
+use rustc_middle::ty::{self as ty, IsSuggestable, Ty, TyCtxt, Upcast};
+use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol, kw, sym};
 use rustc_trait_selection::traits;
 use rustc_type_ir::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
 use super::errors::GenericsArgsErrExtend;
-use crate::bounds::Bounds;
 use crate::errors;
-use crate::hir_ty_lowering::{AssocItemQSelf, HirTyLowerer, PredicateFilter, RegionInferReason};
+use crate::hir_ty_lowering::{
+    AssocItemQSelf, FeedConstTy, HirTyLowerer, PredicateFilter, RegionInferReason,
+};
 
 impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// Add a `Sized` bound to the `bounds` if appropriate.
@@ -27,7 +27,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// Doesn't add the bound if the HIR bounds contain any of `Sized`, `?Sized` or `!Sized`.
     pub(crate) fn add_sized_bound(
         &self,
-        bounds: &mut Bounds<'tcx>,
+        bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         self_ty: Ty<'tcx>,
         hir_bounds: &'tcx [hir::GenericBound<'tcx>],
         self_ty_where_predicates: Option<(LocalDefId, &'tcx [hir::WherePredicate<'tcx>])>,
@@ -67,7 +67,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         search_bounds(hir_bounds);
         if let Some((self_ty, where_clause)) = self_ty_where_predicates {
             for clause in where_clause {
-                if let hir::WherePredicate::BoundPredicate(pred) = clause
+                if let hir::WherePredicateKind::BoundPredicate(pred) = clause.kind
                     && pred.is_param_bound(self_ty.to_def_id())
                 {
                     search_bounds(pred.bounds);
@@ -101,8 +101,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 seen_sized_unbound = true;
                 continue;
             }
-            // There was a `?Trait` bound, but it was not `?Sized`; warn.
-            self.dcx().span_warn(
+            // There was a `?Trait` bound, but it was not `?Sized`
+            self.dcx().span_err(
                 unbound.span,
                 "relaxing a default bound only does something for `?Sized`; \
                 all other traits are not bound by default",
@@ -112,10 +112,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         if seen_sized_unbound || seen_negative_sized_bound || seen_positive_sized_bound {
             // There was in fact a `?Sized`, `!Sized` or explicit `Sized` bound;
             // we don't need to do anything.
-        } else if sized_def_id.is_some() {
+        } else if let Some(sized_def_id) = sized_def_id {
             // There was no `?Sized`, `!Sized` or explicit `Sized` bound;
             // add `Sized` if it's available.
-            bounds.push_sized(tcx, self_ty, span);
+            let trait_ref = ty::TraitRef::new(tcx, sized_def_id, [self_ty]);
+            // Preferable to put this obligation first, since we report better errors for sized ambiguity.
+            bounds.insert(0, (trait_ref.upcast(tcx), span));
         }
     }
 
@@ -145,7 +147,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         &self,
         param_ty: Ty<'tcx>,
         hir_bounds: I,
-        bounds: &mut Bounds<'tcx>,
+        bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         bound_vars: &'tcx ty::List<ty::BoundVariableKind>,
         predicate_filter: PredicateFilter,
     ) where
@@ -188,14 +190,11 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     }
 
                     let region = self.lower_lifetime(lifetime, RegionInferReason::OutlivesBound);
-                    bounds.push_region_bound(
-                        self.tcx(),
-                        ty::Binder::bind_with_vars(
-                            ty::OutlivesPredicate(param_ty, region),
-                            bound_vars,
-                        ),
-                        lifetime.ident.span,
+                    let bound = ty::Binder::bind_with_vars(
+                        ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(param_ty, region)),
+                        bound_vars,
                     );
+                    bounds.push((bound.upcast(self.tcx()), lifetime.ident.span));
                 }
                 hir::GenericBound::Use(..) => {
                     // We don't actually lower `use` into the type layer.
@@ -218,7 +217,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         hir_ref_id: hir::HirId,
         trait_ref: ty::PolyTraitRef<'tcx>,
         constraint: &hir::AssocItemConstraint<'tcx>,
-        bounds: &mut Bounds<'tcx>,
+        bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         duplicates: &mut FxIndexMap<DefId, Span>,
         path_span: Span,
         predicate_filter: PredicateFilter,
@@ -346,9 +345,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             hir::AssocItemConstraintKind::Equality { term } => {
                 let term = match term {
                     hir::Term::Ty(ty) => self.lower_ty(ty).into(),
-                    hir::Term::Const(ct) => {
-                        ty::Const::from_const_arg(tcx, ct, ty::FeedConstTy::No).into()
-                    }
+                    hir::Term::Const(ct) => self.lower_const_arg(ct, FeedConstTy::No).into(),
                 };
 
                 // Find any late-bound regions declared in `ty` that are not
@@ -390,14 +387,13 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     PredicateFilter::All
                     | PredicateFilter::SelfOnly
                     | PredicateFilter::SelfAndAssociatedTypeBounds => {
-                        bounds.push_projection_bound(
-                            tcx,
-                            projection_term.map_bound(|projection_term| ty::ProjectionPredicate {
+                        let bound = projection_term.map_bound(|projection_term| {
+                            ty::ClauseKind::Projection(ty::ProjectionPredicate {
                                 projection_term,
                                 term,
-                            }),
-                            constraint.span,
-                        );
+                            })
+                        });
+                        bounds.push((bound.upcast(tcx), constraint.span));
                     }
                     // SelfTraitThatDefines is only interested in trait predicates.
                     PredicateFilter::SelfTraitThatDefines(_) => {}
@@ -641,13 +637,15 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         let mut num_bound_vars = candidate.bound_vars().len();
         let args = candidate.skip_binder().args.extend_to(tcx, item_def_id, |param, _| {
             let arg = match param.kind {
-                ty::GenericParamDefKind::Lifetime => {
-                    ty::Region::new_bound(tcx, ty::INNERMOST, ty::BoundRegion {
+                ty::GenericParamDefKind::Lifetime => ty::Region::new_bound(
+                    tcx,
+                    ty::INNERMOST,
+                    ty::BoundRegion {
                         var: ty::BoundVar::from_usize(num_bound_vars),
                         kind: ty::BoundRegionKind::Named(param.def_id, param.name),
-                    })
-                    .into()
-                }
+                    },
+                )
+                .into(),
                 ty::GenericParamDefKind::Type { .. } => {
                     let guar = *emitted_bad_param_err.get_or_insert_with(|| {
                         self.dcx().emit_err(crate::errors::ReturnTypeNotationIllegalParam::Type {
@@ -703,7 +701,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 ///
 /// It might actually be possible that we can already support early-bound generic params
 /// in such types if we just lifted some more checks in other places, too, for example
-/// inside [`ty::Const::from_anon_const`]. However, even if that were the case, we should
+/// inside `HirTyLowerer::lower_anon_const`. However, even if that were the case, we should
 /// probably gate this behind another feature flag.
 ///
 /// [^1]: <https://github.com/rust-lang/project-const-generics/issues/28>.
@@ -745,7 +743,7 @@ fn check_assoc_const_binding_type<'tcx>(
     let generics = tcx.generics_of(enclosing_item_owner_id);
     for index in collector.params {
         let param = generics.param_at(index as _, tcx);
-        let is_self_param = param.name == rustc_span::symbol::kw::SelfUpper;
+        let is_self_param = param.name == kw::SelfUpper;
         guar.get_or_insert(cx.dcx().emit_err(crate::errors::ParamInTyOfAssocConstBinding {
             span: assoc_const.span,
             assoc_const,

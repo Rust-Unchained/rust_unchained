@@ -29,7 +29,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let thread = if this.ptr_is_null(this.read_pointer(thread_op)?)? {
             None
         } else {
-            let thread_info_place = this.deref_pointer(thread_op)?;
+            let thread_info_place = this.deref_pointer_as(thread_op, this.machine.layouts.u32)?;
             Some(thread_info_place)
         };
 
@@ -65,15 +65,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let handle = this.read_scalar(handle_op)?;
         let timeout = this.read_scalar(timeout_op)?.to_u32()?;
 
-        let thread = match Handle::from_scalar(handle, this)? {
-            Some(Handle::Thread(thread)) =>
-                match this.thread_id_try_from(thread) {
-                    Ok(thread) => thread,
-                    Err(_) => this.invalid_handle("WaitForSingleObject")?,
-                },
+        let thread = match Handle::try_from_scalar(handle, this)? {
+            Ok(Handle::Thread(thread)) => thread,
             // Unlike on posix, the outcome of joining the current thread is not documented.
             // On current Windows, it just deadlocks.
-            Some(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.active_thread(),
+            Ok(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.active_thread(),
             _ => this.invalid_handle("WaitForSingleObject")?,
         };
 
