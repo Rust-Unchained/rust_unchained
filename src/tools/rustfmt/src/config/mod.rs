@@ -58,7 +58,6 @@ create_config! {
     single_line_let_else_max_width: SingleLineLetElseMaxWidth, true, "Maximum line length for \
         single line let-else statements. A value of zero means always format the divergent `else` \
         block over multiple lines.";
-
     // Comments. macros, and strings
     wrap_comments: WrapComments, false, "Break comments to fit on the line";
     format_code_in_doc_comments: FormatCodeInDocComments, false, "Format the code snippet in \
@@ -157,6 +156,8 @@ create_config! {
     format_generated_files: FormatGeneratedFiles, false, "Format generated files";
     generated_marker_line_search_limit: GeneratedMarkerLineSearchLimit, false, "Number of lines to \
         check for a `@generated` marker when `format_generated_files` is enabled";
+	let_else_style: LetElseStyle, false, "In `let-else` statements, whether to put the `else`\
+        keyword on the same line or the next one.";
 
     // Options that can change the source code beyond whitespace/blocks (somewhat linty things)
     merge_derives: MergeDerives, true, "Merge multiple `#[derive(...)]` into a single one";

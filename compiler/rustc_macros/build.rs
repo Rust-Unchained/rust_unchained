@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP");
+    /*
     if std::env::var("RUSTC_BOOTSTRAP").is_err() {
         eprintln!(
             "error: you are attempting to build the compiler without going through bootstrap"
@@ -13,4 +14,5 @@ fn main() {
         );
         panic!("wrong command used for building");
     }
+    */
 }

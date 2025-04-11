@@ -14,15 +14,15 @@ impl !Sync for NotSync {}
 unsafe impl Send for TestE {}
 unsafe impl Send for MyType {}
 unsafe impl Send for (MyType, MyType) {}
-//~^ ERROR E0117
+//~^ ERROR E0321
 
 unsafe impl Send for &'static NotSync {}
 //~^ ERROR E0321
 
 unsafe impl Send for [MyType] {}
-//~^ ERROR E0117
+//~^ ERROR E0321
 
 unsafe impl Send for &'static [NotSync] {}
-//~^ ERROR only traits defined in the current crate
+//~^ ERROR E0321
 
 fn main() {}

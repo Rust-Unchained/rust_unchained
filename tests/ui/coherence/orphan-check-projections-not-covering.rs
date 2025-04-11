@@ -4,9 +4,9 @@
 //@ revisions: classic next
 //@[next] compile-flags: -Znext-solver
 
-//@ check-pass
 //@ compile-flags: --crate-type=lib
 //@ aux-crate:foreign=parametrized-trait.rs
+//@ build-pass
 //@ edition:2021
 
 trait Identity {
@@ -19,24 +19,15 @@ impl<T> Identity for T {
 
 struct Local;
 
+// Disallowed in standard Rust, allowed in Unchained
 impl<T> foreign::Trait0<Local, T, ()> for <T as Identity>::Output {}
-//~^ WARNING type parameter `T` must be covered by another type
-//~| WARNING this was previously accepted by the compiler
 
-
+// Disallowed in standard Rust, allowed in Unchained
 impl<T> foreign::Trait0<<T as Identity>::Output, Local, T> for Option<T> {}
-//~^ WARNING type parameter `T` must be covered by another type
-//~| WARNING this was previously accepted by the compiler
 
 pub trait Deferred {
     type Output;
 }
 
-// A downstream user could implement
-//
-//     impl<T> Deferred for Type<T> { type Output = T; }
-//     struct Type<T>(T);
-//
+// Disallowed in standard Rust, allowed in Unchained
 impl<T: Deferred> foreign::Trait1<Local, T> for <T as Deferred>::Output {}
-//~^ WARNING type parameter `T` must be covered by another type
-//~| WARNING this was previously accepted by the compiler

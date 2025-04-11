@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,12 +8,9 @@ use std::rc::Rc;
 
 struct Local;
 
-impl<T> Remote1<u32> for Box<T> {
-    //~^ ERROR type parameter `T` must be used as the type parameter for some local type
-}
+// Allowed in Unchained Rust, no conflicts here.
+impl<T> Remote1<u32> for Box<T> {}
 
-impl<'a, T> Remote1<u32> for &'a T {
-    //~^ ERROR type parameter `T` must be used as the type parameter for some local type
-}
+impl<'a, T> Remote1<u32> for &'a T {}
 
 fn main() {}

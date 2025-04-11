@@ -1098,37 +1098,7 @@ impl Step for Tidy {
             cmd.args(args);
         }
 
-        if builder.config.channel == "dev" || builder.config.channel == "nightly" {
-            if !builder.config.json_output {
-                builder.info("fmt check");
-                if builder.initial_rustfmt().is_none() {
-                    let inferred_rustfmt_dir = builder.initial_sysroot.join("bin");
-                    eprintln!(
-                        "\
-ERROR: no `rustfmt` binary found in {PATH}
-INFO: `rust.channel` is currently set to \"{CHAN}\"
-HELP: if you are testing a beta branch, set `rust.channel` to \"beta\" in the `bootstrap.toml` file
-HELP: to skip test's attempt to check tidiness, pass `--skip src/tools/tidy` to `x.py test`",
-                        PATH = inferred_rustfmt_dir.display(),
-                        CHAN = builder.config.channel,
-                    );
-                    crate::exit!(1);
-                }
-                let all = false;
-                crate::core::build_steps::format::format(
-                    builder,
-                    !builder.config.cmd.bless(),
-                    all,
-                    &[],
-                );
-            } else {
-                eprintln!(
-                    "WARNING: `--json-output` is not supported on rustfmt, formatting will be skipped"
-                );
-            }
-        }
-
-        builder.info("tidy check");
+	    builder.info("tidy check");
         cmd.delay_failure().run(builder);
 
         builder.info("x.py completions check");

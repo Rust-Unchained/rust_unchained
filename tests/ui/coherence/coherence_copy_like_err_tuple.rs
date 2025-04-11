@@ -1,3 +1,4 @@
+//@ build-pass
 // Test that we are able to introduce a negative constraint that
 // `MyType: !MyTrait` along with other "fundamental" wrappers.
 
@@ -10,12 +11,7 @@ struct MyType { x: i32 }
 trait MyTrait { fn foo() {} }
 impl<T: lib::MyCopy> MyTrait for T { }
 
-// Tuples are not fundamental, therefore this would require that
-//
-//     (MyType,): !MyTrait
-//
-// which we cannot approve.
+// Allowed in Rust Unchained
 impl MyTrait for (MyType,) { }
-//~^ ERROR E0119
 
 fn main() { }

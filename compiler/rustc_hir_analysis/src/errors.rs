@@ -1,4 +1,5 @@
 //! Errors emitted by `rustc_hir_analysis`.
+#![allow(dead_code)]
 
 use rustc_abi::ExternAbi;
 use rustc_errors::codes::*;

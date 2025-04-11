@@ -5,6 +5,7 @@
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Default)]
 pub(super) struct SetValZST;
 
+#[allow(rustdoc::broken_intra_doc_links)]
 /// A trait to differentiate between `BTreeMap` and `BTreeSet` values.
 /// Returns `true` only for type `SetValZST`, `false` for all other types (blanket implementation).
 /// `TypeId` requires a `'static` lifetime, use of this trait avoids that restriction.

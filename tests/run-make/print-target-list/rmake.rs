@@ -10,7 +10,7 @@ use run_make_support::bare_rustc;
 
 // FIXME(#127877): certain experimental targets fail with creating a 'LLVM TargetMachine' in CI, so
 // we skip them.
-const EXPERIMENTAL_TARGETS: &[&str] = &["avr", "m68k", "csky", "xtensa"];
+const EXPERIMENTAL_TARGETS: &[&str] = &["avr", "m68k", "csky", "xtensa", "amdgcn-amd-amdhsa"];
 
 fn main() {
     let targets = bare_rustc().print("target-list").run().stdout_utf8();

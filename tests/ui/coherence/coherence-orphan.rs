@@ -7,14 +7,18 @@ use lib::TheTrait;
 
 struct TheType;
 
-impl TheTrait<usize> for isize {}
-//~^ ERROR  only traits defined in the current crate can be implemented for primitive types
+impl TheTrait<usize> for isize {
+	fn the_fn(&self) {}
+}
 
-impl TheTrait<TheType> for isize {}
+impl TheTrait<TheType> for isize {
+	fn the_fn(&self) {}
+}
 
-impl TheTrait<isize> for TheType {}
+impl TheTrait<isize> for TheType {
+	fn the_fn(&self) {}
+}
 
-impl !Send for Vec<isize> {}
-//~^ ERROR only traits defined in the current crate can be implemented for types defined outside of the crate
+impl !Send for Vec<isize> {} //~ ERROR E0321
 
 fn main() {}

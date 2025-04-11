@@ -7,7 +7,7 @@
 //! Everything here is basically just a shim around calling either `rustbook` or
 //! `rustdoc`.
 
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::{env, fs, mem};
 
@@ -133,7 +133,7 @@ impl<P: Step> Step for RustbookSrc<P> {
         let name = self.name;
         let src = self.src;
         let out = builder.doc_out(target);
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
 
         let out = out.join(&name);
         let index = out.join("index.html");
@@ -347,7 +347,7 @@ impl Step for Standalone {
         let compiler = self.compiler;
         let _guard = builder.msg_doc(compiler, "standalone", target);
         let out = builder.doc_out(target);
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
 
         let version_info = builder.ensure(SharedAssets { target: self.target }).version_info;
 
@@ -446,7 +446,7 @@ impl Step for Releases {
         let compiler = self.compiler;
         let _guard = builder.msg_doc(compiler, "releases", target);
         let out = builder.doc_out(target);
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
 
         builder.ensure(Standalone {
             compiler: builder.compiler(builder.top_stage, builder.config.build),
@@ -616,7 +616,7 @@ impl Step for Std {
             DocumentationFormat::Json => builder.json_doc_out(target),
         };
 
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
 
         if self.format == DocumentationFormat::Html {
             builder.ensure(SharedAssets { target: self.target });
@@ -799,7 +799,7 @@ impl Step for Rustc {
 
         // This is the intended out directory for compiler documentation.
         let out = builder.compiler_doc_out(target);
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
 
         // Build the standard library, so that proc-macros can use it.
         // (Normally, only the metadata would be necessary, but proc-macros are special since they run at compile-time.)
@@ -856,7 +856,7 @@ impl Step for Rustc {
             // relative links.
             // FIXME: Cargo should probably do this itself.
             let dir_name = krate.replace('-', "_");
-            t!(fs::create_dir_all(out_dir.join(&*dir_name)));
+	        t!(create_dir_recursive(out_dir.join(&*dir_name)));
             cargo.arg("-p").arg(krate);
             if to_open.is_none() {
                 to_open = Some(dir_name);
@@ -944,7 +944,7 @@ macro_rules! tool_doc {
 
                 // This is the intended out directory for compiler documentation.
                 let out = builder.compiler_doc_out(target);
-                t!(fs::create_dir_all(&out));
+                t!(create_dir_recursive(&out));
 
                 let compiler = builder.compiler(stage, builder.config.build);
                 builder.ensure(compile::Std::new(compiler, target));
@@ -993,7 +993,7 @@ macro_rules! tool_doc {
                 let out_dir = builder.stage_out(compiler, Mode::ToolRustc).join(target).join("doc");
                 $(for krate in $crates {
                     let dir_name = krate.replace("-", "_");
-                    t!(fs::create_dir_all(out_dir.join(&*dir_name)));
+                    t!(create_dir_recursive(out_dir.join(&*dir_name)));
                 })?
 
                 // Symlink compiler docs to the output directory of rustdoc documentation.
@@ -1094,7 +1094,7 @@ impl Step for ErrorIndex {
     fn run(self, builder: &Builder<'_>) {
         builder.info(&format!("Documenting error index ({})", self.target));
         let out = builder.doc_out(self.target);
-        t!(fs::create_dir_all(&out));
+        t!(create_dir_recursive(&out));
         tool::ErrorIndex::command(builder).arg("html").arg(out).arg(&builder.version).run(builder);
     }
 }
@@ -1187,7 +1187,7 @@ impl Step for RustcBook {
     /// "rustbook" is used to convert it to HTML.
     fn run(self, builder: &Builder<'_>) {
         let out_base = builder.md_doc_out(self.target).join("rustc");
-        t!(fs::create_dir_all(&out_base));
+        t!(create_dir_recursive(&out_base));
         let out_listing = out_base.join("src/lints");
         builder.cp_link_r(&builder.src.join("src/doc/rustc"), &out_base);
         builder.info(&format!("Generating lint docs ({})", self.target));
@@ -1284,4 +1284,17 @@ impl Step for Reference {
             languages: vec![],
         });
     }
+}
+
+// Unlike `fs::create_dir_all`, this doesn't return an Error if the directory already exists.
+fn create_dir_recursive(path: impl AsRef<Path>) -> io::Result<()> {
+	match fs::DirBuilder::new().recursive(true).create(path) {
+		Ok(_) => Ok(()),
+		Err(err) => {
+			match err.kind() {
+				ErrorKind::AlreadyExists => Ok(()),
+				_ => Err(err),
+			}
+		}
+	}
 }

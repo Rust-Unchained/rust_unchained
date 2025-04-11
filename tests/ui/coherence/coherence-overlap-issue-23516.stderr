@@ -1,12 +1,11 @@
-error[E0119]: conflicting implementations of trait `Sweet` for type `Box<_>`
-  --> $DIR/coherence-overlap-issue-23516.rs:8:1
+error[E0119]: conflicting implementations of trait `Sweet` for type `Box<i32>`
+  --> $DIR/coherence-overlap-issue-23516.rs:10:1
    |
-LL | impl<T:Sugar> Sweet for T { }
-   | ------------------------- first implementation here
 LL | impl<U:Sugar> Sweet for Box<U> { }
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Box<_>`
-   |
-   = note: downstream crates may implement trait `Sugar` for type `std::boxed::Box<_>`
+   | ------------------------------ first implementation here
+...
+LL | impl Sweet for Box<i32> {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Box<i32>`
 
 error: aborting due to 1 previous error
 

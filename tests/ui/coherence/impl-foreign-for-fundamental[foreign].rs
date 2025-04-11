@@ -1,3 +1,4 @@
+//@ build-pass
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -7,13 +8,9 @@ use std::rc::Rc;
 
 struct Local;
 
-impl Remote for Box<i32> {
-    //~^ ERROR only traits defined in the current crate
-    // | can be implemented for arbitrary types [E0117]
-}
-impl<T> Remote for Box<Rc<T>> {
-    //~^ ERROR only traits defined in the current crate
-    // | can be implemented for arbitrary types [E0117]
-}
+// Allowed in Unchained Rust, no conflicts here.
+impl Remote for Box<i32> {}
+
+impl<T> Remote for Box<Rc<T>> {}
 
 fn main() {}

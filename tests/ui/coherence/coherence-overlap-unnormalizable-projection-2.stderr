@@ -1,0 +1,16 @@
+error[E0119]: conflicting implementations of trait `Trait` for type `Box<Local>`
+  --> $DIR/coherence-overlap-unnormalizable-projection-2.rs:17:1
+   |
+LL | / impl<T> Trait for T
+LL | | where
+LL | |     T: 'static,
+LL | |     for<'a> T: WithAssoc<'a>,
+LL | |     for<'a> Box<  <T as WithAssoc<'a>>::Assoc  >: WhereBound,
+   | |_____________________________________________________________- first implementation here
+...
+LL |   impl<T> Trait for Box<T> {}
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Box<Local>`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0119`.

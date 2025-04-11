@@ -1,3 +1,5 @@
+//@ build-pass
+
 pub trait Trait1<X> {
     type Output;
 }
@@ -10,9 +12,8 @@ impl<X, T> Trait1<X> for T where T: Trait2<X> {
     type Output = ();
 }
 
+// Disallowed in standard Rust, allowed in Unchained
 impl<X> Trait1<Box<X>> for A {
-//~^ ERROR conflicting implementations of trait
-//~| downstream crates may implement trait `Trait2<std::boxed::Box<_>>` for type `A`
     type Output = i32;
 }
 

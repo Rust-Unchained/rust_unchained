@@ -85,11 +85,11 @@ fn install_sh(
     } else {
         assert!(
             is_dir_writable_for_user(&prefix),
-            "User doesn't have write access on `install.prefix` path in the `bootstrap.toml`.",
+            "User doesn't have write access on path \"{}\".", prefix.to_string_lossy(),
         );
         assert!(
             is_dir_writable_for_user(&sysconfdir),
-            "User doesn't have write access on `install.sysconfdir` path in `bootstrap.toml`."
+            "User doesn't have write access on \"{}\".", prefix.to_string_lossy()
         );
     }
 
