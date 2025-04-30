@@ -2,6 +2,7 @@
 /// representation of `LangItem`s used in the underlying compiler implementation.
 pub enum TraitSolverLangItem {
     // tidy-alphabetical-start
+    AsyncDestruct,
     AsyncFn,
     AsyncFnKindHelper,
     AsyncFnKindUpvars,

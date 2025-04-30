@@ -52,24 +52,45 @@ pub fn try_run(cmd: &mut Command, print_cmd_on_fail: bool) -> Result<(), ()> {
 
 /// Returns the submodule paths from the `.gitmodules` file in the given directory.
 pub fn parse_gitmodules(target_dir: &Path) -> &[String] {
-    static SUBMODULES_PATHS: OnceLock<Vec<String>> = OnceLock::new();
-    let gitmodules = target_dir.join(".gitmodules");
-    assert!(gitmodules.exists(), "'{}' file is missing.", gitmodules.display());
+	static SUBMODULES_PATHS: OnceLock<Vec<String>> = OnceLock::new();
 
-    let init_submodules_paths = || {
-        let file = File::open(gitmodules).unwrap();
+	// The author of Rust unchained gave up on the submodule nightmare that this repo is.
+	// So I manually return these hard-coded paths if we are looking at the root folder. 
+	if target_dir.join("x.py").exists() {
+		SUBMODULES_PATHS.get_or_init(|| vec![
+			String::from("library/backtrace"),
+			String::from("library/stdarch"),
+			String::from("src/doc/book"),
+			String::from("src/doc/edition-guide"),
+			String::from("src/doc/embedded-book"),
+			String::from("src/doc/nomicon"),
+			String::from("src/doc/reference"),
+			String::from("src/doc/rust-by-example"),
+			String::from("src/gcc"),
+			String::from("src/llvm-project"),
+			String::from("src/tools/cargo"),
+			String::from("src/tools/rustc-perf"),
+			String::from("src/tools/enzyme"),
+		])
+	} else {
+		let gitmodules = target_dir.join(".gitmodules");
+		assert!(gitmodules.exists(), "'{}' file is missing.", gitmodules.display());
 
-        let mut submodules_paths = vec![];
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let line = line.trim();
-            if line.starts_with("path") {
-                let actual_path = line.split(' ').last().expect("Couldn't get value of path");
-                submodules_paths.push(actual_path.to_owned());
-            }
-        }
+		let init_submodules_paths = || {
+			let file = File::open(gitmodules).unwrap();
 
-        submodules_paths
-    };
+			let mut submodules_paths = vec![];
+			for line in BufReader::new(file).lines().map_while(Result::ok) {
+				let line = line.trim();
+				if line.starts_with("path") {
+					let actual_path = line.split(' ').last().expect("Couldn't get value of path");
+					submodules_paths.push(actual_path.to_owned());
+				}
+			}
 
-    SUBMODULES_PATHS.get_or_init(|| init_submodules_paths())
+			submodules_paths
+		};
+
+		SUBMODULES_PATHS.get_or_init(|| init_submodules_paths())
+	}
 }
