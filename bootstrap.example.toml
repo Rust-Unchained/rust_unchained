@@ -19,6 +19,14 @@
 # Note that this has no default value (x.py uses the defaults in `bootstrap.example.toml`).
 #profile = <none>
 
+# Inherits configuration values from different configuration files (a.k.a. config extensions).
+# Supports absolute paths, and uses the current directory (where the bootstrap was invoked)
+# as the base if the given path is not absolute.
+#
+# The overriding logic follows a right-to-left order. For example, in `include = ["a.toml", "b.toml"]`,
+# extension `b.toml` overrides `a.toml`. Also, parent extensions always overrides the inner ones.
+#include = []
+
 # Keeps track of major changes made to this configuration.
 #
 # This value also represents ID of the PR that caused major changes. Meaning,
@@ -172,7 +180,7 @@
 # Note that this will attempt to download GCC even if there are local
 # modifications to the `src/gcc` submodule.
 # Currently, this is only supported for the `x86_64-unknown-linux-gnu` target.
-# download-ci-gcc = false
+#download-ci-gcc = false
 
 # =============================================================================
 # General build configuration options
@@ -492,7 +500,7 @@
 # building without optimizations takes much longer than optimizing. Further, some platforms
 # fail to build without this optimization (c.f. #65352).
 # The valid options are:
-# true - Enable optimizations.
+# true - Enable optimizations (same as 3).
 # false - Disable optimizations.
 # 0 - Disable optimizations.
 # 1 - Basic optimizations.

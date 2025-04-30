@@ -800,6 +800,7 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
         sess.opts.cg.metadata.clone(),
         sess.cfg_version,
     );
+
     let outputs = util::build_output_filenames(&pre_configured_attrs, sess);
 
     let dep_type = DepsType { dep_names: rustc_query_impl::dep_kind_names() };
@@ -981,11 +982,13 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
                 let _ = tcx.ensure_ok().check_coroutine_obligations(
                     tcx.typeck_root_def_id(def_id.to_def_id()).expect_local(),
                 );
-                // Eagerly check the unsubstituted layout for cycles.
-                tcx.ensure_ok().layout_of(
-                    ty::TypingEnv::post_analysis(tcx, def_id.to_def_id())
-                        .as_query_input(tcx.type_of(def_id).instantiate_identity()),
-                );
+                if !tcx.is_async_drop_in_place_coroutine(def_id.to_def_id()) {
+                    // Eagerly check the unsubstituted layout for cycles.
+                    tcx.ensure_ok().layout_of(
+                        ty::TypingEnv::post_analysis(tcx, def_id.to_def_id())
+                            .as_query_input(tcx.type_of(def_id).instantiate_identity()),
+                    );
+                }
             }
         });
     });

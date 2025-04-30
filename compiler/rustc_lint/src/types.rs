@@ -1,7 +1,9 @@
 use std::iter;
 use std::ops::ControlFlow;
 
-use rustc_abi::{BackendRepr, TagEncoding, VariantIdx, Variants, WrappingRange};
+use rustc_abi::{
+    BackendRepr, Integer, IntegerType, TagEncoding, VariantIdx, Variants, WrappingRange,
+};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::DiagMessage;
 use rustc_hir::intravisit::VisitorExt;
@@ -864,8 +866,8 @@ fn ty_is_known_nonnull<'tcx>(
                 return true;
             }
 
-            // `UnsafeCell` has its niche hidden.
-            if def.is_unsafe_cell() {
+            // `UnsafeCell` and `UnsafePinned` have their niche hidden.
+            if def.is_unsafe_cell() || def.is_unsafe_pinned() {
                 return false;
             }
 
@@ -876,23 +878,34 @@ fn ty_is_known_nonnull<'tcx>(
         }
         ty::Pat(base, pat) => {
             ty_is_known_nonnull(tcx, typing_env, *base, mode)
-                || Option::unwrap_or_default(
-                    try {
-                        match **pat {
-                            ty::PatternKind::Range { start, end } => {
-                                let start = start.try_to_value()?.try_to_bits(tcx, typing_env)?;
-                                let end = end.try_to_value()?.try_to_bits(tcx, typing_env)?;
-
-                                // This also works for negative numbers, as we just need
-                                // to ensure we aren't wrapping over zero.
-                                start > 0 && end >= start
-                            }
-                        }
-                    },
-                )
+                || pat_ty_is_known_nonnull(tcx, typing_env, *pat)
         }
         _ => false,
     }
+}
+
+fn pat_ty_is_known_nonnull<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    pat: ty::Pattern<'tcx>,
+) -> bool {
+    Option::unwrap_or_default(
+        try {
+            match *pat {
+                ty::PatternKind::Range { start, end } => {
+                    let start = start.try_to_value()?.try_to_bits(tcx, typing_env)?;
+                    let end = end.try_to_value()?.try_to_bits(tcx, typing_env)?;
+
+                    // This also works for negative numbers, as we just need
+                    // to ensure we aren't wrapping over zero.
+                    start > 0 && end >= start
+                }
+                ty::PatternKind::Or(patterns) => {
+                    patterns.iter().all(|pat| pat_ty_is_known_nonnull(tcx, typing_env, pat))
+                }
+            }
+        },
+    )
 }
 
 /// Given a non-null scalar (or transparent) type `ty`, return the nullable version of that type.
@@ -1036,10 +1049,26 @@ pub(crate) fn repr_nullable_ptr<'tcx>(
             }
             None
         }
-        ty::Pat(base, pat) => match **pat {
-            ty::PatternKind::Range { .. } => get_nullable_type(tcx, typing_env, *base),
-        },
+        ty::Pat(base, pat) => get_nullable_type_from_pat(tcx, typing_env, *base, *pat),
         _ => None,
+    }
+}
+
+fn get_nullable_type_from_pat<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    base: Ty<'tcx>,
+    pat: ty::Pattern<'tcx>,
+) -> Option<Ty<'tcx>> {
+    match *pat {
+        ty::PatternKind::Range { .. } => get_nullable_type(tcx, typing_env, base),
+        ty::PatternKind::Or(patterns) => {
+            let first = get_nullable_type_from_pat(tcx, typing_env, base, patterns[0])?;
+            for &pat in &patterns[1..] {
+                assert_eq!(first, get_nullable_type_from_pat(tcx, typing_env, base, pat)?);
+            }
+            Some(first)
+        }
     }
 }
 
@@ -1243,6 +1272,14 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                             };
                         }
 
+                        if let Some(IntegerType::Fixed(Integer::I128, _)) = def.repr().int {
+                            return FfiUnsafe {
+                                ty,
+                                reason: fluent::lint_improper_ctypes_128bit,
+                                help: None,
+                            };
+                        }
+
                         use improper_ctypes::check_non_exhaustive_variant;
 
                         let non_exhaustive = def.variant_list_has_applicable_non_exhaustive();
@@ -1371,7 +1408,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             ty::UnsafeBinder(_) => todo!("FIXME(unsafe_binder)"),
 
             ty::Param(..)
-            | ty::Alias(ty::Projection | ty::Inherent | ty::Weak, ..)
+            | ty::Alias(ty::Projection | ty::Inherent | ty::Free, ..)
             | ty::Infer(..)
             | ty::Bound(..)
             | ty::Error(_)

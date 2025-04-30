@@ -16,7 +16,7 @@ impl<'tcx> Stable<'tcx> for ty::AliasTyKind {
             ty::Projection => stable_mir::ty::AliasKind::Projection,
             ty::Inherent => stable_mir::ty::AliasKind::Inherent,
             ty::Opaque => stable_mir::ty::AliasKind::Opaque,
-            ty::Weak => stable_mir::ty::AliasKind::Weak,
+            ty::Free => stable_mir::ty::AliasKind::Free,
         }
     }
 }
@@ -412,6 +412,7 @@ impl<'tcx> Stable<'tcx> for ty::Pattern<'tcx> {
                 end: Some(end.stable(tables)),
                 include_end: true,
             },
+            ty::PatternKind::Or(_) => todo!(),
         }
     }
 }
@@ -638,8 +639,8 @@ impl<'tcx> Stable<'tcx> for ty::ClauseKind<'tcx> {
                 const_.stable(tables),
                 ty.stable(tables),
             ),
-            ClauseKind::WellFormed(generic_arg) => {
-                stable_mir::ty::ClauseKind::WellFormed(generic_arg.unpack().stable(tables))
+            ClauseKind::WellFormed(term) => {
+                stable_mir::ty::ClauseKind::WellFormed(term.unpack().stable(tables))
             }
             ClauseKind::ConstEvaluatable(const_) => {
                 stable_mir::ty::ClauseKind::ConstEvaluatable(const_.stable(tables))
@@ -813,6 +814,8 @@ impl<'tcx> Stable<'tcx> for ty::Instance<'tcx> {
             | ty::InstanceKind::DropGlue(..)
             | ty::InstanceKind::CloneShim(..)
             | ty::InstanceKind::FnPtrShim(..)
+            | ty::InstanceKind::FutureDropPollShim(..)
+            | ty::InstanceKind::AsyncDropGlue(..)
             | ty::InstanceKind::AsyncDropGlueCtorShim(..) => {
                 stable_mir::mir::mono::InstanceKind::Shim
             }
@@ -894,12 +897,21 @@ impl<'tcx> Stable<'tcx> for rustc_session::cstore::ForeignModule {
 impl<'tcx> Stable<'tcx> for ty::AssocKind {
     type T = stable_mir::ty::AssocKind;
 
-    fn stable(&self, _tables: &mut Tables<'_>) -> Self::T {
-        use stable_mir::ty::AssocKind;
-        match self {
-            ty::AssocKind::Const => AssocKind::Const,
-            ty::AssocKind::Fn => AssocKind::Fn,
-            ty::AssocKind::Type => AssocKind::Type,
+    fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
+        use stable_mir::ty::{AssocKind, AssocTypeData};
+        match *self {
+            ty::AssocKind::Const { name } => AssocKind::Const { name: name.to_string() },
+            ty::AssocKind::Fn { name, has_self } => {
+                AssocKind::Fn { name: name.to_string(), has_self }
+            }
+            ty::AssocKind::Type { data } => AssocKind::Type {
+                data: match data {
+                    ty::AssocTypeData::Normal(name) => AssocTypeData::Normal(name.to_string()),
+                    ty::AssocTypeData::Rpitit(rpitit) => {
+                        AssocTypeData::Rpitit(rpitit.stable(tables))
+                    }
+                },
+            },
         }
     }
 }
@@ -922,12 +934,9 @@ impl<'tcx> Stable<'tcx> for ty::AssocItem {
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         stable_mir::ty::AssocItem {
             def_id: tables.assoc_def(self.def_id),
-            name: self.name.to_string(),
             kind: self.kind.stable(tables),
             container: self.container.stable(tables),
             trait_item_def_id: self.trait_item_def_id.map(|did| tables.assoc_def(did)),
-            fn_has_self_parameter: self.fn_has_self_parameter,
-            opt_rpitit_info: self.opt_rpitit_info.map(|rpitit| rpitit.stable(tables)),
         }
     }
 }

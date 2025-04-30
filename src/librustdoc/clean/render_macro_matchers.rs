@@ -34,20 +34,20 @@ pub(super) fn render_macro_matcher(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Stri
     //             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
     //         ) => {...};
     //     }
-    printer.cbox(8);
+    let cb = printer.cbox(8);
     printer.word("(");
     printer.zerobreak();
-    printer.ibox(0);
+    let ib = printer.ibox(0);
     match matcher {
         TokenTree::Delimited(_span, _spacing, _delim, tts) => print_tts(&mut printer, tts),
         // Matcher which is not a Delimited is unexpected and should've failed
         // to compile, but we render whatever it is wrapped in parens.
         TokenTree::Token(..) => print_tt(&mut printer, matcher),
     }
-    printer.end();
+    printer.end(ib);
     printer.break_offset_if_not_bol(0, -4);
     printer.word(")");
-    printer.end();
+    printer.end(cb);
     printer.s.eof()
 }
 
@@ -96,7 +96,7 @@ fn print_tt(printer: &mut Printer<'_>, tt: &TokenTree) {
             }
         }
         TokenTree::Delimited(_span, _spacing, delim, tts) => {
-            let open_delim = printer.token_kind_to_string(&token::OpenDelim(*delim));
+            let open_delim = printer.token_kind_to_string(&delim.as_open_token_kind());
             printer.word(open_delim);
             if !tts.is_empty() {
                 if *delim == Delimiter::Brace {
@@ -107,7 +107,7 @@ fn print_tt(printer: &mut Printer<'_>, tt: &TokenTree) {
                     printer.space();
                 }
             }
-            let close_delim = printer.token_kind_to_string(&token::CloseDelim(*delim));
+            let close_delim = printer.token_kind_to_string(&delim.as_close_token_kind());
             printer.word(close_delim);
         }
     }

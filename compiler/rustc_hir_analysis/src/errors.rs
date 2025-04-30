@@ -24,7 +24,7 @@ pub(crate) struct AmbiguousAssocItem<'a> {
     #[label]
     pub span: Span,
     pub assoc_kind: &'static str,
-    pub assoc_name: Ident,
+    pub assoc_ident: Ident,
     pub qself: &'a str,
 }
 
@@ -76,7 +76,7 @@ pub(crate) struct AssocItemIsPrivate {
 pub(crate) struct AssocItemNotFound<'a> {
     #[primary_span]
     pub span: Span,
-    pub assoc_name: Ident,
+    pub assoc_ident: Ident,
     pub assoc_kind: &'static str,
     pub qself: &'a str,
     #[subdiagnostic]
@@ -1674,14 +1674,6 @@ pub(crate) struct BadReturnTypeNotation {
 pub(crate) struct CmseEntryGeneric {
     #[primary_span]
     pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(hir_analysis_register_type_unstable)]
-pub(crate) struct RegisterTypeUnstable<'a> {
-    #[primary_span]
-    pub span: Span,
-    pub ty: Ty<'a>,
 }
 
 #[derive(LintDiagnostic)]

@@ -345,7 +345,7 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
     fn check_item(item: &ast::Item, info: &mut ParseSourceInfo, crate_name: &Option<&str>) -> bool {
         let mut is_extern_crate = false;
         if !info.has_global_allocator
-            && item.attrs.iter().any(|attr| attr.name_or_empty() == sym::global_allocator)
+            && item.attrs.iter().any(|attr| attr.has_name(sym::global_allocator))
         {
             info.has_global_allocator = true;
         }
@@ -377,7 +377,7 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
     }
 
     let mut prev_span_hi = 0;
-    let not_crate_attrs = [sym::forbid, sym::allow, sym::warn, sym::deny, sym::expect];
+    let not_crate_attrs = &[sym::forbid, sym::allow, sym::warn, sym::deny, sym::expect];
     let parsed = parser.parse_item(rustc_parse::parser::ForceCollect::No);
 
     let result = match parsed {
@@ -386,17 +386,13 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
                 && let Some(ref body) = fn_item.body =>
         {
             for attr in &item.attrs {
-                let attr_name = attr.name_or_empty();
-
-                if attr.style == AttrStyle::Outer || not_crate_attrs.contains(&attr_name) {
+                if attr.style == AttrStyle::Outer || attr.has_any_name(not_crate_attrs) {
                     // There is one exception to these attributes:
                     // `#![allow(internal_features)]`. If this attribute is used, we need to
                     // consider it only as a crate-level attribute.
-                    if attr_name == sym::allow
+                    if attr.has_name(sym::allow)
                         && let Some(list) = attr.meta_item_list()
-                        && list.iter().any(|sub_attr| {
-                            sub_attr.name_or_empty().as_str() == "internal_features"
-                        })
+                        && list.iter().any(|sub_attr| sub_attr.has_name(sym::internal_features))
                     {
                         push_to_s(&mut info.crate_attrs, source, attr.span, &mut prev_span_hi);
                     } else {
@@ -411,17 +407,27 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
                     push_to_s(&mut info.crate_attrs, source, attr.span, &mut prev_span_hi);
                 }
             }
+            let mut has_non_items = false;
             for stmt in &body.stmts {
                 let mut is_extern_crate = false;
                 match stmt.kind {
                     StmtKind::Item(ref item) => {
                         is_extern_crate = check_item(&item, &mut info, crate_name);
                     }
-                    StmtKind::Expr(ref expr) if matches!(expr.kind, ast::ExprKind::Err(_)) => {
-                        reset_error_count(&psess);
-                        return Err(());
+                    StmtKind::Expr(ref expr) => {
+                        if matches!(expr.kind, ast::ExprKind::Err(_)) {
+                            reset_error_count(&psess);
+                            return Err(());
+                        }
+                        has_non_items = true;
                     }
-                    StmtKind::MacCall(ref mac_call) if !info.has_main_fn => {
+                    // We assume that the macro calls will expand to item(s) even though they could
+                    // expand to statements and expressions. And the simple fact that we're trying
+                    // to retrieve a `main` function inside it is a terrible idea.
+                    StmtKind::MacCall(ref mac_call) => {
+                        if info.has_main_fn {
+                            continue;
+                        }
                         let mut iter = mac_call.mac.args.tokens.iter();
 
                         while let Some(token) = iter.next() {
@@ -441,7 +447,9 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        has_non_items = true;
+                    }
                 }
 
                 // Weirdly enough, the `Stmt` span doesn't include its attributes, so we need to
@@ -465,6 +473,11 @@ fn parse_source(source: &str, crate_name: &Option<&str>) -> Result<ParseSourceIn
                 } else {
                     push_to_s(&mut info.crates, source, span, &mut prev_span_hi);
                 }
+            }
+            if has_non_items {
+                // FIXME: if `info.has_main_fn` is `true`, emit a warning here to mention that
+                // this code will not be called.
+                info.has_main_fn = false;
             }
             Ok(info)
         }

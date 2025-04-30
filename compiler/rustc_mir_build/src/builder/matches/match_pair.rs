@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rustc_hir::ByRef;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
@@ -101,18 +102,21 @@ impl<'tcx> MatchPairTree<'tcx> {
             place_builder = resolved;
         }
 
-        // Only add the OpaqueCast projection if the given place is an opaque type and the
-        // expected type from the pattern is not.
-        let may_need_cast = match place_builder.base() {
-            PlaceBase::Local(local) => {
-                let ty =
-                    Place::ty_from(local, place_builder.projection(), &cx.local_decls, cx.tcx).ty;
-                ty != pattern.ty && ty.has_opaque_types()
+        if !cx.tcx.next_trait_solver_globally() {
+            // Only add the OpaqueCast projection if the given place is an opaque type and the
+            // expected type from the pattern is not.
+            let may_need_cast = match place_builder.base() {
+                PlaceBase::Local(local) => {
+                    let ty =
+                        Place::ty_from(local, place_builder.projection(), &cx.local_decls, cx.tcx)
+                            .ty;
+                    ty != pattern.ty && ty.has_opaque_types()
+                }
+                _ => true,
+            };
+            if may_need_cast {
+                place_builder = place_builder.project(ProjectionElem::OpaqueCast(pattern.ty));
             }
-            _ => true,
-        };
-        if may_need_cast {
-            place_builder = place_builder.project(ProjectionElem::OpaqueCast(pattern.ty));
         }
 
         let place = place_builder.try_to_place(cx);
@@ -257,7 +261,13 @@ impl<'tcx> MatchPairTree<'tcx> {
                 None
             }
 
-            PatKind::Deref { ref subpattern } => {
+            PatKind::Deref { ref subpattern }
+            | PatKind::DerefPattern { ref subpattern, borrow: ByRef::No } => {
+                if cfg!(debug_assertions) && matches!(pattern.kind, PatKind::DerefPattern { .. }) {
+                    // Only deref patterns on boxes can be lowered using a built-in deref.
+                    debug_assert!(pattern.ty.is_box());
+                }
+
                 MatchPairTree::for_pattern(
                     place_builder.deref(),
                     subpattern,
@@ -268,7 +278,7 @@ impl<'tcx> MatchPairTree<'tcx> {
                 None
             }
 
-            PatKind::DerefPattern { ref subpattern, mutability } => {
+            PatKind::DerefPattern { ref subpattern, borrow: ByRef::Yes(mutability) } => {
                 // Create a new temporary for each deref pattern.
                 // FIXME(deref_patterns): dedup temporaries to avoid multiple `deref()` calls?
                 let temp = cx.temp(

@@ -405,7 +405,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                     let universe = placeholder.universe;
                     let universe_info = self.regioncx.universe_info(universe);
 
-                    universe_info.report_error(self, placeholder, error_element, cause);
+                    universe_info.report_erroneous_element(self, placeholder, error_element, cause);
                 }
 
                 RegionErrorKind::RegionError { fr_origin, longer_fr, shorter_fr, is_reported } => {
@@ -888,7 +888,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                     // Skip `async` desugaring `impl Future`.
                 }
                 if let TyKind::TraitObject(_, lt) = alias_ty.kind {
-                    if lt.res == hir::LifetimeName::ImplicitObjectLifetimeDefault {
+                    if lt.kind == hir::LifetimeKind::ImplicitObjectLifetimeDefault {
                         spans_suggs.push((lt.ident.span.shrink_to_hi(), " + 'a".to_string()));
                     } else {
                         spans_suggs.push((lt.ident.span, "'a".to_string()));

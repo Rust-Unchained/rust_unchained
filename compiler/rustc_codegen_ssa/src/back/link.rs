@@ -18,7 +18,7 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_errors::{DiagCtxtHandle, LintDiagnostic};
-use rustc_fs_util::{fix_windows_verbatim_for_gcc, try_canonicalize};
+use rustc_fs_util::{TempDirBuilder, fix_windows_verbatim_for_gcc, try_canonicalize};
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_macros::LintDiagnostic;
 use rustc_metadata::fs::{METADATA_FILENAME, copy_to_stdout, emit_wrapper_file};
@@ -48,7 +48,6 @@ use rustc_target::spec::{
     LinkerFeatures, LinkerFlavor, LinkerFlavorCli, Lld, PanicStrategy, RelocModel, RelroLevel,
     SanitizerSet, SplitDebuginfo,
 };
-use tempfile::Builder as TempFileBuilder;
 use tracing::{debug, info, warn};
 
 use super::archive::{ArchiveBuilder, ArchiveBuilderBuilder};
@@ -100,7 +99,7 @@ pub fn link_binary(
         });
 
         if outputs.outputs.should_link() {
-            let tmpdir = TempFileBuilder::new()
+            let tmpdir = TempDirBuilder::new()
                 .prefix("rustc")
                 .tempdir()
                 .unwrap_or_else(|error| sess.dcx().emit_fatal(errors::CreateTempDir { error }));
@@ -112,8 +111,12 @@ pub fn link_binary(
                 codegen_results.crate_info.local_crate_name,
             );
             let crate_name = format!("{}", codegen_results.crate_info.local_crate_name);
-            let out_filename =
-                output.file_for_writing(outputs, OutputType::Exe, Some(crate_name.as_str()));
+            let out_filename = output.file_for_writing(
+                outputs,
+                OutputType::Exe,
+                &crate_name,
+                sess.invocation_temp.as_deref(),
+            );
             match crate_type {
                 CrateType::Rlib => {
                     let _timer = sess.timer("link_rlib");
@@ -2009,6 +2012,12 @@ fn add_linked_symbol_object(
         // We handle the name decoration of COFF targets in `symbol_export.rs`, so disable the
         // default mangler in `object` crate.
         file.set_mangling(object::write::Mangling::None);
+    }
+
+    if file.format() == object::BinaryFormat::MachO {
+        // Divide up the sections into sub-sections via symbols for dead code stripping.
+        // Without this flag, unused `#[no_mangle]` or `#[used]` cannot be discard on MachO targets.
+        file.set_subsections_via_symbols();
     }
 
     // ld64 requires a relocation to load undefined symbols, see below.

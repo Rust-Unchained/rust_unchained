@@ -123,7 +123,7 @@ impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
 /// Empty string, to be used where LLVM expects an instruction name, indicating
 /// that the instruction is to be left unnamed (i.e. numbered, in textual IR).
 // FIXME(eddyb) pass `&CStr` directly to FFI once it's a thin pointer.
-const UNNAMED: *const c_char = c"".as_ptr();
+pub(crate) const UNNAMED: *const c_char = c"".as_ptr();
 
 impl<'ll, CX: Borrow<SCx<'ll>>> BackendTypes for GenericBuilder<'_, 'll, CX> {
     type Value = <GenericCx<'ll, CX> as BackendTypes>::Value;
@@ -594,6 +594,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
         unsafe {
             let load = llvm::LLVMBuildLoad2(self.llbuilder, ty, ptr, UNNAMED);
+            let align = align.min(self.cx().tcx.sess.target.max_reliable_alignment());
             llvm::LLVMSetAlignment(load, align.bytes() as c_uint);
             load
         }
@@ -807,6 +808,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         assert_eq!(self.cx.type_kind(self.cx.val_ty(ptr)), TypeKind::Pointer);
         unsafe {
             let store = llvm::LLVMBuildStore(self.llbuilder, val, ptr);
+            let align = align.min(self.cx().tcx.sess.target.max_reliable_alignment());
             let align =
                 if flags.contains(MemFlags::UNALIGNED) { 1 } else { align.bytes() as c_uint };
             llvm::LLVMSetAlignment(store, align);

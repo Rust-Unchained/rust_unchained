@@ -1,12 +1,11 @@
 // tidy-alphabetical-start
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(doc, recursion_limit = "256")] // FIXME(nnethercote): will be removed by #124141
+#![cfg_attr(bootstrap, feature(let_chains))]
 #![feature(array_windows)]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(iter_intersperse)]
-#![feature(let_chains)]
 #![feature(never_type)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
@@ -24,6 +23,7 @@ mod diverges;
 mod errors;
 mod expectation;
 mod expr;
+mod inline_asm;
 // Used by clippy;
 pub mod expr_use_visitor;
 mod fallback;
@@ -266,7 +266,7 @@ fn infer_type_if_missing<'tcx>(fcx: &FnCtxt<'_, 'tcx>, node: Node<'tcx>) -> Opti
     let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer(()), span, .. }) = node.ty()
     {
         if let Some(item) = tcx.opt_associated_item(def_id.into())
-            && let ty::AssocKind::Const = item.kind
+            && let ty::AssocKind::Const { .. } = item.kind
             && let ty::AssocItemContainer::Impl = item.container
             && let Some(trait_item_def_id) = item.trait_item_def_id
         {

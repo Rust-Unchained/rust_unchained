@@ -106,7 +106,7 @@ fn entry_fn(tcx: TyCtxt<'_>) -> (DefId, MiriEntryFnType) {
         } else {
             tcx.dcx().fatal(
                 "`miri_start` must have the following signature:\n\
-                        fn miri_start(argc: isize, argv: *const *const u8) -> isize",
+                fn miri_start(argc: isize, argv: *const *const u8) -> isize",
             );
         }
     } else {
@@ -115,7 +115,7 @@ fn entry_fn(tcx: TyCtxt<'_>) -> (DefId, MiriEntryFnType) {
             Alternatively, you can export a `miri_start` function:\n\
             \n\
             #[cfg(miri)]\n\
-            #[no_mangle]\n\
+            #[unsafe(no_mangle)]\n\
             fn miri_start(argc: isize, argv: *const *const u8) -> isize {\
             \n    // Call the actual start function that your project implements, based on your target's conventions.\n\
             }"
@@ -185,7 +185,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             let num_failed = sync::IntoDynSyncSend(AtomicU32::new(0));
             sync::par_for_each_in(many_seeds.seeds.clone(), |seed| {
                 let mut config = config.clone();
-                config.seed = Some(seed.into());
+                config.seed = Some((*seed).into());
                 eprintln!("Trying seed: {seed}");
                 let return_code = miri::eval_entry(tcx, entry_def_id, entry_type, config)
                     .unwrap_or(rustc_driver::EXIT_FAILURE);

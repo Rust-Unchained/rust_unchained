@@ -16,7 +16,6 @@ extern crate rustc_driver;
 extern crate rustc_interface;
 extern crate stable_mir;
 
-use rustc_smir::rustc_internal;
 use stable_mir::mir::MirVisitor;
 use stable_mir::mir::MutMirVisitor;
 use stable_mir::*;
@@ -184,14 +183,14 @@ impl mir::MutMirVisitor for TestMutVisitor {
 fn main() {
     let path = "sim_visitor_input.rs";
     generate_input(&path).unwrap();
-    let args = vec![
+    let args = &[
         "rustc".to_string(),
         "-Cpanic=abort".to_string(),
         "--crate-name".to_string(),
         CRATE_NAME.to_string(),
         path.to_string(),
     ];
-    run!(args.clone(), test_visitor).unwrap();
+    run!(args, test_visitor).unwrap();
     run!(args, test_mut_visitor).unwrap();
 }
 

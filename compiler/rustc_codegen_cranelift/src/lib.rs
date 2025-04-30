@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use rustc_codegen_ssa::CodegenResults;
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::{CodegenResults, TargetConfig};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_session::Session;
@@ -124,6 +124,7 @@ impl<F: Fn() -> String> Drop for PrintOnPanic<F> {
 /// inside a single codegen unit with the exception of the Cranelift [`Module`](cranelift_module::Module).
 struct CodegenCx {
     output_filenames: Arc<OutputFilenames>,
+    invocation_temp: Option<String>,
     should_write_ir: bool,
     global_asm: String,
     inline_asm_index: usize,
@@ -142,6 +143,7 @@ impl CodegenCx {
         };
         CodegenCx {
             output_filenames: tcx.output_filenames(()).clone(),
+            invocation_temp: tcx.sess.invocation_temp.clone(),
             should_write_ir: crate::pretty_clif::should_write_ir(tcx),
             global_asm: String::new(),
             inline_asm_index: 0,
@@ -176,7 +178,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         }
     }
 
-    fn target_features_cfg(&self, sess: &Session) -> (Vec<Symbol>, Vec<Symbol>) {
+    fn target_config(&self, sess: &Session) -> TargetConfig {
         // FIXME return the actually used target features. this is necessary for #[cfg(target_feature)]
         let target_features = if sess.target.arch == "x86_64" && sess.target.os != "none" {
             // x86_64 mandates SSE2 support and rustc requires the x87 feature to be enabled
@@ -195,7 +197,16 @@ impl CodegenBackend for CraneliftCodegenBackend {
         };
         // FIXME do `unstable_target_features` properly
         let unstable_target_features = target_features.clone();
-        (target_features, unstable_target_features)
+
+        TargetConfig {
+            target_features,
+            unstable_target_features,
+            // Cranelift does not yet support f16 or f128
+            has_reliable_f16: false,
+            has_reliable_f16_math: false,
+            has_reliable_f128: false,
+            has_reliable_f128_math: false,
+        }
     }
 
     fn print_version(&self) {

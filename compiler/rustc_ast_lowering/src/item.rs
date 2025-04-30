@@ -5,7 +5,7 @@ use rustc_ast::*;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
-use rustc_hir::{self as hir, HirId, IsAnonInPath, PredicateOrigin};
+use rustc_hir::{self as hir, HirId, LifetimeSource, PredicateOrigin};
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::ty::{ResolverAstLowering, TyCtxt};
 use rustc_span::edit_distance::find_best_match_for_name;
@@ -645,7 +645,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         (
                             // Disallow `impl Trait` in foreign items.
                             this.lower_fn_decl(fdec, i.id, sig.span, FnDeclKind::ExternFn, None),
-                            this.lower_fn_params_to_names(fdec),
+                            this.lower_fn_params_to_idents(fdec),
                         )
                     });
 
@@ -833,7 +833,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
             }) => {
                 // FIXME(contracts): Deny contract here since it won't apply to
                 // any impl method or callees.
-                let names = self.lower_fn_params_to_names(&sig.decl);
+                let idents = self.lower_fn_params_to_idents(&sig.decl);
                 let (generics, sig) = self.lower_method_sig(
                     generics,
                     sig,
@@ -851,7 +851,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 (
                     *ident,
                     generics,
-                    hir::TraitItemKind::Fn(sig, hir::TraitFn::Required(names)),
+                    hir::TraitItemKind::Fn(sig, hir::TraitFn::Required(idents)),
                     false,
                 )
             }
@@ -1206,8 +1206,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 let precond = if let Some(req) = &contract.requires {
                     // Lower the precondition check intrinsic.
                     let lowered_req = this.lower_expr_mut(&req);
+                    let req_span = this.mark_span_with_reason(
+                        DesugaringKind::Contract,
+                        lowered_req.span,
+                        None,
+                    );
                     let precond = this.expr_call_lang_item_fn_mut(
-                        req.span,
+                        req_span,
                         hir::LangItem::ContractCheckRequires,
                         &*arena_vec![this; lowered_req],
                     );
@@ -1217,6 +1222,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 };
                 let (postcond, body) = if let Some(ens) = &contract.ensures {
                     let ens_span = this.lower_span(ens.span);
+                    let ens_span =
+                        this.mark_span_with_reason(DesugaringKind::Contract, ens_span, None);
                     // Set up the postcondition `let` statement.
                     let check_ident: Ident =
                         Ident::from_str_and_span("__ensures_checker", ens_span);
@@ -1303,7 +1310,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
             // create a fake body so that the entire rest of the compiler doesn't have to deal with
             // this as a special case.
             return self.lower_fn_body(decl, contract, |this| {
-                if attrs.iter().any(|a| a.name_or_empty() == sym::rustc_intrinsic) {
+                if attrs.iter().any(|a| a.has_name(sym::rustc_intrinsic)) {
                     let span = this.lower_span(span);
                     let empty_block = hir::Block {
                         hir_id: this.next_id(),
@@ -1861,7 +1868,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
             }
             GenericParamKind::Lifetime => {
                 let lt_id = self.next_node_id();
-                let lifetime = self.new_named_lifetime(id, lt_id, ident, IsAnonInPath::No);
+                let lifetime =
+                    self.new_named_lifetime(id, lt_id, ident, LifetimeSource::Other, ident.into());
                 hir::WherePredicateKind::RegionPredicate(hir::WhereRegionPredicate {
                     lifetime,
                     bounds,
@@ -1894,7 +1902,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
             }),
             WherePredicateKind::RegionPredicate(WhereRegionPredicate { lifetime, bounds }) => {
                 hir::WherePredicateKind::RegionPredicate(hir::WhereRegionPredicate {
-                    lifetime: self.lower_lifetime(lifetime),
+                    lifetime: self.lower_lifetime(
+                        lifetime,
+                        LifetimeSource::Other,
+                        lifetime.ident.into(),
+                    ),
                     bounds: self.lower_param_bounds(
                         bounds,
                         ImplTraitContext::Disallowed(ImplTraitPosition::Bound),

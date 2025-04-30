@@ -1,7 +1,7 @@
 #![allow(rustc::bad_opt_access)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZero;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use rustc_abi::Align;
@@ -53,7 +53,7 @@ where
         checksum_hash_kind,
     });
 
-    rustc_span::create_session_globals_then(DEFAULT_EDITION, sm_inputs, || {
+    rustc_span::create_session_globals_then(DEFAULT_EDITION, &[], sm_inputs, || {
         let temps_dir = sessopts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
         let io = CompilerIO {
             input: Input::Str { name: FileName::Custom(String::new()), input: String::new() },
@@ -89,8 +89,8 @@ where
     S: Into<String>,
     I: IntoIterator<Item = S>,
 {
-    let locations: BTreeSet<CanonicalizedPath> =
-        locations.into_iter().map(|s| CanonicalizedPath::new(Path::new(&s.into()))).collect();
+    let locations =
+        locations.into_iter().map(|s| CanonicalizedPath::new(PathBuf::from(s.into()))).collect();
 
     ExternEntry {
         location: ExternLocation::ExactPaths(locations),
@@ -614,6 +614,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(control_flow_guard, CFGuard::Checks);
     tracked!(debug_assertions, Some(true));
     tracked!(debuginfo, DebugInfo::Limited);
+    tracked!(dwarf_version, Some(5));
     tracked!(embed_bitcode, false);
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
@@ -817,8 +818,8 @@ fn test_unstable_options_tracking_hash() {
     tracked!(min_function_alignment, Some(Align::EIGHT));
     tracked!(mir_emit_retag, true);
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
-    tracked!(mir_keep_place_mention, true);
     tracked!(mir_opt_level, Some(4));
+    tracked!(mir_preserve_ub, true);
     tracked!(move_size_limit, Some(4096));
     tracked!(mutable_noalias, false);
     tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });

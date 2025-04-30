@@ -22,9 +22,10 @@ impl Display for Ty {
 impl Display for AssocKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            AssocKind::Fn => write!(f, "method"),
-            AssocKind::Const => write!(f, "associated const"),
-            AssocKind::Type => write!(f, "associated type"),
+            AssocKind::Fn { has_self: true, .. } => write!(f, "method"),
+            AssocKind::Fn { has_self: false, .. } => write!(f, "associated function"),
+            AssocKind::Const { .. } => write!(f, "associated const"),
+            AssocKind::Type { .. } => write!(f, "associated type"),
         }
     }
 }
@@ -312,7 +313,9 @@ fn pretty_assert_message<W: Write>(writer: &mut W, msg: &AssertMessage) -> io::R
         AssertMessage::NullPointerDereference => {
             write!(writer, "\"null pointer dereference occurred\"")
         }
-        AssertMessage::ResumedAfterReturn(_) | AssertMessage::ResumedAfterPanic(_) => {
+        AssertMessage::ResumedAfterReturn(_)
+        | AssertMessage::ResumedAfterPanic(_)
+        | AssertMessage::ResumedAfterDrop(_) => {
             write!(writer, "{}", msg.description().unwrap())
         }
     }

@@ -53,6 +53,13 @@ jobs:
     steps:
       - name: Checkout the source code
         uses: actions/checkout@v4
+      # Cache citool to make its build faster, as it's in the critical path.
+      # The rust-cache doesn't bleed into the main `job`, so it should not affect any other
+      # Rust compilation.
+      - name: Cache citool
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: src/ci/citool
       - name: Calculate the CI job matrix
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
@@ -84,6 +91,17 @@ jobs:
         # Check the `calculate_matrix` job to see how is the matrix defined.
         include: ${{ fromJSON(needs.calculate_matrix.outputs.jobs) }}
     steps:
+      - name: Install cargo in AWS CodeBuild
+        if: matrix.codebuild
+        run: |
+          # Check if cargo is installed
+          if ! command -v cargo &> /dev/null; then
+            echo "Cargo not found, installing Rust..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal
+            # Make cargo available in PATH
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
 
@@ -117,9 +135,6 @@ jobs:
           # are passed to the `setup-environment.sh` script encoded in JSON,
           # which then uses log commands to actually set them.
           EXTRA_VARIABLES: ${{ toJson(matrix.env) }}
-
-      - name: setup upstream remote
-        run: src/ci/scripts/setup-upstream-remote.sh
 
       - name: ensure the channel matches the target branch
         run: src/ci/scripts/verify-channel.sh
@@ -161,6 +176,8 @@ jobs:
         run: src/ci/scripts/install-ninja.sh
 
       - name: enable ipv6 on Docker
+        # Don't run on codebuild because systemctl is not available
+        if: ${{ !matrix.codebuild }}
         run: src/ci/scripts/enable-docker-ipv6.sh
 
       # Disable automatic line ending conversion (again). On Windows, when we're

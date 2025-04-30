@@ -8,7 +8,6 @@ use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{ExprKind, HirId, Node, QPath};
-use rustc_hir_analysis::check::intrinsicck::InlineAsmCtxt;
 use rustc_hir_analysis::check::potentially_plural_count;
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_index::IndexVec;
@@ -33,6 +32,7 @@ use crate::errors::SuggestPtrNullMut;
 use crate::fn_ctxt::arg_matrix::{ArgMatrix, Compatibility, Error, ExpectedIdx, ProvidedIdx};
 use crate::fn_ctxt::infer::FnCall;
 use crate::gather_locals::Declaration;
+use crate::inline_asm::InlineAsmCtxt;
 use crate::method::MethodCallee;
 use crate::method::probe::IsSuggestion;
 use crate::method::probe::Mode::MethodCall;
@@ -98,13 +98,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         debug!("FnCtxt::check_asm: {} deferred checks", deferred_asm_checks.len());
         for (asm, hir_id) in deferred_asm_checks.drain(..) {
             let enclosing_id = self.tcx.hir_enclosing_body_owner(hir_id);
-            InlineAsmCtxt::new(
-                enclosing_id,
-                &self.infcx,
-                self.typing_env(self.param_env),
-                &*self.typeck_results.borrow(),
-            )
-            .check_asm(asm);
+            InlineAsmCtxt::new(self, enclosing_id).check_asm(asm);
         }
     }
 
@@ -616,7 +610,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let Some((DefKind::AssocFn, def_id)) =
                     self.typeck_results.borrow().type_dependent_def(call_expr.hir_id)
                     && let Some(assoc) = tcx.opt_associated_item(def_id)
-                    && assoc.fn_has_self_parameter
+                    && assoc.is_method()
                 {
                     Some(*receiver)
                 } else {
@@ -642,8 +636,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     TraitsInScope,
                     |mut ctxt| ctxt.probe_for_similar_candidate(),
                 )
-                && let ty::AssocKind::Fn = assoc.kind
-                && assoc.fn_has_self_parameter
+                && assoc.is_method()
             {
                 let args = self.infcx.fresh_args_for_item(call_name.span, assoc.def_id);
                 let fn_sig = tcx.fn_sig(assoc.def_id).instantiate(tcx, args);
@@ -684,10 +677,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .all(|(expected, found)| self.may_coerce(*expected, *found))
                 && fn_sig.inputs()[1..].len() == input_types.len()
             {
+                let assoc_name = assoc.name();
                 err.span_suggestion_verbose(
                     call_name.span,
-                    format!("you might have meant to use `{}`", assoc.name),
-                    assoc.name,
+                    format!("you might have meant to use `{}`", assoc_name),
+                    assoc_name,
                     Applicability::MaybeIncorrect,
                 );
                 return;
@@ -707,7 +701,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     tcx.def_span(assoc.def_id),
                     format!(
                         "there's is a method with similar name `{}`, but the arguments don't match",
-                        assoc.name,
+                        assoc.name(),
                     ),
                 );
                 return;
@@ -719,7 +713,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     format!(
                         "there's is a method with similar name `{}`, but their argument count \
                          doesn't match",
-                        assoc.name,
+                        assoc.name(),
                     ),
                 );
                 return;
@@ -925,7 +919,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let detect_dotdot = |err: &mut Diag<'_>, ty: Ty<'_>, expr: &hir::Expr<'_>| {
             if let ty::Adt(adt, _) = ty.kind()
-                && self.tcx().lang_items().get(hir::LangItem::RangeFull) == Some(adt.did())
+                && self.tcx().is_lang_item(adt.did(), hir::LangItem::RangeFull)
                 && let hir::ExprKind::Struct(
                     hir::QPath::LangItem(hir::LangItem::RangeFull, _),
                     [],
@@ -1136,7 +1130,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 && let self_implicit =
                     matches!(call_expr.kind, hir::ExprKind::MethodCall(..)) as usize
                 && let Some(Some(arg)) =
-                    self.tcx.fn_arg_names(fn_def_id).get(expected_idx.as_usize() + self_implicit)
+                    self.tcx.fn_arg_idents(fn_def_id).get(expected_idx.as_usize() + self_implicit)
                 && arg.name != kw::SelfLower
             {
                 format!("/* {} */", arg.name)
@@ -2619,7 +2613,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         is_method: bool,
     ) -> Option<(IndexVec<ExpectedIdx, (Option<GenericIdx>, FnParam<'_>)>, &hir::Generics<'_>)>
     {
-        let (sig, generics, body_id, param_names) = match self.tcx.hir_get_if_local(def_id)? {
+        let (sig, generics, body_id, params) = match self.tcx.hir_get_if_local(def_id)? {
             hir::Node::TraitItem(&hir::TraitItem {
                 generics,
                 kind: hir::TraitItemKind::Fn(sig, trait_fn),
@@ -2661,7 +2655,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 None
             }
         });
-        match (body_id, param_names) {
+        match (body_id, params) {
             (Some(_), Some(_)) | (None, None) => unreachable!(),
             (Some(body), None) => {
                 let params = self.tcx.hir_body(body).params;
@@ -2678,7 +2672,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((
-                    fn_inputs.zip(params.iter().map(|&ident| FnParam::Name(ident))).collect(),
+                    fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect(),
                     generics,
                 ))
             }
@@ -2709,14 +2703,14 @@ impl<'tcx> Visitor<'tcx> for FindClosureArg<'tcx> {
 #[derive(Clone, Copy)]
 enum FnParam<'hir> {
     Param(&'hir hir::Param<'hir>),
-    Name(Option<Ident>),
+    Ident(Option<Ident>),
 }
 
 impl FnParam<'_> {
     fn span(&self) -> Span {
         match self {
             Self::Param(param) => param.span,
-            Self::Name(ident) => {
+            Self::Ident(ident) => {
                 if let Some(ident) = ident {
                     ident.span
                 } else {
@@ -2738,7 +2732,7 @@ impl FnParam<'_> {
                     {
                         Some(ident.name)
                     }
-                    FnParam::Name(ident)
+                    FnParam::Ident(ident)
                         if let Some(ident) = ident
                             && ident.name != kw::Underscore =>
                     {

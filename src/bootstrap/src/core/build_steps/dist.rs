@@ -421,13 +421,13 @@ impl Step for Rustc {
                 builder.install(&rustdoc, &image.join("bin"), FileType::Executable);
             }
 
+            let ra_proc_macro_srv_compiler =
+                builder.compiler_for(compiler.stage, builder.config.build, compiler.host);
+            builder.ensure(compile::Rustc::new(ra_proc_macro_srv_compiler, compiler.host));
+
             if let Some(ra_proc_macro_srv) = builder.ensure_if_default(
                 tool::RustAnalyzerProcMacroSrv {
-                    compiler: builder.compiler_for(
-                        compiler.stage,
-                        builder.config.build,
-                        compiler.host,
-                    ),
+                    compiler: ra_proc_macro_srv_compiler,
                     target: compiler.host,
                 },
                 builder.kind,
@@ -612,7 +612,7 @@ impl Step for DebuggerScripts {
 fn skip_host_target_lib(builder: &Builder<'_>, compiler: Compiler) -> bool {
     // The only true set of target libraries came from the build triple, so
     // let's reduce redundant work by only producing archives from that host.
-    if !builder.is_builder_target(compiler.host) {
+    if !builder.config.is_host_target(compiler.host) {
         builder.info("\tskipping, not a build host");
         true
     } else {
@@ -671,7 +671,8 @@ fn copy_target_libs(
                 &self_contained_dst.join(path.file_name().unwrap()),
                 FileType::NativeLibrary,
             );
-        } else if dependency_type == DependencyType::Target || builder.is_builder_target(target) {
+        } else if dependency_type == DependencyType::Target || builder.config.is_host_target(target)
+        {
             builder.copy_link(&path, &dst.join(path.file_name().unwrap()), FileType::NativeLibrary);
         }
     }
@@ -824,7 +825,7 @@ impl Step for Analysis {
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
         let compiler = self.compiler;
         let target = self.target;
-        if !builder.is_builder_target(compiler.host) {
+        if !builder.config.is_host_target(compiler.host) {
             return None;
         }
 
@@ -1177,6 +1178,8 @@ impl Step for Cargo {
         let compiler = self.compiler;
         let target = self.target;
 
+        builder.ensure(compile::Rustc::new(compiler, target));
+
         let cargo = builder.ensure(tool::Cargo { compiler, target });
         let src = builder.src.join("src/tools/cargo");
         let etc = src.join("src/etc");
@@ -1231,6 +1234,8 @@ impl Step for RustAnalyzer {
         let compiler = self.compiler;
         let target = self.target;
 
+        builder.ensure(compile::Rustc::new(compiler, target));
+
         let rust_analyzer = builder.ensure(tool::RustAnalyzer { compiler, target });
 
         let mut tarball = Tarball::new(builder, "rust-analyzer", &target.triple);
@@ -1272,6 +1277,8 @@ impl Step for Clippy {
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
         let compiler = self.compiler;
         let target = self.target;
+
+        builder.ensure(compile::Rustc::new(compiler, target));
 
         // Prepare the image directory
         // We expect clippy to build, because we've exited this step above if tool
@@ -1323,8 +1330,11 @@ impl Step for Miri {
         if !builder.build.unstable_features() {
             return None;
         }
+
         let compiler = self.compiler;
         let target = self.target;
+
+        builder.ensure(compile::Rustc::new(compiler, target));
 
         let miri = builder.ensure(tool::Miri { compiler, target });
         let cargomiri = builder.ensure(tool::CargoMiri { compiler, target });
@@ -1461,6 +1471,8 @@ impl Step for Rustfmt {
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
         let compiler = self.compiler;
         let target = self.target;
+
+        builder.ensure(compile::Rustc::new(compiler, target));
 
         let rustfmt = builder.ensure(tool::Rustfmt { compiler, target });
         let cargofmt = builder.ensure(tool::Cargofmt { compiler, target });
@@ -2118,7 +2130,7 @@ fn maybe_install_llvm(
     //
     // If the LLVM is coming from ourselves (just from CI) though, we
     // still want to install it, as it otherwise won't be available.
-    if builder.is_system_llvm(target) {
+    if builder.config.is_system_llvm(target) {
         trace!("system LLVM requested, no install");
         return false;
     }
@@ -2326,6 +2338,8 @@ impl Step for LlvmBitcodeLinker {
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
         let compiler = self.compiler;
         let target = self.target;
+
+        builder.ensure(compile::Rustc::new(compiler, target));
 
         let llbc_linker =
             builder.ensure(tool::LlvmBitcodeLinker { compiler, target, extra_features: vec![] });

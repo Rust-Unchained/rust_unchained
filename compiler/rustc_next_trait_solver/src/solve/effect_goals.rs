@@ -336,13 +336,6 @@ where
         unreachable!("DiscriminantKind is not const")
     }
 
-    fn consider_builtin_async_destruct_candidate(
-        _ecx: &mut EvalCtxt<'_, D>,
-        _goal: Goal<I, Self>,
-    ) -> Result<Candidate<I>, NoSolution> {
-        unreachable!("AsyncDestruct is not const")
-    }
-
     fn consider_builtin_destruct_candidate(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
@@ -399,12 +392,11 @@ where
         &mut self,
         goal: Goal<I, ty::HostEffectPredicate<I>>,
     ) -> QueryResult<I> {
-        let candidates = self.assemble_and_evaluate_candidates(goal);
         let (_, proven_via) = self.probe(|_| ProbeKind::ShadowedEnvProbing).enter(|ecx| {
             let trait_goal: Goal<I, ty::TraitPredicate<I>> =
                 goal.with(ecx.cx(), goal.predicate.trait_ref);
             ecx.compute_trait_goal(trait_goal)
         })?;
-        self.merge_candidates(proven_via, candidates, |_ecx| Err(NoSolution))
+        self.assemble_and_merge_candidates(proven_via, goal, |_ecx| Err(NoSolution))
     }
 }

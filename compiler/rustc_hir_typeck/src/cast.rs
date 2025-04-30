@@ -501,12 +501,25 @@ impl<'a, 'tcx> CastCheck<'tcx> {
                             .must_apply_modulo_regions()
                         {
                             label = false;
-                            err.span_suggestion(
-                                self.span,
-                                "consider using the `From` trait instead",
-                                format!("{}::from({})", self.cast_ty, snippet),
-                                Applicability::MaybeIncorrect,
-                            );
+                            if let ty::Adt(def, args) = self.cast_ty.kind() {
+                                err.span_suggestion_verbose(
+                                    self.span,
+                                    "consider using the `From` trait instead",
+                                    format!(
+                                        "{}::from({})",
+                                        fcx.tcx.value_path_str_with_args(def.did(), args),
+                                        snippet
+                                    ),
+                                    Applicability::MaybeIncorrect,
+                                );
+                            } else {
+                                err.span_suggestion(
+                                    self.span,
+                                    "consider using the `From` trait instead",
+                                    format!("{}::from({})", self.cast_ty, snippet),
+                                    Applicability::MaybeIncorrect,
+                                );
+                            };
                         }
                     }
 
@@ -1042,30 +1055,31 @@ impl<'a, 'tcx> CastCheck<'tcx> {
         m_cast: ty::TypeAndMut<'tcx>,
     ) -> Result<CastKind, CastError<'tcx>> {
         // array-ptr-cast: allow mut-to-mut, mut-to-const, const-to-const
-        if m_expr.mutbl >= m_cast.mutbl {
-            if let ty::Array(ety, _) = m_expr.ty.kind() {
-                // Due to the limitations of LLVM global constants,
-                // region pointers end up pointing at copies of
-                // vector elements instead of the original values.
-                // To allow raw pointers to work correctly, we
-                // need to special-case obtaining a raw pointer
-                // from a region pointer to a vector.
+        if m_expr.mutbl >= m_cast.mutbl
+            && let ty::Array(ety, _) = m_expr.ty.kind()
+            && fcx.can_eq(fcx.param_env, *ety, m_cast.ty)
+        {
+            // Due to the limitations of LLVM global constants,
+            // region pointers end up pointing at copies of
+            // vector elements instead of the original values.
+            // To allow raw pointers to work correctly, we
+            // need to special-case obtaining a raw pointer
+            // from a region pointer to a vector.
 
-                // Coerce to a raw pointer so that we generate RawPtr in MIR.
-                let array_ptr_type = Ty::new_ptr(fcx.tcx, m_expr.ty, m_expr.mutbl);
-                fcx.coerce(self.expr, self.expr_ty, array_ptr_type, AllowTwoPhase::No, None)
-                    .unwrap_or_else(|_| {
-                        bug!(
+            // Coerce to a raw pointer so that we generate RawPtr in MIR.
+            let array_ptr_type = Ty::new_ptr(fcx.tcx, m_expr.ty, m_expr.mutbl);
+            fcx.coerce(self.expr, self.expr_ty, array_ptr_type, AllowTwoPhase::No, None)
+                .unwrap_or_else(|_| {
+                    bug!(
                         "could not cast from reference to array to pointer to array ({:?} to {:?})",
                         self.expr_ty,
                         array_ptr_type,
                     )
-                    });
+                });
 
-                // this will report a type mismatch if needed
-                fcx.demand_eqtype(self.span, *ety, m_cast.ty);
-                return Ok(CastKind::ArrayPtrCast);
-            }
+            // this will report a type mismatch if needed
+            fcx.demand_eqtype(self.span, *ety, m_cast.ty);
+            return Ok(CastKind::ArrayPtrCast);
         }
 
         Err(CastError::IllegalCast)

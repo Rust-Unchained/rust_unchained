@@ -77,8 +77,8 @@ pub struct TypeckResults<'tcx> {
     /// to a form valid in all Editions, either as a lint diagnostic or hard error.
     rust_2024_migration_desugared_pats: ItemLocalMap<Rust2024IncompatiblePatInfo>,
 
-    /// Stores the types which were implicitly dereferenced in pattern binding modes
-    /// for later usage in THIR lowering. For example,
+    /// Stores the types which were implicitly dereferenced in pattern binding modes or deref
+    /// patterns for later usage in THIR lowering. For example,
     ///
     /// ```
     /// match &&Some(5i32) {
@@ -86,11 +86,20 @@ pub struct TypeckResults<'tcx> {
     ///     _ => {},
     /// }
     /// ```
-    /// leads to a `vec![&&Option<i32>, &Option<i32>]`. Empty vectors are not stored.
+    /// leads to a `vec![&&Option<i32>, &Option<i32>]` and
+    ///
+    /// ```
+    /// #![feature(deref_patterns)]
+    /// match &Box::new(Some(5i32)) {
+    ///     Some(n) => {},
+    ///     _ => {},
+    /// }
+    /// ```
+    /// leads to a `vec![&Box<Option<i32>>, Box<Option<i32>>]`. Empty vectors are not stored.
     ///
     /// See:
     /// <https://github.com/rust-lang/rfcs/blob/master/text/2005-match-ergonomics.md#definitions>
-    pat_adjustments: ItemLocalMap<Vec<Ty<'tcx>>>,
+    pat_adjustments: ItemLocalMap<Vec<ty::adjustment::PatAdjustment<'tcx>>>,
 
     /// Set of reference patterns that match against a match-ergonomics inserted reference
     /// (as opposed to against a reference in the scrutinee type).
@@ -403,11 +412,15 @@ impl<'tcx> TypeckResults<'tcx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_binding_modes }
     }
 
-    pub fn pat_adjustments(&self) -> LocalTableInContext<'_, Vec<Ty<'tcx>>> {
+    pub fn pat_adjustments(
+        &self,
+    ) -> LocalTableInContext<'_, Vec<ty::adjustment::PatAdjustment<'tcx>>> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.pat_adjustments }
     }
 
-    pub fn pat_adjustments_mut(&mut self) -> LocalTableInContextMut<'_, Vec<Ty<'tcx>>> {
+    pub fn pat_adjustments_mut(
+        &mut self,
+    ) -> LocalTableInContextMut<'_, Vec<ty::adjustment::PatAdjustment<'tcx>>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_adjustments }
     }
 
@@ -460,6 +473,21 @@ impl<'tcx> TypeckResults<'tcx> {
             }
         });
         has_ref_mut
+    }
+
+    /// How should a deref pattern find the place for its inner pattern to match on?
+    ///
+    /// In most cases, if the pattern recursively contains a `ref mut` binding, we find the inner
+    /// pattern's scrutinee by calling `DerefMut::deref_mut`, and otherwise we call `Deref::deref`.
+    /// However, for boxes we can use a built-in deref instead, which doesn't borrow the scrutinee;
+    /// in this case, we return `ByRef::No`.
+    pub fn deref_pat_borrow_mode(&self, pointer_ty: Ty<'_>, inner: &hir::Pat<'_>) -> ByRef {
+        if pointer_ty.is_box() {
+            ByRef::No
+        } else {
+            let mutable = self.pat_has_ref_mut_binding(inner);
+            ByRef::Yes(if mutable { Mutability::Mut } else { Mutability::Not })
+        }
     }
 
     /// For a given closure, returns the iterator of `ty::CapturedPlace`s that are captured

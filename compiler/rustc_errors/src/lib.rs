@@ -7,6 +7,7 @@
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
+#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(array_windows)]
@@ -17,7 +18,6 @@
 #![feature(default_field_values)]
 #![feature(error_reporter)]
 #![feature(if_let_guard)]
-#![feature(let_chains)]
 #![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
@@ -47,7 +47,7 @@ pub use codes::*;
 pub use diagnostic::{
     BugAbort, Diag, DiagArg, DiagArgMap, DiagArgName, DiagArgValue, DiagInner, DiagStyledString,
     Diagnostic, EmissionGuarantee, FatalAbort, IntoDiagArg, LintDiagnostic, StringPart, Subdiag,
-    SubdiagMessageOp, Subdiagnostic,
+    Subdiagnostic,
 };
 pub use diagnostic_impls::{
     DiagArgFromDisplay, DiagSymbolList, ElidedLifetimeInPathSubdiag, ExpectedLifetimeParameter,

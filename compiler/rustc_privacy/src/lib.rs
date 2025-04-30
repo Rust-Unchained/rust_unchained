@@ -1,10 +1,9 @@
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(doc, recursion_limit = "256")] // FIXME(nnethercote): will be removed by #124141
+#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(associated_type_defaults)]
-#![feature(let_chains)]
 #![feature(rustdoc_internals)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
@@ -158,7 +157,7 @@ where
                 ty.visit_with(self)
             }
             ty::ClauseKind::ConstEvaluatable(ct) => ct.visit_with(self),
-            ty::ClauseKind::WellFormed(arg) => arg.visit_with(self),
+            ty::ClauseKind::WellFormed(term) => term.visit_with(self),
         }
     }
 
@@ -214,7 +213,7 @@ where
                     }
                 }
             }
-            ty::Alias(kind @ (ty::Inherent | ty::Weak | ty::Projection), data) => {
+            ty::Alias(kind @ (ty::Inherent | ty::Free | ty::Projection), data) => {
                 if self.def_id_visitor.skip_assoc_tys() {
                     // Visitors searching for minimal visibility/reachability want to
                     // conservatively approximate associated types like `Type::Alias`
@@ -228,7 +227,7 @@ where
                     data.def_id,
                     match kind {
                         ty::Inherent | ty::Projection => "associated type",
-                        ty::Weak => "type alias",
+                        ty::Free => "type alias",
                         ty::Opaque => unreachable!(),
                     },
                     &LazyDefPathStr { def_id: data.def_id, tcx },

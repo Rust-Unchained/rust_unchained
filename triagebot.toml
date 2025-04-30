@@ -585,6 +585,11 @@ trigger_files = [
     "src/tools/compiletest"
 ]
 
+[autolabel."A-test-infra-minicore"]
+trigger_files = [
+    "tests/auxiliary/minicore.rs",
+]
+
 [autolabel."A-rustc-dev-guide"]
 trigger_files = [
     "src/doc/rustc-dev-guide",
@@ -659,6 +664,7 @@ message_on_add = [
     """\
 /poll Approve stable backport of #{number}?
 approve
+approve (but does not justify new dot release on its own)
 decline
 don't know
 """,
@@ -866,6 +872,10 @@ cc = ["@GuillaumeGomez"]
 
 [mentions."tests/run-make/"]
 message = "This PR modifies `run-make` tests."
+cc = ["@jieyouxu"]
+
+[mentions."tests/auxiliary/minicore.rs"]
+message = "This PR modifies `tests/auxiliary/minicore.rs`."
 cc = ["@jieyouxu"]
 
 [mentions."src/rustdoc-json-types"]
@@ -1119,6 +1129,11 @@ cc = ["@ZuseZ4"]
 [mentions."compiler/rustc_codegen_llvm/src/llvm/enzyme_ffi.rs"]
 cc = ["@ZuseZ4"]
 
+[mentions."library/core/src/fmt/rt.rs"]
+cc = ["@m-ou-se"]
+[mentions."compiler/rustc_ast_lowering/src/format.rs"]
+cc = ["@m-ou-se"]
+
 [assign]
 warn_non_default_branch.enable = true
 contributing_url = "https://rustc-dev-guide.rust-lang.org/getting-started.html"
@@ -1126,6 +1141,7 @@ users_on_vacation = [
     "fmease",
     "jyn514",
     "Noratrieb",
+    "spastorino",
 ]
 
 [[assign.warn_non_default_branch.exceptions]]

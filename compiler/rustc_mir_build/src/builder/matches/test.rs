@@ -140,12 +140,35 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let success_block = target_block(TestBranch::Success);
                 let fail_block = target_block(TestBranch::Failure);
 
-                let expect_ty = value.ty();
-                let expect = self.literal_operand(test.span, value);
+                let mut expect_ty = value.ty();
+                let mut expect = self.literal_operand(test.span, value);
 
                 let mut place = place;
                 let mut block = block;
                 match ty.kind() {
+                    ty::Str => {
+                        // String literal patterns may have type `str` if `deref_patterns` is
+                        // enabled, in order to allow `deref!("..."): String`. In this case, `value`
+                        // is of type `&str`, so we compare it to `&place`.
+                        if !tcx.features().deref_patterns() {
+                            span_bug!(
+                                test.span,
+                                "matching on `str` went through without enabling deref_patterns"
+                            );
+                        }
+                        let re_erased = tcx.lifetimes.re_erased;
+                        let ref_str_ty = Ty::new_imm_ref(tcx, re_erased, tcx.types.str_);
+                        let ref_place = self.temp(ref_str_ty, test.span);
+                        // `let ref_place: &str = &place;`
+                        self.cfg.push_assign(
+                            block,
+                            self.source_info(test.span),
+                            ref_place,
+                            Rvalue::Ref(re_erased, BorrowKind::Shared, place),
+                        );
+                        place = ref_place;
+                        ty = ref_str_ty;
+                    }
                     ty::Adt(def, _) if tcx.is_lang_item(def.did(), LangItem::String) => {
                         if !tcx.features().string_deref_patterns() {
                             span_bug!(
@@ -173,6 +196,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         block = eq_block;
                         place = ref_str;
                         ty = ref_str_ty;
+                    }
+                    &ty::Pat(base, _) => {
+                        assert_eq!(ty, value.ty());
+                        assert!(base.is_trivially_pure_clone_copy());
+
+                        let transmuted_place = self.temp(base, test.span);
+                        self.cfg.push_assign(
+                            block,
+                            self.source_info(scrutinee_span),
+                            transmuted_place,
+                            Rvalue::Cast(CastKind::Transmute, Operand::Copy(place), base),
+                        );
+
+                        let transmuted_expect = self.temp(base, test.span);
+                        self.cfg.push_assign(
+                            block,
+                            self.source_info(test.span),
+                            transmuted_expect,
+                            Rvalue::Cast(CastKind::Transmute, expect, base),
+                        );
+
+                        place = transmuted_place;
+                        expect = Operand::Copy(transmuted_expect);
+                        ty = base;
+                        expect_ty = base;
                     }
                     _ => {}
                 }
@@ -715,7 +763,7 @@ fn trait_method<'tcx>(
     let item = tcx
         .associated_items(trait_def_id)
         .filter_by_name_unhygienic(method_name)
-        .find(|item| item.kind == ty::AssocKind::Fn)
+        .find(|item| item.is_fn())
         .expect("trait method not found");
 
     let method_ty = Ty::new_fn_def(tcx, item.def_id, args);

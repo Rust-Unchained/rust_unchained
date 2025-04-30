@@ -151,7 +151,6 @@ pub trait Ty<I: Interner<Ty = Self>>:
 
     fn discriminant_ty(self, interner: I) -> I::Ty;
 
-    fn async_destructor_ty(self, interner: I) -> I::Ty;
     fn is_known_rigid(self) -> bool {
         self.kind().is_known_rigid()
     }
@@ -442,6 +441,14 @@ pub trait Predicate<I: Interner<Predicate = Self>>:
 {
     fn as_clause(self) -> Option<I::Clause>;
 
+    fn as_normalizes_to(self) -> Option<ty::Binder<I, ty::NormalizesTo<I>>> {
+        let kind = self.kind();
+        match kind.skip_binder() {
+            ty::PredicateKind::NormalizesTo(pred) => Some(kind.rebind(pred)),
+            _ => None,
+        }
+    }
+
     // FIXME: Eventually uplift the impl out of rustc and make this defaulted.
     fn allow_normalization(self) -> bool;
 }
@@ -583,7 +590,7 @@ pub trait Span<I: Interner>: Copy + Debug + Hash + Eq + TypeFoldable<I> {
 
 pub trait SliceLike: Sized + Copy {
     type Item: Copy;
-    type IntoIter: Iterator<Item = Self::Item>;
+    type IntoIter: Iterator<Item = Self::Item> + DoubleEndedIterator;
 
     fn iter(self) -> Self::IntoIter;
 

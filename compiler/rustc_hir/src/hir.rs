@@ -36,43 +36,110 @@ pub(crate) use crate::hir_id::{HirId, ItemLocalId, ItemLocalMap, OwnerId};
 use crate::intravisit::{FnKind, VisitorExt};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable_Generic)]
-pub enum IsAnonInPath {
-    No,
-    Yes,
+pub enum LifetimeSource {
+    /// E.g. `&Type`, `&'_ Type`, `&'a Type`, `&mut Type`, `&'_ mut Type`, `&'a mut Type`
+    Reference,
+
+    /// E.g. `ContainsLifetime`, `ContainsLifetime<'_>`, `ContainsLifetime<'a>`
+    Path {
+        /// - true for `ContainsLifetime<'_>`, `ContainsLifetime<'a>`,
+        ///   `ContainsLifetime<'_, T>`, `ContainsLifetime<'a, T>`
+        /// - false for `ContainsLifetime`
+        with_angle_brackets: bool,
+    },
+
+    /// E.g. `impl Trait + '_`, `impl Trait + 'a`
+    OutlivesBound,
+
+    /// E.g. `impl Trait + use<'_>`, `impl Trait + use<'a>`
+    PreciseCapturing,
+
+    /// Other usages which have not yet been categorized. Feel free to
+    /// add new sources that you find useful.
+    ///
+    /// Some non-exhaustive examples:
+    /// - `where T: 'a`
+    /// - `fn(_: dyn Trait + 'a)`
+    Other,
 }
 
-/// A lifetime. The valid field combinations are non-obvious. The following
-/// example shows some of them. See also the comments on `LifetimeName`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable_Generic)]
+pub enum LifetimeSyntax {
+    /// E.g. `&Type`, `ContainsLifetime`
+    Hidden,
+
+    /// E.g. `&'_ Type`, `ContainsLifetime<'_>`, `impl Trait + '_`, `impl Trait + use<'_>`
+    Anonymous,
+
+    /// E.g. `&'a Type`, `ContainsLifetime<'a>`, `impl Trait + 'a`, `impl Trait + use<'a>`
+    Named,
+}
+
+impl From<Ident> for LifetimeSyntax {
+    fn from(ident: Ident) -> Self {
+        let name = ident.name;
+
+        if name == kw::Empty {
+            unreachable!("A lifetime name should never be empty");
+        } else if name == kw::UnderscoreLifetime {
+            LifetimeSyntax::Anonymous
+        } else {
+            debug_assert!(name.as_str().starts_with('\''));
+            LifetimeSyntax::Named
+        }
+    }
+}
+
+/// A lifetime. The valid field combinations are non-obvious and not all
+/// combinations are possible. The following example shows some of
+/// them. See also the comments on `LifetimeKind` and `LifetimeSource`.
+///
 /// ```
 /// #[repr(C)]
-/// struct S<'a>(&'a u32);       // res=Param, name='a, IsAnonInPath::No
+/// struct S<'a>(&'a u32);       // res=Param, name='a, source=Reference, syntax=Named
 /// unsafe extern "C" {
-///     fn f1(s: S);             // res=Param, name='_, IsAnonInPath::Yes
-///     fn f2(s: S<'_>);         // res=Param, name='_, IsAnonInPath::No
-///     fn f3<'a>(s: S<'a>);     // res=Param, name='a, IsAnonInPath::No
+///     fn f1(s: S);             // res=Param, name='_, source=Path, syntax=Hidden
+///     fn f2(s: S<'_>);         // res=Param, name='_, source=Path, syntax=Anonymous
+///     fn f3<'a>(s: S<'a>);     // res=Param, name='a, source=Path, syntax=Named
 /// }
 ///
-/// struct St<'a> { x: &'a u32 } // res=Param, name='a, IsAnonInPath::No
+/// struct St<'a> { x: &'a u32 } // res=Param, name='a, source=Reference, syntax=Named
 /// fn f() {
-///     _ = St { x: &0 };        // res=Infer, name='_, IsAnonInPath::Yes
-///     _ = St::<'_> { x: &0 };  // res=Infer, name='_, IsAnonInPath::No
+///     _ = St { x: &0 };        // res=Infer, name='_, source=Path, syntax=Hidden
+///     _ = St::<'_> { x: &0 };  // res=Infer, name='_, source=Path, syntax=Anonymous
 /// }
 ///
-/// struct Name<'a>(&'a str);    // res=Param,  name='a, IsAnonInPath::No
-/// const A: Name = Name("a");   // res=Static, name='_, IsAnonInPath::Yes
-/// const B: &str = "";          // res=Static, name='_, IsAnonInPath::No
-/// static C: &'_ str = "";      // res=Static, name='_, IsAnonInPath::No
-/// static D: &'static str = ""; // res=Static, name='static, IsAnonInPath::No
+/// struct Name<'a>(&'a str);    // res=Param,  name='a, source=Reference, syntax=Named
+/// const A: Name = Name("a");   // res=Static, name='_, source=Path, syntax=Hidden
+/// const B: &str = "";          // res=Static, name='_, source=Reference, syntax=Hidden
+/// static C: &'_ str = "";      // res=Static, name='_, source=Reference, syntax=Anonymous
+/// static D: &'static str = ""; // res=Static, name='static, source=Reference, syntax=Named
 ///
 /// trait Tr {}
-/// fn tr(_: Box<dyn Tr>) {}     // res=ImplicitObjectLifetimeDefault, name='_, IsAnonInPath::No
+/// fn tr(_: Box<dyn Tr>) {}     // res=ImplicitObjectLifetimeDefault, name='_, source=Other, syntax=Hidden
+///
+/// fn capture_outlives<'a>() ->
+///     impl FnOnce() + 'a       // res=Param, ident='a, source=OutlivesBound, syntax=Named
+/// {
+///     || {}
+/// }
+///
+/// fn capture_precise<'a>() ->
+///     impl FnOnce() + use<'a>  // res=Param, ident='a, source=PreciseCapturing, syntax=Named
+/// {
+///     || {}
+/// }
 ///
 /// // (commented out because these cases trigger errors)
-/// // struct S1<'a>(&'a str);   // res=Param, name='a, IsAnonInPath::No
-/// // struct S2(S1);            // res=Error, name='_, IsAnonInPath::Yes
-/// // struct S3(S1<'_>);        // res=Error, name='_, IsAnonInPath::No
-/// // struct S4(S1<'a>);        // res=Error, name='a, IsAnonInPath::No
+/// // struct S1<'a>(&'a str);   // res=Param, name='a, source=Reference, syntax=Named
+/// // struct S2(S1);            // res=Error, name='_, source=Path, syntax=Hidden
+/// // struct S3(S1<'_>);        // res=Error, name='_, source=Path, syntax=Anonymous
+/// // struct S4(S1<'a>);        // res=Error, name='a, source=Path, syntax=Named
 /// ```
+///
+/// Some combinations that cannot occur are `LifetimeSyntax::Hidden` with
+/// `LifetimeSource::OutlivesBound` or `LifetimeSource::PreciseCapturing`
+/// — there's no way to "elide" these lifetimes.
 #[derive(Debug, Copy, Clone, HashStable_Generic)]
 pub struct Lifetime {
     #[stable_hasher(ignore)]
@@ -84,11 +151,15 @@ pub struct Lifetime {
     pub ident: Ident,
 
     /// Semantics of this lifetime.
-    pub res: LifetimeName,
+    pub kind: LifetimeKind,
 
-    /// Is the lifetime anonymous and in a path? Used only for error
-    /// suggestions. See `Lifetime::suggestion` for example use.
-    pub is_anon_in_path: IsAnonInPath,
+    /// The context in which the lifetime occurred. See `Lifetime::suggestion`
+    /// for example use.
+    pub source: LifetimeSource,
+
+    /// The syntax that the user used to declare this lifetime. See
+    /// `Lifetime::suggestion` for example use.
+    pub syntax: LifetimeSyntax,
 }
 
 #[derive(Debug, Copy, Clone, HashStable_Generic)]
@@ -130,7 +201,7 @@ impl ParamName {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable_Generic)]
-pub enum LifetimeName {
+pub enum LifetimeKind {
     /// User-given names or fresh (synthetic) names.
     Param(LocalDefId),
 
@@ -160,16 +231,16 @@ pub enum LifetimeName {
     Static,
 }
 
-impl LifetimeName {
+impl LifetimeKind {
     fn is_elided(&self) -> bool {
         match self {
-            LifetimeName::ImplicitObjectLifetimeDefault | LifetimeName::Infer => true,
+            LifetimeKind::ImplicitObjectLifetimeDefault | LifetimeKind::Infer => true,
 
             // It might seem surprising that `Fresh` counts as not *elided*
             // -- but this is because, as far as the code in the compiler is
             // concerned -- `Fresh` variants act equivalently to "some fresh name".
             // They correspond to early-bound regions on an impl, in other words.
-            LifetimeName::Error | LifetimeName::Param(..) | LifetimeName::Static => false,
+            LifetimeKind::Error | LifetimeKind::Param(..) | LifetimeKind::Static => false,
         }
     }
 }
@@ -184,10 +255,11 @@ impl Lifetime {
     pub fn new(
         hir_id: HirId,
         ident: Ident,
-        res: LifetimeName,
-        is_anon_in_path: IsAnonInPath,
+        kind: LifetimeKind,
+        source: LifetimeSource,
+        syntax: LifetimeSyntax,
     ) -> Lifetime {
-        let lifetime = Lifetime { hir_id, ident, res, is_anon_in_path };
+        let lifetime = Lifetime { hir_id, ident, kind, source, syntax };
 
         // Sanity check: elided lifetimes form a strict subset of anonymous lifetimes.
         #[cfg(debug_assertions)]
@@ -202,30 +274,51 @@ impl Lifetime {
     }
 
     pub fn is_elided(&self) -> bool {
-        self.res.is_elided()
+        self.kind.is_elided()
     }
 
     pub fn is_anonymous(&self) -> bool {
         self.ident.name == kw::UnderscoreLifetime
     }
 
+    pub fn is_syntactically_hidden(&self) -> bool {
+        matches!(self.syntax, LifetimeSyntax::Hidden)
+    }
+
+    pub fn is_syntactically_anonymous(&self) -> bool {
+        matches!(self.syntax, LifetimeSyntax::Anonymous)
+    }
+
+    pub fn is_static(&self) -> bool {
+        self.kind == LifetimeKind::Static
+    }
+
     pub fn suggestion(&self, new_lifetime: &str) -> (Span, String) {
+        use LifetimeSource::*;
+        use LifetimeSyntax::*;
+
         debug_assert!(new_lifetime.starts_with('\''));
 
-        match (self.is_anon_in_path, self.ident.span.is_empty()) {
+        match (self.syntax, self.source) {
+            // The user wrote `'a` or `'_`.
+            (Named | Anonymous, _) => (self.ident.span, format!("{new_lifetime}")),
+
             // The user wrote `Path<T>`, and omitted the `'_,`.
-            (IsAnonInPath::Yes, true) => (self.ident.span, format!("{new_lifetime}, ")),
+            (Hidden, Path { with_angle_brackets: true }) => {
+                (self.ident.span, format!("{new_lifetime}, "))
+            }
 
             // The user wrote `Path` and omitted the `<'_>`.
-            (IsAnonInPath::Yes, false) => {
+            (Hidden, Path { with_angle_brackets: false }) => {
                 (self.ident.span.shrink_to_hi(), format!("<{new_lifetime}>"))
             }
 
             // The user wrote `&type` or `&mut type`.
-            (IsAnonInPath::No, true) => (self.ident.span, format!("{new_lifetime} ")),
+            (Hidden, Reference) => (self.ident.span, format!("{new_lifetime} ")),
 
-            // The user wrote `'a` or `'_`.
-            (IsAnonInPath::No, false) => (self.ident.span, format!("{new_lifetime}")),
+            (Hidden, source) => {
+                unreachable!("can't suggest for a hidden lifetime of {source:?}")
+            }
         }
     }
 }
@@ -1014,7 +1107,7 @@ pub struct WhereRegionPredicate<'hir> {
 impl<'hir> WhereRegionPredicate<'hir> {
     /// Returns `true` if `param_def_id` matches the `lifetime` of this predicate.
     fn is_param_bound(&self, param_def_id: LocalDefId) -> bool {
-        self.lifetime.res == LifetimeName::Param(param_def_id)
+        self.lifetime.kind == LifetimeKind::Param(param_def_id)
     }
 }
 
@@ -1237,7 +1330,7 @@ impl AttributeExt for Attribute {
             Attribute::Parsed(AttributeKind::DocComment { kind, comment, .. }) => {
                 Some((*comment, *kind))
             }
-            Attribute::Unparsed(_) if self.name_or_empty() == sym::doc => {
+            Attribute::Unparsed(_) if self.has_name(sym::doc) => {
                 self.value_str().map(|s| (s, CommentKind::Line))
             }
             _ => None,
@@ -1262,8 +1355,8 @@ impl Attribute {
     }
 
     #[inline]
-    pub fn name_or_empty(&self) -> Symbol {
-        AttributeExt::name_or_empty(self)
+    pub fn name(&self) -> Option<Symbol> {
+        AttributeExt::name(self)
     }
 
     #[inline]
@@ -1299,6 +1392,11 @@ impl Attribute {
     #[inline]
     pub fn has_name(&self, name: Symbol) -> bool {
         AttributeExt::has_name(self, name)
+    }
+
+    #[inline]
+    pub fn has_any_name(&self, names: &[Symbol]) -> bool {
+        AttributeExt::has_any_name(self, names)
     }
 
     #[inline]
@@ -1715,6 +1813,9 @@ pub enum TyPatKind<'hir> {
     /// A range pattern (e.g., `1..=2` or `1..2`).
     Range(&'hir ConstArg<'hir>, &'hir ConstArg<'hir>),
 
+    /// A list of patterns where only one needs to be satisfied
+    Or(&'hir [TyPat<'hir>]),
+
     /// A placeholder for a pattern that wasn't well formed in some way.
     Err(ErrorGuaranteed),
 }
@@ -1756,7 +1857,7 @@ pub enum PatKind<'hir> {
     Never,
 
     /// A tuple pattern (e.g., `(a, b)`).
-    /// If the `..` pattern fragment is present, then `Option<usize>` denotes its position.
+    /// If the `..` pattern fragment is present, then `DotDotPos` denotes its position.
     /// `0 <= position <= subpats.len()`
     Tuple(&'hir [Pat<'hir>], DotDotPos),
 
@@ -3399,9 +3500,9 @@ pub struct BareFnTy<'hir> {
     pub abi: ExternAbi,
     pub generic_params: &'hir [GenericParam<'hir>],
     pub decl: &'hir FnDecl<'hir>,
-    // `Option` because bare fn parameter names are optional. We also end up
+    // `Option` because bare fn parameter identifiers are optional. We also end up
     // with `None` in some error cases, e.g. invalid parameter patterns.
-    pub param_names: &'hir [Option<Ident>],
+    pub param_idents: &'hir [Option<Ident>],
 }
 
 #[derive(Debug, Clone, Copy, HashStable_Generic)]

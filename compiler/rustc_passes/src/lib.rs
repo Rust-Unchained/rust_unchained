@@ -6,10 +6,10 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(doc, recursion_limit = "256")] // FIXME(nnethercote): will be removed by #124141
+#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(let_chains)]
+#![feature(box_patterns)]
 #![feature(map_try_insert)]
 #![feature(rustdoc_internals)]
 #![feature(try_blocks)]

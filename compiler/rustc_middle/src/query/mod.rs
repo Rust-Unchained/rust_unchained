@@ -161,11 +161,11 @@ rustc_queries! {
 
     /// Represents crate as a whole (as distinct from the top-level crate module).
     ///
-    /// If you call `hir_crate` (e.g., indirectly by calling `tcx.hir_crate()`),
-    /// we will have to assume that any change means that you need to be recompiled.
-    /// This is because the `hir_crate` query gives you access to all other items.
-    /// To avoid this fate, do not call `tcx.hir_crate()`; instead,
-    /// prefer wrappers like [`TyCtxt::hir_visit_all_item_likes_in_crate`].
+    /// If you call `tcx.hir_crate(())` we will have to assume that any change
+    /// means that you need to be recompiled. This is because the `hir_crate`
+    /// query gives you access to all other items. To avoid this fate, do not
+    /// call `tcx.hir_crate(())`; instead, prefer wrappers like
+    /// [`TyCtxt::hir_visit_all_item_likes_in_crate`].
     query hir_crate(key: ()) -> &'tcx Crate<'tcx> {
         arena_cache
         eval_always
@@ -197,7 +197,7 @@ rustc_queries! {
 
     /// Gives access to the HIR node's parent for the HIR owner `key`.
     ///
-    /// This can be conveniently accessed by methods on `tcx.hir()`.
+    /// This can be conveniently accessed by `tcx.hir_*` methods.
     /// Avoid calling this query directly.
     query hir_owner_parent(key: hir::OwnerId) -> hir::HirId {
         desc { |tcx| "getting HIR parent of `{}`", tcx.def_path_str(key) }
@@ -205,7 +205,7 @@ rustc_queries! {
 
     /// Gives access to the HIR nodes and bodies inside `key` if it's a HIR owner.
     ///
-    /// This can be conveniently accessed by methods on `tcx.hir()`.
+    /// This can be conveniently accessed by `tcx.hir_*` methods.
     /// Avoid calling this query directly.
     query opt_hir_owner_nodes(key: LocalDefId) -> Option<&'tcx hir::OwnerNodes<'tcx>> {
         desc { |tcx| "getting HIR owner items in `{}`", tcx.def_path_str(key) }
@@ -214,7 +214,7 @@ rustc_queries! {
 
     /// Gives access to the HIR attributes inside the HIR owner `key`.
     ///
-    /// This can be conveniently accessed by methods on `tcx.hir()`.
+    /// This can be conveniently accessed by `tcx.hir_*` methods.
     /// Avoid calling this query directly.
     query hir_attr_map(key: hir::OwnerId) -> &'tcx hir::AttributeMap<'tcx> {
         desc { |tcx| "getting HIR owner attributes in `{}`", tcx.def_path_str(key) }
@@ -289,7 +289,7 @@ rustc_queries! {
 
     /// Returns whether the type alias given by `DefId` is lazy.
     ///
-    /// I.e., if the type alias expands / ought to expand to a [weak] [alias type]
+    /// I.e., if the type alias expands / ought to expand to a [free] [alias type]
     /// instead of the underyling aliased type.
     ///
     /// Relevant for features `lazy_type_alias` and `type_alias_impl_trait`.
@@ -298,7 +298,7 @@ rustc_queries! {
     ///
     /// This query *may* panic if the given definition is not a type alias.
     ///
-    /// [weak]: rustc_middle::ty::Weak
+    /// [free]: rustc_middle::ty::Free
     /// [alias type]: rustc_middle::ty::AliasTy
     query type_alias_is_lazy(key: DefId) -> bool {
         desc { |tcx|
@@ -383,6 +383,15 @@ rustc_queries! {
     ) -> &'tcx ty::List<LocalDefId> {
         desc {
             |tcx| "computing the opaque types defined by `{}`",
+            tcx.def_path_str(key.to_def_id())
+        }
+    }
+
+    query stalled_generators_within(
+        key: LocalDefId
+    ) -> &'tcx ty::List<LocalDefId> {
+        desc {
+            |tcx| "computing the coroutines defined within `{}`",
             tcx.def_path_str(key.to_def_id())
         }
     }
@@ -1350,7 +1359,11 @@ rustc_queries! {
     /// Generates a MIR body for the shim.
     query mir_shims(key: ty::InstanceKind<'tcx>) -> &'tcx mir::Body<'tcx> {
         arena_cache
-        desc { |tcx| "generating MIR shim for `{}`", tcx.def_path_str(key.def_id()) }
+        desc {
+            |tcx| "generating MIR shim for `{}`, instance={:?}",
+            tcx.def_path_str(key.def_id()),
+            key
+        }
     }
 
     /// The `symbol_name` query provides the symbol name for calling a
@@ -1442,8 +1455,8 @@ rustc_queries! {
         desc { |tcx| "computing target features for inline asm of `{}`", tcx.def_path_str(def_id) }
     }
 
-    query fn_arg_names(def_id: DefId) -> &'tcx [Option<rustc_span::Ident>] {
-        desc { |tcx| "looking up function parameter names for `{}`", tcx.def_path_str(def_id) }
+    query fn_arg_idents(def_id: DefId) -> &'tcx [Option<rustc_span::Ident>] {
+        desc { |tcx| "looking up function parameter identifiers for `{}`", tcx.def_path_str(def_id) }
         separate_provide_extern
     }
 
@@ -1581,6 +1594,10 @@ rustc_queries! {
     query is_unpin_raw(env: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>) -> bool {
         desc { "computing whether `{}` is `Unpin`", env.value }
     }
+    /// Query backing `Ty::is_async_drop`.
+    query is_async_drop_raw(env: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>) -> bool {
+        desc { "computing whether `{}` is `AsyncDrop`", env.value }
+    }
     /// Query backing `Ty::needs_drop`.
     query needs_drop_raw(env: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>) -> bool {
         desc { "computing whether `{}` needs drop", env.value }
@@ -1610,6 +1627,14 @@ rustc_queries! {
     /// then `Err(AlwaysRequiresDrop)` is returned.
     query adt_drop_tys(def_id: DefId) -> Result<&'tcx ty::List<Ty<'tcx>>, AlwaysRequiresDrop> {
         desc { |tcx| "computing when `{}` needs drop", tcx.def_path_str(def_id) }
+        cache_on_disk_if { true }
+    }
+
+    /// A list of types where the ADT requires async drop if and only if any of
+    /// those types require async drop. If the ADT is known to always need async drop
+    /// then `Err(AlwaysRequiresDrop)` is returned.
+    query adt_async_drop_tys(def_id: DefId) -> Result<&'tcx ty::List<Ty<'tcx>>, AlwaysRequiresDrop> {
+        desc { |tcx| "computing when `{}` needs async drop", tcx.def_path_str(def_id) }
         cache_on_disk_if { true }
     }
 
@@ -1900,6 +1925,11 @@ rustc_queries! {
 
     // The macro which defines `rustc_metadata::provide_extern` depends on this query's name.
     // Changing the name should cause a compiler error, but in case that changes, be aware.
+    //
+    // The hash should not be calculated before the `analysis` pass is complete, specifically
+    // until `tcx.untracked().definitions.freeze()` has been called, otherwise if incremental
+    // compilation is enabled calculating this hash can freeze this structure too early in
+    // compilation and cause subsequent crashes when attempting to write to `definitions`
     query crate_hash(_: CrateNum) -> Svh {
         eval_always
         desc { "looking up the hash a crate" }
@@ -2266,7 +2296,7 @@ rustc_queries! {
     /// Do not call this query directly: Invoke `normalize` instead.
     ///
     /// </div>
-    query normalize_canonicalized_weak_ty(
+    query normalize_canonicalized_free_alias(
         goal: CanonicalAliasGoal<'tcx>
     ) -> Result<
         &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, NormalizationResult<'tcx>>>,

@@ -120,6 +120,17 @@ impl Path {
         Path { segments: thin_vec![PathSegment::from_ident(ident)], span: ident.span, tokens: None }
     }
 
+    pub fn is_ident(&self, name: Symbol) -> bool {
+        if let [segment] = self.segments.as_ref()
+            && segment.args.is_none()
+            && segment.ident.name == name
+        {
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_global(&self) -> bool {
         self.segments.first().is_some_and(|segment| segment.ident.name == kw::PathRoot)
     }
@@ -1916,7 +1927,7 @@ impl AttrArgs {
 }
 
 /// Delimited arguments, as used in `#[attr()/[]/{}]` or `mac!()/[]/{}`.
-#[derive(Clone, Encodable, Decodable, Debug)]
+#[derive(Clone, Encodable, Decodable, Debug, HashStable_Generic)]
 pub struct DelimArgs {
     pub dspan: DelimSpan,
     pub delim: Delimiter, // Note: `Delimiter::Invisible` never occurs
@@ -1928,18 +1939,6 @@ impl DelimArgs {
     /// when used as a standalone item or statement.
     pub fn need_semicolon(&self) -> bool {
         !matches!(self, DelimArgs { delim: Delimiter::Brace, .. })
-    }
-}
-
-impl<CTX> HashStable<CTX> for DelimArgs
-where
-    CTX: crate::HashStableContext,
-{
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        let DelimArgs { dspan, delim, tokens } = self;
-        dspan.hash_stable(ctx, hasher);
-        delim.hash_stable(ctx, hasher);
-        tokens.hash_stable(ctx, hasher);
     }
 }
 
@@ -2469,6 +2468,8 @@ pub struct TyPat {
 pub enum TyPatKind {
     /// A range pattern (e.g., `1...2`, `1..2`, `1..`, `..2`, `1..=2`, `..=2`).
     Range(Option<P<AnonConst>>, Option<P<AnonConst>>, Spanned<RangeEnd>),
+
+    Or(ThinVec<P<TyPat>>),
 
     /// Placeholder for a pattern that wasn't syntactically well formed in some way.
     Err(ErrorGuaranteed),

@@ -148,6 +148,14 @@ impl<'tcx> MirPatch<'tcx> {
         self.term_patch_map[bb].is_some()
     }
 
+    pub(crate) fn terminator_loc(&self, body: &Body<'tcx>, bb: BasicBlock) -> Location {
+        let offset = match bb.index().checked_sub(body.basic_blocks.len()) {
+            Some(index) => self.new_blocks[index].statements.len(),
+            None => body[bb].statements.len(),
+        };
+        Location { block: bb, statement_index: offset }
+    }
+
     /// Queues the addition of a new temporary with additional local info.
     pub(crate) fn new_local_with_info(
         &mut self,
@@ -181,7 +189,7 @@ impl<'tcx> MirPatch<'tcx> {
 
     /// Queues the addition of a new basic block.
     pub(crate) fn new_block(&mut self, data: BasicBlockData<'tcx>) -> BasicBlock {
-        let block = BasicBlock::new(self.term_patch_map.len());
+        let block = self.term_patch_map.next_index();
         debug!("MirPatch: new_block: {:?}: {:?}", block, data);
         self.new_blocks.push(data);
         self.term_patch_map.push(None);

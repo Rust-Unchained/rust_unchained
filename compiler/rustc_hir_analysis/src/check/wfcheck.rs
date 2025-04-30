@@ -76,12 +76,7 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
         )
     }
 
-    fn register_wf_obligation(
-        &self,
-        span: Span,
-        loc: Option<WellFormedLoc>,
-        arg: ty::GenericArg<'tcx>,
-    ) {
+    fn register_wf_obligation(&self, span: Span, loc: Option<WellFormedLoc>, term: ty::Term<'tcx>) {
         let cause = traits::ObligationCause::new(
             span,
             self.body_def_id,
@@ -91,7 +86,7 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
             self.tcx(),
             cause,
             self.param_env,
-            ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(arg))),
+            ty::ClauseKind::WellFormed(term),
         ));
     }
 }
@@ -408,7 +403,7 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, trait_def_id: LocalDefId) {
             let gat_def_id = gat_item.def_id.expect_local();
             let gat_item = tcx.associated_item(gat_def_id);
             // If this item is not an assoc ty, or has no args, then it's not a GAT
-            if gat_item.kind != ty::AssocKind::Type {
+            if !gat_item.is_type() {
                 continue;
             }
             let gat_generics = tcx.generics_of(gat_def_id);
@@ -432,7 +427,7 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, trait_def_id: LocalDefId) {
 
                 let item_required_bounds = match tcx.associated_item(item_def_id).kind {
                     // In our example, this corresponds to `into_iter` method
-                    ty::AssocKind::Fn => {
+                    ty::AssocKind::Fn { .. } => {
                         // For methods, we check the function signature's return type for any GATs
                         // to constrain. In the `into_iter` case, we see that the return type
                         // `Self::Iter<'a>` is a GAT we want to gather any potential missing bounds from.
@@ -453,7 +448,7 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, trait_def_id: LocalDefId) {
                         )
                     }
                     // In our example, this corresponds to the `Iter` and `Item` associated types
-                    ty::AssocKind::Type => {
+                    ty::AssocKind::Type { .. } => {
                         // If our associated item is a GAT with missing bounds, add them to
                         // the param-env here. This allows this GAT to propagate missing bounds
                         // to other GATs.
@@ -474,7 +469,7 @@ fn check_gat_where_clauses(tcx: TyCtxt<'_>, trait_def_id: LocalDefId) {
                             gat_generics,
                         )
                     }
-                    ty::AssocKind::Const => None,
+                    ty::AssocKind::Const { .. } => None,
                 };
 
                 if let Some(item_required_bounds) = item_required_bounds {
@@ -1076,7 +1071,7 @@ fn check_associated_item(
         };
 
         match item.kind {
-            ty::AssocKind::Const => {
+            ty::AssocKind::Const { .. } => {
                 let ty = tcx.type_of(item.def_id).instantiate_identity();
                 let ty = wfcx.normalize(span, Some(WellFormedLoc::Ty(item_id)), ty);
                 wfcx.register_wf_obligation(span, loc, ty.into());
@@ -1089,7 +1084,7 @@ fn check_associated_item(
                 );
                 Ok(())
             }
-            ty::AssocKind::Fn => {
+            ty::AssocKind::Fn { .. } => {
                 let sig = tcx.fn_sig(item.def_id).instantiate_identity();
                 let hir_sig = sig_if_method.expect("bad signature for method");
                 check_fn_or_method(
@@ -1101,7 +1096,7 @@ fn check_associated_item(
                 );
                 check_method_receiver(wfcx, hir_sig, item, self_ty)
             }
-            ty::AssocKind::Type => {
+            ty::AssocKind::Type { .. } => {
                 if let ty::AssocItemContainer::Trait = item.container {
                     check_associated_type_bounds(wfcx, item, span)
                 }
@@ -1486,8 +1481,41 @@ fn check_where_clauses<'tcx>(wfcx: &WfCheckingCtxt<'_, 'tcx>, span: Span, def_id
                     tcx.def_span(param.def_id),
                     matches!(param.kind, GenericParamDefKind::Type { .. })
                         .then(|| WellFormedLoc::Ty(param.def_id.expect_local())),
-                    default,
+                    default.as_term().unwrap(),
                 );
+            } else {
+                // If we've got a generic const parameter we still want to check its
+                // type is correct in case both it and the param type are fully concrete.
+                let GenericArgKind::Const(ct) = default.unpack() else {
+                    continue;
+                };
+
+                let ct_ty = match ct.kind() {
+                    ty::ConstKind::Infer(_)
+                    | ty::ConstKind::Placeholder(_)
+                    | ty::ConstKind::Bound(_, _) => unreachable!(),
+                    ty::ConstKind::Error(_) | ty::ConstKind::Expr(_) => continue,
+                    ty::ConstKind::Value(cv) => cv.ty,
+                    ty::ConstKind::Unevaluated(uv) => {
+                        infcx.tcx.type_of(uv.def).instantiate(infcx.tcx, uv.args)
+                    }
+                    ty::ConstKind::Param(param_ct) => param_ct.find_ty_from_env(wfcx.param_env),
+                };
+
+                let param_ty = tcx.type_of(param.def_id).instantiate_identity();
+                if !ct_ty.has_param() && !param_ty.has_param() {
+                    let cause = traits::ObligationCause::new(
+                        tcx.def_span(param.def_id),
+                        wfcx.body_def_id,
+                        ObligationCauseCode::WellFormed(None),
+                    );
+                    wfcx.register_obligation(Obligation::new(
+                        tcx,
+                        cause,
+                        wfcx.param_env,
+                        ty::ClauseKind::ConstArgHasType(ct, param_ty),
+                    ));
+                }
             }
         }
     }
@@ -1716,7 +1744,7 @@ fn check_method_receiver<'tcx>(
 ) -> Result<(), ErrorGuaranteed> {
     let tcx = wfcx.tcx();
 
-    if !method.fn_has_self_parameter {
+    if !method.is_method() {
         return Ok(());
     }
 
@@ -1991,7 +2019,7 @@ fn check_variances_for_type_defn<'tcx>(
         ItemKind::TyAlias(..) => {
             assert!(
                 tcx.type_alias_is_lazy(item.owner_id),
-                "should not be computing variance of non-weak type alias"
+                "should not be computing variance of non-free type alias"
             );
         }
         kind => span_bug!(item.span, "cannot compute the variances of {kind:?}"),
@@ -2223,7 +2251,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsProbablyCyclical<'tcx> {
     fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<(), ()> {
         let def_id = match ty.kind() {
             ty::Adt(adt_def, _) => Some(adt_def.did()),
-            ty::Alias(ty::Weak, alias_ty) => Some(alias_ty.def_id),
+            ty::Alias(ty::Free, alias_ty) => Some(alias_ty.def_id),
             _ => None,
         };
         if let Some(def_id) = def_id {

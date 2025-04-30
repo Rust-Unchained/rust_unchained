@@ -140,6 +140,9 @@ impl f16 {
     pub const RADIX: u32 = 2;
 
     /// Number of significant digits in base 2.
+    ///
+    /// Note that the size of the mantissa in the bitwise representation is one
+    /// smaller than this since the leading 1 is not stored explicitly.
     #[unstable(feature = "f16", issue = "116909")]
     pub const MANTISSA_DIGITS: u32 = 11;
 
@@ -189,16 +192,22 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     pub const MAX: f16 = 6.5504e+4_f16;
 
-    /// One greater than the minimum possible normal power of 2 exponent.
+    /// One greater than the minimum possible *normal* power of 2 exponent
+    /// for a significand bounded by 1 ≤ x < 2 (i.e. the IEEE definition).
     ///
-    /// If <i>x</i>&nbsp;=&nbsp;`MIN_EXP`, then normal numbers
-    /// ≥&nbsp;0.5&nbsp;×&nbsp;2<sup><i>x</i></sup>.
+    /// This corresponds to the exact minimum possible *normal* power of 2 exponent
+    /// for a significand bounded by 0.5 ≤ x < 1 (i.e. the C definition).
+    /// In other words, all normal numbers representable by this type are
+    /// greater than or equal to 0.5&nbsp;×&nbsp;2<sup><i>MIN_EXP</i></sup>.
     #[unstable(feature = "f16", issue = "116909")]
     pub const MIN_EXP: i32 = -13;
-    /// Maximum possible power of 2 exponent.
+    /// One greater than the maximum possible power of 2 exponent
+    /// for a significand bounded by 1 ≤ x < 2 (i.e. the IEEE definition).
     ///
-    /// If <i>x</i>&nbsp;=&nbsp;`MAX_EXP`, then normal numbers
-    /// &lt;&nbsp;1&nbsp;×&nbsp;2<sup><i>x</i></sup>.
+    /// This corresponds to the exact maximum possible power of 2 exponent
+    /// for a significand bounded by 0.5 ≤ x < 1 (i.e. the C definition).
+    /// In other words, all numbers representable by this type are
+    /// strictly less than 2<sup><i>MAX_EXP</i></sup>.
     #[unstable(feature = "f16", issue = "116909")]
     pub const MAX_EXP: i32 = 16;
 
@@ -219,14 +228,16 @@ impl f16 {
 
     /// Not a Number (NaN).
     ///
-    /// Note that IEEE 754 doesn't define just a single NaN value;
-    /// a plethora of bit patterns are considered to be NaN.
-    /// Furthermore, the standard makes a difference
-    /// between a "signaling" and a "quiet" NaN,
-    /// and allows inspecting its "payload" (the unspecified bits in the bit pattern).
-    /// This constant isn't guaranteed to equal to any specific NaN bitpattern,
-    /// and the stability of its representation over Rust versions
-    /// and target platforms isn't guaranteed.
+    /// Note that IEEE 754 doesn't define just a single NaN value; a plethora of bit patterns are
+    /// considered to be NaN. Furthermore, the standard makes a difference between a "signaling" and
+    /// a "quiet" NaN, and allows inspecting its "payload" (the unspecified bits in the bit pattern)
+    /// and its sign. See the [specification of NaN bit patterns](f32#nan-bit-patterns) for more
+    /// info.
+    ///
+    /// This constant is guaranteed to be a quiet NaN (on targets that follow the Rust assumptions
+    /// that the quiet/signaling bit being set to 1 indicates a quiet NaN). Beyond that, nothing is
+    /// guaranteed about the specific bit pattern chosen here: both payload and sign are arbitrary.
+    /// The concrete bit pattern may change across Rust versions and target platforms.
     #[allow(clippy::eq_op)]
     #[rustc_diagnostic_item = "f16_nan"]
     #[unstable(feature = "f16", issue = "116909")]
@@ -787,7 +798,7 @@ impl f16 {
         }
     }
 
-    /// Calculates the middle point of `self` and `rhs`.
+    /// Calculates the midpoint (average) between `self` and `rhs`.
     ///
     /// This returns NaN when *either* argument is NaN or if a combination of
     /// +inf and -inf is provided as arguments.
@@ -803,6 +814,7 @@ impl f16 {
     /// # }
     /// ```
     #[inline]
+    #[doc(alias = "average")]
     #[unstable(feature = "f16", issue = "116909")]
     #[rustc_const_unstable(feature = "f16", issue = "116909")]
     pub const fn midpoint(self, other: f16) -> f16 {
@@ -886,6 +898,7 @@ impl f16 {
     #[inline]
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "this returns the result of the operation, without modifying the original"]
+    #[cfg_attr(not(bootstrap), allow(unnecessary_transmutes))]
     pub const fn to_bits(self) -> u16 {
         // SAFETY: `u16` is a plain old datatype so we can always transmute to it.
         unsafe { mem::transmute(self) }
@@ -932,6 +945,7 @@ impl f16 {
     #[inline]
     #[must_use]
     #[unstable(feature = "f16", issue = "116909")]
+    #[cfg_attr(not(bootstrap), allow(unnecessary_transmutes))]
     pub const fn from_bits(v: u16) -> Self {
         // It turns out the safety issues with sNaN were overblown! Hooray!
         // SAFETY: `u16` is a plain old datatype so we can always transmute from it.
@@ -1344,8 +1358,9 @@ impl f16 {
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[unstable(feature = "float_algebraic", issue = "136469")]
+    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
     #[inline]
-    pub fn algebraic_add(self, rhs: f16) -> f16 {
+    pub const fn algebraic_add(self, rhs: f16) -> f16 {
         intrinsics::fadd_algebraic(self, rhs)
     }
 
@@ -1354,8 +1369,9 @@ impl f16 {
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[unstable(feature = "float_algebraic", issue = "136469")]
+    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
     #[inline]
-    pub fn algebraic_sub(self, rhs: f16) -> f16 {
+    pub const fn algebraic_sub(self, rhs: f16) -> f16 {
         intrinsics::fsub_algebraic(self, rhs)
     }
 
@@ -1364,8 +1380,9 @@ impl f16 {
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[unstable(feature = "float_algebraic", issue = "136469")]
+    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
     #[inline]
-    pub fn algebraic_mul(self, rhs: f16) -> f16 {
+    pub const fn algebraic_mul(self, rhs: f16) -> f16 {
         intrinsics::fmul_algebraic(self, rhs)
     }
 
@@ -1374,8 +1391,9 @@ impl f16 {
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[unstable(feature = "float_algebraic", issue = "136469")]
+    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
     #[inline]
-    pub fn algebraic_div(self, rhs: f16) -> f16 {
+    pub const fn algebraic_div(self, rhs: f16) -> f16 {
         intrinsics::fdiv_algebraic(self, rhs)
     }
 
@@ -1384,8 +1402,9 @@ impl f16 {
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[unstable(feature = "float_algebraic", issue = "136469")]
+    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
     #[inline]
-    pub fn algebraic_rem(self, rhs: f16) -> f16 {
+    pub const fn algebraic_rem(self, rhs: f16) -> f16 {
         intrinsics::frem_algebraic(self, rhs)
     }
 }

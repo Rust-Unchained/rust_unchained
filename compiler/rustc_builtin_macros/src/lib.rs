@@ -5,7 +5,7 @@
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(doc, recursion_limit = "256")] // FIXME(nnethercote): will be removed by #124141
+#![cfg_attr(bootstrap, feature(let_chains))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(assert_matches)]
@@ -13,12 +13,12 @@
 #![feature(box_patterns)]
 #![feature(decl_macro)]
 #![feature(if_let_guard)]
-#![feature(let_chains)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
 #![feature(rustdoc_internals)]
 #![feature(string_from_utf8_lossy_owned)]
 #![feature(try_blocks)]
+#![recursion_limit = "256"]
 // tidy-alphabetical-end
 
 extern crate proc_macro;

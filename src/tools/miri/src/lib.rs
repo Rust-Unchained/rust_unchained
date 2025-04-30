@@ -1,6 +1,5 @@
 #![feature(rustc_private)]
 #![feature(cfg_match)]
-#![feature(cell_update)]
 #![feature(float_gamma)]
 #![feature(float_erf)]
 #![feature(map_try_insert)]
@@ -169,7 +168,7 @@ pub const MIRI_DEFAULT_ARGS: &[&str] = &[
     "-Zalways-encode-mir",
     "-Zextra-const-ub-checks",
     "-Zmir-emit-retag",
-    "-Zmir-keep-place-mention",
+    "-Zmir-preserve-ub",
     "-Zmir-opt-level=0",
     "-Zmir-enable-passes=-CheckAlignment,-CheckNull",
     // Deduplicating diagnostics means we miss events when tracking what happens during an

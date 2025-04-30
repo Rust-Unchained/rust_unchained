@@ -38,14 +38,25 @@ pub(crate) fn add_configuration(
     codegen_backend: &dyn CodegenBackend,
 ) {
     let tf = sym::target_feature;
+    let tf_cfg = codegen_backend.target_config(sess);
 
-    let (target_features, unstable_target_features) = codegen_backend.target_features_cfg(sess);
+    sess.unstable_target_features.extend(tf_cfg.unstable_target_features.iter().copied());
+    sess.target_features.extend(tf_cfg.target_features.iter().copied());
 
-    sess.unstable_target_features.extend(unstable_target_features.iter().copied());
+    cfg.extend(tf_cfg.target_features.into_iter().map(|feat| (tf, Some(feat))));
 
-    sess.target_features.extend(target_features.iter().copied());
-
-    cfg.extend(target_features.into_iter().map(|feat| (tf, Some(feat))));
+    if tf_cfg.has_reliable_f16 {
+        cfg.insert((sym::target_has_reliable_f16, None));
+    }
+    if tf_cfg.has_reliable_f16_math {
+        cfg.insert((sym::target_has_reliable_f16_math, None));
+    }
+    if tf_cfg.has_reliable_f128 {
+        cfg.insert((sym::target_has_reliable_f128, None));
+    }
+    if tf_cfg.has_reliable_f128_math {
+        cfg.insert((sym::target_has_reliable_f128_math, None));
+    }
 
     if sess.crt_static(None) {
         cfg.insert((tf, Some(sym::crt_dash_static)));
@@ -117,6 +128,7 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     thread_stack_size: usize,
     edition: Edition,
     sm_inputs: SourceMapInputs,
+    extra_symbols: &[&'static str],
     f: F,
 ) -> R {
     // The "thread pool" is a single spawned thread in the non-parallel
@@ -134,9 +146,12 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
         // name contains null bytes.
         let r = builder
             .spawn_scoped(s, move || {
-                rustc_span::create_session_globals_then(edition, Some(sm_inputs), || {
-                    f(CurrentGcx::new())
-                })
+                rustc_span::create_session_globals_then(
+                    edition,
+                    extra_symbols,
+                    Some(sm_inputs),
+                    || f(CurrentGcx::new()),
+                )
             })
             .unwrap()
             .join();
@@ -152,6 +167,7 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
     thread_builder_diag: &EarlyDiagCtxt,
     edition: Edition,
     threads: usize,
+    extra_symbols: &[&'static str],
     sm_inputs: SourceMapInputs,
     f: F,
 ) -> R {
@@ -168,18 +184,24 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
     let registry = sync::Registry::new(std::num::NonZero::new(threads).unwrap());
 
     if !sync::is_dyn_thread_safe() {
-        return run_in_thread_with_globals(thread_stack_size, edition, sm_inputs, |current_gcx| {
-            // Register the thread for use with the `WorkerLocal` type.
-            registry.register();
+        return run_in_thread_with_globals(
+            thread_stack_size,
+            edition,
+            sm_inputs,
+            extra_symbols,
+            |current_gcx| {
+                // Register the thread for use with the `WorkerLocal` type.
+                registry.register();
 
-            f(current_gcx)
-        });
+                f(current_gcx)
+            },
+        );
     }
 
     let current_gcx = FromDyn::from(CurrentGcx::new());
     let current_gcx2 = current_gcx.clone();
 
-    let builder = rayon::ThreadPoolBuilder::new()
+    let builder = rayon_core::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
         .acquire_thread_handler(jobserver::acquire_thread)
         .release_thread_handler(jobserver::release_thread)
@@ -230,13 +252,13 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
     // pool. Upon creation, each worker thread created gets a copy of the
     // session globals in TLS. This is possible because `SessionGlobals` impls
     // `Send` in the parallel compiler.
-    rustc_span::create_session_globals_then(edition, Some(sm_inputs), || {
+    rustc_span::create_session_globals_then(edition, extra_symbols, Some(sm_inputs), || {
         rustc_span::with_session_globals(|session_globals| {
             let session_globals = FromDyn::from(session_globals);
             builder
                 .build_scoped(
                     // Initialize each new worker thread when created.
-                    move |thread: rayon::ThreadBuilder| {
+                    move |thread: rayon_core::ThreadBuilder| {
                         // Register the thread for use with the `WorkerLocal` type.
                         registry.register();
 
@@ -245,7 +267,9 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
                         })
                     },
                     // Run `f` on the first thread in the thread pool.
-                    move |pool: &rayon::ThreadPool| pool.install(|| f(current_gcx.into_inner())),
+                    move |pool: &rayon_core::ThreadPool| {
+                        pool.install(|| f(current_gcx.into_inner()))
+                    },
                 )
                 .unwrap()
         })

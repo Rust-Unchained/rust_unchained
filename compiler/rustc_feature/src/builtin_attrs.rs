@@ -6,6 +6,7 @@ use AttributeDuplicates::*;
 use AttributeGate::*;
 use AttributeType::*;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_span::edition::Edition;
 use rustc_span::{Symbol, sym};
 
 use crate::{Features, Stability};
@@ -39,6 +40,26 @@ const GATED_CFGS: &[GatedCfg] = &[
     // this is consistent with naming of the compiler flag it's for
     (sym::fmt_debug, sym::fmt_debug, Features::fmt_debug),
     (sym::emscripten_wasm_eh, sym::cfg_emscripten_wasm_eh, Features::cfg_emscripten_wasm_eh),
+    (
+        sym::target_has_reliable_f16,
+        sym::cfg_target_has_reliable_f16_f128,
+        Features::cfg_target_has_reliable_f16_f128,
+    ),
+    (
+        sym::target_has_reliable_f16_math,
+        sym::cfg_target_has_reliable_f16_f128,
+        Features::cfg_target_has_reliable_f16_f128,
+    ),
+    (
+        sym::target_has_reliable_f128,
+        sym::cfg_target_has_reliable_f16_f128,
+        Features::cfg_target_has_reliable_f16_f128,
+    ),
+    (
+        sym::target_has_reliable_f128_math,
+        sym::cfg_target_has_reliable_f16_f128,
+        Features::cfg_target_has_reliable_f16_f128,
+    ),
 ];
 
 /// Find a gated cfg determined by the `pred`icate which is given the cfg's name.
@@ -65,9 +86,12 @@ pub enum AttributeSafety {
     /// Normal attribute that does not need `#[unsafe(...)]`
     Normal,
 
-    /// Unsafe attribute that requires safety obligations
-    /// to be discharged
-    Unsafe,
+    /// Unsafe attribute that requires safety obligations to be discharged.
+    ///
+    /// An error is emitted when `#[unsafe(...)]` is omitted, except when the attribute's edition
+    /// is less than the one stored in `unsafe_since`. This handles attributes that were safe in
+    /// earlier editions, but become unsafe in later ones.
+    Unsafe { unsafe_since: Option<Edition> },
 }
 
 #[derive(Clone, Copy)]
@@ -187,12 +211,23 @@ macro_rules! template {
 }
 
 macro_rules! ungated {
+    (unsafe($edition:ident) $attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr $(,)?) => {
+        BuiltinAttribute {
+            name: sym::$attr,
+            encode_cross_crate: $encode_cross_crate,
+            type_: $typ,
+            safety: AttributeSafety::Unsafe { unsafe_since: Some(Edition::$edition) },
+            template: $tpl,
+            gate: Ungated,
+            duplicates: $duplicates,
+        }
+    };
     (unsafe $attr:ident, $typ:expr, $tpl:expr, $duplicates:expr, $encode_cross_crate:expr $(,)?) => {
         BuiltinAttribute {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
-            safety: AttributeSafety::Unsafe,
+            safety: AttributeSafety::Unsafe { unsafe_since: None },
             template: $tpl,
             gate: Ungated,
             duplicates: $duplicates,
@@ -217,7 +252,7 @@ macro_rules! gated {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
-            safety: AttributeSafety::Unsafe,
+            safety: AttributeSafety::Unsafe { unsafe_since: None },
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::$gate, $msg, Features::$gate),
@@ -228,7 +263,7 @@ macro_rules! gated {
             name: sym::$attr,
             encode_cross_crate: $encode_cross_crate,
             type_: $typ,
-            safety: AttributeSafety::Unsafe,
+            safety: AttributeSafety::Unsafe { unsafe_since: None },
             template: $tpl,
             duplicates: $duplicates,
             gate: Gated(Stability::Unstable, sym::$attr, $msg, Features::$attr),
@@ -423,11 +458,12 @@ pub static BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
     ungated!(no_link, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(repr, Normal, template!(List: "C"), DuplicatesOk, EncodeCrossCrate::No),
-    ungated!(unsafe export_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
-    ungated!(unsafe link_section, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
-    ungated!(unsafe no_mangle, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
+    ungated!(unsafe(Edition2024) export_name, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
+    ungated!(unsafe(Edition2024) link_section, Normal, template!(NameValueStr: "name"), FutureWarnPreceding, EncodeCrossCrate::No),
+    ungated!(unsafe(Edition2024) no_mangle, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
     ungated!(used, Normal, template!(Word, List: "compiler|linker"), WarnFollowing, EncodeCrossCrate::No),
     ungated!(link_ordinal, Normal, template!(List: "ordinal"), ErrorPreceding, EncodeCrossCrate::Yes),
+    ungated!(unsafe naked, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No),
 
     // Limits:
     ungated!(
@@ -499,12 +535,6 @@ pub static BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
     // Unstable attributes:
     // ==========================================================================
-
-    // Linking:
-    gated!(
-        naked, Normal, template!(Word), WarnFollowing, EncodeCrossCrate::No,
-        naked_functions, experimental!(naked)
-    ),
 
     // Testing:
     gated!(
@@ -661,14 +691,6 @@ pub static BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "`rustc_never_type_options` is used to experiment with never type fallback and work on \
          never type stabilization, and will never be stable"
     ),
-    rustc_attr!(
-        rustc_macro_edition_2021,
-        Normal,
-        template!(Word),
-        ErrorFollowing,
-        EncodeCrossCrate::No,
-        "makes spans in this macro edition 2021"
-    ),
 
     // ==========================================================================
     // Internal attributes: Runtime related:
@@ -752,7 +774,7 @@ pub static BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
     rustc_attr!(
         rustc_macro_transparency, Normal,
-        template!(NameValueStr: "transparent|semitransparent|opaque"), ErrorFollowing,
+        template!(NameValueStr: "transparent|semiopaque|opaque"), ErrorFollowing,
         EncodeCrossCrate::Yes, "used internally for testing macro hygiene",
     ),
     rustc_attr!(
@@ -915,6 +937,10 @@ pub static BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         rustc_never_returns_null_ptr, Normal, template!(Word), ErrorFollowing,
         EncodeCrossCrate::Yes,
         "#[rustc_never_returns_null_ptr] is used to mark functions returning non-null pointers."
+    ),
+    rustc_attr!(
+        rustc_no_implicit_autorefs, AttributeType::Normal, template!(Word), ErrorFollowing, EncodeCrossCrate::Yes,
+        "`#[rustc_no_implicit_autorefs]` is used to mark functions for which an autoref to the dereference of a raw pointer should not be used as an argument."
     ),
     rustc_attr!(
         rustc_coherence_is_core, AttributeType::CrateLevel, template!(Word), ErrorFollowing, EncodeCrossCrate::No,

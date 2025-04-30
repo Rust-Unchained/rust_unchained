@@ -24,10 +24,10 @@ use super::{
 };
 use crate::error_reporting::InferCtxtErrorExt;
 use crate::infer::{InferCtxt, TyOrConstInferVar};
-use crate::traits::EvaluateConstErr;
 use crate::traits::normalize::normalize_with_depth_to;
 use crate::traits::project::{PolyProjectionObligation, ProjectionCacheKeyExt as _};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
+use crate::traits::{EvaluateConstErr, sizedness_fast_path};
 
 pub(crate) type PendingPredicateObligations<'tcx> = ThinVec<PendingPredicateObligation<'tcx>>;
 
@@ -162,7 +162,7 @@ where
         self.select(selcx)
     }
 
-    fn drain_unstalled_obligations(
+    fn drain_stalled_obligations_for_coroutines(
         &mut self,
         infcx: &InferCtxt<'tcx>,
     ) -> PredicateObligations<'tcx> {
@@ -334,6 +334,10 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
         let obligation = &pending_obligation.obligation;
 
         let infcx = self.selcx.infcx;
+
+        if sizedness_fast_path(infcx.tcx, obligation.predicate) {
+            return ProcessResult::Changed(thin_vec::thin_vec![]);
+        }
 
         if obligation.predicate.has_aliases() {
             let mut obligations = PredicateObligations::new();
@@ -536,18 +540,18 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     self.selcx.infcx.err_ctxt().report_overflow_obligation(&obligation, false);
                 }
 
-                ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(arg)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
                     match wf::obligations(
                         self.selcx.infcx,
                         obligation.param_env,
                         obligation.cause.body_id,
                         obligation.recursion_depth + 1,
-                        arg,
+                        term,
                         obligation.cause.span,
                     ) {
                         None => {
                             pending_obligation.stalled_on =
-                                vec![TyOrConstInferVar::maybe_from_generic_arg(arg).unwrap()];
+                                vec![TyOrConstInferVar::maybe_from_term(term).unwrap()];
                             ProcessResult::Unchanged
                         }
                         Some(os) => ProcessResult::Changed(mk_pending(obligation, os)),

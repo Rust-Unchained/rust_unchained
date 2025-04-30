@@ -77,7 +77,15 @@ impl<'tcx> At<'_, 'tcx> {
                 .into_value_registering_obligations(self.infcx, &mut *fulfill_cx);
             let errors = fulfill_cx.select_all_or_error(self.infcx);
             let value = self.infcx.resolve_vars_if_possible(value);
-            if errors.is_empty() { Ok(value) } else { Err(errors) }
+            if errors.is_empty() {
+                Ok(value)
+            } else {
+                // Drop pending obligations, since deep normalization may happen
+                // in a loop and we don't want to trigger the assertion on the next
+                // iteration due to pending ambiguous obligations we've left over.
+                let _ = fulfill_cx.collect_remaining_errors(self.infcx);
+                Err(errors)
+            }
         }
     }
 }
@@ -325,7 +333,7 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
                 );
                 normalized_ty
             }
-            ty::Weak => {
+            ty::Free => {
                 let recursion_limit = self.cx().recursion_limit();
                 if !recursion_limit.value_within_limit(self.depth) {
                     self.selcx.infcx.err_ctxt().report_overflow_error(

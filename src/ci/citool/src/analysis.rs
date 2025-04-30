@@ -8,9 +8,9 @@ use build_helper::metrics::{
 };
 
 use crate::github::JobInfoResolver;
-use crate::metrics;
 use crate::metrics::{JobMetrics, JobName, get_test_suites};
 use crate::utils::{output_details, pluralize};
+use crate::{metrics, utils};
 
 /// Outputs durations of individual bootstrap steps from the gathered bootstrap invocations,
 /// and also a table with summarized information about executed tests.
@@ -394,16 +394,15 @@ fn aggregate_tests(metrics: &JsonRoot) -> TestSuiteData {
             // Poor man's detection of doctests based on the "(line XYZ)" suffix
             let is_doctest = matches!(suite.metadata, TestSuiteMetadata::CargoPackage { .. })
                 && test.name.contains("(line");
-            let test_entry = Test { name: generate_test_name(&test.name), stage, is_doctest };
+            let test_entry = Test {
+                name: utils::normalize_path_delimiters(&test.name).to_string(),
+                stage,
+                is_doctest,
+            };
             tests.insert(test_entry, test.outcome.clone());
         }
     }
     TestSuiteData { tests }
-}
-
-/// Normalizes Windows-style path delimiters to Unix-style paths.
-fn generate_test_name(name: &str) -> String {
-    name.replace('\\', "/")
 }
 
 /// Prints test changes in Markdown format to stdout.
@@ -520,23 +519,27 @@ fn report_test_diffs(
             }
 
             if doctest_count > 0 {
+                let prefix =
+                    if doctest_count < original_diff_count { "Additionally, " } else { "" };
                 println!(
-                    "\nAdditionally, {doctest_count} doctest {} were found. These are ignored, as they are noisy.",
+                    "\n{prefix}{doctest_count} doctest {} were found. These are ignored, as they are noisy.",
                     pluralize("diff", doctest_count)
                 );
             }
 
             // Now print the job group index
-            println!("\n**Job group index**\n");
-            for (group, jobs) in job_index.into_iter().enumerate() {
-                println!(
-                    "- {}: {}",
-                    format_job_group(group as u64),
-                    jobs.iter()
-                        .map(|j| format_job_link(job_info_resolver, job_metrics, j))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+            if !job_index.is_empty() {
+                println!("\n**Job group index**\n");
+                for (group, jobs) in job_index.into_iter().enumerate() {
+                    println!(
+                        "- {}: {}",
+                        format_job_group(group as u64),
+                        jobs.iter()
+                            .map(|j| format_job_link(job_info_resolver, job_metrics, j))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
         },
     );
