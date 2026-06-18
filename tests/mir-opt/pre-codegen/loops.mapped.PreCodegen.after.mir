@@ -19,10 +19,10 @@ fn mapped(_1: impl Iterator<Item = T>, _2: impl Fn(T) -> U) -> () {
             debug self => _5;
             let mut _6: &mut impl Iterator<Item = T>;
             let mut _7: std::option::Option<T>;
-            let mut _8: &mut impl Fn(T) -> U;
             scope 5 (inlined Option::<T>::map::<U, &mut impl Fn(T) -> U>) {
                 debug self => _7;
                 debug f => _8;
+                let mut _8: &mut impl Fn(T) -> U;
                 let mut _9: isize;
                 let _10: T;
                 let mut _11: (T,);

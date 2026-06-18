@@ -12,7 +12,7 @@ fn slice_get_unchecked_mut_range(_1: &mut [u32], _2: std::ops::Range<usize>) -> 
         scope 2 (inlined <std::ops::Range<usize> as SliceIndex<[u32]>>::get_unchecked_mut) {
             let mut _6: usize;
             let _7: ();
-            let _8: usize;
+            let mut _8: usize;
             scope 3 {
                 scope 6 (inlined core::slice::index::get_offset_len_mut_noubcheck::<u32>) {
                     let _10: *mut u32;

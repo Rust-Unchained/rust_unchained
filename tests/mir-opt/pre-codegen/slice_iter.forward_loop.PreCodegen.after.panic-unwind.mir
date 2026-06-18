@@ -4,6 +4,7 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
     debug slice => _1;
     debug f => _2;
     let mut _0: ();
+    let mut _10: *const T;
     let mut _11: std::ptr::NonNull<T>;
     let mut _12: *const T;
     let mut _26: std::option::Option<&T>;
@@ -23,12 +24,12 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
             let _15: std::ptr::NonNull<T>;
             let mut _18: bool;
             let mut _21: std::ptr::NonNull<T>;
+            let mut _22: usize;
             let mut _23: usize;
             let _25: &T;
             scope 17 {
                 let _14: *const T;
                 scope 18 {
-                    let _22: usize;
                     scope 19 {
                         scope 22 (inlined core::num::<impl usize>::unchecked_sub) {
                             scope 23 (inlined core::ub_checks::check_language_ub) {
@@ -70,14 +71,13 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
     }
     scope 3 (inlined core::slice::<impl [T]>::iter) {
         scope 4 (inlined std::slice::Iter::<'_, T>::new) {
-            let _3: usize;
+            let mut _3: usize;
+            let mut _6: std::ptr::NonNull<T>;
             let mut _7: *mut T;
             let mut _8: *mut T;
-            let mut _10: *const T;
+            let mut _9: *const T;
             scope 5 {
-                let _6: std::ptr::NonNull<T>;
                 scope 6 {
-                    let _9: *const T;
                     scope 7 {
                     }
                     scope 11 (inlined std::ptr::without_provenance::<T>) {
@@ -105,6 +105,7 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
 
     bb0: {
         StorageLive(_3);
+        StorageLive(_9);
         StorageLive(_4);
         _3 = PtrMetadata(copy _1);
         _4 = &raw const (*_1);
@@ -112,7 +113,6 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
         _5 = copy _4 as *const T (PtrToPtr);
         _6 = NonNull::<T> { pointer: move _5 };
         StorageDead(_5);
-        StorageLive(_9);
         switchInt(const <T as std::mem::SizedTypeProperties>::IS_ZST) -> [0: bb1, otherwise: bb2];
     }
 
@@ -133,9 +133,9 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
     }
 
     bb3: {
-        _10 = copy _9;
-        StorageDead(_9);
+        _10 = move _9;
         StorageDead(_4);
+        StorageDead(_9);
         StorageDead(_3);
         StorageLive(_11);
         StorageLive(_12);
@@ -148,8 +148,8 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
         StorageLive(_26);
         StorageLive(_13);
         StorageLive(_14);
-        StorageLive(_22);
         StorageLive(_23);
+        StorageLive(_22);
         StorageLive(_15);
         StorageLive(_25);
         _13 = copy _11;
@@ -189,8 +189,8 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
         StorageDead(_18);
         StorageDead(_25);
         StorageDead(_15);
-        StorageDead(_23);
         StorageDead(_22);
+        StorageDead(_23);
         StorageDead(_14);
         StorageDead(_13);
         goto -> bb10;
@@ -198,14 +198,14 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
 
     bb8: {
         _22 = copy _14 as usize (Transmute);
-        switchInt(copy _22) -> [0: bb9, otherwise: bb12];
+        switchInt(move _22) -> [0: bb9, otherwise: bb12];
     }
 
     bb9: {
         StorageDead(_25);
         StorageDead(_15);
-        StorageDead(_23);
         StorageDead(_22);
+        StorageDead(_23);
         StorageDead(_14);
         StorageDead(_13);
         goto -> bb10;
@@ -236,8 +236,8 @@ fn forward_loop(_1: &[T], _2: impl Fn(&T)) -> () {
         _26 = Option::<&T>::Some(copy _25);
         StorageDead(_25);
         StorageDead(_15);
-        StorageDead(_23);
         StorageDead(_22);
+        StorageDead(_23);
         StorageDead(_14);
         StorageDead(_13);
         _27 = copy ((_26 as Some).0: &T);
