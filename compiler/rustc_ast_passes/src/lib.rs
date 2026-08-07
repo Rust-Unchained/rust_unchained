@@ -3,17 +3,12 @@
 //! by `rustc_ast_lowering`.
 
 // tidy-alphabetical-start
-#![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(let_chains))]
-#![doc(rust_logo)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
+#![feature(iter_intersperse)]
 #![feature(iter_is_partitioned)]
-#![feature(rustdoc_internals)]
+#![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
 pub mod ast_validation;
-mod errors;
+mod diagnostics;
 pub mod feature_gate;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

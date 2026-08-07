@@ -1,5 +1,5 @@
 use ide_db::{
-    assists::{AssistId, AssistKind},
+    assists::AssistId,
     defs::Definition,
     search::{FileReference, SearchScope},
     syntax_helpers::suggest_name,
@@ -7,13 +7,14 @@ use ide_db::{
 };
 use itertools::Itertools;
 use syntax::{
-    ast::{self, make, AstNode, FieldExpr, HasName, IdentPat},
-    ted,
+    T,
+    ast::{self, AstNode, FieldExpr, HasName, IdentPat, syntax_factory::SyntaxFactory},
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 use crate::{
     assist_context::{AssistContext, Assists, SourceChangeBuilder},
-    utils::ref_field_expr::determine_ref_and_parens,
+    utils::{cover_edit_range, ref_field_expr::determine_ref_and_parens},
 };
 
 // Assist: destructure_tuple_binding
@@ -33,7 +34,10 @@ use crate::{
 //     let v = _0;
 // }
 // ```
-pub(crate) fn destructure_tuple_binding(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn destructure_tuple_binding(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     destructure_tuple_binding_impl(acc, ctx, false)
 }
 
@@ -57,7 +61,7 @@ pub(crate) fn destructure_tuple_binding(acc: &mut Assists, ctx: &AssistContext<'
 // ```
 pub(crate) fn destructure_tuple_binding_impl(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     with_sub_pattern: bool,
 ) -> Option<()> {
     let ident_pat = ctx.find_node_at_offset::<ast::IdentPat>()?;
@@ -65,7 +69,7 @@ pub(crate) fn destructure_tuple_binding_impl(
 
     if with_sub_pattern {
         acc.add(
-            AssistId("destructure_tuple_binding_in_sub_pattern", AssistKind::RefactorRewrite),
+            AssistId::refactor_rewrite("destructure_tuple_binding_in_sub_pattern"),
             "Destructure tuple in sub-pattern",
             data.ident_pat.syntax().text_range(),
             |edit| destructure_tuple_edit_impl(ctx, edit, &data, true),
@@ -73,7 +77,7 @@ pub(crate) fn destructure_tuple_binding_impl(
     }
 
     acc.add(
-        AssistId("destructure_tuple_binding", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("destructure_tuple_binding"),
         if with_sub_pattern { "Destructure tuple in place" } else { "Destructure tuple" },
         data.ident_pat.syntax().text_range(),
         |edit| destructure_tuple_edit_impl(ctx, edit, &data, false),
@@ -83,21 +87,25 @@ pub(crate) fn destructure_tuple_binding_impl(
 }
 
 fn destructure_tuple_edit_impl(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     edit: &mut SourceChangeBuilder,
     data: &TupleData,
     in_sub_pattern: bool,
 ) {
-    let assignment_edit = edit_tuple_assignment(ctx, edit, data, in_sub_pattern);
-    let current_file_usages_edit = edit_tuple_usages(data, edit, ctx, in_sub_pattern);
+    let editor = edit.make_editor(data.ident_pat.syntax());
+    let make = editor.make();
 
-    assignment_edit.apply();
+    let assignment_edit = edit_tuple_assignment(ctx, edit, &editor, data, in_sub_pattern);
+    let current_file_usages_edit = edit_tuple_usages(data, ctx, make, in_sub_pattern);
+
+    assignment_edit.apply(&editor);
     if let Some(usages_edit) = current_file_usages_edit {
-        usages_edit.into_iter().for_each(|usage_edit| usage_edit.apply(edit))
+        usages_edit.into_iter().for_each(|usage_edit| usage_edit.apply(ctx, edit, &editor))
     }
+    edit.add_file_edits(ctx.vfs_file_id(), editor);
 }
 
-fn collect_data(ident_pat: IdentPat, ctx: &AssistContext<'_>) -> Option<TupleData> {
+fn collect_data(ident_pat: IdentPat, ctx: &AssistContext<'_, '_>) -> Option<TupleData> {
     if ident_pat.at_token().is_some() {
         // Cannot destructure pattern with sub-pattern:
         // Only IdentPat can have sub-pattern,
@@ -142,7 +150,7 @@ fn collect_data(ident_pat: IdentPat, ctx: &AssistContext<'_>) -> Option<TupleDat
         .map(|(id, ty)| {
             match name_generator.for_type(&ty, ctx.db(), ctx.edition()) {
                 Some(name) => name,
-                None => name_generator.suggest_name(&format!("_{}", id)),
+                None => name_generator.suggest_name(&format!("_{id}")),
             }
             .to_string()
         })
@@ -156,19 +164,20 @@ enum RefType {
     Mutable,
 }
 struct TupleData {
+    // FIXME: After removing ted, it may be possible to reuse destructure_struct_binding::Target
     ident_pat: IdentPat,
     ref_type: Option<RefType>,
     field_names: Vec<String>,
     usages: Option<Vec<FileReference>>,
 }
 fn edit_tuple_assignment(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     edit: &mut SourceChangeBuilder,
+    editor: &SyntaxEditor,
     data: &TupleData,
     in_sub_pattern: bool,
 ) -> AssignmentEdit {
-    let ident_pat = edit.make_mut(data.ident_pat.clone());
-
+    let make = editor.make();
     let tuple_pat = {
         let original = &data.ident_pat;
         let is_ref = original.ref_token().is_some();
@@ -176,43 +185,61 @@ fn edit_tuple_assignment(
         let fields = data
             .field_names
             .iter()
-            .map(|name| ast::Pat::from(make::ident_pat(is_ref, is_mut, make::name(name))));
-        make::tuple_pat(fields).clone_for_update()
+            .map(|name| ast::Pat::from(make.ident_pat(is_ref, is_mut, make.name(name))));
+        make.tuple_pat(fields)
     };
+    let is_shorthand_field = data
+        .ident_pat
+        .name()
+        .as_ref()
+        .and_then(ast::RecordPatField::for_field_name)
+        .is_some_and(|field| field.colon_token().is_none());
 
     if let Some(cap) = ctx.config.snippet_cap {
         // place cursor on first tuple name
         if let Some(ast::Pat::IdentPat(first_pat)) = tuple_pat.fields().next() {
-            edit.add_tabstop_before(
-                cap,
-                first_pat.name().expect("first ident pattern should have a name"),
-            )
+            let annotation = edit.make_tabstop_before(cap);
+            editor.add_annotation(
+                first_pat.name().expect("first ident pattern should have a name").syntax(),
+                annotation,
+            );
         }
     }
 
-    AssignmentEdit { ident_pat, tuple_pat, in_sub_pattern }
+    AssignmentEdit {
+        ident_pat: data.ident_pat.clone(),
+        tuple_pat,
+        in_sub_pattern,
+        is_shorthand_field,
+    }
 }
 struct AssignmentEdit {
     ident_pat: ast::IdentPat,
     tuple_pat: ast::TuplePat,
     in_sub_pattern: bool,
+    is_shorthand_field: bool,
 }
 
 impl AssignmentEdit {
-    fn apply(self) {
+    fn apply(self, editor: &SyntaxEditor) {
+        let make = editor.make();
         // with sub_pattern: keep original tuple and add subpattern: `tup @ (_0, _1)`
         if self.in_sub_pattern {
-            self.ident_pat.set_pat(Some(self.tuple_pat.into()))
+            self.ident_pat.set_pat(Some(self.tuple_pat.into()), editor);
+        } else if self.is_shorthand_field {
+            editor.insert(Position::after(self.ident_pat.syntax()), self.tuple_pat.syntax());
+            editor.insert(Position::after(self.ident_pat.syntax()), make.whitespace(" "));
+            editor.insert(Position::after(self.ident_pat.syntax()), make.token(T![:]));
         } else {
-            ted::replace(self.ident_pat.syntax(), self.tuple_pat.syntax())
+            editor.replace(self.ident_pat.syntax(), self.tuple_pat.syntax())
         }
     }
 }
 
 fn edit_tuple_usages(
     data: &TupleData,
-    edit: &mut SourceChangeBuilder,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
+    make: &SyntaxFactory,
     in_sub_pattern: bool,
 ) -> Option<Vec<EditTupleUsage>> {
     // We need to collect edits first before actually applying them
@@ -228,20 +255,20 @@ fn edit_tuple_usages(
         .as_ref()?
         .as_slice()
         .iter()
-        .filter_map(|r| edit_tuple_usage(ctx, edit, r, data, in_sub_pattern))
+        .filter_map(|r| edit_tuple_usage(ctx, make, r, data, in_sub_pattern))
         .collect_vec();
 
     Some(edits)
 }
 fn edit_tuple_usage(
-    ctx: &AssistContext<'_>,
-    builder: &mut SourceChangeBuilder,
+    ctx: &AssistContext<'_, '_>,
+    make: &SyntaxFactory,
     usage: &FileReference,
     data: &TupleData,
     in_sub_pattern: bool,
 ) -> Option<EditTupleUsage> {
     match detect_tuple_index(usage, data) {
-        Some(index) => Some(edit_tuple_field_usage(ctx, builder, data, index)),
+        Some(index) => Some(edit_tuple_field_usage(ctx, make, data, index)),
         None if in_sub_pattern => {
             cov_mark::hit!(destructure_tuple_call_with_subpattern);
             None
@@ -251,21 +278,19 @@ fn edit_tuple_usage(
 }
 
 fn edit_tuple_field_usage(
-    ctx: &AssistContext<'_>,
-    builder: &mut SourceChangeBuilder,
+    ctx: &AssistContext<'_, '_>,
+    make: &SyntaxFactory,
     data: &TupleData,
     index: TupleIndex,
 ) -> EditTupleUsage {
     let field_name = &data.field_names[index.index];
-    let field_name = make::expr_path(make::ext::ident_path(field_name));
+    let field_name = make.expr_path(make.ident_path(field_name));
 
     if data.ref_type.is_some() {
         let (replace_expr, ref_data) = determine_ref_and_parens(ctx, &index.field_expr);
-        let replace_expr = builder.make_mut(replace_expr);
-        EditTupleUsage::ReplaceExpr(replace_expr, ref_data.wrap_expr(field_name))
+        EditTupleUsage::ReplaceExpr(replace_expr, ref_data.wrap_expr_with_factory(field_name, make))
     } else {
-        let field_expr = builder.make_mut(index.field_expr);
-        EditTupleUsage::ReplaceExpr(field_expr.into(), field_name)
+        EditTupleUsage::ReplaceExpr(index.field_expr.into(), field_name)
     }
 }
 enum EditTupleUsage {
@@ -281,14 +306,25 @@ enum EditTupleUsage {
 }
 
 impl EditTupleUsage {
-    fn apply(self, edit: &mut SourceChangeBuilder) {
+    fn apply(
+        self,
+        ctx: &AssistContext<'_, '_>,
+        edit: &mut SourceChangeBuilder,
+        syntax_editor: &SyntaxEditor,
+    ) {
         match self {
             EditTupleUsage::NoIndex(range) => {
                 edit.insert(range.start(), "/*");
                 edit.insert(range.end(), "*/");
             }
             EditTupleUsage::ReplaceExpr(target_expr, replace_with) => {
-                ted::replace(target_expr.syntax(), replace_with.clone_for_update().syntax())
+                if let Some(range) = ctx.sema.original_range_opt(target_expr.syntax()) {
+                    let source = ctx.source_file().syntax();
+                    syntax_editor.replace_all(
+                        cover_edit_range(source, range.range),
+                        vec![replace_with.syntax().clone().into()],
+                    );
+                }
             }
         }
     }
@@ -319,24 +355,6 @@ fn detect_tuple_index(usage: &FileReference, data: &TupleData) -> Option<TupleIn
     if let Some(field_expr) = ast::FieldExpr::cast(node) {
         let idx = field_expr.name_ref()?.as_tuple_field()?;
         if idx < data.field_names.len() {
-            // special case: in macro call -> range of `field_expr` in applied macro, NOT range in actual file!
-            if field_expr.syntax().ancestors().any(|a| ast::MacroStmts::can_cast(a.kind())) {
-                cov_mark::hit!(destructure_tuple_macro_call);
-
-                // issue: cannot differentiate between tuple index passed into macro or tuple index as result of macro:
-                // ```rust
-                // macro_rules! m {
-                //     ($t1:expr, $t2:expr) => { $t1; $t2.0 }
-                // }
-                // let t = (1,2);
-                // m!(t.0, t)
-                // ```
-                // -> 2 tuple index usages detected!
-                //
-                // -> only handle `t`
-                return None;
-            }
-
             Some(TupleIndex { index: idx, field_expr })
         } else {
             // tuple index out of range
@@ -356,7 +374,7 @@ mod tests {
     // Tests for direct tuple destructure:
     // `let $0t = (1,2);` -> `let (_0, _1) = (1,2);`
 
-    fn assist(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+    fn assist(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
         destructure_tuple_binding_impl(acc, ctx, false)
     }
 
@@ -800,6 +818,48 @@ fn main() {
     }
 
     #[test]
+    fn in_record_shorthand_field() {
+        check_assist(
+            assist,
+            r#"
+struct S { field: (i32, i32) }
+fn main() {
+    let S { $0field } = S { field: (2, 3) };
+    let v = field.0 + field.1;
+}
+            "#,
+            r#"
+struct S { field: (i32, i32) }
+fn main() {
+    let S { field: ($0_0, _1) } = S { field: (2, 3) };
+    let v = _0 + _1;
+}
+            "#,
+        )
+    }
+
+    #[test]
+    fn in_record_field() {
+        check_assist(
+            assist,
+            r#"
+struct S { field: (i32, i32) }
+fn main() {
+    let S { field: $0t } = S { field: (2, 3) };
+    let v = t.0 + t.1;
+}
+            "#,
+            r#"
+struct S { field: (i32, i32) }
+fn main() {
+    let S { field: ($0_0, _1) } = S { field: (2, 3) };
+    let v = _0 + _1;
+}
+            "#,
+        )
+    }
+
+    #[test]
     fn in_nested_tuple() {
         check_assist(
             assist,
@@ -840,6 +900,7 @@ fn main() {
         check_assist(
             assist,
             r#"
+//- minicore: fn
 fn main() {
     let f = |$0t| t.0 + t.1;
     let v = f((1,2));
@@ -1044,6 +1105,7 @@ fn main() {
         check_assist(
             assist,
             r#"
+//- minicore: fn
 fn main() {
     let $0t = (1,2);
     let v = t.1;
@@ -1121,10 +1183,10 @@ fn main {
         use super::*;
         use crate::tests::check_assist_by_label;
 
-        fn assist(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+        fn assist(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
             destructure_tuple_binding_impl(acc, ctx, true)
         }
-        fn in_place_assist(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+        fn in_place_assist(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
             destructure_tuple_binding_impl(acc, ctx, false)
         }
 
@@ -1174,15 +1236,11 @@ fn main {
         fn destructure_in_sub_pattern() {
             check_sub_pattern_assist(
                 r#"
-#![feature(bindings_after_at)]
-
 fn main() {
     let $0t = (1,2);
 }
                 "#,
                 r#"
-#![feature(bindings_after_at)]
-
 fn main() {
     let t @ ($0_0, _1) = (1,2);
 }
@@ -1192,7 +1250,7 @@ fn main() {
 
         #[test]
         fn trigger_both_destructure_tuple_assists() {
-            fn assist(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+            fn assist(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
                 destructure_tuple_binding_impl(acc, ctx, true)
             }
             let text = r#"
@@ -1365,7 +1423,6 @@ fn main() {
 
         #[test]
         fn detect_macro_call() {
-            cov_mark::check!(destructure_tuple_macro_call);
             check_in_place_assist(
                 r#"
 macro_rules! m {
@@ -1384,7 +1441,7 @@ macro_rules! m {
 
 fn main() {
     let ($0_0, _1) = (1,2);
-    m!(/*t*/.0);
+    m!(_0);
 }
                 "#,
             )
@@ -1476,7 +1533,6 @@ fn main() {
     m!(t.0);
 }
                 "#,
-                // FIXME: replace `t.0` with `_0` (cannot detect range of tuple index in macro call)
                 r#"
 macro_rules! m {
     ($e:expr) => { "foo"; $e };
@@ -1484,10 +1540,9 @@ macro_rules! m {
 
 fn main() {
     let ($0_0, _1) = (1,2);
-    m!(/*t*/.0);
+    m!(_0);
 }
                 "#,
-                // FIXME: replace `t.0` with `_0`
                 r#"
 macro_rules! m {
     ($e:expr) => { "foo"; $e };
@@ -1495,7 +1550,7 @@ macro_rules! m {
 
 fn main() {
     let t @ ($0_0, _1) = (1,2);
-    m!(t.0);
+    m!(_0);
 }
                 "#,
             )
@@ -1514,7 +1569,6 @@ fn main() {
     m!((t).0);
 }
                 "#,
-                // FIXME: replace `(t).0` with `_0`
                 r#"
 macro_rules! m {
     ($e:expr) => { "foo"; $e };
@@ -1522,10 +1576,9 @@ macro_rules! m {
 
 fn main() {
     let ($0_0, _1) = (1,2);
-    m!((/*t*/).0);
+    m!(_0);
 }
                 "#,
-                // FIXME: replace `(t).0` with `_0`
                 r#"
 macro_rules! m {
     ($e:expr) => { "foo"; $e };
@@ -1533,7 +1586,7 @@ macro_rules! m {
 
 fn main() {
     let t @ ($0_0, _1) = (1,2);
-    m!((t).0);
+    m!(_0);
 }
                 "#,
             )
@@ -1581,7 +1634,6 @@ fn main() {
     m!(t, t.0);
 }
                 "#,
-                // FIXME: replace `t.0` in macro call (not IN macro) with `_0`
                 r#"
 macro_rules! m {
     ($t:expr, $i:expr) => { $t.0 + $i };
@@ -1589,10 +1641,9 @@ macro_rules! m {
 
 fn main() {
     let ($0_0, _1) = (1,2);
-    m!(/*t*/, /*t*/.0);
+    m!(t, _0);
 }
                 "#,
-                // FIXME: replace `t.0` in macro call with `_0`
                 r#"
 macro_rules! m {
     ($t:expr, $i:expr) => { $t.0 + $i };
@@ -1600,9 +1651,37 @@ macro_rules! m {
 
 fn main() {
     let t @ ($0_0, _1) = (1,2);
-    m!(t, t.0);
+    m!(t, _0);
 }
                 "#,
+            )
+        }
+    }
+
+    mod in_macro_expr {
+        use super::assist::*;
+
+        // exact repro from #20716: tuple index inside write! must not panic
+        #[test]
+        fn tuple_index_in_write_macro() {
+            check_in_place_assist(
+                r#"
+//- minicore: write, fmt
+use core::fmt::Write;
+fn main() {
+    let mut s = String::new();
+    let $0x = (2i32, 3i32);
+    write!(s, "{}", x.0).unwrap();
+}
+"#,
+                r#"
+use core::fmt::Write;
+fn main() {
+    let mut s = String::new();
+    let ($0_0, _1) = (2i32, 3i32);
+    write!(s, "{}", _0).unwrap();
+}
+"#,
             )
         }
     }
@@ -1707,7 +1786,7 @@ fn main() {
             // * `?`
             check_in_place_assist(
                 r#"
-//- minicore: option
+//- minicore: try, option
 fn f1(v: i32) {}
 fn f2(v: &i32) {}
 trait T {

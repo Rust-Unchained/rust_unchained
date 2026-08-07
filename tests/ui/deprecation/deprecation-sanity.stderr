@@ -1,74 +1,111 @@
-error[E0541]: unknown meta item 'reason'
-  --> $DIR/deprecation-sanity.rs:4:43
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:6:7
    |
 LL |     #[deprecated(since = "a", note = "a", reason)]
-   |                                           ^^^^^^ expected one of `since`, `note`
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------^
+   |                                           |
+   |                                           valid arguments are `since` or `note`
 
-error[E0539]: expected a quoted string literal
-  --> $DIR/deprecation-sanity.rs:7:31
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:9:7
    |
 LL |     #[deprecated(since = "a", note)]
-   |                               ^^^^
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^----^
+   |                               |
+   |                               expected this to be of the form `note = "..."`
 
-error[E0539]: expected a quoted string literal
-  --> $DIR/deprecation-sanity.rs:10:18
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:12:7
    |
 LL |     #[deprecated(since, note = "a")]
-   |                  ^^^^^
+   |       ^^^^^^^^^^^-----^^^^^^^^^^^^^
+   |                  |
+   |                  expected this to be of the form `since = "..."`
 
-error[E0539]: expected a quoted string literal
-  --> $DIR/deprecation-sanity.rs:13:31
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:15:7
    |
 LL |     #[deprecated(since = "a", note(b))]
-   |                               ^^^^^^^
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^-------^
+   |                               |
+   |                               expected this to be of the form `note = "..."`
 
-error[E0539]: expected a quoted string literal
-  --> $DIR/deprecation-sanity.rs:16:18
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:18:7
    |
 LL |     #[deprecated(since(b), note = "a")]
-   |                  ^^^^^^^^
+   |       ^^^^^^^^^^^--------^^^^^^^^^^^^^
+   |                  |
+   |                  expected this to be of the form `since = "..."`
 
-error[E0565]: literal in `deprecated` value must be a string
-  --> $DIR/deprecation-sanity.rs:19:25
+error[E0539]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:21:7
    |
 LL |     #[deprecated(note = b"test")]
-   |                         -^^^^^^
+   |       ^^^^^^^^^^^^^^^^^^-^^^^^^^
    |                         |
    |                         help: consider removing the prefix
+   |
+   = note: expected a normal string literal, not a byte string literal
 
-error[E0565]: item in `deprecated` must be a key/value pair
-  --> $DIR/deprecation-sanity.rs:22:18
+error[E0565]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:24:7
    |
 LL |     #[deprecated("test")]
-   |                  ^^^^^^
+   |       ^^^^^^^^^^^------^
+   |                  |
+   |                  didn't expect a literal here
+   |
+help: try using `=` instead
+   |
+LL -     #[deprecated("test")]
+LL +     #[deprecated = "test"]
+   |
+
+error[E0565]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:27:7
+   |
+LL |     #[deprecated("1.2.3")]
+   |       ^^^^^^^^^^^-------^
+   |                  |
+   |                  didn't expect a literal here
+   |
+help: try specifying a deprecated since version
+   |
+LL |     #[deprecated(since = "1.2.3")]
+   |                  +++++++
 
 error: multiple `deprecated` attributes
-  --> $DIR/deprecation-sanity.rs:27:1
+  --> $DIR/deprecation-sanity.rs:32:1
    |
 LL | #[deprecated(since = "a", note = "b")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
    |
 note: attribute also specified here
-  --> $DIR/deprecation-sanity.rs:26:1
+  --> $DIR/deprecation-sanity.rs:31:1
    |
 LL | #[deprecated(since = "a", note = "b")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0538]: multiple 'since' items
-  --> $DIR/deprecation-sanity.rs:30:27
+error[E0538]: malformed `deprecated` attribute input
+  --> $DIR/deprecation-sanity.rs:35:3
    |
 LL | #[deprecated(since = "a", since = "b", note = "c")]
-   |                           ^^^^^^^^^^^
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^-----------^^^^^^^^^^^^^
+   |                           |
+   |                           found `since` used as a key more than once
 
-error: this `#[deprecated]` annotation has no effect
-  --> $DIR/deprecation-sanity.rs:35:1
+error: the `deprecated` attribute cannot be used on trait impl blocks
+  --> $DIR/deprecation-sanity.rs:40:3
    |
 LL | #[deprecated = "hello"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^ help: remove the unnecessary deprecation attribute
+   |   ^^^^^^^^^^
    |
+   = help: the `deprecated` attribute can be applied to associated consts, associated types, constants, crates, data types, enum variants, foreign statics, functions, inherent impl blocks, macro defs, modules, statics, struct fields, traits, type aliases, and use statements
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
    = note: `#[deny(useless_deprecated)]` on by default
 
-error: aborting due to 10 previous errors
+error: aborting due to 11 previous errors
 
-Some errors have detailed explanations: E0538, E0539, E0541, E0565.
+Some errors have detailed explanations: E0538, E0539, E0565.
 For more information about an error, try `rustc --explain E0538`.

@@ -1,10 +1,9 @@
 //@aux-build:proc_macros.rs
-#![allow(
+#![allow(clippy::map_identity)]
+#![expect(
     clippy::clone_on_copy,
-    clippy::map_identity,
-    clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_filter_map,
-    unused
+    clippy::unnecessary_lazy_evaluations
 )]
 #![warn(clippy::filter_map_bool_then)]
 
@@ -87,5 +86,26 @@ fn issue11503() {
     }
     let bools: &[&&DerefToBool] = &[&&DerefToBool];
     let _: Vec<usize> = bools.iter().enumerate().filter_map(|(i, b)| b.then(|| i)).collect();
+    //~^ filter_map_bool_then
+}
+
+fn issue15047() {
+    #[derive(Clone, Copy)]
+    enum MyEnum {
+        A,
+        B,
+        C,
+    }
+
+    macro_rules! foo {
+        ($e:expr) => {
+            $e + 1
+        };
+    }
+
+    let x = 1;
+    let _ = [(MyEnum::A, "foo", 1i32)]
+        .iter()
+        .filter_map(|(t, s, i)| matches!(t, MyEnum::A if s.starts_with("bar")).then(|| foo!(x)));
     //~^ filter_map_bool_then
 }

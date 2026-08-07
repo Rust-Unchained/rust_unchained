@@ -3,27 +3,26 @@ name: CI
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
   schedule:
     # Run multiple times a day as the successfull cached links are not checked every time.
-    - cron: '0 */8 * * *'
+    - cron: "0 */8 * * *"
 
 jobs:
   ci:
     if: github.repository == 'rust-lang/rustc-dev-guide'
     runs-on: ubuntu-latest
     env:
-      MDBOOK_VERSION: 0.4.21
-      MDBOOK_LINKCHECK2_VERSION: 0.9.1
-      MDBOOK_MERMAID_VERSION: 0.12.6
-      MDBOOK_TOC_VERSION: 0.11.2
+      MDBOOK_VERSION: 0.5.2
+      MDBOOK_LINKCHECK2_VERSION: 0.11.0
+      MDBOOK_MERMAID_VERSION: 0.17.0
       MDBOOK_OUTPUT__LINKCHECK__FOLLOW_WEB_LINKS: ${{ github.event_name != 'pull_request' }}
       DEPLOY_DIR: book/html
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # linkcheck needs the base commit.
           fetch-depth: 0
@@ -34,7 +33,7 @@ jobs:
         with:
           path: |
             ~/.cargo/bin
-          key: ${{ runner.os }}-${{ env.MDBOOK_VERSION }}--${{ env.MDBOOK_LINKCHECK2_VERSION }}--${{ env.MDBOOK_TOC_VERSION }}--${{ env.MDBOOK_MERMAID_VERSION }}
+          key: ${{ runner.os }}-${{ env.MDBOOK_VERSION }}--${{ env.MDBOOK_LINKCHECK2_VERSION }}--${{ env.MDBOOK_MERMAID_VERSION }}
 
       - name: Restore cached Linkcheck
         if: github.event_name == 'schedule'
@@ -57,7 +56,6 @@ jobs:
         run: |
           cargo install mdbook --version ${{ env.MDBOOK_VERSION }}
           cargo install mdbook-linkcheck2 --version ${{ env.MDBOOK_LINKCHECK2_VERSION }}
-          cargo install mdbook-toc --version ${{ env.MDBOOK_TOC_VERSION }}
           cargo install mdbook-mermaid --version ${{ env.MDBOOK_MERMAID_VERSION }}
 
       - name: Check build
@@ -84,3 +82,9 @@ jobs:
           git add .
           git commit -m "Deploy ${GITHUB_SHA} to gh-pages"
           git push --quiet -f "https://x-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" HEAD:gh-pages
+
+      - name: Check if files comply with semantic line breaks
+        continue-on-error: true
+        run: |
+          # using split_inclusive that uses regex feature that uses an unstable feature
+          RUSTC_BOOTSTRAP=1 cargo run --release --manifest-path ci/sembr/Cargo.toml src

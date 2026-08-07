@@ -8,8 +8,15 @@
 #![allow(internal_features)]
 #![warn(unreachable_pub)]
 
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+
 #[lang = "sized"]
-trait Sized {}
+pub trait Sized: MetaSized {}
+
 #[lang = "sync"]
 trait Sync {}
 impl<T> Sync for T {}
@@ -18,14 +25,11 @@ trait Copy {}
 #[lang = "freeze"]
 auto trait Freeze {}
 
-impl<T: ?Sized> Copy for *mut T {}
+impl<T: PointeeSized> Copy for *mut T {}
 
-#[lang = "drop_in_place"]
+#[lang = "drop_glue"]
 #[inline]
-#[allow(unconditional_recursion)]
-pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {
-    drop_in_place(to_drop);
-}
+pub unsafe fn drop_glue<T: PointeeSized>(_to_drop: &mut T) {}
 
 #[cfg(all(target_os = "windows", target_arch = "x86", target_env = "gnu"))]
 pub mod eh_frames {

@@ -6,13 +6,10 @@ use miropt_test_tools::{MiroptTest, MiroptTestFile, files_for_miropt_test};
 use tracing::debug;
 
 use super::{Emit, TestCx, WillExecute};
-use crate::compute_diff::write_diff;
+use crate::runtest::compute_diff::write_diff;
 
 impl TestCx<'_> {
     pub(super) fn run_mir_opt_test(&self) {
-        let pm = self.pass_mode();
-        let should_run = self.should_run(pm);
-
         let mut test_info = files_for_miropt_test(
             &self.testpaths.file.as_std_path(),
             self.config.get_pointer_width(),
@@ -21,26 +18,18 @@ impl TestCx<'_> {
 
         let passes = std::mem::take(&mut test_info.passes);
 
-        let proc_res = self.compile_test_with_passes(should_run, Emit::Mir, passes);
+        let proc_res = self.compile_test_general(WillExecute::No, Emit::Mir, passes);
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
         }
         self.check_mir_dump(test_info);
-
-        if let WillExecute::Yes = should_run {
-            let proc_res = self.exec_compiled_test();
-
-            if !proc_res.status.success() {
-                self.fatal_proc_rec("test run failed!", &proc_res);
-            }
-        }
     }
 
     fn check_mir_dump(&self, test_info: MiroptTest) {
         let test_dir = self.testpaths.file.parent().unwrap();
         let test_crate = self.testpaths.file.file_stem().unwrap().replace('-', "_");
 
-        let MiroptTest { run_filecheck, suffix, files, passes: _ } = test_info;
+        let MiroptTest { suffix, files, passes: _ } = test_info;
 
         if self.config.bless {
             for e in glob(&format!("{}/{}.*{}.mir", test_dir, test_crate, suffix)).unwrap() {
@@ -80,7 +69,7 @@ impl TestCx<'_> {
                 }
                 let expected_string = fs::read_to_string(&expected_file).unwrap();
                 if dumped_string != expected_string {
-                    print!("{}", write_diff(&expected_string, &dumped_string, 3));
+                    write!(self.stdout, "{}", write_diff(&expected_string, &dumped_string, 3));
                     panic!(
                         "Actual MIR output differs from expected MIR output {}",
                         expected_file.display()
@@ -89,7 +78,7 @@ impl TestCx<'_> {
             }
         }
 
-        if run_filecheck {
+        if !self.props.skip_filecheck {
             let output_path = self.output_base_name().with_extension("mir");
             let proc_res = self.verify_with_filecheck(&output_path);
             if !proc_res.status.success() {

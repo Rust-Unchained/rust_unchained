@@ -14,7 +14,7 @@ use rustc_mir_dataflow::{
 use rustc_span::Span;
 use tracing::{debug, instrument};
 
-use crate::deref_separator::deref_finder;
+use crate::PassPolicy;
 use crate::elaborate_drop::{DropElaborator, DropFlagMode, DropStyle, Unwind, elaborate_drop};
 use crate::patch::MirPatch;
 
@@ -62,6 +62,7 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
             let env = MoveDataTypingEnv { move_data, typing_env };
 
             let mut inits = MaybeInitializedPlaces::new(tcx, body, &env.move_data)
+                .exclude_inactive_in_otherwise()
                 .skipping_unreachable_unwind()
                 .iterate_to_fixpoint(tcx, body, Some("elaborate_drops"))
                 .into_results_cursor(body);
@@ -85,11 +86,11 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
             .elaborate()
         };
         elaborate_patch.apply(body);
-        deref_finder(tcx, body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        // Implements MIR drop semantics.
+        PassPolicy::Required
     }
 }
 
@@ -158,6 +159,10 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
         self.env.typing_env
     }
 
+    fn allow_async_drops(&self) -> bool {
+        true
+    }
+
     #[instrument(level = "debug", skip(self), ret)]
     fn drop_style(&self, path: Self::Path, mode: DropFlagMode) -> DropStyle {
         let ((maybe_init, maybe_uninit), multipart) = match mode {
@@ -184,17 +189,23 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
         }
     }
 
-    fn clear_drop_flag(&mut self, loc: Location, path: Self::Path, mode: DropFlagMode) {
+    fn drop_flags_for(&mut self, path: Self::Path, mode: DropFlagMode) -> Vec<Place<'tcx>> {
+        let mut flags = vec![];
         match mode {
             DropFlagMode::Shallow => {
-                self.set_drop_flag(loc, path, DropFlagState::Absent);
+                if let Some(flag) = self.drop_flags[path] {
+                    flags.push(flag.into());
+                }
             }
             DropFlagMode::Deep => {
                 on_all_children_bits(self.move_data(), path, |child| {
-                    self.set_drop_flag(loc, child, DropFlagState::Absent)
+                    if let Some(flag) = self.drop_flags[child] {
+                        flags.push(flag.into());
+                    }
                 });
             }
         }
+        flags
     }
 
     fn field_subpath(&self, path: Self::Path, field: FieldIdx) -> Option<Self::Path> {
@@ -243,8 +254,8 @@ struct ElaborateDropsCtxt<'a, 'tcx> {
 }
 
 impl fmt::Debug for ElaborateDropsCtxt<'_, '_> {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Ok(())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ElaborateDropsCtxt").finish_non_exhaustive()
     }
 }
 
@@ -328,7 +339,8 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
         // This function should mirror what `collect_drop_flags` does.
         for (bb, data) in self.body.basic_blocks.iter_enumerated() {
             let terminator = data.terminator();
-            let TerminatorKind::Drop { place, target, unwind, replace } = terminator.kind else {
+            let TerminatorKind::Drop { place, target, unwind, replace, drop } = terminator.kind
+            else {
                 continue;
             };
 
@@ -364,7 +376,16 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                         }
                     };
                     self.init_data.seek_before(self.body.terminator_loc(bb));
-                    elaborate_drop(self, terminator.source_info, place, path, target, unwind, bb)
+                    elaborate_drop(
+                        self,
+                        terminator.source_info,
+                        place,
+                        path,
+                        target,
+                        unwind,
+                        bb,
+                        drop,
+                    )
                 }
                 LookupResult::Parent(None) => {}
                 LookupResult::Parent(Some(_)) => {
@@ -384,11 +405,14 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
     }
 
     fn constant_bool(&self, span: Span, val: bool) -> Rvalue<'tcx> {
-        Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-            span,
-            user_ty: None,
-            const_: Const::from_bool(self.tcx, val),
-        })))
+        Rvalue::Use(
+            Operand::Constant(Box::new(ConstOperand {
+                span,
+                user_ty: None,
+                const_: Const::from_bool(self.tcx, val),
+            })),
+            WithRetag::Yes,
+        )
     }
 
     fn set_drop_flag(&mut self, loc: Location, path: MovePathIndex, val: DropFlagState) {

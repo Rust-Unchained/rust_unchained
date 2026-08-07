@@ -17,14 +17,14 @@
 //! <https://github.com/WebAssembly/component-model>.
 
 use crate::spec::{
-    LinkSelfContainedDefault, RelocModel, Target, TargetMetadata, base, crt_objects,
+    Arch, Env, LinkSelfContainedDefault, Os, RelocModel, Target, TargetMetadata, base, crt_objects,
 };
 
 pub(crate) fn target() -> Target {
     let mut options = base::wasm::options();
 
-    options.os = "wasi".into();
-    options.env = "p2".into();
+    options.os = Os::Wasi;
+    options.env = Env::P2;
     options.linker = Some("wasm-component-ld".into());
 
     options.pre_link_objects_self_contained = crt_objects::pre_wasi_self_contained();
@@ -46,10 +46,6 @@ pub(crate) fn target() -> Target {
     // without a main function.
     options.crt_static_allows_dylibs = true;
 
-    // WASI's `sys::args::init` function ignores its arguments; instead,
-    // `args::args()` makes the WASI API calls itself.
-    options.main_needs_argc_argv = false;
-
     // And, WASI mangles the name of "main" to distinguish between different
     // signatures.
     options.entry_name = "__main_void".into();
@@ -63,13 +59,13 @@ pub(crate) fn target() -> Target {
         llvm_target: "wasm32-wasip2".into(),
         metadata: TargetMetadata {
             description: Some("WebAssembly".into()),
-            tier: Some(3),
+            tier: Some(2),
             host_tools: Some(false),
             std: Some(true),
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20".into(),
-        arch: "wasm32".into(),
+        arch: Arch::Wasm32,
         options,
     }
 }

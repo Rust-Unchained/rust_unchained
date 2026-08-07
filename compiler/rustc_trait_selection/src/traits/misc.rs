@@ -1,20 +1,20 @@
 //! Miscellaneous type-system utilities that are too small to deserve their own modules.
 
-use std::assert_matches::assert_matches;
-
 use hir::LangItem;
 use rustc_ast::Mutability;
 use rustc_hir as hir;
 use rustc_infer::infer::{RegionResolutionError, TyCtxtInferExt};
+use rustc_middle::bug;
 use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt, TypeVisitableExt, TypingMode};
+use rustc_span::{Span, sym};
 
 use crate::regions::InferCtxtRegionExt;
-use crate::traits::{self, FulfillmentError, ObligationCause};
+use crate::traits::{self, FulfillmentError, Obligation, ObligationCause};
 
 pub enum CopyImplementationError<'tcx> {
     InfringingFields(Vec<(&'tcx ty::FieldDef, Ty<'tcx>, InfringingFieldsReason<'tcx>)>),
     NotAnAdt,
-    HasDestructor,
+    HasDestructor(hir::def_id::DefId),
     HasUnsafeFields,
 }
 
@@ -23,6 +23,7 @@ pub enum ConstParamTyImplementationError<'tcx> {
     InvalidInnerTyOfBuiltinTy(Vec<(Ty<'tcx>, InfringingFieldsReason<'tcx>)>),
     InfrigingFields(Vec<(&'tcx ty::FieldDef, Ty<'tcx>, InfringingFieldsReason<'tcx>)>),
     NotAnAdtOrBuiltinAllowed,
+    NonExhaustive(Span),
 }
 
 pub enum InfringingFieldsReason<'tcx> {
@@ -77,8 +78,8 @@ pub fn type_allowed_to_implement_copy<'tcx>(
     )
     .map_err(CopyImplementationError::InfringingFields)?;
 
-    if adt.has_dtor(tcx) {
-        return Err(CopyImplementationError::HasDestructor);
+    if let Some(did) = adt.destructor(tcx).map(|dtor| dtor.did) {
+        return Err(CopyImplementationError::HasDestructor(did));
     }
 
     if impl_safety.is_safe() && self_type.has_unsafe_fields() {
@@ -98,10 +99,9 @@ pub fn type_allowed_to_implement_const_param_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     self_type: Ty<'tcx>,
-    lang_item: LangItem,
     parent_cause: ObligationCause<'tcx>,
 ) -> Result<(), ConstParamTyImplementationError<'tcx>> {
-    assert_matches!(lang_item, LangItem::ConstParamTy | LangItem::UnsizedConstParamTy);
+    let mut need_unstable_feature_bound = false;
 
     let inner_tys: Vec<_> = match *self_type.kind() {
         // Trivially okay as these types are all:
@@ -112,24 +112,33 @@ pub fn type_allowed_to_implement_const_param_ty<'tcx>(
 
         // Handle types gated under `feature(unsized_const_params)`
         // FIXME(unsized_const_params): Make `const N: [u8]` work then forbid references
-        ty::Slice(inner_ty) | ty::Ref(_, inner_ty, Mutability::Not)
-            if lang_item == LangItem::UnsizedConstParamTy =>
-        {
+        ty::Slice(inner_ty) | ty::Ref(_, inner_ty, Mutability::Not) => {
+            need_unstable_feature_bound = true;
             vec![inner_ty]
         }
-        ty::Str if lang_item == LangItem::UnsizedConstParamTy => {
+        ty::Str => {
+            need_unstable_feature_bound = true;
             vec![Ty::new_slice(tcx, tcx.types.u8)]
         }
-        ty::Str | ty::Slice(..) | ty::Ref(_, _, Mutability::Not) => {
-            return Err(ConstParamTyImplementationError::UnsizedConstParamsFeatureRequired);
-        }
-
         ty::Array(inner_ty, _) => vec![inner_ty],
 
         // `str` morally acts like a newtype around `[u8]`
         ty::Tuple(inner_tys) => inner_tys.into_iter().collect(),
 
         ty::Adt(adt, args) if adt.is_enum() || adt.is_struct() => {
+            if !tcx.features().adt_const_params() {
+                for variant in adt.variants() {
+                    if variant.is_field_list_non_exhaustive() {
+                        let attr_span = match hir::find_attr!(tcx, variant.def_id, hir::attrs::AttributeKind::NonExhaustive(span) => *span)
+                        {
+                            Some(sp) => sp,
+                            None => bug!("non_exhaustive variant missing NonExhaustive attribute"),
+                        };
+                        return Err(ConstParamTyImplementationError::NonExhaustive(attr_span));
+                    }
+                }
+            }
+
             all_fields_implement_trait(
                 tcx,
                 param_env,
@@ -137,7 +146,7 @@ pub fn type_allowed_to_implement_const_param_ty<'tcx>(
                 adt,
                 args,
                 parent_cause.clone(),
-                lang_item,
+                LangItem::ConstParamTy,
             )
             .map_err(ConstParamTyImplementationError::InfrigingFields)?;
 
@@ -153,21 +162,35 @@ pub fn type_allowed_to_implement_const_param_ty<'tcx>(
         let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
         let ocx = traits::ObligationCtxt::new_with_diagnostics(&infcx);
 
+        // Make sure impls certain types are gated with #[unstable_feature_bound(unsized_const_params)]
+        if need_unstable_feature_bound {
+            ocx.register_obligation(Obligation::new(
+                tcx,
+                parent_cause.clone(),
+                param_env,
+                ty::ClauseKind::UnstableFeature(sym::unsized_const_params),
+            ));
+
+            if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+                return Err(ConstParamTyImplementationError::UnsizedConstParamsFeatureRequired);
+            }
+        }
+
         ocx.register_bound(
             parent_cause.clone(),
             param_env,
             inner_ty,
-            tcx.require_lang_item(lang_item, Some(parent_cause.span)),
+            tcx.require_lang_item(LangItem::ConstParamTy, parent_cause.span),
         );
 
-        let errors = ocx.select_all_or_error();
+        let errors = ocx.evaluate_obligations_error_on_ambiguity();
         if !errors.is_empty() {
             infringing_inner_tys.push((inner_ty, InfringingFieldsReason::Fulfill(errors)));
             continue;
         }
 
         // Check regions assuming the self type of the impl is WF
-        let errors = infcx.resolve_regions(parent_cause.body_id, param_env, [self_type]);
+        let errors = infcx.resolve_regions(parent_cause.body_def_id, param_env, [self_type]);
         if !errors.is_empty() {
             infringing_inner_tys.push((inner_ty, InfringingFieldsReason::Regions(errors)));
             continue;
@@ -193,7 +216,7 @@ pub fn all_fields_implement_trait<'tcx>(
     parent_cause: ObligationCause<'tcx>,
     lang_item: LangItem,
 ) -> Result<(), Vec<(&'tcx ty::FieldDef, Ty<'tcx>, InfringingFieldsReason<'tcx>)>> {
-    let trait_def_id = tcx.require_lang_item(lang_item, Some(parent_cause.span));
+    let trait_def_id = tcx.require_lang_item(lang_item, parent_cause.span);
 
     let mut infringing = Vec::new();
     for variant in adt.variants() {
@@ -226,15 +249,21 @@ pub fn all_fields_implement_trait<'tcx>(
             } else {
                 ObligationCause::dummy_with_span(field_ty_span)
             };
-            let ty = ocx.normalize(&normalization_cause, param_env, unnormalized_ty);
-            let normalization_errors = ocx.select_where_possible();
+            let ty: Ty<'_> = ocx.normalize(&normalization_cause, param_env, unnormalized_ty);
+            let normalization_errors = ocx.try_evaluate_obligations();
 
             // NOTE: The post-normalization type may also reference errors,
             // such as when we project to a missing type or we have a mismatch
             // between expected and found const-generic types. Don't report an
             // additional copy error here, since it's not typically useful.
             if !normalization_errors.is_empty() || ty.references_error() {
-                tcx.dcx().span_delayed_bug(field_span, format!("couldn't normalize struct field `{unnormalized_ty}` when checking {tr} implementation", tr = tcx.def_path_str(trait_def_id)));
+                tcx.dcx().span_delayed_bug(
+                    field_span,
+                    format!(
+                        "couldn't normalize struct field `{ty}` when checking {tr} implementation",
+                        tr = tcx.def_path_str(trait_def_id)
+                    ),
+                );
                 continue;
             }
 
@@ -244,13 +273,13 @@ pub fn all_fields_implement_trait<'tcx>(
                 ty,
                 trait_def_id,
             );
-            let errors = ocx.select_all_or_error();
+            let errors = ocx.evaluate_obligations_error_on_ambiguity();
             if !errors.is_empty() {
                 infringing.push((field, ty, InfringingFieldsReason::Fulfill(errors)));
             }
 
             // Check regions assuming the self type of the impl is WF
-            let errors = infcx.resolve_regions(parent_cause.body_id, param_env, [self_type]);
+            let errors = infcx.resolve_regions(parent_cause.body_def_id, param_env, [self_type]);
             if !errors.is_empty() {
                 infringing.push((field, ty, InfringingFieldsReason::Regions(errors)));
             }

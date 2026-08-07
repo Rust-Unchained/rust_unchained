@@ -17,7 +17,7 @@ impl AttrProcMacro for ExpandRequires {
         annotation: TokenStream,
         annotated: TokenStream,
     ) -> Result<TokenStream, ErrorGuaranteed> {
-        expand_requires_tts(ecx, span, annotation, annotated)
+        expand_contract_clause_tts(ecx, span, annotation, annotated, kw::ContractRequires)
     }
 }
 
@@ -29,7 +29,7 @@ impl AttrProcMacro for ExpandEnsures {
         annotation: TokenStream,
         annotated: TokenStream,
     ) -> Result<TokenStream, ErrorGuaranteed> {
-        expand_ensures_tts(ecx, span, annotation, annotated)
+        expand_contract_clause_tts(ecx, span, annotation, annotated, kw::ContractEnsures)
     }
 }
 
@@ -48,9 +48,9 @@ fn expand_contract_clause(
     ecx: &mut ExtCtxt<'_>,
     attr_span: Span,
     annotated: TokenStream,
-    inject: impl FnOnce(&mut TokenStream) -> Result<(), ErrorGuaranteed>,
+    inject: impl FnOnce(&mut Vec<TokenTree>) -> Result<(), ErrorGuaranteed>,
 ) -> Result<TokenStream, ErrorGuaranteed> {
-    let mut new_tts = TokenStream::default();
+    let mut new_tts = vec![];
     let mut cursor = annotated.iter();
 
     let is_kw = |tt: &TokenTree, sym: Symbol| {
@@ -60,7 +60,7 @@ fn expand_contract_clause(
     // Find the `fn` keyword to check if this is a function.
     if cursor
         .find(|tt| {
-            new_tts.push_tree((*tt).clone());
+            new_tts.push((*tt).clone());
             is_kw(tt, kw::Fn)
         })
         .is_none()
@@ -69,6 +69,14 @@ fn expand_contract_clause(
             .sess
             .dcx()
             .span_err(attr_span, "contract annotations can only be used on functions"));
+    }
+
+    // Contracts are not yet supported on async/gen functions
+    if new_tts.iter().any(|tt| is_kw(tt, kw::Async) || is_kw(tt, kw::Gen)) {
+        return Err(ecx.sess.dcx().span_err(
+            attr_span,
+            "contract annotations are not yet supported on async or gen functions",
+        ));
     }
 
     // Found the `fn` keyword, now find either the `where` token or the function body.
@@ -94,7 +102,7 @@ fn expand_contract_clause(
         if is_kw(tt, kw::Where) {
             break tt;
         }
-        new_tts.push_tree(tt.clone());
+        new_tts.push(tt.clone());
     };
 
     // At this point, we've transcribed everything from the `fn` through the formal parameter list
@@ -106,9 +114,9 @@ fn expand_contract_clause(
 
     // Above we injected the internal AST requires/ensures construct. Now copy over all the other
     // token trees.
-    new_tts.push_tree(next_tt.clone());
+    new_tts.push(next_tt.clone());
     while let Some(tt) = cursor.next() {
-        new_tts.push_tree(tt.clone());
+        new_tts.push(tt.clone());
         if cursor.peek().is_none()
             && !matches!(tt, TokenTree::Delimited(_, _, token::Delimiter::Brace, _))
         {
@@ -119,51 +127,26 @@ fn expand_contract_clause(
         }
     }
 
-    Ok(new_tts)
+    Ok(TokenStream::new(new_tts))
 }
 
-fn expand_requires_tts(
+fn expand_contract_clause_tts(
     ecx: &mut ExtCtxt<'_>,
     attr_span: Span,
     annotation: TokenStream,
     annotated: TokenStream,
+    clause_keyword: rustc_span::Symbol,
 ) -> Result<TokenStream, ErrorGuaranteed> {
     let feature_span = ecx.with_def_site_ctxt(attr_span);
     expand_contract_clause(ecx, attr_span, annotated, |new_tts| {
-        new_tts.push_tree(TokenTree::Token(
-            token::Token::from_ast_ident(Ident::new(kw::ContractRequires, feature_span)),
+        new_tts.push(TokenTree::Token(
+            token::Token::from_ast_ident(Ident::new(clause_keyword, feature_span)),
             Spacing::Joint,
         ));
-        new_tts.push_tree(TokenTree::Token(
-            token::Token::new(token::TokenKind::OrOr, attr_span),
-            Spacing::Alone,
-        ));
-        new_tts.push_tree(TokenTree::Delimited(
+        new_tts.push(TokenTree::Delimited(
             DelimSpan::from_single(attr_span),
             DelimSpacing::new(Spacing::JointHidden, Spacing::JointHidden),
-            token::Delimiter::Parenthesis,
-            annotation,
-        ));
-        Ok(())
-    })
-}
-
-fn expand_ensures_tts(
-    ecx: &mut ExtCtxt<'_>,
-    attr_span: Span,
-    annotation: TokenStream,
-    annotated: TokenStream,
-) -> Result<TokenStream, ErrorGuaranteed> {
-    let feature_span = ecx.with_def_site_ctxt(attr_span);
-    expand_contract_clause(ecx, attr_span, annotated, |new_tts| {
-        new_tts.push_tree(TokenTree::Token(
-            token::Token::from_ast_ident(Ident::new(kw::ContractEnsures, feature_span)),
-            Spacing::Joint,
-        ));
-        new_tts.push_tree(TokenTree::Delimited(
-            DelimSpan::from_single(attr_span),
-            DelimSpacing::new(Spacing::JointHidden, Spacing::JointHidden),
-            token::Delimiter::Parenthesis,
+            token::Delimiter::Brace,
             annotation,
         ));
         Ok(())

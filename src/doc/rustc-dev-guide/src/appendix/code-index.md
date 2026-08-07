@@ -1,22 +1,21 @@
 # Code Index
 
-rustc has a lot of important data structures. This is an attempt to give some
-guidance on where to learn more about some of the key data structures of the
-compiler.
+rustc has a lot of important data structures.
+This is an attempt to give some guidance on where to learn more
+about some of the key data structures of the compiler.
 
 Item            |  Kind    | Short description           | Chapter            | Declaration
 ----------------|----------|-----------------------------|--------------------|-------------------
 `BodyId` | struct | One of four types of HIR node identifiers | [Identifiers in the HIR] | [compiler/rustc_hir/src/hir.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/hir/struct.BodyId.html)
 `Compiler` | struct | Represents a compiler session and can be used to drive a compilation. | [The Rustc Driver and Interface] | [compiler/rustc_interface/src/interface.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_interface/interface/struct.Compiler.html)
 `ast::Crate` | struct | A syntax-level representation of a parsed crate | [The parser] | [compiler/rustc_ast/src/ast.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_ast/ast/struct.Crate.html)
-`rustc_hir::Crate` | struct | A more abstract, compiler-friendly form of a crate's AST | [The Hir] | [compiler/rustc_hir/src/hir.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/hir/struct.Crate.html)
+`hir::Crate` | struct | A more abstract, compiler-friendly form of a crate's AST | [The Hir] | [compiler/rustc_middle/src/hir/mod.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/hir/struct.Crate.html)
 `DefId` | struct | One of four types of HIR node identifiers | [Identifiers in the HIR] | [compiler/rustc_hir/src/def_id.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/def_id/struct.DefId.html)
 `Diag` | struct | A struct for a compiler diagnostic, such as an error or lint | [Emitting Diagnostics] | [compiler/rustc_errors/src/diagnostic.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_errors/struct.Diag.html)
-`DocContext` | struct | A state container used by rustdoc when crawling through a crate to gather its documentation | [Rustdoc] | [src/librustdoc/core.rs](https://github.com/rust-lang/rust/blob/master/src/librustdoc/core.rs)
-`HirId` | struct | One of four types of HIR node identifiers | [Identifiers in the HIR] | [compiler/rustc_hir/src/hir_id.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/hir_id/struct.HirId.html)
+`DocContext` | struct | A state container used by rustdoc when crawling through a crate to gather its documentation | [Rustdoc] | [src/librustdoc/core.rs](https://github.com/rust-lang/rust/blob/HEAD/src/librustdoc/core.rs)
+`HirId` | struct | One of four types of HIR node identifiers | [Identifiers in the HIR] | [compiler/rustc_hir_id/src/lib.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/struct.HirId.html)
 `Lexer` | struct | This is the lexer used during parsing. It consumes characters from the raw source code being compiled and produces a series of tokens for use by the rest of the parser | [The parser] |  [compiler/rustc_parse/src/lexer/mod.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/lexer/struct.Lexer.html)
 `NodeId` | struct | One of four types of HIR node identifiers. Being phased out | [Identifiers in the HIR] | [compiler/rustc_ast/src/ast.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_ast/node_id/struct.NodeId.html)
-`P` | struct | An owned immutable smart pointer. By contrast, `&T` is not owned, and `Box<T>` is not immutable. | None | [compiler/rustc_ast/src/ptr.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_ast/ptr/struct.P.html)
 `ParamEnv` | struct | Information about generic parameters or `Self`, useful for working with associated or generic items | [Parameter Environment] | [compiler/rustc_middle/src/ty/mod.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.ParamEnv.html)
 `ParseSess` | struct | This struct contains information about a parsing session | [The parser] | [compiler/rustc_session/src/parse/parse.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_session/parse/struct.ParseSess.html)
 `Rib` | struct | Represents a single scope of names | [Name resolution] | [compiler/rustc_resolve/src/lib.rs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_resolve/late/struct.Rib.html)
@@ -34,11 +33,11 @@ Item            |  Kind    | Short description           | Chapter            | 
 [Identifiers in the HIR]: ../hir.html#hir-id
 [The parser]: ../the-parser.html
 [The Rustc Driver and Interface]: ../rustc-driver/intro.html
-[Type checking]: ../type-checking.html
+[Type checking]: ../hir-typeck/summary.html
 [The `ty` modules]: ../ty.html
 [Rustdoc]: ../rustdoc.html
 [Emitting Diagnostics]: ../diagnostics.html
 [Macro expansion]: ../macro-expansion.html
 [Name resolution]: ../name-resolution.html
-[Parameter Environment]: ../typing_parameter_envs.html
+[Parameter Environment]: ../typing-parameter-envs.html
 [Trait Solving: Goals and Clauses]: ../traits/goals-and-clauses.html#domain-goals

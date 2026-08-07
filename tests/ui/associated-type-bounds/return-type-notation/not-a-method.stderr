@@ -4,11 +4,13 @@ error[E0575]: expected function, found function `function`
 LL |     function(..): Send,
    |     ^^^^^^^^^^^^ not a function
 
-error[E0573]: expected type, found function `function`
+error[E0573]: cannot find type `function` in this scope
   --> $DIR/not-a-method.rs:15:5
    |
 LL |     function(): Send,
-   |     ^^^^^^^^^^ not a type
+   |     ^^^^^^^^ not found in this scope
+   |
+   = note: a function named `function` exists in another namespace
 
 error[E0576]: cannot find function `method` in this scope
   --> $DIR/not-a-method.rs:27:5
@@ -16,7 +18,7 @@ error[E0576]: cannot find function `method` in this scope
 LL |     method(..): Send,
    |     ^^^^^^ not found in this scope
 
-error[E0412]: cannot find type `method` in this scope
+error[E0425]: cannot find type `method` in this scope
   --> $DIR/not-a-method.rs:36:5
    |
 LL |     method(): Send,
@@ -36,5 +38,5 @@ LL |     method(..): Send,
 
 error: aborting due to 6 previous errors
 
-Some errors have detailed explanations: E0412, E0573, E0575, E0576.
-For more information about an error, try `rustc --explain E0412`.
+Some errors have detailed explanations: E0425, E0573, E0575, E0576.
+For more information about an error, try `rustc --explain E0425`.

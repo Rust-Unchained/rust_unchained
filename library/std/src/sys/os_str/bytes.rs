@@ -4,11 +4,11 @@
 use core::clone::CloneToUninit;
 
 use crate::borrow::Cow;
+use crate::bstr::ByteStr;
 use crate::collections::TryReserveError;
-use crate::fmt::Write;
 use crate::rc::Rc;
 use crate::sync::Arc;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner};
 use crate::{fmt, mem, str};
 
 #[cfg(test)]
@@ -64,25 +64,7 @@ impl fmt::Debug for Slice {
 
 impl fmt::Display for Slice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // If we're the empty string then our iterator won't actually yield
-        // anything, so perform the formatting manually
-        if self.inner.is_empty() {
-            return "".fmt(f);
-        }
-
-        for chunk in self.inner.utf8_chunks() {
-            let valid = chunk.valid();
-            // If we successfully decoded the whole chunk as a valid string then
-            // we can return a direct formatting of the string which will also
-            // respect various formatting flags if possible.
-            if chunk.invalid().is_empty() {
-                return valid.fmt(f);
-            }
-
-            f.write_str(valid)?;
-            f.write_char(char::REPLACEMENT_CHARACTER)?;
-        }
-        Ok(())
+        fmt::Display::fmt(ByteStr::new(&self.inner), f)
     }
 }
 
@@ -115,7 +97,7 @@ impl Buf {
     }
 
     #[inline]
-    pub fn from_string(s: String) -> Buf {
+    pub const fn from_string(s: String) -> Buf {
         Buf { inner: s.into_bytes() }
     }
 
@@ -176,17 +158,17 @@ impl Buf {
 
     #[inline]
     pub fn as_slice(&self) -> &Slice {
-        // SAFETY: Slice just wraps [u8],
-        // and &*self.inner is &[u8], therefore
-        // transmuting &[u8] to &Slice is safe.
+        // SAFETY: Slice is just a wrapper for [u8],
+        // and self.inner.as_slice() returns &[u8].
+        // Therefore, transmuting &[u8] to &Slice is safe.
         unsafe { mem::transmute(self.inner.as_slice()) }
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut Slice {
-        // SAFETY: Slice just wraps [u8],
-        // and &mut *self.inner is &mut [u8], therefore
-        // transmuting &mut [u8] to &mut Slice is safe.
+        // SAFETY: Slice is just a wrapper for [u8],
+        // and self.inner.as_mut_slice() returns &mut [u8].
+        // Therefore, transmuting &mut [u8] to &mut Slice is safe.
         unsafe { mem::transmute(self.inner.as_mut_slice()) }
     }
 
@@ -216,19 +198,28 @@ impl Buf {
         self.as_slice().into_rc()
     }
 
-    /// Provides plumbing to core `Vec::truncate`.
-    /// More well behaving alternative to allowing outer types
-    /// full mutable access to the core `Vec`.
+    /// Provides plumbing to `Vec::truncate` without giving full mutable access
+    /// to the `Vec`.
+    ///
+    /// # Safety
+    ///
+    /// The length must be at an `OsStr` boundary, according to
+    /// `Slice::check_public_boundary`.
     #[inline]
-    pub(crate) fn truncate(&mut self, len: usize) {
+    pub unsafe fn truncate_unchecked(&mut self, len: usize) {
         self.inner.truncate(len);
     }
 
-    /// Provides plumbing to core `Vec::extend_from_slice`.
-    /// More well behaving alternative to allowing outer types
-    /// full mutable access to the core `Vec`.
+    /// Provides plumbing to `Vec::extend_from_slice` without giving full
+    /// mutable access to the `Vec`.
+    ///
+    /// # Safety
+    ///
+    /// The slice must be valid for the platform encoding (as described in
+    /// `OsStr::from_encoded_bytes_unchecked`). This encoding has no safety
+    /// requirements.
     #[inline]
-    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
+    pub unsafe fn extend_from_slice_unchecked(&mut self, other: &[u8]) {
         self.inner.extend_from_slice(other);
     }
 }
@@ -247,16 +238,24 @@ impl Slice {
     #[track_caller]
     #[inline]
     pub fn check_public_boundary(&self, index: usize) {
+        if self.try_check_public_boundary(index).is_none() {
+            panic!("byte index {index} is not an OsStr boundary");
+        }
+    }
+
+    #[track_caller]
+    #[inline]
+    pub fn try_check_public_boundary(&self, index: usize) -> Option<()> {
         if index == 0 || index == self.inner.len() {
-            return;
+            return Some(());
         }
         if index < self.inner.len()
             && (self.inner[index - 1].is_ascii() || self.inner[index].is_ascii())
         {
-            return;
+            return Some(());
         }
 
-        slow_path(&self.inner, index);
+        return slow_path(&self.inner, index);
 
         /// We're betting that typical splits will involve an ASCII character.
         ///
@@ -264,26 +263,26 @@ impl Slice {
         /// better assembly.
         #[track_caller]
         #[inline(never)]
-        fn slow_path(bytes: &[u8], index: usize) {
-            let (before, after) = bytes.split_at(index);
+        fn slow_path(bytes: &[u8], index: usize) -> Option<()> {
+            let (before, after) = bytes.split_at_checked(index)?;
 
             // UTF-8 takes at most 4 bytes per codepoint, so we don't
             // need to check more than that.
             let after = after.get(..4).unwrap_or(after);
             match str::from_utf8(after) {
-                Ok(_) => return,
-                Err(err) if err.valid_up_to() != 0 => return,
+                Ok(_) => return Some(()),
+                Err(err) if err.valid_up_to() != 0 => return Some(()),
                 Err(_) => (),
             }
 
             for len in 2..=4.min(index) {
                 let before = &before[index - len..];
                 if str::from_utf8(before).is_ok() {
-                    return;
+                    return Some(());
                 }
             }
 
-            panic!("byte index {index} is not an OsStr boundary");
+            None
         }
     }
 
@@ -310,12 +309,6 @@ impl Slice {
     #[inline]
     pub fn clone_into(&self, buf: &mut Buf) {
         self.inner.clone_into(&mut buf.inner)
-    }
-
-    #[inline]
-    pub fn into_box(&self) -> Box<Slice> {
-        let boxed: Box<[u8]> = self.inner.into();
-        unsafe { mem::transmute(boxed) }
     }
 
     #[inline]

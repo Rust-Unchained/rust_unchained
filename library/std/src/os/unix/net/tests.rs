@@ -3,10 +3,13 @@ use crate::io::prelude::*;
 use crate::io::{self, ErrorKind, IoSlice, IoSliceMut};
 #[cfg(target_os = "android")]
 use crate::os::android::net::{SocketAddrExt, UnixSocketExt};
+#[cfg(target_os = "cygwin")]
+use crate::os::cygwin::net::{SocketAddrExt, UnixSocketExt};
 #[cfg(target_os = "linux")]
 use crate::os::linux::net::{SocketAddrExt, UnixSocketExt};
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use crate::os::unix::io::AsRawFd;
+use crate::path::Path;
 use crate::test_helpers::tmpdir;
 use crate::thread;
 use crate::time::Duration;
@@ -21,7 +24,14 @@ macro_rules! or_panic {
 }
 
 #[test]
+fn sock_addr_from_pathname() {
+    let address = or_panic!(SocketAddr::from_pathname("/path/to/socket"));
+    assert_eq!(address.as_pathname(), Some(Path::new("/path/to/socket")));
+}
+
+#[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn basic() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -29,6 +39,7 @@ fn basic() {
     let msg2 = b"world!";
 
     let listener = or_panic!(UnixListener::bind(&socket_path));
+    assert_eq!(Some(&*socket_path), listener.local_addr().unwrap().as_pathname());
     let thread = thread::spawn(move || {
         let mut stream = or_panic!(listener.accept()).0;
         let mut buf = [0; 5];
@@ -49,6 +60,7 @@ fn basic() {
 }
 
 #[test]
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn vectored() {
     let (mut s1, mut s2) = or_panic!(UnixStream::pair());
 
@@ -69,11 +81,14 @@ fn vectored() {
 }
 
 #[test]
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn pair() {
     let msg1 = b"hello";
     let msg2 = b"world!";
 
     let (mut s1, mut s2) = or_panic!(UnixStream::pair());
+    assert!(s1.local_addr().unwrap().is_unnamed());
+    assert!(s2.peer_addr().unwrap().is_unnamed());
     let thread = thread::spawn(move || {
         // s1 must be moved in or the test will hang!
         let mut buf = [0; 5];
@@ -93,6 +108,7 @@ fn pair() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn try_clone() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -120,6 +136,7 @@ fn try_clone() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn iter() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -142,6 +159,7 @@ fn iter() {
 }
 
 #[test]
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn long_path() {
     let dir = tmpdir();
     let socket_path = dir.path().join(
@@ -168,8 +186,10 @@ fn long_path() {
 }
 
 #[test]
-#[cfg(not(target_os = "nto"))]
+#[cfg(not(any(target_os = "nto", target_os = "qnx")))]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin connect needs handshake
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn timeouts() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -198,6 +218,8 @@ fn timeouts() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin connect needs handshake
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_read_timeout() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -218,6 +240,8 @@ fn test_read_timeout() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin connect needs handshake
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_read_with_timeout() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -246,6 +270,8 @@ fn test_read_with_timeout() {
 // when passed zero Durations
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin connect needs handshake
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_stream_timeout_zero_duration() {
     let dir = tmpdir();
     let socket_path = dir.path().join("sock");
@@ -266,6 +292,7 @@ fn test_unix_stream_timeout_zero_duration() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock1");
@@ -283,6 +310,8 @@ fn test_unix_datagram() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin autobinds an address
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unnamed_unix_datagram() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock1");
@@ -301,6 +330,7 @@ fn test_unnamed_unix_datagram() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram_connect_to_recv_addr() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock1");
@@ -326,6 +356,8 @@ fn test_unix_datagram_connect_to_recv_addr() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin autobinds an address
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_connect_unix_datagram() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock1");
@@ -353,6 +385,7 @@ fn test_connect_unix_datagram() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram_recv() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock1");
@@ -370,6 +403,7 @@ fn test_unix_datagram_recv() {
 }
 
 #[test]
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn datagram_pair() {
     let msg1 = b"hello";
     let msg2 = b"world!";
@@ -396,6 +430,7 @@ fn datagram_pair() {
 // when passed zero Durations
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram_timeout_zero_duration() {
     let dir = tmpdir();
     let path = dir.path().join("sock");
@@ -411,13 +446,23 @@ fn test_unix_datagram_timeout_zero_duration() {
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[test]
+fn abstract_socket_addr_debug() {
+    assert_eq!(
+        r#""\0hello world\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x11\x12\r\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\x80\x81\xfe\xff" (abstract)"#,
+        format!("{:?}", SocketAddr::from_abstract_name(b"\0hello world\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x11\x12\r\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\x80\x81\xfe\xff").unwrap()),
+    );
+}
+
 #[test]
 fn abstract_namespace_not_allowed_connect() {
     assert!(UnixStream::connect("\0asdf").is_err());
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin cannot bind to abstract addr
 fn test_abstract_stream_connect() {
     let msg1 = b"hello";
     let msg2 = b"world";
@@ -447,8 +492,9 @@ fn test_abstract_stream_connect() {
     thread.join().unwrap();
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin cannot bind to abstract addr
 fn test_abstract_stream_iter() {
     let addr = or_panic!(SocketAddr::from_abstract_name(b"hidden"));
     let listener = or_panic!(UnixListener::bind_addr(&addr));
@@ -469,8 +515,9 @@ fn test_abstract_stream_iter() {
     thread.join().unwrap();
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin cannot bind to abstract addr
 fn test_abstract_datagram_bind_send_to_addr() {
     let addr1 = or_panic!(SocketAddr::from_abstract_name(b"ns1"));
     let sock1 = or_panic!(UnixDatagram::bind_addr(&addr1));
@@ -490,8 +537,9 @@ fn test_abstract_datagram_bind_send_to_addr() {
     assert_eq!(addr.as_abstract_name().unwrap(), b"ns1");
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin cannot bind to abstract addr
 fn test_abstract_datagram_connect_addr() {
     let addr1 = or_panic!(SocketAddr::from_abstract_name(b"ns3"));
     let bsock1 = or_panic!(UnixDatagram::bind_addr(&addr1));
@@ -515,7 +563,7 @@ fn test_abstract_datagram_connect_addr() {
     or_panic!(bsock2.recv_from(&mut buf));
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
 fn test_abstract_name_too_long() {
     match SocketAddr::from_abstract_name(
@@ -529,7 +577,7 @@ fn test_abstract_name_too_long() {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
 fn test_abstract_no_pathname_and_not_unnamed() {
     let name = b"local";
@@ -541,6 +589,7 @@ fn test_abstract_no_pathname_and_not_unnamed() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_stream_peek() {
     let (txdone, rxdone) = crate::sync::mpsc::channel();
 
@@ -574,6 +623,7 @@ fn test_unix_stream_peek() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram_peek() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock");
@@ -599,6 +649,7 @@ fn test_unix_datagram_peek() {
 
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "vxworks", ignore = "Unix sockets are not implemented in VxWorks")]
 fn test_unix_datagram_peek_from() {
     let dir = tmpdir();
     let path1 = dir.path().join("sock");
@@ -660,9 +711,10 @@ fn test_send_vectored_fds_unix_stream() {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[test]
 #[cfg_attr(target_os = "android", ignore)] // Android SELinux rules prevent creating Unix sockets
+#[cfg_attr(target_os = "cygwin", ignore)] // Cygwin recvmsg doesn't support Unix sockets
 fn test_send_vectored_with_ancillary_to_unix_datagram() {
     fn getpid() -> libc::pid_t {
         unsafe { libc::getpid() }

@@ -1,4 +1,6 @@
-use rustc_index::{Idx, IndexVec};
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::thin_vec::ThinVec;
+use rustc_index::Idx;
 use rustc_middle::mir::*;
 use rustc_middle::ty::Ty;
 use rustc_span::Span;
@@ -9,7 +11,9 @@ use tracing::debug;
 /// and replacement of terminators, and then apply the queued changes all at
 /// once with `apply`. This is useful for MIR transformation passes.
 pub(crate) struct MirPatch<'tcx> {
-    term_patch_map: IndexVec<BasicBlock, Option<TerminatorKind<'tcx>>>,
+    term_patch_map: FxHashMap<BasicBlock, TerminatorKind<'tcx>>,
+    /// Set of statements that should be replaced by `Nop`.
+    nop_statements: Vec<Location>,
     new_blocks: Vec<BasicBlockData<'tcx>>,
     new_statements: Vec<(Location, StatementKind<'tcx>)>,
     new_locals: Vec<LocalDecl<'tcx>>,
@@ -21,18 +25,25 @@ pub(crate) struct MirPatch<'tcx> {
     // Cached block for UnwindTerminate (with reason)
     terminate_block: Option<(BasicBlock, UnwindTerminateReason)>,
     body_span: Span,
+    /// The number of locals at the start of the transformation. New locals
+    /// get appended at the end.
     next_local: usize,
+    /// The number of blocks at the start of the transformation. New blocks
+    /// get appended at the end.
+    next_block: usize,
 }
 
 impl<'tcx> MirPatch<'tcx> {
     /// Creates a new, empty patch.
     pub(crate) fn new(body: &Body<'tcx>) -> Self {
         let mut result = MirPatch {
-            term_patch_map: IndexVec::from_elem(None, &body.basic_blocks),
+            term_patch_map: Default::default(),
+            nop_statements: vec![],
             new_blocks: vec![],
             new_statements: vec![],
             new_locals: vec![],
             next_local: body.local_decls.len(),
+            next_block: body.basic_blocks.len(),
             resume_block: None,
             unreachable_cleanup_block: None,
             unreachable_no_cleanup_block: None,
@@ -78,14 +89,14 @@ impl<'tcx> MirPatch<'tcx> {
             return bb;
         }
 
-        let bb = self.new_block(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        let bb = self.new_block(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(self.body_span),
                 kind: TerminatorKind::UnwindResume,
+                attributes: ThinVec::new(),
             }),
-            is_cleanup: true,
-        });
+            true,
+        ));
         self.resume_block = Some(bb);
         bb
     }
@@ -95,14 +106,14 @@ impl<'tcx> MirPatch<'tcx> {
             return bb;
         }
 
-        let bb = self.new_block(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        let bb = self.new_block(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(self.body_span),
                 kind: TerminatorKind::Unreachable,
+                attributes: ThinVec::new(),
             }),
-            is_cleanup: true,
-        });
+            true,
+        ));
         self.unreachable_cleanup_block = Some(bb);
         bb
     }
@@ -112,14 +123,14 @@ impl<'tcx> MirPatch<'tcx> {
             return bb;
         }
 
-        let bb = self.new_block(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        let bb = self.new_block(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(self.body_span),
                 kind: TerminatorKind::Unreachable,
+                attributes: ThinVec::new(),
             }),
-            is_cleanup: false,
-        });
+            false,
+        ));
         self.unreachable_no_cleanup_block = Some(bb);
         bb
     }
@@ -131,21 +142,33 @@ impl<'tcx> MirPatch<'tcx> {
             return cached_bb;
         }
 
-        let bb = self.new_block(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        let bb = self.new_block(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(self.body_span),
                 kind: TerminatorKind::UnwindTerminate(reason),
+                attributes: ThinVec::new(),
             }),
-            is_cleanup: true,
-        });
+            true,
+        ));
         self.terminate_block = Some((bb, reason));
         bb
     }
 
     /// Has a replacement of this block's terminator been queued in this patch?
     pub(crate) fn is_term_patched(&self, bb: BasicBlock) -> bool {
-        self.term_patch_map[bb].is_some()
+        self.term_patch_map.contains_key(&bb)
+    }
+
+    /// Universal getter for block data, either it is in 'old' blocks or in patched ones
+    pub(crate) fn block<'a>(
+        &'a self,
+        body: &'a Body<'tcx>,
+        bb: BasicBlock,
+    ) -> &'a BasicBlockData<'tcx> {
+        match bb.index().checked_sub(body.basic_blocks.len()) {
+            Some(new) => &self.new_blocks[new],
+            None => &body[bb],
+        }
     }
 
     /// Queues the addition of a new temporary with additional local info.
@@ -155,8 +178,7 @@ impl<'tcx> MirPatch<'tcx> {
         span: Span,
         local_info: LocalInfo<'tcx>,
     ) -> Local {
-        let index = self.next_local;
-        self.next_local += 1;
+        let index = self.next_local + self.new_locals.len();
         let mut new_decl = LocalDecl::new(ty, span);
         **new_decl.local_info.as_mut().unwrap_crate_local() = local_info;
         self.new_locals.push(new_decl);
@@ -165,8 +187,7 @@ impl<'tcx> MirPatch<'tcx> {
 
     /// Queues the addition of a new temporary.
     pub(crate) fn new_temp(&mut self, ty: Ty<'tcx>, span: Span) -> Local {
-        let index = self.next_local;
-        self.next_local += 1;
+        let index = self.next_local + self.new_locals.len();
         self.new_locals.push(LocalDecl::new(ty, span));
         Local::new(index)
     }
@@ -174,25 +195,33 @@ impl<'tcx> MirPatch<'tcx> {
     /// Returns the type of a local that's newly-added in the patch.
     pub(crate) fn local_ty(&self, local: Local) -> Ty<'tcx> {
         let local = local.as_usize();
-        assert!(local < self.next_local);
-        let new_local_idx = self.new_locals.len() - (self.next_local - local);
+        assert!(local < self.next_local + self.new_locals.len());
+        let new_local_idx = local - self.next_local;
         self.new_locals[new_local_idx].ty
     }
 
     /// Queues the addition of a new basic block.
     pub(crate) fn new_block(&mut self, data: BasicBlockData<'tcx>) -> BasicBlock {
-        let block = self.term_patch_map.next_index();
+        let block = BasicBlock::from_usize(self.next_block + self.new_blocks.len());
         debug!("MirPatch: new_block: {:?}: {:?}", block, data);
         self.new_blocks.push(data);
-        self.term_patch_map.push(None);
         block
     }
 
     /// Queues the replacement of a block's terminator.
     pub(crate) fn patch_terminator(&mut self, block: BasicBlock, new: TerminatorKind<'tcx>) {
-        assert!(self.term_patch_map[block].is_none());
+        assert!(!self.term_patch_map.contains_key(&block));
         debug!("MirPatch: patch_terminator({:?}, {:?})", block, new);
-        self.term_patch_map[block] = Some(new);
+        self.term_patch_map.insert(block, new);
+    }
+
+    /// Mark given statement to be replaced by a `Nop`.
+    ///
+    /// This method only works on statements from the initial body, and cannot be used to remove
+    /// statements from `add_statement` or `add_assign`.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) fn nop_statement(&mut self, loc: Location) {
+        self.nop_statements.push(loc);
     }
 
     /// Queues the insertion of a statement at a given location. The statement
@@ -231,6 +260,7 @@ impl<'tcx> MirPatch<'tcx> {
             self.new_blocks.len(),
             body.basic_blocks.len()
         );
+        debug_assert_eq!(self.next_block, body.basic_blocks.len());
         let bbs = if self.term_patch_map.is_empty() && self.new_blocks.is_empty() {
             body.basic_blocks.as_mut_preserves_cfg()
         } else {
@@ -238,11 +268,9 @@ impl<'tcx> MirPatch<'tcx> {
         };
         bbs.extend(self.new_blocks);
         body.local_decls.extend(self.new_locals);
-        for (src, patch) in self.term_patch_map.into_iter_enumerated() {
-            if let Some(patch) = patch {
-                debug!("MirPatch: patching block {:?}", src);
-                bbs[src].terminator_mut().kind = patch;
-            }
+
+        for loc in self.nop_statements {
+            bbs[loc.block].statements[loc.statement_index].make_nop(true);
         }
 
         let mut new_statements = self.new_statements;
@@ -260,11 +288,22 @@ impl<'tcx> MirPatch<'tcx> {
             }
             debug!("MirPatch: adding statement {:?} at loc {:?}+{}", stmt, loc, delta);
             loc.statement_index += delta;
-            let source_info = Self::source_info_for_index(&body[loc.block], loc);
-            body[loc.block]
+            let source_info = Self::source_info_for_index(&bbs[loc.block], loc);
+            bbs[loc.block]
                 .statements
-                .insert(loc.statement_index, Statement { source_info, kind: stmt });
+                .insert(loc.statement_index, Statement::new(source_info, stmt));
             delta += 1;
+        }
+
+        // The order in which we patch terminators does not change the result.
+        #[allow(rustc::potential_query_instability)]
+        for (src, patch) in self.term_patch_map {
+            debug!("MirPatch: patching block {:?}", src);
+            let bb = &mut bbs[src];
+            if let TerminatorKind::Unreachable = patch {
+                bb.statements.clear();
+            }
+            bb.terminator_mut().kind = patch;
         }
     }
 
@@ -276,10 +315,7 @@ impl<'tcx> MirPatch<'tcx> {
     }
 
     pub(crate) fn source_info_for_location(&self, body: &Body<'tcx>, loc: Location) -> SourceInfo {
-        let data = match loc.block.index().checked_sub(body.basic_blocks.len()) {
-            Some(new) => &self.new_blocks[new],
-            None => &body[loc.block],
-        };
+        let data = self.block(body, loc.block);
         Self::source_info_for_index(data, loc)
     }
 }

@@ -1,16 +1,29 @@
 use rustc_data_structures::unord::{ExtendUnord, UnordSet};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint;
+use rustc_span::Span;
 use tracing::debug;
 
-pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { check_unused_traits, ..*providers };
+struct UnusedImport<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    span: Span,
 }
 
-fn check_unused_traits(tcx: TyCtxt<'_>, (): ()) {
+impl<'a, 'tcx> Diagnostic<'a, ()> for UnusedImport<'tcx> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        let Self { tcx, span } = self;
+        if let Ok(snippet) = tcx.sess.source_map().span_to_snippet(span) {
+            Diag::new(dcx, level, format!("unused import: `{snippet}`"))
+        } else {
+            Diag::new(dcx, level, "unused import")
+        }
+    }
+}
+
+pub(super) fn check_unused_traits(tcx: TyCtxt<'_>, (): ()) {
     let mut used_trait_imports = UnordSet::<LocalDefId>::default();
 
     // FIXME: Use `tcx.hir_par_body_owners()` when we implement creating `DefId`s
@@ -23,7 +36,7 @@ fn check_unused_traits(tcx: TyCtxt<'_>, (): ()) {
         used_trait_imports.extend_unord(imports.items().copied());
     }
 
-    for &id in tcx.maybe_unused_trait_imports(()) {
+    for &id in tcx.resolutions(()).maybe_unused_trait_imports.iter() {
         debug_assert_eq!(tcx.def_kind(id), DefKind::Use);
         if tcx.visibility(id).is_public() {
             continue;
@@ -36,12 +49,11 @@ fn check_unused_traits(tcx: TyCtxt<'_>, (): ()) {
             continue;
         }
         let (path, _) = item.expect_use();
-        tcx.node_span_lint(lint::builtin::UNUSED_IMPORTS, item.hir_id(), path.span, |lint| {
-            if let Ok(snippet) = tcx.sess.source_map().span_to_snippet(path.span) {
-                lint.primary_message(format!("unused import: `{snippet}`"));
-            } else {
-                lint.primary_message("unused import");
-            }
-        });
+        tcx.emit_node_span_lint(
+            lint::builtin::UNUSED_IMPORTS,
+            item.hir_id(),
+            path.span,
+            UnusedImport { tcx, span: path.span },
+        );
     }
 }

@@ -17,14 +17,17 @@
 //!
 //! # Test history
 //!
-//! - The previous rmake.rs iteration of this test was flakey for unknown reason on `i686-mingw`
-//!   *specifically*, so assertion failures in this test was made extremely verbose to help
-//!   diagnose why the ICE messages was different *specifically* on `i686-mingw`.
-//! - An attempt is made to re-enable this test on `i686-mingw` (by removing `ignore-windows`). If
-//!   this test is still flakey, please restore the `ignore-windows` directive.
+//! The previous rmake.rs iteration of this test was flaky for unknown reason on
+//! `i686-pc-windows-gnu`, so assertion failures in this test was made extremely verbose to help
+//! diagnose why the ICE messages was different. It appears that backtraces on `i686-pc-windows-gnu`
+//! specifically are quite unpredictable in how many backtrace frames are involved.
+//!
+//! Disabled on `i686-pc-windows-msvc` as well, because sometimes the middle portion of the ICE
+//! backtrace becomes `<unknown>`.
 
-//@ ignore-windows
-//FIXME(#128911): still flakey on i686-mingw.
+//@ ignore-cross-compile (exercising ICE dump on host)
+//@ ignore-i686-pc-windows-gnu (unwind mechanism produces unpredictable backtraces)
+//@ ignore-i686-pc-windows-msvc (sometimes partial backtrace becomes `<unknown>`)
 
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
@@ -192,7 +195,10 @@ fn test_flag_and_env(baseline: &IceDump) {
             .env("RUSTC_ICE", &real_dir)
             .arg("-Ztreat-err-as-bug=1")
             .arg(metrics_arg)
-            .run_fail();
+            .run_fail()
+            .assert_stderr_contains(
+                "ignoring -Zmetrics-dir in favor of RUSTC_ICE for destination of ICE report files",
+            );
 
         let cwd_ice_files = find_ice_dumps_in_dir(cwd());
         assert!(cwd_ice_files.is_empty(), "RUSTC_ICE should override -Zmetrics-dir");

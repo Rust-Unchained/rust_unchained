@@ -1,5 +1,7 @@
 //! impl bool {}
 
+use crate::marker::Destruct;
+
 impl bool {
     /// Returns `Some(t)` if the `bool` is [`true`](../std/keyword.true.html),
     /// or `None` otherwise.
@@ -29,8 +31,9 @@ impl bool {
     /// assert_eq!(a, 2);
     /// ```
     #[stable(feature = "bool_to_option", since = "1.62.0")]
+    #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
     #[inline]
-    pub fn then_some<T>(self, t: T) -> Option<T> {
+    pub const fn then_some<T: [const] Destruct>(self, t: T) -> Option<T> {
         if self { Some(t) } else { None }
     }
 
@@ -57,8 +60,101 @@ impl bool {
     #[doc(alias = "then_with")]
     #[stable(feature = "lazy_bool_to_option", since = "1.50.0")]
     #[rustc_diagnostic_item = "bool_then"]
+    #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
     #[inline]
-    pub fn then<T, F: FnOnce() -> T>(self, f: F) -> Option<T> {
+    pub const fn then<T, F: [const] FnOnce() -> T + [const] Destruct>(self, f: F) -> Option<T> {
         if self { Some(f()) } else { None }
+    }
+
+    /// Returns `Ok(())` if the `bool` is [`true`](../std/keyword.true.html),
+    /// or `Err(err)` otherwise.
+    ///
+    /// Arguments passed to `ok_or` are eagerly evaluated; if you are
+    /// passing the result of a function call, it is recommended to use
+    /// [`ok_or_else`], which is lazily evaluated.
+    ///
+    /// [`ok_or_else`]: bool::ok_or_else
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(false.ok_or(0), Err(0));
+    /// assert_eq!(true.ok_or(0), Ok(()));
+    /// ```
+    ///
+    /// ```
+    /// let mut a = 0;
+    /// let mut function_with_side_effects = || { a += 1; };
+    ///
+    /// assert!(true.ok_or(function_with_side_effects()).is_ok());
+    /// assert!(false.ok_or(function_with_side_effects()).is_err());
+    ///
+    /// // `a` is incremented twice because the value passed to `ok_or` is
+    /// // evaluated eagerly.
+    /// assert_eq!(a, 2);
+    /// ```
+    #[stable(feature = "bool_to_result", since = "1.98.0")]
+    #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
+    #[inline]
+    pub const fn ok_or<E: [const] Destruct>(self, err: E) -> Result<(), E> {
+        if self { Ok(()) } else { Err(err) }
+    }
+
+    /// Returns `Ok(())` if the `bool` is [`true`](../std/keyword.true.html),
+    /// or `Err(f())` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(false.ok_or_else(|| 0), Err(0));
+    /// assert_eq!(true.ok_or_else(|| 0), Ok(()));
+    /// ```
+    ///
+    /// ```
+    /// let mut a = 0;
+    ///
+    /// assert!(true.ok_or_else(|| { a += 1; }).is_ok());
+    /// assert!(false.ok_or_else(|| { a += 1; }).is_err());
+    ///
+    /// // `a` is incremented once because the closure is evaluated lazily by
+    /// // `ok_or_else`.
+    /// assert_eq!(a, 1);
+    /// ```
+    #[stable(feature = "bool_to_result", since = "1.98.0")]
+    #[rustc_const_unstable(feature = "const_bool", issue = "151531")]
+    #[inline]
+    pub const fn ok_or_else<E, F: [const] FnOnce() -> E + [const] Destruct>(
+        self,
+        f: F,
+    ) -> Result<(), E> {
+        if self { Ok(()) } else { Err(f()) }
+    }
+
+    /// Toggles `self` in-place.
+    ///
+    /// - If `self` is [`true`], sets `self` to [`false`].
+    /// - If `self` is [`false`], sets `self` to [`true`].
+    ///
+    /// Equivalent to `value = !value`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(bool_toggle)]
+    /// let mut boolean = false;
+    ///
+    /// boolean.toggle();
+    /// assert_eq!(boolean, true);
+    ///
+    /// boolean.toggle();
+    /// assert_eq!(boolean, false);
+    /// ```
+    ///
+    /// [`true`]: ../std/keyword.true.html
+    /// [`false`]: ../std/keyword.false.html
+    #[unstable(feature = "bool_toggle", issue = "159298")]
+    #[inline]
+    pub const fn toggle(&mut self) {
+        *self = !*self;
     }
 }

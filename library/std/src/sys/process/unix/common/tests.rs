@@ -99,8 +99,13 @@ fn test_process_group_posix_spawn() {
         cmd.stdout(Stdio::MakePipe);
         let (mut cat, _pipes) = t!(cmd.spawn(Stdio::Null, true));
 
+        let pid = cat.id() as libc::pid_t;
+        let pgid = libc::getpgid(pid);
+        assert_ne!(-1, pgid, "getpgid failed");
+        assert_eq!(pid, pgid, "child process ID does not match its process group ID");
+
         // Check that we can kill its process group, which means there *is* one.
-        t!(cvt(libc::kill(-(cat.id() as libc::pid_t), libc::SIGINT)));
+        t!(cvt(libc::kill(-pgid, libc::SIGINT)));
 
         t!(cat.wait());
     }
@@ -127,8 +132,96 @@ fn test_process_group_no_posix_spawn() {
         cmd.stdout(Stdio::MakePipe);
         let (mut cat, _pipes) = t!(cmd.spawn(Stdio::Null, true));
 
+        let pid = cat.id() as libc::pid_t;
+        let pgid = libc::getpgid(pid);
+        assert_ne!(-1, pgid, "getpgid failed");
+        assert_eq!(pid, pgid, "child process ID does not match its process group ID");
+
+        if cfg!(target_os = "qnx") {
+            // kill(-pgid) appears to be unable to terminate the child process on QNX8
+            return;
+        }
+
         // Check that we can kill its process group, which means there *is* one.
-        t!(cvt(libc::kill(-(cat.id() as libc::pid_t), libc::SIGINT)));
+        t!(cvt(libc::kill(-pgid, libc::SIGINT)));
+
+        t!(cat.wait());
+    }
+}
+
+#[test]
+#[cfg_attr(
+    any(
+        // See test_process_mask
+        target_os = "macos",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+    ),
+    ignore
+)]
+fn test_setsid_posix_spawn() {
+    // Spawn a cat subprocess that's just going to hang since there is no I/O.
+    let mut cmd = Command::new(OsStr::new("cat"));
+    cmd.setsid(true);
+    cmd.stdin(Stdio::MakePipe);
+    cmd.stdout(Stdio::MakePipe);
+    let (mut cat, _pipes) = t!(cmd.spawn(Stdio::Null, true));
+
+    unsafe {
+        let pid = cat.id() as libc::pid_t;
+        let pgid = libc::getpgid(pid);
+        assert_ne!(-1, pgid, "getpgid failed");
+        assert_eq!(pid, pgid, "child process ID does not match its process group ID");
+
+        if cfg!(target_os = "qnx") {
+            // kill(-pgid) appears to be unable to terminate the child process on QNX8
+            return;
+        }
+
+        // Setsid will create a new session and process group, so check that
+        // we can kill the process group, which means there *is* one.
+        t!(cvt(libc::kill(-pgid, libc::SIGINT)));
+
+        t!(cat.wait());
+    }
+}
+
+#[test]
+#[cfg_attr(
+    any(
+        // See test_process_mask
+        target_os = "macos",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+    ),
+    ignore
+)]
+fn test_setsid_no_posix_spawn() {
+    let mut cmd = Command::new(OsStr::new("cat"));
+    cmd.setsid(true);
+    cmd.stdin(Stdio::MakePipe);
+    cmd.stdout(Stdio::MakePipe);
+
+    unsafe {
+        // Same as above, create hang-y cat. This time, force using the non-posix_spawn path.
+        cmd.pre_exec(Box::new(|| Ok(()))); // pre_exec forces fork + exec rather than posix spawn.
+        let (mut cat, _pipes) = t!(cmd.spawn(Stdio::Null, true));
+
+        let pid = cat.id() as libc::pid_t;
+        let pgid = libc::getpgid(pid);
+        assert_ne!(-1, pgid, "getpgid failed");
+        assert_eq!(pid, pgid, "child process ID does not match its process group ID");
+
+        if cfg!(target_os = "qnx") {
+            // kill(-pgid) appears to be unable to terminate the child process on QNX8
+            return;
+        }
+
+        // Setsid will create a new session and process group, so check that
+        // we can kill the process group, which means there *is* one.
+        t!(cvt(libc::kill(-pgid, libc::SIGINT)));
 
         t!(cat.wait());
     }

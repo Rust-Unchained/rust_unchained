@@ -2,8 +2,8 @@
 //! assist in ide_assists because that would require the ide_assists crate
 //! depend on the ide_ssr crate.
 
-use ide_assists::{Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel};
-use ide_db::{label::Label, source_change::SourceChange, FileRange, RootDatabase};
+use ide_assists::{Assist, AssistId, AssistResolveStrategy, GroupLabel};
+use ide_db::{FileRange, RootDatabase, label::Label, source_change::SourceChange};
 
 pub(crate) fn ssr_assists(
     db: &RootDatabase,
@@ -16,7 +16,7 @@ pub(crate) fn ssr_assists(
         Some(ssr_data) => ssr_data,
         None => return ssr_assists,
     };
-    let id = AssistId("ssr", AssistKind::RefactorRewrite);
+    let id = AssistId::refactor_rewrite("ssr");
 
     let (source_change_for_file, source_change_for_workspace) = if resolve.should_resolve(&id) {
         let edits = match_finder.edits();
@@ -58,12 +58,8 @@ pub(crate) fn ssr_assists(
 mod tests {
     use expect_test::expect;
     use ide_assists::{Assist, AssistResolveStrategy};
-    use ide_db::{
-        base_db::ra_salsa::Durability, symbol_index::SymbolsDatabase, FileRange, FxHashSet,
-        RootDatabase,
-    };
+    use ide_db::{FileRange, FxHashSet, LocalRoots, RootDatabase, base_db::salsa::Setter as _};
     use test_fixture::WithFixture;
-    use triomphe::Arc;
 
     use super::ssr_assists;
 
@@ -74,11 +70,11 @@ mod tests {
         let (mut db, file_id, range_or_offset) = RootDatabase::with_range_or_offset(ra_fixture);
         let mut local_roots = FxHashSet::default();
         local_roots.insert(test_fixture::WORKSPACE);
-        db.set_local_roots_with_durability(Arc::new(local_roots), Durability::HIGH);
+        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
         ssr_assists(
             &db,
             &resolve,
-            FileRange { file_id: file_id.into(), range: range_or_offset.into() },
+            FileRange { file_id: file_id.file_id(&db), range: range_or_offset.into() },
         )
     }
 
@@ -120,6 +116,7 @@ mod tests {
                 id: AssistId(
                     "ssr",
                     RefactorRewrite,
+                    None,
                 ),
                 label: "Apply SSR in file",
                 group: Some(
@@ -139,9 +136,9 @@ mod tests {
                                         Indel {
                                             insert: "3",
                                             delete: 33..34,
-                                            annotation: None,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 None,
                             ),
@@ -163,6 +160,7 @@ mod tests {
                 id: AssistId(
                     "ssr",
                     RefactorRewrite,
+                    None,
                 ),
                 label: "Apply SSR in workspace",
                 group: Some(
@@ -182,9 +180,9 @@ mod tests {
                                         Indel {
                                             insert: "3",
                                             delete: 33..34,
-                                            annotation: None,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 None,
                             ),
@@ -196,9 +194,9 @@ mod tests {
                                         Indel {
                                             insert: "3",
                                             delete: 11..12,
-                                            annotation: None,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 None,
                             ),
@@ -240,6 +238,7 @@ mod tests {
                 id: AssistId(
                     "ssr",
                     RefactorRewrite,
+                    None,
                 ),
                 label: "Apply SSR in file",
                 group: Some(
@@ -260,6 +259,7 @@ mod tests {
                 id: AssistId(
                     "ssr",
                     RefactorRewrite,
+                    None,
                 ),
                 label: "Apply SSR in workspace",
                 group: Some(

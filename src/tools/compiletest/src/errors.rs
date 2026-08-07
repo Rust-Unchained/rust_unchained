@@ -9,16 +9,19 @@ use regex::Regex;
 use tracing::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     Help,
     Error,
     Note,
     Suggestion,
     Warning,
+    Raw,
+    /// Used for better recovery and diagnostics in compiletest.
+    Unknown,
 }
 
 impl ErrorKind {
-    pub fn from_compiler_str(s: &str) -> ErrorKind {
+    pub(crate) fn from_compiler_str(s: &str) -> ErrorKind {
         match s {
             "help" => ErrorKind::Help,
             "error" | "error: internal compiler error" => ErrorKind::Error,
@@ -37,15 +40,16 @@ impl ErrorKind {
             "NOTE" | "note" => ErrorKind::Note,
             "SUGGESTION" => ErrorKind::Suggestion,
             "WARN" | "WARNING" | "warn" | "warning" => ErrorKind::Warning,
+            "RAW" => ErrorKind::Raw,
             _ => return None,
         })
     }
 
-    pub fn expect_from_user_str(s: &str) -> ErrorKind {
+    pub(crate) fn expect_from_user_str(s: &str) -> ErrorKind {
         ErrorKind::from_user_str(s).unwrap_or_else(|| {
             panic!(
                 "unexpected diagnostic kind `{s}`, expected \
-                 `ERROR`, `WARN`, `NOTE`, `HELP` or `SUGGESTION`"
+                 `ERROR`, `WARN`, `NOTE`, `HELP`, `SUGGESTION` or `RAW`"
             )
         })
     }
@@ -59,37 +63,23 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Note => write!(f, "NOTE"),
             ErrorKind::Suggestion => write!(f, "SUGGESTION"),
             ErrorKind::Warning => write!(f, "WARN"),
+            ErrorKind::Raw => write!(f, "RAW"),
+            ErrorKind::Unknown => write!(f, "UNKNOWN"),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Error {
-    pub line_num: Option<usize>,
+pub(crate) struct Error {
+    pub(crate) line_num: Option<usize>,
+    pub(crate) column_num: Option<usize>,
     /// What kind of message we expect (e.g., warning, error, suggestion).
-    /// `None` if not specified or unknown message kind.
-    pub kind: Option<ErrorKind>,
-    pub msg: String,
+    pub(crate) kind: ErrorKind,
+    pub(crate) msg: String,
     /// For some `Error`s, like secondary lines of multi-line diagnostics, line annotations
     /// are not mandatory, even if they would otherwise be mandatory for primary errors.
     /// Only makes sense for "actual" errors, not for "expected" errors.
-    pub require_annotation: bool,
-}
-
-impl Error {
-    pub fn render_for_expected(&self) -> String {
-        use colored::Colorize;
-        format!(
-            "{: <10}line {: >3}: {}",
-            self.kind.map(|kind| kind.to_string()).unwrap_or_default(),
-            self.line_num_str(),
-            self.msg.cyan(),
-        )
-    }
-
-    pub fn line_num_str(&self) -> String {
-        self.line_num.map_or("?".to_string(), |line_num| line_num.to_string())
-    }
+    pub(crate) require_annotation: bool,
 }
 
 /// Looks for either "//~| KIND MESSAGE" or "//~^^... KIND MESSAGE"
@@ -102,7 +92,7 @@ impl Error {
 ///
 /// If revision is not None, then we look
 /// for `//[X]~` instead, where `X` is the current revision.
-pub fn load_errors(testfile: &Utf8Path, revision: Option<&str>) -> Vec<Error> {
+pub(crate) fn load_errors(testfile: &Utf8Path, revision: Option<&str>) -> Vec<Error> {
     let rdr = BufReader::new(File::open(testfile.as_std_path()).unwrap());
 
     // `last_nonfollow_error` tracks the most recently seen
@@ -173,9 +163,12 @@ fn parse_expected(
     // Get the part of the comment after the sigil (e.g. `~^^` or ~|).
     let tag = captures.get(0).unwrap();
     let rest = line[tag.end()..].trim_start();
-    let (kind_str, _) = rest.split_once(|c: char| !c.is_ascii_alphabetic()).unwrap_or((rest, ""));
-    let kind = ErrorKind::from_user_str(kind_str);
-    let untrimmed_msg = if kind.is_some() { &rest[kind_str.len()..] } else { rest };
+    let (kind_str, _) =
+        rest.split_once(|c: char| c != '_' && !c.is_ascii_alphabetic()).unwrap_or((rest, ""));
+    let (kind, untrimmed_msg) = match ErrorKind::from_user_str(kind_str) {
+        Some(kind) => (kind, &rest[kind_str.len()..]),
+        None => (ErrorKind::Unknown, rest),
+    };
     let msg = untrimmed_msg.strip_prefix(':').unwrap_or(untrimmed_msg).trim().to_owned();
 
     let line_num_adjust = &captures["adjust"];
@@ -188,6 +181,7 @@ fn parse_expected(
     } else {
         (false, Some(line_num - line_num_adjust.len()))
     };
+    let column_num = Some(tag.start() + 1);
 
     debug!(
         "line={:?} tag={:?} follow_prev={:?} kind={:?} msg={:?}",
@@ -197,7 +191,7 @@ fn parse_expected(
         kind,
         msg
     );
-    Some((follow_prev, Error { line_num, kind, msg, require_annotation: true }))
+    Some((follow_prev, Error { line_num, column_num, kind, msg, require_annotation: true }))
 }
 
 #[cfg(test)]

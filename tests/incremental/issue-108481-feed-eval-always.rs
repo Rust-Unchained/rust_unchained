@@ -1,4 +1,5 @@
-//@ revisions: cpass1 cpass2
+//@ revisions: bpass1 bpass2
+//@ ignore-backends: gcc
 
 #![crate_type = "rlib"]
 
@@ -12,5 +13,5 @@ pub struct ConstGeneric<const CHUNK_SIZE: usize> {
     _p: [(); CHUNK_SIZE],
 }
 
-#[cfg(cpass1)]
+#[cfg(bpass1)]
 impl<const CHUNK_SIZE: usize> ConstGeneric<CHUNK_SIZE> {}

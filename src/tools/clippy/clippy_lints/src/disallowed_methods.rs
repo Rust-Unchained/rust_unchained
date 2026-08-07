@@ -1,6 +1,7 @@
 use clippy_config::Conf;
 use clippy_config::types::{DisallowedPath, create_disallowed_map};
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::paths::PathNS;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
 use rustc_hir::{Expr, ExprKind};
@@ -33,6 +34,9 @@ declare_clippy_lint! {
     ///     { path = "std::vec::Vec::leak", reason = "no leaking memory" },
     ///     # Can also add a `replacement` that will be offered as a suggestion.
     ///     { path = "std::sync::Mutex::new", reason = "prefer faster & simpler non-poisonable mutex", replacement = "parking_lot::Mutex::new" },
+    ///     # This would normally error if the path is incorrect, but with `allow-invalid` = `true`,
+    ///     # it will be silently ignored
+    ///     { path = "std::fs::InvalidPath", reason = "use alternative instead", allow-invalid = true },
     /// ]
     /// ```
     ///
@@ -57,6 +61,8 @@ declare_clippy_lint! {
     "use of a disallowed method call"
 }
 
+impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
+
 pub struct DisallowedMethods {
     disallowed: DefIdMap<(&'static str, &'static DisallowedPath)>,
 }
@@ -66,6 +72,7 @@ impl DisallowedMethods {
         let (disallowed, _) = create_disallowed_map(
             tcx,
             &conf.disallowed_methods,
+            PathNS::Value,
             |def_kind| {
                 matches!(
                     def_kind,
@@ -79,10 +86,11 @@ impl DisallowedMethods {
     }
 }
 
-impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
-
 impl<'tcx> LateLintPass<'tcx> for DisallowedMethods {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+        if expr.span.desugaring_kind().is_some() {
+            return;
+        }
         let (id, span) = match &expr.kind {
             ExprKind::Path(path) if let Res::Def(_, id) = cx.qpath_res(path, expr.hir_id) => (id, expr.span),
             ExprKind::MethodCall(name, ..) if let Some(id) = cx.typeck_results().type_dependent_def_id(expr.hir_id) => {

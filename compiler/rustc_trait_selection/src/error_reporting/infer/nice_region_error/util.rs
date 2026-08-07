@@ -16,6 +16,8 @@ pub struct AnonymousParamInfo<'tcx> {
     pub param: &'tcx hir::Param<'tcx>,
     /// The type corresponding to the anonymous region parameter.
     pub param_ty: Ty<'tcx>,
+    /// The original type before region replacement.
+    pub orig_param_ty: Ty<'tcx>,
     /// The `ty::LateParamRegionKind` corresponding to the anonymous region.
     pub kind: ty::LateParamRegionKind,
     /// The `Span` of the parameter type.
@@ -46,7 +48,7 @@ pub fn find_param_with_region<'tcx>(
         ty::ReLateParam(late_param) => (late_param.scope, late_param.kind),
         ty::ReEarlyParam(ebr) => {
             let region_def = tcx.generics_of(generic_param_scope).region_param(ebr, tcx).def_id;
-            (tcx.parent(region_def), ty::LateParamRegionKind::Named(region_def, ebr.name))
+            (tcx.parent(region_def), ty::LateParamRegionKind::Named(region_def))
         }
         _ => return None, // not a free region
     };
@@ -66,12 +68,12 @@ pub fn find_param_with_region<'tcx>(
 
     let owner_id = tcx.hir_body_owner(body.id());
     let fn_decl = tcx.hir_fn_decl_by_hir_id(owner_id)?;
-    let poly_fn_sig = tcx.fn_sig(id).instantiate_identity();
+    let poly_fn_sig = tcx.fn_sig(id).instantiate_identity().skip_norm_wip();
 
     let fn_sig = tcx.liberate_late_bound_regions(id, poly_fn_sig);
     body.params
         .iter()
-        .take(if fn_sig.c_variadic {
+        .take(if fn_sig.c_variadic() {
             fn_sig.inputs().len()
         } else {
             assert_eq!(fn_sig.inputs().len(), body.params.len());
@@ -94,7 +96,14 @@ pub fn find_param_with_region<'tcx>(
                 let ty_hir_id = fn_decl.inputs[index].hir_id;
                 let param_ty_span = tcx.hir_span(ty_hir_id);
                 let is_first = index == 0;
-                AnonymousParamInfo { param, param_ty: new_param_ty, param_ty_span, kind, is_first }
+                AnonymousParamInfo {
+                    param,
+                    param_ty: new_param_ty,
+                    orig_param_ty: ty,
+                    param_ty_span,
+                    kind,
+                    is_first,
+                }
             })
         })
 }
@@ -117,12 +126,13 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         region_def_id: DefId,
         hir_sig: &hir::FnSig<'_>,
     ) -> Option<Span> {
-        let fn_ty = self.tcx().type_of(scope_def_id).instantiate_identity();
+        let tcx = self.tcx();
+        let fn_ty = tcx.type_of(scope_def_id).instantiate_identity().skip_norm_wip();
         if let ty::FnDef(_, _) = fn_ty.kind() {
-            let ret_ty = fn_ty.fn_sig(self.tcx()).output();
+            let ret_ty = fn_ty.fn_sig(tcx).output();
             let span = hir_sig.decl.output.span();
             let future_output = if hir_sig.header.is_async() {
-                ret_ty.map_bound(|ty| self.cx.get_impl_future_output_ty(ty)).transpose()
+                ret_ty.map_bound(|ty| tcx.get_impl_future_output_ty(ty)).transpose()
             } else {
                 None
             };
@@ -144,7 +154,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // We are only checking is any region meets the condition so order doesn't matter
         #[allow(rustc::potential_query_instability)]
         late_bound_regions.iter().any(|r| match *r {
-            ty::BoundRegionKind::Named(def_id, _) => def_id == region_def_id,
+            ty::BoundRegionKind::Named(def_id) => def_id == region_def_id,
             _ => false,
         })
     }

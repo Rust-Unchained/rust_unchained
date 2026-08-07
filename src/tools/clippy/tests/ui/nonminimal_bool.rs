@@ -1,11 +1,10 @@
 //@no-rustfix: overlapping suggestions
-#![allow(
-    unused,
+#![warn(clippy::nonminimal_bool)]
+#![expect(
     clippy::diverging_sub_expression,
-    clippy::needless_if,
+    clippy::needless_ifs,
     clippy::redundant_pattern_matching
 )]
-#![warn(clippy::nonminimal_bool)]
 #![allow(clippy::useless_vec)]
 
 fn main() {
@@ -182,13 +181,11 @@ fn issue_5794() {
     if !b == true {}
     //~^ nonminimal_bool
     //~| bool_comparison
-    //~| bool_comparison
     if !b != true {}
     //~^ nonminimal_bool
     //~| bool_comparison
     if true == !b {}
     //~^ nonminimal_bool
-    //~| bool_comparison
     //~| bool_comparison
     if true != !b {}
     //~^ nonminimal_bool
@@ -235,4 +232,22 @@ mod issue14404 {
             todo!()
         }
     }
+}
+
+fn dont_simplify_double_not_if_types_differ() {
+    struct S;
+
+    impl std::ops::Not for S {
+        type Output = bool;
+        fn not(self) -> bool {
+            true
+        }
+    }
+
+    // The lint must propose `if !!S`, not `if S`.
+    // FIXME: `bool_comparison` will propose to use `S == true`
+    // which is invalid.
+    if !S != true {}
+    //~^ nonminimal_bool
+    //~| bool_comparison
 }

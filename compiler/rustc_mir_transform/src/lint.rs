@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::mir::visit::{PlaceContext, Visitor};
+use rustc_middle::mir::visit::{PlaceContext, VisitPlacesWith, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::{MaybeStorageDead, MaybeStorageLive, always_storage_live_locals};
@@ -66,6 +66,12 @@ impl<'a, 'tcx> Lint<'a, 'tcx> {
     }
 }
 
+/// Checks whether reading `src` while assigning to `dest` would violate MIR's
+/// non-overlap requirement for assignments.
+fn places_conflict_for_assignment<'tcx>(dest: Place<'tcx>, src: Place<'tcx>) -> bool {
+    dest == src || (dest.local == src.local && !dest.is_indirect() && !src.is_indirect())
+}
+
 impl<'a, 'tcx> Visitor<'tcx> for Lint<'a, 'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
         if context.is_use() {
@@ -78,16 +84,35 @@ impl<'a, 'tcx> Visitor<'tcx> for Lint<'a, 'tcx> {
 
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match &statement.kind {
-            StatementKind::Assign(box (dest, rvalue)) => {
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue {
-                    // The sides of an assignment must not alias. Currently this just checks whether
-                    // the places are identical.
-                    if dest == src {
-                        self.fail(
-                            location,
-                            "encountered `Assign` statement with overlapping memory",
-                        );
-                    }
+            StatementKind::Assign((dest, rvalue)) => {
+                let forbid_aliasing = match rvalue {
+                    Rvalue::Use(..)
+                    | Rvalue::CopyForDeref(..)
+                    | Rvalue::Repeat(..)
+                    | Rvalue::Aggregate(..)
+                    | Rvalue::Cast(..)
+                    | Rvalue::WrapUnsafeBinder(..) => true,
+                    Rvalue::ThreadLocalRef(..)
+                    | Rvalue::UnaryOp(..)
+                    | Rvalue::BinaryOp(..)
+                    | Rvalue::Ref(..)
+                    | Rvalue::Reborrow(..)
+                    | Rvalue::RawPtr(..)
+                    | Rvalue::Discriminant(..) => false,
+                };
+                // The sides of an assignment must not alias.
+                if forbid_aliasing {
+                    VisitPlacesWith(|src: Place<'tcx>, _| {
+                        if places_conflict_for_assignment(*dest, src) {
+                            self.fail(
+                                location,
+                                format!(
+                                    "encountered `{statement:?}` statement with overlapping memory"
+                                ),
+                            );
+                        }
+                    })
+                    .visit_rvalue(rvalue, location);
                 }
             }
             StatementKind::StorageLive(local) => {

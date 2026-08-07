@@ -1,13 +1,16 @@
-use rustc_ast::ptr::P;
 use rustc_ast::token::NtExprKind::*;
 use rustc_ast::token::NtPatKind::*;
 use rustc_ast::token::{self, InvisibleOrigin, MetaVarKind, NonterminalKind, Token};
+use rustc_ast::tokenstream::WithTokens;
+use rustc_ast_pretty::pprust;
 use rustc_errors::PResult;
 use rustc_span::{Ident, kw};
 
-use crate::errors::UnexpectedNonterminal;
+use crate::diagnostics::UnexpectedNonterminal;
 use crate::parser::pat::{CommaRecoveryMode, RecoverColon, RecoverComma};
-use crate::parser::{FollowedByType, ForceCollect, ParseNtResult, Parser, PathStyle};
+use crate::parser::{
+    AllowConstBlockItems, FollowedByType, ForceCollect, ParseNtResult, Parser, PathStyle,
+};
 
 impl<'a> Parser<'a> {
     /// Checks whether a non-terminal may begin with a particular token.
@@ -24,17 +27,16 @@ impl<'a> Parser<'a> {
                 | MetaVarKind::Pat(_)
                 | MetaVarKind::Expr { .. }
                 | MetaVarKind::Ty { .. }
-                | MetaVarKind::Literal // `true`, `false`
                 | MetaVarKind::Meta { .. }
                 | MetaVarKind::Path => true,
+                // `true`, `false`
+                MetaVarKind::Literal => true,
 
-                MetaVarKind::Item
-                | MetaVarKind::Block
-                | MetaVarKind::Vis => false,
+                MetaVarKind::Item | MetaVarKind::Block | MetaVarKind::Vis | MetaVarKind::Guard => {
+                    false
+                }
 
-                MetaVarKind::Ident
-                | MetaVarKind::Lifetime
-                | MetaVarKind::TT => unreachable!(),
+                MetaVarKind::Ident | MetaVarKind::Lifetime | MetaVarKind::TT => unreachable!(),
             }
         }
 
@@ -85,7 +87,8 @@ impl<'a> Parser<'a> {
                     | MetaVarKind::Ty { .. }
                     | MetaVarKind::Meta { .. }
                     | MetaVarKind::Path
-                    | MetaVarKind::Vis => false,
+                    | MetaVarKind::Vis
+                    | MetaVarKind::Guard => false,
                     MetaVarKind::Lifetime | MetaVarKind::Ident | MetaVarKind::TT => {
                         unreachable!()
                     }
@@ -102,8 +105,12 @@ impl<'a> Parser<'a> {
                 token::Lifetime(..) | token::NtLifetime(..) => true,
                 _ => false,
             },
+            NonterminalKind::Guard => match token.kind {
+                token::OpenInvisible(InvisibleOrigin::MetaVar(MetaVarKind::Guard)) => true,
+                _ => token.is_keyword(kw::If),
+            },
             NonterminalKind::TT | NonterminalKind::Item | NonterminalKind::Stmt => {
-                token.kind.close_delim().is_none()
+                token.kind != token::Eof && token.kind.close_delim().is_none()
             }
         }
     }
@@ -119,30 +126,37 @@ impl<'a> Parser<'a> {
         match kind {
             // Note that TT is treated differently to all the others.
             NonterminalKind::TT => Ok(ParseNtResult::Tt(self.parse_token_tree())),
-            NonterminalKind::Item => match self.parse_item(ForceCollect::Yes)? {
+            NonterminalKind::Item => match self
+                .parse_item(ForceCollect::Yes, AllowConstBlockItems::Yes)?
+            {
                 Some(item) => Ok(ParseNtResult::Item(item)),
                 None => Err(self.dcx().create_err(UnexpectedNonterminal::Item(self.token.span))),
             },
             NonterminalKind::Block => {
                 // While a block *expression* may have attributes (e.g. `#[my_attr] { ... }`),
                 // the ':block' matcher does not support them
-                Ok(ParseNtResult::Block(self.collect_tokens_no_attrs(|this| this.parse_block())?))
+                Ok(ParseNtResult::Block(self.collect_tokens_no_attrs(|this| {
+                    this.parse_block().map(|block| WithTokens::new(block))
+                })?))
             }
-            NonterminalKind::Stmt => match self.parse_stmt(ForceCollect::Yes)? {
-                Some(stmt) => Ok(ParseNtResult::Stmt(P(stmt))),
+            NonterminalKind::Stmt => match self.parse_stmt_nonterminal(ForceCollect::Yes) {
+                Some(stmt) => Ok(ParseNtResult::Stmt(Box::new(stmt))),
                 None => {
                     Err(self.dcx().create_err(UnexpectedNonterminal::Statement(self.token.span)))
                 }
             },
             NonterminalKind::Pat(pat_kind) => Ok(ParseNtResult::Pat(
-                self.collect_tokens_no_attrs(|this| match pat_kind {
-                    PatParam { .. } => this.parse_pat_no_top_alt(None, None),
-                    PatWithOr => this.parse_pat_no_top_guard(
-                        None,
-                        RecoverComma::No,
-                        RecoverColon::No,
-                        CommaRecoveryMode::EitherTupleOrPipe,
-                    ),
+                self.collect_tokens_no_attrs(|this| {
+                    match pat_kind {
+                        PatParam { .. } => this.parse_pat_no_top_alt(None, None),
+                        PatWithOr => this.parse_pat_no_top_guard(
+                            None,
+                            RecoverComma::No,
+                            RecoverColon::No,
+                            CommaRecoveryMode::EitherTupleOrPipe,
+                        ),
+                    }
+                    .map(|pat| WithTokens::new(Box::new(pat)))
                 })?,
                 pat_kind,
             )),
@@ -155,9 +169,9 @@ impl<'a> Parser<'a> {
                     self.collect_tokens_no_attrs(|this| this.parse_literal_maybe_minus())?,
                 ))
             }
-            NonterminalKind::Ty => Ok(ParseNtResult::Ty(
-                self.collect_tokens_no_attrs(|this| this.parse_ty_no_question_mark_recover())?,
-            )),
+            NonterminalKind::Ty => Ok(ParseNtResult::Ty(self.collect_tokens_no_attrs(|this| {
+                this.parse_ty_no_question_mark_recover().map(|ty| WithTokens::new(ty))
+            })?)),
             // This could be handled like a token, since it is one.
             NonterminalKind::Ident => {
                 if let Some((ident, is_raw)) = get_macro_ident(&self.token) {
@@ -166,19 +180,23 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(self.dcx().create_err(UnexpectedNonterminal::Ident {
                         span: self.token.span,
-                        token: self.token,
+                        token: pprust::token_to_string(&self.token),
                     }))
                 }
             }
-            NonterminalKind::Path => Ok(ParseNtResult::Path(P(
-                self.collect_tokens_no_attrs(|this| this.parse_path(PathStyle::Type))?
-            ))),
-            NonterminalKind::Meta => {
-                Ok(ParseNtResult::Meta(P(self.parse_attr_item(ForceCollect::Yes)?)))
+            NonterminalKind::Path => {
+                Ok(ParseNtResult::Path(self.collect_tokens_no_attrs(|this| {
+                    this.parse_path(PathStyle::Type).map(|path| WithTokens::new(Box::new(path)))
+                })?))
             }
+            NonterminalKind::Meta => Ok(ParseNtResult::Meta(
+                self.parse_attr_item(ForceCollect::Yes)?.map(|item| Box::new(item)),
+            )),
             NonterminalKind::Vis => {
-                Ok(ParseNtResult::Vis(P(self
-                    .collect_tokens_no_attrs(|this| this.parse_visibility(FollowedByType::Yes))?)))
+                Ok(ParseNtResult::Vis(self.collect_tokens_no_attrs(|this| {
+                    this.parse_visibility(FollowedByType::Yes)
+                        .map(|vis| WithTokens::new(Box::new(vis)))
+                })?))
             }
             NonterminalKind::Lifetime => {
                 // We want to keep `'keyword` parsing, just like `keyword` is still
@@ -189,9 +207,12 @@ impl<'a> Parser<'a> {
                 } else {
                     Err(self.dcx().create_err(UnexpectedNonterminal::Lifetime {
                         span: self.token.span,
-                        token: self.token,
+                        token: pprust::token_to_string(&self.token),
                     }))
                 }
+            }
+            NonterminalKind::Guard => {
+                Ok(ParseNtResult::Guard(self.expect_match_arm_guard(ForceCollect::Yes)?))
             }
         }
     }

@@ -282,21 +282,22 @@ When using `cargo dev new_lint`, the lint is automatically registered and
 nothing more has to be done.
 
 When declaring a new lint by hand and `cargo dev update_lints` is used, the lint
-pass may have to be registered manually in the `register_lints` function in
-`clippy_lints/src/lib.rs`:
+pass may have to be registered manually by adding an entry to the
+`early_lint_methods!` macro invocation in `clippy_lints/src/lib.rs`, at the
+`// add early passes here` marker:
 
 ```rust,ignore
-store.register_early_pass(|| Box::new(foo_functions::FooFunctions));
+FooFunctions: foo_functions::FooFunctions = foo_functions::FooFunctions,
 ```
 
-As one may expect, there is a corresponding `register_late_pass` method
-available as well. Without a call to one of `register_early_pass` or
-`register_late_pass`, the lint pass in question will not be run.
+As one may expect, there is a corresponding `late_lint_methods!` macro available
+as well. Without an entry in one of `early_lint_methods!` or `late_lint_methods!`,
+the lint pass in question will not be run.
 
 One reason that `cargo dev update_lints` does not automate this step is that
 multiple lints can use the same lint pass, so registering the lint pass may
 already be done when adding a new lint. Another reason that this step is not
-automated is that the order that the passes are registered determines the order
+automated is that the order that the passes are listed determines the order
 the passes actually run, which in turn affects the order that any emitted lints
 are output in.
 
@@ -416,7 +417,7 @@ In our example, `is_foo_fn` looks like:
 
 fn is_foo_fn(fn_kind: FnKind<'_>) -> bool {
     match fn_kind {
-        FnKind::Fn(_, ident, ..) => {
+        FnKind::Fn(_, _, Fn { ident, .. }) => {
             // check if `fn` name is `foo`
             ident.name.as_str() == "foo"
         }
@@ -446,8 +447,8 @@ Sometimes a lint makes suggestions that require a certain version of Rust. For
 example, the `manual_strip` lint suggests using `str::strip_prefix` and
 `str::strip_suffix` which is only available after Rust 1.45. In such cases, you
 need to ensure that the MSRV configured for the project is >= the MSRV of the
-required Rust feature. If multiple features are required, just use the one with
-a lower MSRV.
+required Rust feature. If multiple features are used in a suggestion, choose a
+MSRV that supports them all.
 
 First, add an MSRV alias for the required feature in [`clippy_utils::msrvs`].
 This can be accessed later as `msrvs::STR_STRIP_PREFIX`, for example.
@@ -759,8 +760,7 @@ for some users. Adding a configuration is done in the following steps:
 Here are some pointers to things you are likely going to need for every lint:
 
 * [Clippy utils][utils] - Various helper functions. Maybe the function you need
-  is already in here ([`is_type_diagnostic_item`], [`implements_trait`],
-  [`snippet`], etc)
+  is already in here ([`implements_trait`], [`snippet`], etc)
 * [Clippy diagnostics][diagnostics]
 * [Let chains][let-chains]
 * [`from_expansion`][from_expansion] and
@@ -790,7 +790,6 @@ get away with copying things from existing similar lints. If you are stuck,
 don't hesitate to ask on [Zulip] or in the issue/PR.
 
 [utils]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/index.html
-[`is_type_diagnostic_item`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/ty/fn.is_type_diagnostic_item.html
 [`implements_trait`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/ty/fn.implements_trait.html
 [`snippet`]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/source/fn.snippet.html
 [let-chains]: https://github.com/rust-lang/rust/pull/94927

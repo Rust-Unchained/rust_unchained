@@ -1,6 +1,5 @@
 #![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(clippy::assertions_on_constants)]
-#![feature(path_file_prefix)]
 
 use std::cmp::Ordering;
 use std::ffi::OsStr;
@@ -54,10 +53,8 @@ fn explore_directory(dir: &Path) -> Vec<String> {
             if let Some(ext) = path.extension() {
                 match ext.to_str().unwrap() {
                     "rs" | "toml" => current_file.clone_from(&file_prefix),
-                    "stderr" | "stdout" => {
-                        if file_prefix != current_file {
-                            missing_files.push(path.to_str().unwrap().to_string());
-                        }
+                    "stderr" | "stdout" if file_prefix != current_file => {
+                        missing_files.push(path.to_str().unwrap().to_string());
                     },
                     _ => {},
                 }

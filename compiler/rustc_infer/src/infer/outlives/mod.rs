@@ -1,18 +1,21 @@
 //! Various code related to computing outlives relations.
 
+use std::iter;
+
 use rustc_data_structures::undo_log::UndoLogs;
-use rustc_middle::traits::query::{NoSolution, OutlivesBound};
+use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::ty;
+use rustc_span::Span;
 use tracing::instrument;
 
 use self::env::OutlivesEnvironment;
 use super::region_constraints::{RegionConstraintData, UndoLog};
-use super::{InferCtxt, RegionResolutionError, SubregionOrigin};
+use super::{InferCtxt, RegionResolutionError};
 use crate::infer::free_regions::RegionRelations;
 use crate::infer::lexical_region_resolve;
+use crate::infer::region_constraints::ConstraintKind;
 
 pub mod env;
-pub mod for_liveness;
 pub mod obligations;
 pub mod test_type_match;
 pub(crate) mod verify;
@@ -26,7 +29,7 @@ pub fn explicit_outlives_bounds<'tcx>(
         .into_iter()
         .filter_map(ty::Clause::as_region_outlives_clause)
         .filter_map(ty::Binder::no_bound_vars)
-        .map(|ty::OutlivesPredicate(r_a, r_b)| OutlivesBound::RegionSubRegion(r_b, r_a))
+        .map(|ty::OutlivesClause(r_a, r_b)| OutlivesBound::RegionSubRegion(r_b, r_a))
 }
 
 impl<'tcx> InferCtxt<'tcx> {
@@ -35,36 +38,54 @@ impl<'tcx> InferCtxt<'tcx> {
     /// done -- or the compiler will panic -- but it is legal to use
     /// `resolve_vars_if_possible` as well as `fully_resolve`.
     ///
-    /// If you are in a crate that has access to `rustc_trait_selection`,
-    /// then it's probably better to use `resolve_regions`,
-    /// which knows how to normalize registered region obligations.
+    /// Don't call this directly unless you know what you're doing.
+    /// You probably want to use `resolve_regions` instead.
     #[must_use]
-    pub fn resolve_regions_with_normalize(
+    pub fn resolve_regions_with_outlives_env(
         &self,
         outlives_env: &OutlivesEnvironment<'tcx>,
-        deeply_normalize_ty: impl Fn(
-            ty::PolyTypeOutlivesPredicate<'tcx>,
-            SubregionOrigin<'tcx>,
-        ) -> Result<ty::PolyTypeOutlivesPredicate<'tcx>, NoSolution>,
+        span: Span,
     ) -> Vec<RegionResolutionError<'tcx>> {
-        match self.process_registered_region_obligations(outlives_env, deeply_normalize_ty) {
-            Ok(()) => {}
-            Err((clause, origin)) => {
-                return vec![RegionResolutionError::CannotNormalize(clause, origin)];
-            }
-        };
+        self.process_registered_region_obligations(outlives_env, span);
 
-        let storage = {
+        let mut storage = {
             let mut inner = self.inner.borrow_mut();
             let inner = &mut *inner;
             assert!(
                 self.tainted_by_errors().is_some() || inner.region_obligations.is_empty(),
                 "region_obligations not empty: {:#?}",
-                inner.region_obligations
+                inner.region_obligations,
             );
             assert!(!UndoLogs::<UndoLog<'_>>::in_snapshot(&inner.undo_log));
             inner.region_constraint_storage.take().expect("regions already resolved")
         };
+
+        storage.data.constraints = storage
+            .data
+            .constraints
+            .iter()
+            .flat_map(|(constraint, origin)| {
+                constraint.iter_outlives().zip(iter::repeat_with(|| origin.clone()))
+            })
+            .collect();
+
+        // Filter out any region-region outlives assumptions that are implied by
+        // coroutine well-formedness.
+        if self.tcx.sess.opts.unstable_opts.higher_ranked_assumptions {
+            storage.data.constraints.retain(|(c, _)| match c.kind {
+                ConstraintKind::RegSubReg => !outlives_env
+                    .higher_ranked_assumptions()
+                    .contains(&ty::OutlivesClause(c.sup.into(), c.sub)),
+
+                ConstraintKind::VarSubVar
+                | ConstraintKind::RegSubVar
+                | ConstraintKind::VarSubReg => true,
+
+                ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+                    unreachable!();
+                }
+            });
+        }
 
         let region_rels = &RegionRelations::new(self.tcx, outlives_env.free_region_map());
 
@@ -92,6 +113,11 @@ impl<'tcx> InferCtxt<'tcx> {
             self.inner.borrow().region_obligations.is_empty(),
             "region_obligations not empty: {:#?}",
             self.inner.borrow().region_obligations
+        );
+        assert!(
+            self.inner.borrow().region_assumptions.is_empty(),
+            "region_assumptions not empty: {:#?}",
+            self.inner.borrow().region_assumptions
         );
 
         self.inner.borrow_mut().unwrap_region_constraints().take_and_reset_data()

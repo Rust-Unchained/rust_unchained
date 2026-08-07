@@ -36,13 +36,13 @@ declare_clippy_lint! {
     style,
     "Perform saturating addition instead of implicitly checking max bound of data type"
 }
+
 declare_lint_pass!(ImplicitSaturatingAdd => [IMPLICIT_SATURATING_ADD]);
 
 impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingAdd {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if let ExprKind::If(cond, then, None) = expr.kind
-            && let ExprKind::DropTemps(expr1) = cond.kind
-            && let Some((c, op_node, l)) = get_const(cx, expr1)
+            && let Some((c, op_node, l)) = get_const(cx, cond)
             && let BinOpKind::Ne | BinOpKind::Lt = op_node
             && let ExprKind::Block(block, None) = then.kind
             && let Block {
@@ -66,8 +66,8 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingAdd {
             && Some(c) == get_int_max(ty)
             && let ctxt = expr.span.ctxt()
             && ex.span.ctxt() == ctxt
-            && expr1.span.ctxt() == ctxt
-            && clippy_utils::SpanlessEq::new(cx).eq_expr(l, target)
+            && cond.span.ctxt() == ctxt
+            && clippy_utils::SpanlessEq::new(cx).eq_expr(ctxt, l, target)
             && AssignOpKind::AddAssign == op1.node
             && let ExprKind::Lit(lit) = value.kind
             && let LitKind::Int(Pu128(1), LitIntType::Unsuffixed) = lit.node
@@ -118,10 +118,11 @@ fn get_int_max(ty: Ty<'_>) -> Option<u128> {
 fn get_const<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<(u128, BinOpKind, &'tcx Expr<'tcx>)> {
     if let ExprKind::Binary(op, l, r) = expr.kind {
         let ecx = ConstEvalCtxt::new(cx);
-        if let Some(Constant::Int(c)) = ecx.eval(r) {
+        let ctxt = expr.span.ctxt();
+        if let Some(Constant::Int(c)) = ecx.eval_local(r, ctxt) {
             return Some((c, op.node, l));
         }
-        if let Some(Constant::Int(c)) = ecx.eval(l) {
+        if let Some(Constant::Int(c)) = ecx.eval_local(l, ctxt) {
             return Some((c, invert_op(op.node)?, r));
         }
     }

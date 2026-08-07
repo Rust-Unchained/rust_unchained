@@ -1,6 +1,6 @@
-use rustc_abi::{HasDataLayout, TyAbiInterface};
+use rustc_abi::{ArmCall, CanonAbi, HasDataLayout, TyAbiInterface};
 
-use crate::callconv::{ArgAbi, Conv, FnAbi, Reg, RegKind, Uniform};
+use crate::callconv::{ArgAbi, FnAbi, Reg, RegKind, Uniform};
 use crate::spec::HasTargetSpec;
 
 fn is_homogeneous_aggregate<'a, Ty, C>(cx: &C, arg: &mut ArgAbi<'a, Ty>) -> Option<Uniform>
@@ -19,7 +19,7 @@ where
         let valid_unit = match unit.kind {
             RegKind::Integer => false,
             RegKind::Float => true,
-            RegKind::Vector => size.bits() == 64 || size.bits() == 128,
+            RegKind::Vector { .. } => size.bits() == 64 || size.bits() == 128,
         };
 
         valid_unit.then_some(Uniform::consecutive(unit, size))
@@ -65,6 +65,10 @@ where
         // Not touching this...
         return;
     }
+    if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+        arg.make_indirect();
+        return;
+    }
     if !arg.layout.is_aggregate() {
         arg.extend_integer_width_to(32);
         return;
@@ -77,7 +81,7 @@ where
         }
     }
 
-    let align = arg.layout.align.abi.bytes();
+    let align = arg.layout.align.bytes();
     let total = arg.layout.size;
     arg.cast_to(Uniform::consecutive(if align <= 4 { Reg::i32() } else { Reg::i64() }, total));
 }
@@ -90,7 +94,7 @@ where
     // If this is a target with a hard-float ABI, and the function is not explicitly
     // `extern "aapcs"`, then we must use the VFP registers for homogeneous aggregates.
     let vfp = cx.target_spec().llvm_target.ends_with("hf")
-        && fn_abi.conv != Conv::ArmAapcs
+        && fn_abi.conv != CanonAbi::Arm(ArmCall::Aapcs)
         && !fn_abi.c_variadic;
 
     if !fn_abi.ret.is_ignore() {

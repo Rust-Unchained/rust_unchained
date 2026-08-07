@@ -1,6 +1,5 @@
 //@ run-pass
-
-#![feature(if_let_guard, let_chains)]
+//@ edition: 2024
 
 fn check_if_let(opt: Option<Option<Option<i32>>>, value: i32) -> bool {
     if let Some(first) = opt

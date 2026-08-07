@@ -17,6 +17,11 @@ where
         return;
     }
 
+    // `!` cannot be deref-ed
+    if cx.typeck_results().expr_ty(scrutinee).is_never() {
+        return;
+    }
+
     let (first_sugg, msg, title);
     let ctxt = expr.span.ctxt();
     let mut app = Applicability::Unspecified;
@@ -45,7 +50,7 @@ where
     }
 
     let remaining_suggs = pats.filter_map(|pat| {
-        if let PatKind::Ref(refp, _) = pat.kind {
+        if let PatKind::Ref(refp, _, _) = pat.kind {
             Some((pat.span, snippet(cx, refp.span, "..").to_string()))
         } else {
             None

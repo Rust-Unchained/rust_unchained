@@ -1,7 +1,7 @@
 //! This checks the output of `--print=cfg`
 //!
 //! Specifically it checks that output is correctly formatted
-//! (ie. no duplicated cfgs, values are between "", names are not).
+//! (i.e. no duplicated cfgs, values are between "", names are not).
 //!
 //! It also checks that some targets have the correct set cfgs.
 
@@ -47,6 +47,12 @@ fn main() {
         target: "arm-unknown-linux-gnueabihf",
         includes: &["unix", "target_abi=\"eabihf\""],
         disallow: &["windows"],
+    });
+    // Regression test for #90834: Android must not have `target_env="gnu"`.
+    check(PrintCfg {
+        target: "i686-linux-android",
+        includes: &["unix", "target_os=\"android\""],
+        disallow: &["windows", "target_env=\"gnu\""],
     });
 }
 

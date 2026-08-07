@@ -11,6 +11,7 @@ use rustc_abi::{ExternAbi, Integer};
 use rustc_data_structures::base_n::{ALPHANUMERIC_ONLY, CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
+use rustc_hir::find_attr;
 use rustc_middle::bug;
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{
@@ -18,7 +19,6 @@ use rustc_middle::ty::{
     IntTy, List, Region, RegionKind, TermKind, Ty, TyCtxt, TypeFoldable, UintTy,
 };
 use rustc_span::def_id::DefId;
-use rustc_span::sym;
 use tracing::instrument;
 
 use crate::cfi::typeid::TypeIdOptions;
@@ -79,7 +79,7 @@ fn encode_args<'tcx>(
         s.push('I');
         let def_generics = tcx.generics_of(for_def);
         for (n, arg) in args.iter().enumerate() {
-            match arg.unpack() {
+            match arg.kind() {
                 GenericArgKind::Lifetime(region) => {
                     s.push_str(&encode_region(region, dict));
                 }
@@ -88,8 +88,10 @@ fn encode_args<'tcx>(
                 }
                 GenericArgKind::Const(c) => {
                     let n = n + (has_erased_self as usize);
-                    let ct_ty =
-                        tcx.type_of(def_generics.param_at(n, tcx).def_id).instantiate_identity();
+                    let ct_ty = tcx
+                        .type_of(def_generics.param_at(n, tcx).def_id)
+                        .instantiate_identity()
+                        .skip_norm_wip();
                     s.push_str(&encode_const(tcx, c, ct_ty, dict, options));
                 }
             }
@@ -127,34 +129,8 @@ fn encode_const<'tcx>(
             // Element type
             s.push_str(&encode_ty(tcx, cv.ty, dict, options));
 
-            // The only allowed types of const values are bool, u8, u16, u32,
-            // u64, u128, usize i8, i16, i32, i64, i128, isize, and char. The
-            // bool value false is encoded as 0 and true as 1.
-            match cv.ty.kind() {
-                ty::Int(ity) => {
-                    let bits = cv
-                        .try_to_bits(tcx, ty::TypingEnv::fully_monomorphized())
-                        .expect("expected monomorphic const in cfi");
-                    let val = Integer::from_int_ty(&tcx, *ity).size().sign_extend(bits) as i128;
-                    if val < 0 {
-                        s.push('n');
-                    }
-                    let _ = write!(s, "{val}");
-                }
-                ty::Uint(_) => {
-                    let val = cv
-                        .try_to_bits(tcx, ty::TypingEnv::fully_monomorphized())
-                        .expect("expected monomorphic const in cfi");
-                    let _ = write!(s, "{val}");
-                }
-                ty::Bool => {
-                    let val = cv.try_to_bool().expect("expected monomorphic const in cfi");
-                    let _ = write!(s, "{val}");
-                }
-                _ => {
-                    bug!("encode_const: unexpected type `{:?}`", cv.ty);
-                }
-            }
+            // Element value
+            s.push_str(&encode_const_value(tcx, cv, dict, options));
         }
 
         _ => {
@@ -166,6 +142,127 @@ fn encode_const<'tcx>(
     s.push('E');
 
     compress(dict, DictKey::Const(ct), &mut s);
+
+    s
+}
+
+/// Encodes a const value using the Itanium C++ ABI as the element value of a literal argument (see
+/// <https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling.literal>).
+fn encode_const_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cv: ty::Value<'tcx>,
+    dict: &mut FxHashMap<DictKey<'tcx>, usize>,
+    options: EncodeTyOptions,
+) -> String {
+    let mut s = String::new();
+
+    match cv.ty.kind() {
+        // Primitive types
+
+        // The bool value false is encoded as 0 and true as 1.
+        ty::Bool => {
+            let val = cv.try_to_bool().expect("expected monomorphic const in cfi");
+            s.push(if val { '1' } else { '0' });
+        }
+
+        // Integer values are encoded as their decimal values, with negative values preceded by n.
+        ty::Int(ity) => {
+            let bits = cv
+                .try_to_bits(tcx, ty::TypingEnv::fully_monomorphized())
+                .expect("expected monomorphic const in cfi");
+            let val = Integer::from_int_ty(&tcx, *ity).size().sign_extend(bits) as i128;
+            if val < 0 {
+                s.push('n');
+            }
+            let _ = write!(s, "{}", val.unsigned_abs());
+        }
+
+        ty::Uint(..) => {
+            let val = cv
+                .try_to_bits(tcx, ty::TypingEnv::fully_monomorphized())
+                .expect("expected monomorphic const in cfi");
+            let _ = write!(s, "{val}");
+        }
+
+        // char values are encoded as their Unicode scalar values (i.e., as their decimal u32
+        // values).
+        ty::Char => {
+            let val = cv
+                .try_to_bits(tcx, ty::TypingEnv::fully_monomorphized())
+                .expect("expected monomorphic const in cfi");
+            let _ = write!(s, "{val}");
+        }
+
+        // str values are encoded as their UTF-8 encodings in hexadecimal.
+        ty::Str => {
+            // Hide the str type behind a reference for try_to_raw_bytes (i.e., the valtree of a
+            // str value is the valtree of its reference).
+            let ref_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, cv.ty);
+            let cv = ty::Value { ty: ref_ty, valtree: cv.valtree };
+            let bytes = cv.try_to_raw_bytes(tcx).expect("expected monomorphic const in cfi");
+            for byte in bytes {
+                let _ = write!(s, "{byte:02x}");
+            }
+        }
+
+        // Sequence types
+        // Array, slice, and tuple values are encoded as their element values as literal arguments.
+        ty::Array(..) | ty::Slice(..) | ty::Tuple(..) => {
+            for field in cv.to_branch() {
+                let ty::ConstKind::Value(field_cv) = field.kind() else {
+                    bug!("encode_const_value: unexpected kind `{:?}`", field.kind());
+                };
+                s.push_str(&encode_const(tcx, *field, field_cv.ty, dict, options));
+            }
+        }
+
+        // User-defined types
+        // Struct and enum values are encoded as their field values as literal arguments, preceded
+        // by V<variant-index> for enum values.
+        ty::Adt(adt_def, ..) => {
+            let contents = cv.destructure_adt_const();
+            if adt_def.is_enum() {
+                let _ = write!(s, "V{}", contents.variant.as_u32());
+            }
+            for field in contents.fields {
+                let ty::ConstKind::Value(field_cv) = field.kind() else {
+                    bug!("encode_const_value: unexpected kind `{:?}`", field.kind());
+                };
+                s.push_str(&encode_const(tcx, *field, field_cv.ty, dict, options));
+            }
+        }
+
+        // Pointer types
+        // Reference values are encoded as the values of their referents (i.e., the valtree of a
+        // reference value is the valtree of its referent).
+        ty::Ref(_, ty0, ..) => {
+            let cv = ty::Value { ty: *ty0, valtree: cv.valtree };
+            s.push_str(&encode_const_value(tcx, cv, dict, options));
+        }
+
+        // Unexpected types
+        ty::Float(..)
+        | ty::Never
+        | ty::Foreign(..)
+        | ty::Pat(..)
+        | ty::FnDef(..)
+        | ty::FnPtr(..)
+        | ty::RawPtr(..)
+        | ty::Closure(..)
+        | ty::CoroutineClosure(..)
+        | ty::Coroutine(..)
+        | ty::CoroutineWitness(..)
+        | ty::Dynamic(..)
+        | ty::UnsafeBinder(..)
+        | ty::Param(..)
+        | ty::Alias(..)
+        | ty::Bound(..)
+        | ty::Error(..)
+        | ty::Infer(..)
+        | ty::Placeholder(..) => {
+            bug!("encode_const_value: unexpected type `{:?}`", cv.ty);
+        }
+    }
 
     s
 }
@@ -183,7 +280,7 @@ fn encode_fnsig<'tcx>(
 
     let mut encode_ty_options = EncodeTyOptions::from_bits(options.bits())
         .unwrap_or_else(|| bug!("encode_fnsig: invalid option(s) `{:?}`", options.bits()));
-    match fn_sig.abi {
+    match fn_sig.abi() {
         ExternAbi::C { .. } => {
             encode_ty_options.insert(EncodeTyOptions::GENERALIZE_REPR_C);
         }
@@ -207,10 +304,10 @@ fn encode_fnsig<'tcx>(
             s.push_str(&encode_ty(tcx, ty, dict, encode_ty_options));
         }
 
-        if fn_sig.c_variadic {
+        if fn_sig.c_variadic() {
             s.push('z');
         }
-    } else if fn_sig.c_variadic {
+    } else if fn_sig.c_variadic() {
         s.push('z');
     } else {
         // Empty parameter lists, whether declared as () or conventionally as (void), are
@@ -245,12 +342,14 @@ fn encode_predicate<'tcx>(
             let name = encode_ty_name(tcx, projection.def_id);
             let _ = write!(s, "u{}{}", name.len(), name);
             s.push_str(&encode_args(tcx, projection.args, projection.def_id, true, dict, options));
-            match projection.term.unpack() {
+            match projection.term.kind() {
                 TermKind::Ty(ty) => s.push_str(&encode_ty(tcx, ty, dict, options)),
                 TermKind::Const(c) => s.push_str(&encode_const(
                     tcx,
                     c,
-                    tcx.type_of(projection.def_id).instantiate(tcx, projection.args),
+                    tcx.type_of(projection.def_id)
+                        .instantiate(tcx, projection.args)
+                        .skip_norm_wip(),
                     dict,
                     options,
                 )),
@@ -287,7 +386,7 @@ fn encode_region<'tcx>(region: Region<'tcx>, dict: &mut FxHashMap<DictKey<'tcx>,
     // u6region[I[<region-disambiguator>][<region-index>]E] as vendor extended type
     let mut s = String::new();
     match region.kind() {
-        RegionKind::ReBound(debruijn, r) => {
+        RegionKind::ReBound(ty::BoundVarIndexKind::Bound(debruijn), r) => {
             s.push_str("u6regionI");
             // Debruijn index, which identifies the binder, as region disambiguator
             let num = debruijn.index() as u64;
@@ -303,7 +402,8 @@ fn encode_region<'tcx>(region: Region<'tcx>, dict: &mut FxHashMap<DictKey<'tcx>,
             s.push_str("u6region");
             compress(dict, DictKey::Region(region), &mut s);
         }
-        RegionKind::ReEarlyParam(..)
+        RegionKind::ReBound(ty::BoundVarIndexKind::Canonical, _)
+        | RegionKind::ReEarlyParam(..)
         | RegionKind::ReLateParam(..)
         | RegionKind::ReStatic
         | RegionKind::ReError(_)
@@ -445,36 +545,19 @@ pub(crate) fn encode_ty<'tcx>(
         ty::Adt(adt_def, args) => {
             let mut s = String::new();
             let def_id = adt_def.did();
-            if let Some(cfi_encoding) = tcx.get_attr(def_id, sym::cfi_encoding) {
+            if let Some(encoding) = find_attr!(tcx, def_id, CfiEncoding { encoding } => encoding) {
+                let encoding = encoding.as_str().trim();
                 // Use user-defined CFI encoding for type
-                if let Some(value_str) = cfi_encoding.value_str() {
-                    let value_str = value_str.as_str().trim();
-                    if !value_str.is_empty() {
-                        s.push_str(value_str);
-                        // Don't compress user-defined builtin types (see
-                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-builtin and
-                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
-                        let builtin_types = [
-                            "v", "w", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y",
-                            "n", "o", "f", "d", "e", "g", "z", "Dh",
-                        ];
-                        if !builtin_types.contains(&value_str) {
-                            compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
-                        }
-                    } else {
-                        #[allow(
-                            rustc::diagnostic_outside_of_impl,
-                            rustc::untranslatable_diagnostic
-                        )]
-                        tcx.dcx()
-                            .struct_span_err(
-                                cfi_encoding.span(),
-                                format!("invalid `cfi_encoding` for `{:?}`", ty.kind()),
-                            )
-                            .emit();
-                    }
-                } else {
-                    bug!("encode_ty: invalid `cfi_encoding` for `{:?}`", ty.kind());
+                s.push_str(&encoding);
+                // Don't compress user-defined builtin types (see
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-builtin and
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
+                let builtin_types = [
+                    "v", "w", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y", "n", "o",
+                    "f", "d", "e", "g", "z", "Dh",
+                ];
+                if !builtin_types.contains(&encoding) {
+                    compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
                 }
             } else if options.contains(EncodeTyOptions::GENERALIZE_REPR_C) && adt_def.repr().c() {
                 // For cross-language LLVM CFI support, the encoding must be compatible at the FFI
@@ -507,26 +590,10 @@ pub(crate) fn encode_ty<'tcx>(
         ty::Foreign(def_id) => {
             // <length><name>, where <name> is <unscoped-name>
             let mut s = String::new();
-            if let Some(cfi_encoding) = tcx.get_attr(*def_id, sym::cfi_encoding) {
+
+            if let Some(encoding) = find_attr!(tcx, *def_id, CfiEncoding {encoding} => encoding) {
                 // Use user-defined CFI encoding for type
-                if let Some(value_str) = cfi_encoding.value_str() {
-                    if !value_str.to_string().trim().is_empty() {
-                        s.push_str(value_str.to_string().trim());
-                    } else {
-                        #[allow(
-                            rustc::diagnostic_outside_of_impl,
-                            rustc::untranslatable_diagnostic
-                        )]
-                        tcx.dcx()
-                            .struct_span_err(
-                                cfi_encoding.span(),
-                                format!("invalid `cfi_encoding` for `{:?}`", ty.kind()),
-                            )
-                            .emit();
-                    }
-                } else {
-                    bug!("encode_ty: invalid `cfi_encoding` for `{:?}`", ty.kind());
-                }
+                s.push_str(encoding.as_str().trim());
             } else {
                 let name = tcx.item_name(*def_id).to_string();
                 let _ = write!(s, "{}{}", name.len(), name);
@@ -536,13 +603,30 @@ pub(crate) fn encode_ty<'tcx>(
         }
 
         // Function types
-        ty::FnDef(def_id, args) | ty::Closure(def_id, args) => {
+        ty::Closure(def_id, args) => {
             // u<length><name>[I<element-type1..element-typeN>E], where <element-type> is <subst>,
             // as vendor extended type.
             let mut s = String::new();
             let name = encode_ty_name(tcx, *def_id);
             let _ = write!(s, "u{}{}", name.len(), name);
             s.push_str(&encode_args(tcx, args, *def_id, false, dict, options));
+            compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
+            typeid.push_str(&s);
+        }
+
+        // FIXME: could stand to merge this and the prior match arm
+        ty::FnDef(def_id, args) => {
+            let mut s = String::new();
+            let name = encode_ty_name(tcx, *def_id);
+            let _ = write!(s, "u{}{}", name.len(), name);
+            s.push_str(&encode_args(
+                tcx,
+                args.no_bound_vars().unwrap(),
+                *def_id,
+                false,
+                dict,
+                options,
+            ));
             compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
             typeid.push_str(&s);
         }
@@ -622,17 +706,14 @@ pub(crate) fn encode_ty<'tcx>(
 
         // FIXME(unsafe_binders): Implement this.
         ty::UnsafeBinder(_) => {
-            todo!()
+            unimplemented!()
         }
 
         // Trait types
-        ty::Dynamic(predicates, region, kind) => {
+        ty::Dynamic(predicates, region) => {
             // u3dynI<element-type1[..element-typeN]>E, where <element-type> is <predicate>, as
             // vendor extended type.
-            let mut s = String::from(match kind {
-                ty::Dyn => "u3dynI",
-                ty::DynStar => "u7dynstarI",
-            });
+            let mut s = String::from("u3dynI");
             s.push_str(&encode_predicates(tcx, predicates, dict, options));
             s.push_str(&encode_region(*region, dict));
             s.push('E');
@@ -714,15 +795,17 @@ fn encode_ty_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             hir::definitions::DefPathData::ValueNs(..) => "v",
             hir::definitions::DefPathData::Closure => "C",
             hir::definitions::DefPathData::Ctor => "c",
-            hir::definitions::DefPathData::AnonConst => "k",
+            hir::definitions::DefPathData::AnonConst => "K",
             hir::definitions::DefPathData::OpaqueTy => "i",
             hir::definitions::DefPathData::SyntheticCoroutineBody => "s",
+            hir::definitions::DefPathData::NestedStatic => "n",
             hir::definitions::DefPathData::CrateRoot
             | hir::definitions::DefPathData::Use
             | hir::definitions::DefPathData::GlobalAsm
             | hir::definitions::DefPathData::MacroNs(..)
+            | hir::definitions::DefPathData::OpaqueLifetime(..)
             | hir::definitions::DefPathData::LifetimeNs(..)
-            | hir::definitions::DefPathData::AnonAssocTy => {
+            | hir::definitions::DefPathData::AnonAssocTy(..) => {
                 bug!("encode_ty_name: unexpected `{:?}`", disambiguated_data.data);
             }
         });

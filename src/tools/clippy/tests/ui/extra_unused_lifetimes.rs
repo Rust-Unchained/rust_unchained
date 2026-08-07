@@ -1,16 +1,16 @@
 //@aux-build:proc_macro_derive.rs
+//@aux-build:proc_macros.rs
 
-#![allow(
-    unused,
-    dead_code,
+#![expect(
+    clippy::needless_arbitrary_self_type,
     clippy::needless_lifetimes,
-    clippy::needless_pass_by_value,
-    clippy::needless_arbitrary_self_type
+    clippy::needless_pass_by_value
 )]
 #![warn(clippy::extra_unused_lifetimes)]
 
 #[macro_use]
 extern crate proc_macro_derive;
+extern crate proc_macros;
 
 fn empty() {}
 
@@ -18,6 +18,39 @@ fn used_lt<'a>(x: &'a u8) {}
 
 fn unused_lt<'a>(x: u8) {}
 //~^ extra_unused_lifetimes
+
+struct BoxedFoo(Box<dyn for<'a> Fn()>);
+//~^ extra_unused_lifetimes
+
+struct BoxedFooFine(Box<dyn for<'a> Fn(&'a u32)>);
+
+fn unused_for_return() -> impl for<'a> Fn()
+//~^ extra_unused_lifetimes
+{
+    || unimplemented!()
+}
+
+trait SimpleTrait<'a> {}
+
+trait SimplerTrait {}
+
+impl dyn for<'a> SimpleTrait<'a> {}
+
+impl dyn for<'a> SimplerTrait {}
+//~^ extra_unused_lifetimes
+
+impl<T: for<'a> SimpleTrait<'a>> SimplerTrait for T {}
+
+impl<T: for<'a> SimplerTrait> SimpleTrait<'_> for T {}
+//~^ extra_unused_lifetimes
+
+async fn unused_impl_for<F>(body: impl for<'a> FnOnce(u32) -> F)
+//~^ extra_unused_lifetimes
+where
+    F: Future<Output = ()>,
+{
+    unimplemented!()
+}
 
 fn unused_lt_transitive<'a, 'b: 'a>(x: &'b u8) {
     // 'a is useless here since it's not directly bound
@@ -146,6 +179,50 @@ mod issue_13578 {
     pub trait Foo {}
 
     impl<'a, T: 'a> Foo for Option<T> where &'a T: Foo {}
+}
+
+// no lint on proc macro generated code
+mod proc_macro_generated {
+    use proc_macros::external;
+
+    // no lint on external macro (extra unused lifetimes in impl block)
+    external! {
+        struct ExternalImplStruct;
+
+        impl<'a> ExternalImplStruct {
+            fn foo() {}
+        }
+    }
+
+    // no lint on external macro (extra unused lifetimes in method)
+    external! {
+        struct ExternalMethodStruct;
+
+        impl ExternalMethodStruct {
+            fn bar<'a>(&self) {}
+        }
+    }
+
+    // no lint on external macro (extra unused lifetimes in trait method)
+    external! {
+        trait ExternalUnusedLifetimeTrait {
+            fn unused_lt<'a>(x: u8) {}
+        }
+    }
+}
+
+mod issue17255 {
+
+    trait AnotherSimpleTrait<'a> {}
+
+    macro_rules! mac {
+        ($lt:lifetime, $t:ident, $tr:path) => {
+            impl<$t: for<'lt> $tr> AnotherSimpleTrait<'_> for $t {}
+        };
+    }
+
+    // Do not lint code expanded from macros
+    mac!('a, T, super::SimplerTrait);
 }
 
 fn main() {}

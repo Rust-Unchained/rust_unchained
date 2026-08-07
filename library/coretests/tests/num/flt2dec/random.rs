@@ -1,10 +1,11 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-use core::num::flt2dec::strategy::grisu::{format_exact_opt, format_shortest_opt};
-use core::num::flt2dec::{DecodableFloat, Decoded, FullDecoded, MAX_SIG_DIGITS, decode};
+use core::num::imp::flt2dec;
 use std::mem::MaybeUninit;
 use std::str;
 
+use flt2dec::strategy::grisu::{format_exact_opt, format_shortest_opt};
+use flt2dec::{DecodableFloat, Decoded, FullDecoded, MAX_SIG_DIGITS, decode};
 use rand::distr::{Distribution, Uniform};
 
 pub fn decode_finite<T: DecodableFloat>(v: T) -> Decoded {
@@ -79,6 +80,20 @@ where
     (npassed, nignored)
 }
 
+#[cfg(target_has_reliable_f16)]
+pub fn f16_random_equivalence_test<F, G>(f: F, g: G, k: usize, n: usize)
+where
+    F: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> Option<(&'a [u8], i16)>,
+    G: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> (&'a [u8], i16),
+{
+    let mut rng = crate::test_rng();
+    let f16_range = Uniform::new(0x0001u16, 0x7c00).unwrap();
+    iterate("f16_random_equivalence_test", k, n, f, g, |_| {
+        let x = f16::from_bits(f16_range.sample(&mut rng));
+        decode_finite(x)
+    });
+}
+
 pub fn f32_random_equivalence_test<F, G>(f: F, g: G, k: usize, n: usize)
 where
     F: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> Option<(&'a [u8], i16)>,
@@ -105,6 +120,24 @@ where
     });
 }
 
+#[cfg(target_has_reliable_f16)]
+pub fn f16_exhaustive_equivalence_test<F, G>(f: F, g: G, k: usize)
+where
+    F: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> Option<(&'a [u8], i16)>,
+    G: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> (&'a [u8], i16),
+{
+    // Unlike the other float types, `f16` is small enough that these exhaustive tests
+    // can run in less than a second so we don't need to ignore it.
+
+    // iterate from 0x0001 to 0x7bff, i.e., all finite ranges
+    let (npassed, nignored) =
+        iterate("f16_exhaustive_equivalence_test", k, 0x7bff, f, g, |i: usize| {
+            let x = f16::from_bits(i as u16 + 1);
+            decode_finite(x)
+        });
+    assert_eq!((npassed, nignored), (29735, 2008));
+}
+
 pub fn f32_exhaustive_equivalence_test<F, G>(f: F, g: G, k: usize)
 where
     F: for<'a> FnMut(&Decoded, &'a mut [MaybeUninit<u8>]) -> Option<(&'a [u8], i16)>,
@@ -127,12 +160,23 @@ where
 
 #[test]
 fn shortest_random_equivalence_test() {
-    use core::num::flt2dec::strategy::dragon::format_shortest as fallback;
+    use flt2dec::strategy::dragon::format_shortest as fallback;
     // Miri is too slow
     let n = if cfg!(miri) { 10 } else { 10_000 };
 
     f64_random_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS, n);
     f32_random_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS, n);
+    #[cfg(target_has_reliable_f16)]
+    f16_random_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS, n);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri is to slow
+#[cfg(target_has_reliable_f16)]
+fn shortest_f16_exhaustive_equivalence_test() {
+    // see the f32 version
+    use flt2dec::strategy::dragon::format_shortest as fallback;
+    f16_exhaustive_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS);
 }
 
 #[test]
@@ -145,7 +189,7 @@ fn shortest_f32_exhaustive_equivalence_test() {
     // with `--nocapture` (and plenty of time and appropriate rustc flags), this should print:
     // `done, ignored=17643158 passed=2121451881 failed=0`.
 
-    use core::num::flt2dec::strategy::dragon::format_shortest as fallback;
+    use flt2dec::strategy::dragon::format_shortest as fallback;
     f32_exhaustive_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS);
 }
 
@@ -154,13 +198,30 @@ fn shortest_f32_exhaustive_equivalence_test() {
 fn shortest_f64_hard_random_equivalence_test() {
     // this again probably has to use appropriate rustc flags.
 
-    use core::num::flt2dec::strategy::dragon::format_shortest as fallback;
+    use flt2dec::strategy::dragon::format_shortest as fallback;
     f64_random_equivalence_test(format_shortest_opt, fallback, MAX_SIG_DIGITS, 100_000_000);
 }
 
 #[test]
+#[cfg(target_has_reliable_f16)]
+fn exact_f16_random_equivalence_test() {
+    use flt2dec::strategy::dragon::format_exact as fallback;
+    // Miri is too slow
+    let n = if cfg!(miri) { 3 } else { 1_000 };
+
+    for k in 1..21 {
+        f16_random_equivalence_test(
+            |d, buf| format_exact_opt(d, buf, i16::MIN),
+            |d, buf| fallback(d, buf, i16::MIN),
+            k,
+            n,
+        );
+    }
+}
+
+#[test]
 fn exact_f32_random_equivalence_test() {
-    use core::num::flt2dec::strategy::dragon::format_exact as fallback;
+    use flt2dec::strategy::dragon::format_exact as fallback;
     // Miri is too slow
     let n = if cfg!(miri) { 3 } else { 1_000 };
 
@@ -176,7 +237,7 @@ fn exact_f32_random_equivalence_test() {
 
 #[test]
 fn exact_f64_random_equivalence_test() {
-    use core::num::flt2dec::strategy::dragon::format_exact as fallback;
+    use flt2dec::strategy::dragon::format_exact as fallback;
     // Miri is too slow
     let n = if cfg!(miri) { 2 } else { 1_000 };
 

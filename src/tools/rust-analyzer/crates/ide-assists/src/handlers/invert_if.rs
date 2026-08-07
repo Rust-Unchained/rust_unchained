@@ -1,13 +1,13 @@
 use ide_db::syntax_helpers::node_ext::is_pattern_cond;
 use syntax::{
-    ast::{self, AstNode},
     T,
+    ast::{self, AstNode, syntax_factory::SyntaxFactory},
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
-    utils::invert_boolean_expression_legacy,
-    AssistId, AssistKind,
+    utils::invert_boolean_expression,
 };
 
 // Assist: invert_if
@@ -26,8 +26,10 @@ use crate::{
 //     if y { B } else { A }
 // }
 // ```
-pub(crate) fn invert_if(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let if_keyword = ctx.find_token_syntax_at_offset(T![if])?;
+pub(crate) fn invert_if(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
+    let if_keyword = ctx
+        .find_token_syntax_at_offset(T![if])
+        .or_else(|| ctx.find_token_syntax_at_offset(T![else]))?;
     let expr = ast::IfExpr::cast(if_keyword.parent()?)?;
     let if_range = if_keyword.text_range();
     let cursor_in_range = if_range.contains_range(ctx.selection_trimmed());
@@ -47,8 +49,9 @@ pub(crate) fn invert_if(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()
         ast::ElseBranch::IfExpr(_) => return None,
     };
 
-    acc.add(AssistId("invert_if", AssistKind::RefactorRewrite), "Invert if", if_range, |edit| {
-        let flip_cond = invert_boolean_expression_legacy(cond.clone());
+    acc.add(AssistId::refactor_rewrite("invert_if"), "Invert if", if_range, |edit| {
+        let make = SyntaxFactory::without_mappings();
+        let flip_cond = invert_boolean_expression(&make, cond.clone());
         edit.replace_ast(cond, flip_cond);
 
         let else_node = else_block.syntax();
@@ -112,6 +115,24 @@ mod tests {
     }
 
     #[test]
+    fn invert_if_general_case_needs_paren() {
+        check_assist(
+            invert_if,
+            "fn f() { i$0f cond as bool { 3 * 2 } else { 1 } }",
+            "fn f() { if !(cond as bool) { 1 } else { 3 * 2 } }",
+        )
+    }
+
+    #[test]
+    fn invert_if_on_else_keyword() {
+        check_assist(
+            invert_if,
+            "fn f() { if cond { 3 * 2 } e$0lse { 1 } }",
+            "fn f() { if !cond { 1 } else { 3 * 2 } }",
+        )
+    }
+
+    #[test]
     fn invert_if_doesnt_apply_with_cursor_not_on_if() {
         check_assist_not_applicable(invert_if, "fn f() { if !$0cond { 3 * 2 } else { 1 } }")
     }
@@ -122,6 +143,18 @@ mod tests {
             invert_if,
             "fn f() { i$0f let Some(_) = Some(1) { 1 } else { 0 } }",
         )
+    }
+
+    #[test]
+    fn invert_if_doesnt_apply_with_if_let_chain() {
+        check_assist_not_applicable(
+            invert_if,
+            "fn f() { i$0f x && let Some(_) = Some(1) { 1 } else { 0 } }",
+        );
+        check_assist_not_applicable(
+            invert_if,
+            "fn f() { i$0f let Some(_) = Some(1) && x { 1 } else { 0 } }",
+        );
     }
 
     #[test]

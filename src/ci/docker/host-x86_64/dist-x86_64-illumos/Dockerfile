@@ -15,6 +15,7 @@ RUN apt-get update && \
     python2.7 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY scripts/shared.sh /tmp/
 COPY scripts/illumos-toolchain.sh /tmp/
 
 RUN bash /tmp/illumos-toolchain.sh x86_64 sysroot
@@ -35,5 +36,5 @@ ENV \
 
 ENV HOSTS=x86_64-unknown-illumos
 
-ENV RUST_CONFIGURE_ARGS --enable-extended --disable-docs
-ENV SCRIPT python2.7 ../x.py dist --host $HOSTS --target $HOSTS
+ENV RUST_CONFIGURE_ARGS="--enable-extended --disable-docs"
+ENV SCRIPT="python2.7 ../x.py dist --host $HOSTS --target $HOSTS"

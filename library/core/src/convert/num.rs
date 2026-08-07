@@ -1,17 +1,9 @@
-use crate::num::TryFromIntError;
-
-mod private {
-    /// This trait being unreachable from outside the crate
-    /// prevents other implementations of the `FloatToInt` trait,
-    /// which allows potentially adding more trait methods after the trait is `#[stable]`.
-    #[unstable(feature = "convert_float_to_int", issue = "67057")]
-    pub trait Sealed {}
-}
+use crate::num::{IntErrorKind, TryFromIntError};
 
 /// Supporting trait for inherent methods of `f32` and `f64` such as `to_int_unchecked`.
 /// Typically doesn’t need to be used directly.
 #[unstable(feature = "convert_float_to_int", issue = "67057")]
-pub trait FloatToInt<Int>: private::Sealed + Sized {
+pub impl(self) trait FloatToInt<Int>: Sized {
     #[unstable(feature = "convert_float_to_int", issue = "67057")]
     #[doc(hidden)]
     unsafe fn to_int_unchecked(self) -> Int;
@@ -19,8 +11,6 @@ pub trait FloatToInt<Int>: private::Sealed + Sized {
 
 macro_rules! impl_float_to_int {
     ($Float:ty => $($Int:ty),+) => {
-        #[unstable(feature = "convert_float_to_int", issue = "67057")]
-        impl private::Sealed for $Float {}
         $(
             #[unstable(feature = "convert_float_to_int", issue = "67057")]
             impl FloatToInt<$Int> for $Float {
@@ -39,61 +29,51 @@ impl_float_to_int!(f32 => u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i12
 impl_float_to_int!(f64 => u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
 impl_float_to_int!(f128 => u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
 
-// Conversion traits for primitive integer and float types
-// Conversions T -> T are covered by a blanket impl and therefore excluded
-// Some conversions from and to usize/isize are not implemented due to portability concerns
-macro_rules! impl_from {
-    (bool => $Int:ty $(,)?) => {
-        impl_from!(
-            bool => $Int,
-            #[stable(feature = "from_bool", since = "1.28.0")],
-            concat!(
-                "Converts a [`bool`] to [`", stringify!($Int), "`] losslessly.\n",
-                "The resulting value is `0` for `false` and `1` for `true` values.\n",
-                "\n",
-                "# Examples\n",
-                "\n",
-                "```\n",
-                "assert_eq!(", stringify!($Int), "::from(true), 1);\n",
-                "assert_eq!(", stringify!($Int), "::from(false), 0);\n",
-                "```\n",
-            ),
-        );
-    };
-    ($Small:ty => $Large:ty, #[$attr:meta] $(,)?) => {
-        impl_from!(
-            $Small => $Large,
-            #[$attr],
-            concat!("Converts [`", stringify!($Small), "`] to [`", stringify!($Large), "`] losslessly."),
-        );
-    };
-    ($Small:ty => $Large:ty, #[$attr:meta], $doc:expr $(,)?) => {
-        #[$attr]
-        impl From<$Small> for $Large {
-            // Rustdocs on the impl block show a "[+] show undocumented items" toggle.
-            // Rustdocs on functions do not.
-            #[doc = $doc]
+/// Implement `From<bool>` for integers
+macro_rules! impl_from_bool {
+    ($($int:ty)*) => {$(
+        #[stable(feature = "from_bool", since = "1.28.0")]
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl From<bool> for $int {
+            /// Converts from [`bool`] to
+            #[doc = concat!("[`", stringify!($int), "`]")]
+            /// , by turning `false` into `0` and `true` into `1`.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            #[doc = concat!("assert_eq!(", stringify!($int), "::from(false), 0);")]
+            ///
+            #[doc = concat!("assert_eq!(", stringify!($int), "::from(true), 1);")]
+            /// ```
             #[inline(always)]
-            fn from(small: $Small) -> Self {
-                small as Self
+            fn from(b: bool) -> Self {
+                b as Self
             }
         }
-    };
+    )*}
 }
 
 // boolean -> integer
-impl_from!(bool => u8);
-impl_from!(bool => u16);
-impl_from!(bool => u32);
-impl_from!(bool => u64);
-impl_from!(bool => u128);
-impl_from!(bool => usize);
-impl_from!(bool => i8);
-impl_from!(bool => i16);
-impl_from!(bool => i32);
-impl_from!(bool => i64);
-impl_from!(bool => i128);
-impl_from!(bool => isize);
+impl_from_bool!(u8 u16 u32 u64 u128 usize);
+impl_from_bool!(i8 i16 i32 i64 i128 isize);
+
+/// Implement `From<$small>` for `$large`
+macro_rules! impl_from {
+    ($small:ty => $large:ty, $(#[$attrs:meta]),+) => {
+        $(#[$attrs])+
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl From<$small> for $large {
+            #[doc = concat!("Converts from [`", stringify!($small), "`] to [`", stringify!($large), "`] losslessly.")]
+            #[inline(always)]
+            fn from(small: $small) -> Self {
+                debug_assert!(<$large>::MIN as i128 <= <$small>::MIN as i128);
+                debug_assert!(<$small>::MAX as u128 <= <$large>::MAX as u128);
+                small as Self
+            }
+        }
+    }
+}
 
 // unsigned integer -> unsigned integer
 impl_from!(u8 => u16, #[stable(feature = "lossless_int_conv", since = "1.5.0")]);
@@ -153,66 +133,72 @@ impl_from!(i16 => isize, #[stable(feature = "lossless_iusize_conv", since = "1.2
 // * 53 bits in f64
 // * 113 bits in f128
 // Lossy float conversions are not implemented at this time.
-// FIXME(f16_f128): The `f16`/`f128` impls `#[stable]` attributes should be changed to reference
+// FIXME(f16,f128): The `f16`/`f128` impls `#[stable]` attributes should be changed to reference
 // `f16`/`f128` when they are stabilised (trait impls have to have a `#[stable]` attribute, but none
 // of the `f16`/`f128` impls can be used on stable as the `f16` and `f128` types are unstable).
 
 // signed integer -> float
-impl_from!(i8 => f16, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(i8 => f16, #[unstable(feature = "f16", issue = "116909")], #[unstable_feature_bound(f16)]);
 impl_from!(i8 => f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
 impl_from!(i8 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(i8 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(i8 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 impl_from!(i16 => f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
 impl_from!(i16 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(i16 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(i16 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 impl_from!(i32 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(i32 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-// FIXME(f16_f128): This impl would allow using `f128` on stable before it is stabilised.
-// impl_from!(i64 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(i32 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
+impl_from!(i64 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 
 // unsigned integer -> float
-impl_from!(u8 => f16, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(u8 => f16, #[unstable(feature = "f16", issue = "116909")], #[unstable_feature_bound(f16)]);
 impl_from!(u8 => f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
 impl_from!(u8 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(u8 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(u16 => f16, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(u8 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 impl_from!(u16 => f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
 impl_from!(u16 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(u16 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(u16 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 impl_from!(u32 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(u32 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-// FIXME(f16_f128): This impl would allow using `f128` on stable before it is stabilised.
-// impl_from!(u64 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(u32 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
+impl_from!(u64 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 
 // float -> float
-// FIXME(f16_f128): adding additional `From<{float}>` impls to `f32` breaks inference. See
-// <https://github.com/rust-lang/rust/issues/123831>
-impl_from!(f16 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(f16 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+
+// FIXME(f16): adding the additional `From<{float}>` impl to `f32` would break inference in cases
+// like `f32::from(1.0)`. The type checker has a custom workaround to keep that and similar code
+// compiling even with the second `From<16> for f32` instance. We keep this instance unstable for
+// now so that we can later remove the workaround.
+//
+// See also <https://github.com/rust-lang/rust/issues/123831>.
+impl_from!(f16 => f32, #[unstable(feature = "f32_from_f16", issue = "154005")], #[unstable_feature_bound(f32_from_f16)]);
+impl_from!(f16 => f64, #[unstable(feature = "f16", issue = "116909")], #[unstable_feature_bound(f16)]);
+// Also #[unstable(feature = "f16", issue = "116909")]:
+impl_from!(f16 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f16, f128)]);
 impl_from!(f32 => f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(f32 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
-impl_from!(f64 => f128, #[stable(feature = "lossless_float_conv", since = "1.6.0")]);
+impl_from!(f32 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
+impl_from!(f64 => f128, #[unstable(feature = "f128", issue = "116909")], #[unstable_feature_bound(f128)]);
 
 macro_rules! impl_float_from_bool {
     (
+        $(#[$attr:meta])*
         $float:ty $(;
             doctest_prefix: $(#[doc = $doctest_prefix:literal])*
             doctest_suffix: $(#[doc = $doctest_suffix:literal])*
         )?
     ) => {
-        #[stable(feature = "float_from_bool", since = "1.68.0")]
-        impl From<bool> for $float {
+        $(#[$attr])*
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+            const impl From<bool> for $float {
             #[doc = concat!("Converts a [`bool`] to [`", stringify!($float),"`] losslessly.")]
             /// The resulting value is positive `0.0` for `false` and `1.0` for `true` values.
             ///
             /// # Examples
             /// ```
             $($(#[doc = $doctest_prefix])*)?
-            #[doc = concat!("let x: ", stringify!($float)," = false.into();")]
+            #[doc = concat!("let x = ", stringify!($float), "::from(false);")]
             /// assert_eq!(x, 0.0);
             /// assert!(x.is_sign_positive());
             ///
-            #[doc = concat!("let y: ", stringify!($float)," = true.into();")]
+            #[doc = concat!("let y = ", stringify!($float), "::from(true);")]
             /// assert_eq!(y, 1.0);
             $($(#[doc = $doctest_suffix])*)?
             /// ```
@@ -226,20 +212,32 @@ macro_rules! impl_float_from_bool {
 
 // boolean -> float
 impl_float_from_bool!(
+    #[unstable(feature = "f16", issue = "116909")]
+    #[unstable_feature_bound(f16)]
     f16;
     doctest_prefix:
     // rustdoc doesn't remove the conventional space after the `///`
+    ///# #![allow(unused_features)]
     ///#![feature(f16)]
     ///# #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
     ///
     doctest_suffix:
     ///# }
 );
-impl_float_from_bool!(f32);
-impl_float_from_bool!(f64);
 impl_float_from_bool!(
+    #[stable(feature = "float_from_bool", since = "1.68.0")]
+    f32
+);
+impl_float_from_bool!(
+    #[stable(feature = "float_from_bool", since = "1.68.0")]
+    f64
+);
+impl_float_from_bool!(
+    #[unstable(feature = "f128", issue = "116909")]
+    #[unstable_feature_bound(f128)]
     f128;
     doctest_prefix:
+    ///# #![allow(unused_features)]
     ///#![feature(f128)]
     ///# #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
     ///
@@ -251,7 +249,8 @@ impl_float_from_bool!(
 macro_rules! impl_try_from_unbounded {
     ($source:ty => $($target:ty),+) => {$(
         #[stable(feature = "try_from", since = "1.34.0")]
-        impl TryFrom<$source> for $target {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$source> for $target {
             type Error = TryFromIntError;
 
             /// Tries to create the target number type from a source
@@ -269,7 +268,8 @@ macro_rules! impl_try_from_unbounded {
 macro_rules! impl_try_from_lower_bounded {
     ($source:ty => $($target:ty),+) => {$(
         #[stable(feature = "try_from", since = "1.34.0")]
-        impl TryFrom<$source> for $target {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$source> for $target {
             type Error = TryFromIntError;
 
             /// Tries to create the target number type from a source
@@ -280,7 +280,7 @@ macro_rules! impl_try_from_lower_bounded {
                 if u >= 0 {
                     Ok(u as Self)
                 } else {
-                    Err(TryFromIntError(()))
+                    Err(TryFromIntError(IntErrorKind::NegOverflow))
                 }
             }
         }
@@ -291,7 +291,8 @@ macro_rules! impl_try_from_lower_bounded {
 macro_rules! impl_try_from_upper_bounded {
     ($source:ty => $($target:ty),+) => {$(
         #[stable(feature = "try_from", since = "1.34.0")]
-        impl TryFrom<$source> for $target {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$source> for $target {
             type Error = TryFromIntError;
 
             /// Tries to create the target number type from a source
@@ -300,7 +301,7 @@ macro_rules! impl_try_from_upper_bounded {
             #[inline]
             fn try_from(u: $source) -> Result<Self, Self::Error> {
                 if u > (Self::MAX as $source) {
-                    Err(TryFromIntError(()))
+                    Err(TryFromIntError(IntErrorKind::PosOverflow))
                 } else {
                     Ok(u as Self)
                 }
@@ -313,7 +314,8 @@ macro_rules! impl_try_from_upper_bounded {
 macro_rules! impl_try_from_both_bounded {
     ($source:ty => $($target:ty),+) => {$(
         #[stable(feature = "try_from", since = "1.34.0")]
-        impl TryFrom<$source> for $target {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$source> for $target {
             type Error = TryFromIntError;
 
             /// Tries to create the target number type from a source
@@ -323,10 +325,57 @@ macro_rules! impl_try_from_both_bounded {
             fn try_from(u: $source) -> Result<Self, Self::Error> {
                 let min = Self::MIN as $source;
                 let max = Self::MAX as $source;
-                if u < min || u > max {
-                    Err(TryFromIntError(()))
+                if u < min {
+                    Err(TryFromIntError(IntErrorKind::NegOverflow))
+                } else if u > max {
+                    Err(TryFromIntError(IntErrorKind::PosOverflow))
                 } else {
                     Ok(u as Self)
+                }
+            }
+        }
+    )*}
+}
+
+/// Implement `TryFrom<integer>` for `bool`
+macro_rules! impl_try_from_integer_for_bool {
+    ($signedness:ident $($int:ty)+) => {$(
+        #[stable(feature = "bool_try_from_int", since = "1.95.0")]
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$int> for bool {
+            type Error = TryFromIntError;
+
+            /// Tries to create a bool from an integer type.
+            /// Returns an error if the integer is not 0 or 1.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            #[doc = concat!("assert_eq!(bool::try_from(0_", stringify!($int), "), Ok(false));")]
+            ///
+            #[doc = concat!("assert_eq!(bool::try_from(1_", stringify!($int), "), Ok(true));")]
+            ///
+            #[doc = concat!("assert!(bool::try_from(2_", stringify!($int), ").is_err());")]
+            /// ```
+            #[inline]
+            fn try_from(i: $int) -> Result<Self, Self::Error> {
+                sign_dependent_expr!{
+                    $signedness ?
+                    if signed {
+                        match i {
+                            0 => Ok(false),
+                            1 => Ok(true),
+                            ..0 => Err(TryFromIntError(IntErrorKind::NegOverflow)),
+                            2.. => Err(TryFromIntError(IntErrorKind::PosOverflow)),
+                        }
+                    }
+                    if unsigned {
+                        match i {
+                            0 => Ok(false),
+                            1 => Ok(true),
+                            2.. => Err(TryFromIntError(IntErrorKind::PosOverflow)),
+                        }
+                    }
                 }
             }
         }
@@ -338,6 +387,10 @@ macro_rules! rev {
         $mac!($target => $source);
     )*}
 }
+
+// integer -> bool
+impl_try_from_integer_for_bool!(unsigned u128 u64 u32 u16 u8);
+impl_try_from_integer_for_bool!(signed i128 i64 i32 i16 i8);
 
 // unsigned integer -> unsigned integer
 impl_try_from_upper_bounded!(u16 => u8);
@@ -375,7 +428,7 @@ impl_try_from_lower_bounded!(isize => usize);
 
 #[cfg(target_pointer_width = "16")]
 mod ptr_try_from_impls {
-    use super::TryFromIntError;
+    use super::{IntErrorKind, TryFromIntError};
 
     impl_try_from_upper_bounded!(usize => u8);
     impl_try_from_unbounded!(usize => u16, u32, u64, u128);
@@ -397,7 +450,7 @@ mod ptr_try_from_impls {
 
 #[cfg(target_pointer_width = "32")]
 mod ptr_try_from_impls {
-    use super::TryFromIntError;
+    use super::{IntErrorKind, TryFromIntError};
 
     impl_try_from_upper_bounded!(usize => u8, u16);
     impl_try_from_unbounded!(usize => u32, u64, u128);
@@ -422,7 +475,7 @@ mod ptr_try_from_impls {
 
 #[cfg(target_pointer_width = "64")]
 mod ptr_try_from_impls {
-    use super::TryFromIntError;
+    use super::{IntErrorKind, TryFromIntError};
 
     impl_try_from_upper_bounded!(usize => u8, u16, u32);
     impl_try_from_unbounded!(usize => u64, u128);
@@ -451,7 +504,8 @@ use crate::num::NonZero;
 macro_rules! impl_nonzero_int_from_nonzero_int {
     ($Small:ty => $Large:ty) => {
         #[stable(feature = "nz_int_conv", since = "1.41.0")]
-        impl From<NonZero<$Small>> for NonZero<$Large> {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl From<NonZero<$Small>> for NonZero<$Large> {
             // Rustdocs on the impl block show a "[+] show undocumented items" toggle.
             // Rustdocs on functions do not.
             #[doc = concat!("Converts <code>[NonZero]\\<[", stringify!($Small), "]></code> ")]
@@ -509,7 +563,8 @@ impl_nonzero_int_from_nonzero_int!(u64 => i128);
 macro_rules! impl_nonzero_int_try_from_int {
     ($Int:ty) => {
         #[stable(feature = "nzint_try_from_int_conv", since = "1.46.0")]
-        impl TryFrom<$Int> for NonZero<$Int> {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<$Int> for NonZero<$Int> {
             type Error = TryFromIntError;
 
             // Rustdocs on the impl block show a "[+] show undocumented items" toggle.
@@ -518,7 +573,7 @@ macro_rules! impl_nonzero_int_try_from_int {
             #[doc = concat!("to <code>[NonZero]\\<[", stringify!($Int), "]></code>.")]
             #[inline]
             fn try_from(value: $Int) -> Result<Self, Self::Error> {
-                Self::new(value).ok_or(TryFromIntError(()))
+                Self::new(value).ok_or(TryFromIntError(IntErrorKind::Zero))
             }
         }
     };
@@ -541,7 +596,8 @@ impl_nonzero_int_try_from_int!(isize);
 macro_rules! impl_nonzero_int_try_from_nonzero_int {
     ($source:ty => $($target:ty),+) => {$(
         #[stable(feature = "nzint_try_from_nzint_conv", since = "1.49.0")]
-        impl TryFrom<NonZero<$source>> for NonZero<$target> {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        const impl TryFrom<NonZero<$source>> for NonZero<$target> {
             type Error = TryFromIntError;
 
             // Rustdocs on the impl block show a "[+] show undocumented items" toggle.
@@ -586,3 +642,98 @@ impl_nonzero_int_try_from_nonzero_int!(i32 => u8, u16, u32, u64, u128, usize);
 impl_nonzero_int_try_from_nonzero_int!(i64 => u8, u16, u32, u64, u128, usize);
 impl_nonzero_int_try_from_nonzero_int!(i128 => u8, u16, u32, u64, u128, usize);
 impl_nonzero_int_try_from_nonzero_int!(isize => u8, u16, u32, u64, u128, usize);
+
+/// Conversion between integers, wrapping around or saturating at the target type's boundaries.
+#[unstable(feature = "integer_casts", issue = "157388")]
+#[rustc_const_unstable(feature = "integer_casts", issue = "157388")]
+pub impl(self) const trait BoundedCastFromInt<T>: Sized {
+    /// Converts `value` to this type, wrapping around at the boundary of the type.
+    #[unstable(feature = "integer_casts", issue = "157388")]
+    fn wrapping_cast_from(value: T) -> Self;
+
+    /// Converts `value` to this type, saturating at the numeric bounds instead of overflowing.
+    #[unstable(feature = "integer_casts", issue = "157388")]
+    fn saturating_cast_from(value: T) -> Self;
+}
+
+/// Fallible conversion between integers.
+#[unstable(feature = "integer_casts", issue = "157388")]
+#[rustc_const_unstable(feature = "integer_casts", issue = "157388")]
+pub impl(self) const trait CheckedCastFromInt<T>: Sized {
+    /// Converts `value` to this type, returning `None` if overflow would have occurred.
+    #[unstable(feature = "integer_casts", issue = "157388")]
+    fn checked_cast_from(value: T) -> Option<Self>;
+
+    /// Converts `value` to this type, assuming overflow cannot occur.
+    ///
+    /// # Safety
+    ///
+    /// This results in undefined behavior when `value` will overflow when
+    /// converted to this type.
+    #[unstable(feature = "integer_casts", issue = "157388")]
+    unsafe fn unchecked_cast_from(value: T) -> Self;
+
+    /// Converts `value` to this type, panicking on overflow.
+    ///
+    /// # Panics
+    ///
+    /// This function will always panic on overflow, regardless of whether overflow checks are enabled.
+    #[unstable(feature = "integer_casts", issue = "157388")]
+    fn strict_cast_from(value: T) -> Self;
+}
+
+macro_rules! impl_int_cast {
+    ($Src:ty as [$($Dst:ty),*]) => {$(
+        #[unstable(feature = "integer_casts", issue = "157388")]
+        #[rustc_const_unstable(feature = "integer_casts", issue = "157388")]
+        const impl CheckedCastFromInt<$Src> for $Dst {
+            #[inline]
+            fn checked_cast_from(value: $Src) -> Option<Self> {
+                value.try_into().ok()
+            }
+
+            #[inline(always)]
+            unsafe fn unchecked_cast_from(value: $Src) -> Self {
+                // SAFETY: the safety contract must be upheld by the caller.
+                unsafe { value.try_into().unwrap_unchecked() }
+            }
+
+            #[inline]
+            #[track_caller]
+            fn strict_cast_from(value: $Src) -> Self {
+                match value.try_into() {
+                    Ok(x) => x,
+                    Err(_) => core::num::imp::overflow_panic::cast_integer()
+                }
+            }
+        }
+
+        #[unstable(feature = "integer_casts", issue = "157388")]
+        #[rustc_const_unstable(feature = "integer_casts", issue = "157388")]
+        const impl BoundedCastFromInt<$Src> for $Dst {
+            #[inline(always)]
+            fn wrapping_cast_from(value: $Src) -> Self {
+                value as Self
+            }
+
+            #[inline]
+            #[allow(unused_comparisons)]
+            #[allow(irrefutable_let_patterns)]
+            fn saturating_cast_from(value: $Src) -> Self {
+                if let Ok(x) = value.try_into() {
+                    return x;
+                }
+
+                if value < 0 { <$Dst>::MIN } else { <$Dst>::MAX }
+            }
+        }
+    )*};
+}
+
+macro_rules! impl_all_int_casts {
+    ([$($Src:ty),*]) => {$(
+        impl_int_cast!($Src as [u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize]);
+    )*};
+}
+
+impl_all_int_casts!([u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize]);

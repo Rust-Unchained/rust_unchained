@@ -5,16 +5,16 @@ and we appreciate all of them.
 
 The best way to get started is by asking for help in the [#new
 members](https://rust-lang.zulipchat.com/#narrow/stream/122652-new-members)
-Zulip stream. We have lots of docs below of how to get started on your own, but
+Zulip stream. We have a lot of documentation below on how to get started on your own, but
 the Zulip stream is the best place to *ask* for help.
 
 Documentation for contributing to the compiler or tooling is located in the [Guide to Rustc
 Development][rustc-dev-guide], commonly known as the [rustc-dev-guide]. Documentation for the
-standard library in the [Standard library developers Guide][std-dev-guide], commonly known as the [std-dev-guide].
+standard library is in the [Standard library developers Guide][std-dev-guide], commonly known as the [std-dev-guide].
 
 ## Making changes to subtrees and submodules
 
-For submodules, changes need to be made against the repository corresponding the
+For submodules, changes need to be made against the repository corresponding to the
 submodule, and not the main `rust-lang/rust` repository.
 
 For subtrees, prefer sending a PR against the subtree's repository if it does
@@ -25,15 +25,24 @@ rustc-dev-guide change that does not accompany a compiler change).
 
 The [rustc-dev-guide] is meant to help document how rustc –the Rust compiler– works,
 as well as to help new contributors get involved in rustc development. It is recommended
-to read and understand the [rustc-dev-guide] before making a contribution. This guide
+that you read and understand the [rustc-dev-guide] before making a contribution. This guide
 talks about the different bots in the Rust ecosystem, the Rust development tools,
 bootstrapping, the compiler architecture, source code representation, and more.
 
+## LLM policy
+
+We have a policy for how LLMs are allowed to be used in contributions to `rust-lang/rust`.
+You can read it [on Forge][LLM policy].
+For suggestions about how to use LLMs *well*, and how to review LLM-created PRs, see [the dev-guide][llm-guidance].
+
+[LLM policy]: https://forge.rust-lang.org/policies/llm-usage.html
+[llm-guidance]: https://rustc-dev-guide.rust-lang.org/llm-guidance.html
+
 ## [Getting help](https://rustc-dev-guide.rust-lang.org/getting-started.html#asking-questions)
 
-There are many ways you can get help when you're stuck. Rust has many platforms for this:
-[internals], [rust-zulip], and [rust-discord]. It is recommended to ask for help on
-the [rust-zulip], but any of these platforms are a great way to seek help and even
+There are many ways you can get help when you're stuck. Rust has two platforms for this:
+[internals] and [rust-zulip]. It is recommended to ask for help on
+the [rust-zulip], but any of these platforms are great ways to seek help and even
 find a mentor! You can learn more about asking questions and getting help in the
 [Asking Questions](https://rustc-dev-guide.rust-lang.org/getting-started.html#asking-questions) chapter of the [rustc-dev-guide].
 
@@ -47,5 +56,4 @@ refer to [this section][contributing-bug-reports] and [open an issue][issue temp
 [contributing-bug-reports]: https://rustc-dev-guide.rust-lang.org/contributing.html#bug-reports
 [issue template]: https://github.com/rust-lang/rust/issues/new/choose
 [internals]: https://internals.rust-lang.org
-[rust-discord]: http://discord.gg/rust-lang
 [rust-zulip]: https://rust-lang.zulipchat.com

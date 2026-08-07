@@ -20,8 +20,6 @@ use rustc_middle::ty::{self, Ty, TyCtxt, Upcast};
 use rustc_span::Span;
 use thin_vec::ThinVec;
 
-pub use self::ImplSource::*;
-pub use self::SelectionError::*;
 pub use self::engine::{FromSolverError, ScrubbedTraitError, TraitEngine};
 pub(crate) use self::project::UndoLog;
 pub use self::project::{
@@ -39,6 +37,8 @@ use crate::infer::InferCtxt;
 #[derive(Clone, TypeFoldable, TypeVisitable)]
 pub struct Obligation<'tcx, T> {
     /// The reason we have to prove this thing.
+    /// FIXME: we shouldn't ignore the cause but instead change the affected visitors
+    /// to only visit predicates manually.
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
     pub cause: ObligationCause<'tcx>,
@@ -158,11 +158,11 @@ impl<'tcx, O> Obligation<'tcx, O> {
     pub fn misc(
         tcx: TyCtxt<'tcx>,
         span: Span,
-        body_id: LocalDefId,
+        body_def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
         trait_ref: impl Upcast<TyCtxt<'tcx>, O>,
     ) -> Obligation<'tcx, O> {
-        Obligation::new(tcx, ObligationCause::misc(span, body_id), param_env, trait_ref)
+        Obligation::new(tcx, ObligationCause::misc(span, body_def_id), param_env, trait_ref)
     }
 
     pub fn with<P>(

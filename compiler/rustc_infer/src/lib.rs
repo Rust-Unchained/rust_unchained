@@ -13,21 +13,11 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![allow(internal_features)]
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(bootstrap, feature(let_chains))]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(assert_matches)]
+#![allow(rustc::direct_use_of_rustc_type_ir)]
 #![feature(extend_one)]
-#![feature(iterator_try_collect)]
-#![feature(rustdoc_internals)]
 #![recursion_limit = "512"] // For rustdoc
 // tidy-alphabetical-end
 
-mod errors;
+mod diagnostics;
 pub mod infer;
 pub mod traits;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

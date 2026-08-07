@@ -1,5 +1,6 @@
 //! Routines for manipulating the control-flow graph.
 
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use tracing::debug;
@@ -42,7 +43,7 @@ impl<'tcx> CFG<'tcx> {
     ) {
         self.push(
             block,
-            Statement { source_info, kind: StatementKind::Assign(Box::new((place, rvalue))) },
+            Statement::new(source_info, StatementKind::Assign(Box::new((place, rvalue)))),
         );
     }
 
@@ -57,7 +58,7 @@ impl<'tcx> CFG<'tcx> {
             block,
             source_info,
             temp,
-            Rvalue::Use(Operand::Constant(Box::new(constant))),
+            Rvalue::Use(Operand::Constant(Box::new(constant)), WithRetag::Yes),
         );
     }
 
@@ -72,11 +73,14 @@ impl<'tcx> CFG<'tcx> {
             block,
             source_info,
             place,
-            Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::zero_sized(tcx.types.unit),
-            }))),
+            Rvalue::Use(
+                Operand::Constant(Box::new(ConstOperand {
+                    span: source_info.span,
+                    user_ty: None,
+                    const_: Const::zero_sized(tcx.types.unit),
+                })),
+                WithRetag::Yes,
+            ),
         );
     }
 
@@ -88,7 +92,7 @@ impl<'tcx> CFG<'tcx> {
         place: Place<'tcx>,
     ) {
         let kind = StatementKind::FakeRead(Box::new((cause, place)));
-        let stmt = Statement { source_info, kind };
+        let stmt = Statement::new(source_info, kind);
         self.push(block, stmt);
     }
 
@@ -99,7 +103,7 @@ impl<'tcx> CFG<'tcx> {
         place: Place<'tcx>,
     ) {
         let kind = StatementKind::PlaceMention(Box::new(place));
-        let stmt = Statement { source_info, kind };
+        let stmt = Statement::new(source_info, kind);
         self.push(block, stmt);
     }
 
@@ -110,7 +114,7 @@ impl<'tcx> CFG<'tcx> {
     /// syntax (e.g. `continue` or `if !`) that would otherwise not appear in MIR.
     pub(crate) fn push_coverage_span_marker(&mut self, block: BasicBlock, source_info: SourceInfo) {
         let kind = StatementKind::Coverage(coverage::CoverageKind::SpanMarker);
-        let stmt = Statement { source_info, kind };
+        let stmt = Statement::new(source_info, kind);
         self.push(block, stmt);
     }
 
@@ -119,7 +123,7 @@ impl<'tcx> CFG<'tcx> {
         block: BasicBlock,
         source_info: SourceInfo,
         kind: TerminatorKind<'tcx>,
-    ) {
+    ) -> &mut Terminator<'tcx> {
         debug!("terminating block {:?} <- {:?}", block, kind);
         debug_assert!(
             self.block_data(block).terminator.is_none(),
@@ -127,11 +131,18 @@ impl<'tcx> CFG<'tcx> {
             block,
             self.block_data(block)
         );
-        self.block_data_mut(block).terminator = Some(Terminator { source_info, kind });
+        self.block_data_mut(block).terminator =
+            Some(Terminator { source_info, kind, attributes: ThinVec::new() });
+        self.block_data_mut(block).terminator.as_mut().unwrap()
     }
 
     /// In the `origin` block, push a `goto -> target` terminator.
-    pub(crate) fn goto(&mut self, origin: BasicBlock, source_info: SourceInfo, target: BasicBlock) {
+    pub(crate) fn goto(
+        &mut self,
+        origin: BasicBlock,
+        source_info: SourceInfo,
+        target: BasicBlock,
+    ) -> &mut Terminator<'tcx> {
         self.terminate(origin, source_info, TerminatorKind::Goto { target })
     }
 }

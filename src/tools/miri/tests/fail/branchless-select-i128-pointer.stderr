@@ -1,4 +1,4 @@
-error: Undefined Behavior: constructing invalid value: encountered a dangling reference ($HEX[noalloc] has no provenance)
+error: Undefined Behavior: constructing invalid value of type &str: encountered a dangling reference ($HEX[noalloc] has no provenance)
   --> tests/fail/branchless-select-i128-pointer.rs:LL:CC
    |
 LL | /             transmute::<_, &str>(
@@ -6,12 +6,10 @@ LL | |
 LL | |                 !mask & transmute::<_, TwoPtrs>("false !")
 LL | |                     | mask & transmute::<_, TwoPtrs>("true !"),
 LL | |             )
-   | |_____________^ constructing invalid value: encountered a dangling reference ($HEX[noalloc] has no provenance)
+   | |_____________^ Undefined Behavior occurred here
    |
    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
-   = note: BACKTRACE:
-   = note: inside `main` at tests/fail/branchless-select-i128-pointer.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

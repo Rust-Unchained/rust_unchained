@@ -1,5 +1,5 @@
 #![warn(clippy::enum_variant_names)]
-#![allow(non_camel_case_types, clippy::upper_case_acronyms)]
+#![expect(non_camel_case_types, clippy::upper_case_acronyms)]
 
 enum FakeCallType {
     CALL,
@@ -217,6 +217,21 @@ mod issue11494 {
         //~^ enum_variant_names
         Valid,
         Invalid,
+    }
+}
+
+mod encapsulated {
+    mod types {
+        pub struct FooError;
+        pub struct BarError;
+        pub struct BazError;
+    }
+
+    enum Error {
+        FooError(types::FooError),
+        BarError(types::BarError),
+        BazError(types::BazError),
+        Other,
     }
 }
 

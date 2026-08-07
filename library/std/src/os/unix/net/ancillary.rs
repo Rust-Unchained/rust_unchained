@@ -16,7 +16,8 @@ use crate::sys::net::Socket;
     not(target_os = "linux"),
     not(target_os = "android"),
     not(target_os = "netbsd"),
-    not(target_os = "freebsd")
+    not(target_os = "freebsd"),
+    not(target_os = "cygwin"),
 ))]
 #[allow(non_camel_case_types)]
 mod libc {
@@ -195,14 +196,15 @@ impl<'a, T> Iterator for AncillaryDataIter<'a, T> {
     not(target_os = "android"),
     not(target_os = "linux"),
     not(target_os = "netbsd"),
-    not(target_os = "freebsd")
+    not(target_os = "freebsd"),
+    not(target_os = "cygwin"),
 ))]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 #[derive(Clone)]
 pub struct SocketCred(());
 
 /// Unix credential.
-#[cfg(any(target_os = "android", target_os = "linux",))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 #[derive(Clone)]
 pub struct SocketCred(libc::ucred);
@@ -217,8 +219,8 @@ pub struct SocketCred(libc::sockcred);
 #[derive(Clone)]
 pub struct SocketCred(libc::sockcred2);
 
-#[doc(cfg(any(target_os = "android", target_os = "linux")))]
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[doc(cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin")))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 impl SocketCred {
     /// Creates a Unix credential struct.
     ///
@@ -407,7 +409,8 @@ impl<'a> Iterator for ScmRights<'a> {
     not(target_os = "android"),
     not(target_os = "linux"),
     not(target_os = "netbsd"),
-    not(target_os = "freebsd")
+    not(target_os = "freebsd"),
+    not(target_os = "cygwin"),
 ))]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 pub struct ScmCredentials<'a>(AncillaryDataIter<'a, ()>);
@@ -415,7 +418,7 @@ pub struct ScmCredentials<'a>(AncillaryDataIter<'a, ()>);
 /// This control message contains unix credentials.
 ///
 /// The level is equal to `SOL_SOCKET` and the type is equal to `SCM_CREDENTIALS` or `SCM_CREDS`.
-#[cfg(any(target_os = "android", target_os = "linux",))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 pub struct ScmCredentials<'a>(AncillaryDataIter<'a, libc::ucred>);
 
@@ -432,7 +435,8 @@ pub struct ScmCredentials<'a>(AncillaryDataIter<'a, libc::sockcred>);
     target_os = "android",
     target_os = "linux",
     target_os = "netbsd",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "cygwin",
 ))]
 #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
 impl<'a> Iterator for ScmCredentials<'a> {
@@ -460,7 +464,8 @@ pub enum AncillaryData<'a> {
         target_os = "android",
         target_os = "linux",
         target_os = "netbsd",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "cygwin",
     ))]
     ScmCredentials(ScmCredentials<'a>),
 }
@@ -489,7 +494,8 @@ impl<'a> AncillaryData<'a> {
         target_os = "android",
         target_os = "linux",
         target_os = "netbsd",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "cygwin",
     ))]
     unsafe fn as_credentials(data: &'a [u8]) -> Self {
         let ancillary_data_iter = AncillaryDataIter::new(data);
@@ -507,7 +513,7 @@ impl<'a> AncillaryData<'a> {
             match (*cmsg).cmsg_level {
                 libc::SOL_SOCKET => match (*cmsg).cmsg_type {
                     libc::SCM_RIGHTS => Ok(AncillaryData::as_rights(data)),
-                    #[cfg(any(target_os = "android", target_os = "linux",))]
+                    #[cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin"))]
                     libc::SCM_CREDENTIALS => Ok(AncillaryData::as_credentials(data)),
                     #[cfg(target_os = "freebsd")]
                     libc::SCM_CREDS2 => Ok(AncillaryData::as_credentials(data)),
@@ -570,7 +576,15 @@ impl<'a> Iterator for Messages<'a> {
 /// A Unix socket Ancillary data struct.
 ///
 /// # Example
-/// ```no_run
+///
+#[cfg_attr(
+    any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+    doc = "```no_run"
+)]
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+    doc = "```ignore (needs unix)"
+)]
 /// #![feature(unix_socket_ancillary_data)]
 /// use std::os::unix::net::{UnixStream, SocketAncillary, AncillaryData};
 /// use std::io::IoSliceMut;
@@ -609,7 +623,14 @@ impl<'a> SocketAncillary<'a> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore (needs unix)"
+    )]
     /// # #![allow(unused_mut)]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::SocketAncillary;
@@ -652,7 +673,14 @@ impl<'a> SocketAncillary<'a> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore (needs unix)"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixStream, SocketAncillary};
     /// use std::io::IoSliceMut;
@@ -686,7 +714,14 @@ impl<'a> SocketAncillary<'a> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore (needs unix)"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixStream, SocketAncillary};
     /// use std::os::unix::io::AsRawFd;
@@ -729,7 +764,8 @@ impl<'a> SocketAncillary<'a> {
         target_os = "android",
         target_os = "linux",
         target_os = "netbsd",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "cygwin",
     ))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn add_creds(&mut self, creds: &[SocketCred]) -> bool {
@@ -752,7 +788,14 @@ impl<'a> SocketAncillary<'a> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore (needs unix)"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixStream, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;

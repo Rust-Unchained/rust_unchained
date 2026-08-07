@@ -2,10 +2,10 @@
 // Alignment of 128 bit types is not currently handled, this will
 // need to be fixed when PowerPC vector support is added.
 
-use rustc_abi::{Endian, HasDataLayout, TyAbiInterface};
+use rustc_abi::{HasDataLayout, TyAbiInterface};
 
 use crate::callconv::{Align, ArgAbi, FnAbi, Reg, RegKind, Uniform};
-use crate::spec::HasTargetSpec;
+use crate::spec::{HasTargetSpec, LlvmAbi, Os};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ABI {
@@ -36,7 +36,7 @@ where
         let valid_unit = match unit.kind {
             RegKind::Integer => false,
             RegKind::Float => true,
-            RegKind::Vector => arg.layout.size.bits() == 128,
+            RegKind::Vector { .. } => arg.layout.size.bits() == 128,
         };
 
         valid_unit.then_some(Uniform::consecutive(unit, arg.layout.size))
@@ -50,6 +50,10 @@ where
 {
     if arg.is_ignore() || !arg.layout.is_sized() {
         // Not touching this...
+        return;
+    }
+    if !is_ret && arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+        arg.make_indirect();
         return;
     }
     if !arg.layout.is_aggregate() {
@@ -89,7 +93,7 @@ where
         // Aggregates larger than i64 should be padded at the tail to fill out a whole number
         // of i64s or i128s, depending on the aggregate alignment. Always use an array for
         // this, even if there is only a single element.
-        let reg = if arg.layout.align.abi.bytes() > 8 { Reg::i128() } else { Reg::i64() };
+        let reg = if arg.layout.align.bytes() > 8 { Reg::i128() } else { Reg::i64() };
         arg.cast_to(Uniform::consecutive(
             reg,
             size.align_to(Align::from_bytes(reg.size.bytes()).unwrap()),
@@ -102,15 +106,13 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout + HasTargetSpec,
 {
-    let abi = if cx.target_spec().env == "musl" || cx.target_spec().os == "freebsd" {
-        ELFv2
-    } else if cx.target_spec().os == "aix" {
-        AIX
-    } else {
-        match cx.data_layout().endian {
-            Endian::Big => ELFv1,
-            Endian::Little => ELFv2,
-        }
+    let abi = match cx.target_spec().options.llvm_abiname {
+        LlvmAbi::ElfV1 => ELFv1,
+        LlvmAbi::ElfV2 => ELFv2,
+        LlvmAbi::Unspecified if cx.target_spec().os == Os::Aix => AIX,
+        // Target::check_consistency enforces that every target except AIX
+        // sets llvm_abiname to either ElfV1 or ElfV2
+        _ => unreachable!(),
     };
 
     classify(cx, &mut fn_abi.ret, abi, true);

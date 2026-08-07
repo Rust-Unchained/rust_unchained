@@ -1,5 +1,5 @@
 #![warn(clippy::box_default)]
-#![allow(clippy::boxed_local, clippy::default_constructed_unit_structs)]
+#![expect(clippy::boxed_local, clippy::default_constructed_unit_structs)]
 
 #[derive(Default)]
 struct ImplementsDefault;
@@ -126,7 +126,7 @@ fn issue_10381() {
     impl Bar for Foo {}
 
     fn maybe_get_bar(i: u32) -> Option<Box<dyn Bar>> {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             Some(Box::new(Foo::default()))
         } else {
             None

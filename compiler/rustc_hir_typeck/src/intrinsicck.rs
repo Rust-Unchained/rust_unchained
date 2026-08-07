@@ -7,10 +7,10 @@ use rustc_hir as hir;
 use rustc_index::Idx;
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutError, SizeSkeleton};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
+use rustc_span::ErrorGuaranteed;
+use rustc_span::def_id::LocalDefId;
 use tracing::trace;
-
-use super::FnCtxt;
 
 /// If the type is `Option<T>`, it will return `T`, otherwise
 /// the type itself. Works on most `Option`-like types.
@@ -32,126 +32,244 @@ fn unpack_option_like<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
         }
 
         if def.variant(data_idx).fields.len() == 1 {
-            return def.variant(data_idx).single_field().ty(tcx, args);
+            return def.variant(data_idx).single_field().ty(tcx, args).skip_norm_wip();
         }
     }
 
     ty
 }
 
-impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
-    /// FIXME: Move this check out of typeck, since it'll easily cycle when revealing opaques,
-    /// and we shouldn't need to check anything here if the typeck results are tainted.
-    pub(crate) fn check_transmute(&self, from: Ty<'tcx>, to: Ty<'tcx>, hir_id: HirId) {
-        let tcx = self.tcx;
-        let dl = &tcx.data_layout;
-        let span = tcx.hir_span(hir_id);
-        let normalize = |ty| {
-            let ty = self.resolve_vars_if_possible(ty);
-            if let Ok(ty) =
-                self.tcx.try_normalize_erasing_regions(self.typing_env(self.param_env), ty)
-            {
-                ty
+/// Try to display a sensible error with as much information as possible.
+fn skeleton_string<'tcx>(
+    ty: Ty<'tcx>,
+    sk: Result<SizeSkeleton<'tcx>, &'tcx LayoutError<'tcx>>,
+) -> String {
+    match sk {
+        Ok(SizeSkeleton::Pointer { tail, .. }) => format!("pointer to `{tail}`"),
+        Ok(SizeSkeleton::Known(size, _)) => {
+            if let Some(v) = u128::from(size.bytes()).checked_mul(8) {
+                format!("{v} bits")
             } else {
-                Ty::new_error_with_message(
-                    tcx,
-                    span,
-                    "tried to normalize non-wf type in check_transmute",
-                )
-            }
-        };
-        let from = normalize(from);
-        let to = normalize(to);
-        trace!(?from, ?to);
-        if from.has_non_region_infer() || to.has_non_region_infer() {
-            // Note: this path is currently not reached in any test, so any
-            // example that triggers this would be worth minimizing and
-            // converting into a test.
-            self.dcx().span_bug(span, "argument to transmute has inference variables");
-        }
-        // Transmutes that are only changing lifetimes are always ok.
-        if from == to {
-            return;
-        }
-
-        let skel = |ty| SizeSkeleton::compute(ty, tcx, self.typing_env(self.param_env));
-        let sk_from = skel(from);
-        let sk_to = skel(to);
-        trace!(?sk_from, ?sk_to);
-
-        // Check for same size using the skeletons.
-        if let (Ok(sk_from), Ok(sk_to)) = (sk_from, sk_to) {
-            if sk_from.same_size(sk_to) {
-                return;
-            }
-
-            // Special-case transmuting from `typeof(function)` and
-            // `Option<typeof(function)>` to present a clearer error.
-            let from = unpack_option_like(tcx, from);
-            if let (&ty::FnDef(..), SizeSkeleton::Known(size_to, _)) = (from.kind(), sk_to)
-                && size_to == Pointer(dl.instruction_address_space).size(&tcx)
-            {
-                struct_span_code_err!(self.dcx(), span, E0591, "can't transmute zero-sized type")
-                    .with_note(format!("source type: {from}"))
-                    .with_note(format!("target type: {to}"))
-                    .with_help("cast with `as` to a pointer instead")
-                    .emit();
-                return;
+                // `u128` should definitely be able to hold the size of different architectures
+                // larger sizes should be reported as error `are too big for the target architecture`
+                // otherwise we have a bug somewhere
+                bug!("{:?} overflow for u128", size)
             }
         }
+        Err(LayoutError::TooGeneric(bad)) => {
+            if *bad == ty {
+                "this type does not have a fixed size".to_owned()
+            } else {
+                format!("size can vary because of {bad}")
+            }
+        }
+        Err(err) => err.to_string(),
+    }
+}
 
-        // Try to display a sensible error with as much information as possible.
-        let skeleton_string = |ty: Ty<'tcx>, sk: Result<_, &_>| match sk {
-            Ok(SizeSkeleton::Pointer { tail, .. }) => format!("pointer to `{tail}`"),
-            Ok(SizeSkeleton::Known(size, _)) => {
-                if let Some(v) = u128::from(size.bytes()).checked_mul(8) {
-                    format!("{v} bits")
-                } else {
-                    // `u128` should definitely be able to hold the size of different architectures
-                    // larger sizes should be reported as error `are too big for the target architecture`
-                    // otherwise we have a bug somewhere
-                    bug!("{:?} overflow for u128", size)
-                }
-            }
-            Ok(SizeSkeleton::Generic(size)) => {
-                if let Some(size) =
-                    self.try_structurally_resolve_const(span, size).try_to_target_usize(tcx)
-                {
-                    format!("{size} bytes")
-                } else {
-                    format!("generic size {size}")
-                }
-            }
-            Err(LayoutError::TooGeneric(bad)) => {
-                if *bad == ty {
-                    "this type does not have a fixed size".to_owned()
-                } else {
-                    format!("size can vary because of {bad}")
-                }
-            }
-            Err(err) => err.to_string(),
-        };
-
-        let mut err = struct_span_code_err!(
-            self.dcx(),
-            span,
-            E0512,
-            "cannot transmute between types of different sizes, \
-                                        or dependently-sized types"
-        );
-        if from == to {
-            err.note(format!("`{from}` does not have a fixed size"));
-            err.emit();
+fn check_transmute<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    from: Unnormalized<'tcx, Ty<'tcx>>,
+    to: Unnormalized<'tcx, Ty<'tcx>>,
+    hir_id: HirId,
+) -> Result<(), ErrorGuaranteed> {
+    let span = tcx.hir_span(hir_id);
+    let normalize = |ty| {
+        if let Ok(ty) = tcx.try_normalize_erasing_regions(typing_env, ty) {
+            ty
         } else {
-            err.note(format!("source type: `{}` ({})", from, skeleton_string(from, sk_from)))
-                .note(format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
-            if let Err(LayoutError::ReferencesError(_)) = sk_from {
-                err.delay_as_bug();
-            } else if let Err(LayoutError::ReferencesError(_)) = sk_to {
-                err.delay_as_bug();
-            } else {
-                err.emit();
-            }
+            Ty::new_error_with_message(
+                tcx,
+                span,
+                format!("tried to normalize non-wf type {ty:#?} in check_transmute"),
+            )
+        }
+    };
+
+    let from = normalize(from);
+    let to = normalize(to);
+    trace!(?from, ?to);
+
+    // Transmutes that are only changing lifetimes are always ok.
+    if from == to {
+        return Ok(());
+    }
+
+    let sk_from = SizeSkeleton::compute(from, tcx, typing_env, span);
+    let sk_to = SizeSkeleton::compute(to, tcx, typing_env, span);
+    trace!(?sk_from, ?sk_to);
+
+    // Check for same size using the skeletons.
+    if let Ok(sk_from) = sk_from
+        && let Ok(sk_to) = sk_to
+    {
+        if sk_from.same_size(sk_to) {
+            return Ok(());
+        }
+
+        // Special-case transmuting from `typeof(function)` and
+        // `Option<typeof(function)>` to present a clearer error.
+        let from = unpack_option_like(tcx, from);
+        if let ty::FnDef(..) = from.kind()
+            && let SizeSkeleton::Known(size_to, _) = sk_to
+            && size_to == Pointer(tcx.data_layout.instruction_address_space).size(&tcx)
+        {
+            struct_span_code_err!(tcx.sess.dcx(), span, E0591, "can't transmute zero-sized type")
+                .with_note(format!("source type: {from}"))
+                .with_note(format!("target type: {to}"))
+                .with_help("cast with `as` to a pointer instead")
+                .emit();
+            return Ok(());
         }
     }
+
+    let mut err = struct_span_code_err!(
+        tcx.sess.dcx(),
+        span,
+        E0512,
+        "cannot transmute between types of different sizes, or dependently-sized types"
+    );
+    if from == to {
+        err.note(format!("`{from}` does not have a fixed size"));
+        Err(err.emit())
+    } else {
+        err.note(format!("source type: `{}` ({})", from, skeleton_string(from, sk_from)));
+        err.note(format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
+        Err(err.emit())
+    }
+}
+
+fn check_offload<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    kernel_ty: Ty<'tcx>,
+    args_ty: Ty<'tcx>,
+    ret_ty: Ty<'tcx>,
+    hir_id: HirId,
+) -> Result<(), ErrorGuaranteed> {
+    let span = tcx.hir_span(hir_id);
+    let ty::FnDef(kernel_def_id, kernel_args) = *kernel_ty.kind() else {
+        let err = tcx
+            .sess
+            .dcx()
+            .struct_span_err(
+                span,
+                format!("expected a function item for the offload kernel, found `{}`", kernel_ty),
+            )
+            .emit();
+        return Err(err);
+    };
+
+    let kernel_sig =
+        tcx.fn_sig(kernel_def_id).instantiate(tcx, kernel_args.skip_binder()).skip_norm_wip();
+    let kernel_sig = tcx.instantiate_bound_regions_with_erased(kernel_sig);
+
+    let ty::Tuple(tuple_fields) = *args_ty.kind() else {
+        let err = tcx
+            .sess
+            .dcx()
+            .struct_span_err(
+                span,
+                format!("expected a tuple for the offload arguments, found `{}`", args_ty),
+            )
+            .emit();
+        return Err(err);
+    };
+
+    if kernel_sig.inputs().len() != tuple_fields.len() {
+        let err = tcx
+            .sess
+            .dcx()
+            .struct_span_err(
+                span,
+                format!(
+                    "offload kernel expects {} arguments, but {} arguments were provided",
+                    kernel_sig.inputs().len(),
+                    tuple_fields.len()
+                ),
+            )
+            .emit();
+        return Err(err);
+    }
+
+    let normalize = |ty| {
+        if let Ok(ty) = tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(ty)) {
+            ty
+        } else {
+            Ty::new_error_with_message(
+                tcx,
+                span,
+                format!("tried to normalize non-wf type {ty:#?} in check_offload"),
+            )
+        }
+    };
+
+    let mut result = Ok(());
+
+    for (i, (&input_ty, arg_ty)) in kernel_sig.inputs().iter().zip(tuple_fields.iter()).enumerate()
+    {
+        let norm_input_ty = normalize(input_ty);
+        let norm_arg_ty = normalize(arg_ty);
+        if norm_input_ty != norm_arg_ty {
+            let err = tcx
+                .sess
+                .dcx()
+                .struct_span_err(
+                    span,
+                    format!(
+                        "type mismatch in offload kernel argument {}: expected `{}`, found `{}`",
+                        i, norm_input_ty, norm_arg_ty
+                    ),
+                )
+                .emit();
+            result = Err(err);
+        }
+    }
+
+    let norm_kernel_ret = normalize(kernel_sig.output());
+    let norm_offload_ret = normalize(ret_ty);
+    if norm_kernel_ret != norm_offload_ret {
+        let err = tcx.sess.dcx().struct_span_err(
+            span,
+            format!(
+                "offload kernel return type mismatch: kernel returns `{}`, but offload call expects `{}`",
+                norm_kernel_ret, norm_offload_ret
+            )
+        ).emit();
+        result = Err(err);
+    }
+
+    result
+}
+
+pub(crate) fn check_transmutes(tcx: TyCtxt<'_>, owner: LocalDefId) -> Result<(), ErrorGuaranteed> {
+    assert!(!tcx.is_typeck_child(owner.to_def_id()));
+    let typeck_results = tcx.typeck(owner);
+    if let Some(e) = typeck_results.tainted_by_errors {
+        return Err(e);
+    };
+
+    let typing_env = ty::TypingEnv::codegen(tcx, owner);
+    let mut result = Ok(());
+    for &(from, to, hir_id) in &typeck_results.transmutes_to_check {
+        let (to, from) = ty::set_aliases_to_non_rigid(tcx, (to, from)).unzip();
+        result = result.and(check_transmute(tcx, typing_env, from, to, hir_id));
+    }
+    result
+}
+
+pub(crate) fn check_offloads(tcx: TyCtxt<'_>, owner: LocalDefId) -> Result<(), ErrorGuaranteed> {
+    assert!(!tcx.is_typeck_child(owner.to_def_id()));
+    let typeck_results = tcx.typeck(owner);
+    if let Some(e) = typeck_results.tainted_by_errors {
+        return Err(e);
+    };
+
+    let typing_env = ty::TypingEnv::codegen(tcx, owner);
+    let mut result = Ok(());
+    for &(kernel_ty, args_ty, ret_ty, hir_id) in &typeck_results.offloads_to_check {
+        result = result.and(check_offload(tcx, typing_env, kernel_ty, args_ty, ret_ty, hir_id));
+    }
+    result
 }

@@ -43,7 +43,7 @@ pub(crate) struct BuildMetrics {
     state: RefCell<MetricsState>,
 }
 
-/// NOTE: this isn't really cloning anything, but `x suggest` doesn't need metrics so this is probably ok.
+// NOTE: this isn't really cloning anything, but necessary for `Build: Clone`.
 impl Clone for BuildMetrics {
     fn clone(&self) -> Self {
         Self::init()
@@ -222,7 +222,7 @@ impl BuildMetrics {
             format_version: CURRENT_FORMAT_VERSION,
             system_stats,
             invocations,
-            ci_metadata: get_ci_metadata(CiEnv::current()),
+            ci_metadata: get_ci_metadata(build.config.ci_env),
         };
 
         t!(std::fs::create_dir_all(dest.parent().unwrap()));

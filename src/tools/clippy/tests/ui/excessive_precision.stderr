@@ -157,7 +157,7 @@ LL +     let bad_bige32: f32 = 1.123_456_8E-10;
    |
 
 error: float has excessive precision
-  --> tests/ui/excessive_precision.rs:83:13
+  --> tests/ui/excessive_precision.rs:86:13
    |
 LL |     let _ = 2.225_073_858_507_201_1e-308_f64;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -169,7 +169,7 @@ LL +     let _ = 2.225_073_858_507_201e-308_f64;
    |
 
 error: float has excessive precision
-  --> tests/ui/excessive_precision.rs:87:13
+  --> tests/ui/excessive_precision.rs:90:13
    |
 LL |     let _ = 1.000_000_000_000_001e-324_f64;
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -181,7 +181,7 @@ LL +     let _ = 0_f64;
    |
 
 error: float has excessive precision
-  --> tests/ui/excessive_precision.rs:98:20
+  --> tests/ui/excessive_precision.rs:101:20
    |
 LL |     const _: f64 = 3.0000000000000000e+00;
    |                    ^^^^^^^^^^^^^^^^^^^^^^
@@ -192,5 +192,56 @@ LL -     const _: f64 = 3.0000000000000000e+00;
 LL +     const _: f64 = 3.0;
    |
 
-error: aborting due to 16 previous errors
+error: float has excessive precision
+  --> tests/ui/excessive_precision.rs:106:18
+   |
+LL |     let _: f32 = 1.01234567890123456789012345678901234567890;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: consider making it a `const` item
+  --> tests/ui/excessive_precision.rs:106:5
+   |
+LL |     let _: f32 = 1.01234567890123456789012345678901234567890;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider changing the type or truncating it to
+   |
+LL -     let _: f32 = 1.01234567890123456789012345678901234567890;
+LL +     let _: f32 = 1.012_345_7;
+   |
+
+error: float has excessive precision
+  --> tests/ui/excessive_precision.rs:108:18
+   |
+LL |     let _: f64 = 1.01234567890123456789012345678901234567890;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: consider making it a `const` item
+  --> tests/ui/excessive_precision.rs:108:5
+   |
+LL |     let _: f64 = 1.01234567890123456789012345678901234567890;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider changing the type or truncating it to
+   |
+LL -     let _: f64 = 1.01234567890123456789012345678901234567890;
+LL +     let _: f64 = 1.012_345_678_901_234_6;
+   |
+
+error: float has excessive precision
+  --> tests/ui/excessive_precision.rs:120:17
+   |
+LL |     let gamma = 0.5772156649015328606065120900824024310421;
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: consider making it a `const` item
+  --> tests/ui/excessive_precision.rs:120:5
+   |
+LL |     let gamma = 0.5772156649015328606065120900824024310421;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider changing the type or truncating it to
+   |
+LL -     let gamma = 0.5772156649015328606065120900824024310421;
+LL +     let gamma = 0.577_215_664_901_532_9;
+   |
+
+error: aborting due to 19 previous errors
 

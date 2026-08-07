@@ -1,3 +1,4 @@
+//@ edition:2015
 #![feature(associated_type_defaults)]
 
 struct S;
@@ -15,9 +16,9 @@ mod method {
         fn c(&self) { }
     }
 
-    impl A for ::S {}
-    impl B for ::S {}
-    impl C for ::S {}
+    impl A for crate::S {}
+    impl B for crate::S {}
+    impl C for crate::S {}
 }
 
 mod assoc_const {
@@ -33,9 +34,9 @@ mod assoc_const {
         const C: u8 = 0;
     }
 
-    impl A for ::S {}
-    impl B for ::S {}
-    impl C for ::S {}
+    impl A for crate::S {}
+    impl B for crate::S {}
+    impl C for crate::S {}
 }
 
 mod assoc_ty {
@@ -51,9 +52,9 @@ mod assoc_ty {
         type C = u8;
     }
 
-    impl A for ::S {}
-    impl B for ::S {}
-    impl C for ::S {}
+    impl A for crate::S {}
+    impl B for crate::S {}
+    impl C for crate::S {}
 }
 
 fn check_method() {
@@ -76,9 +77,9 @@ fn check_method() {
     // Methods, UFCS
     // a, b, c are resolved as trait items, their traits need to be in scope
     S::a(&S);
-    //~^ ERROR no function or associated item named `a` found
+    //~^ ERROR no associated function or constant named `a` found
     S::b(&S);
-    //~^ ERROR no function or associated item named `b` found
+    //~^ ERROR no associated function or constant named `b` found
     S::c(&S); // OK
     // a, b, c are resolved as inherent items, their traits don't need to be in scope
     <dyn C>::a(&S); //~ ERROR method `a` is private
@@ -94,14 +95,12 @@ fn check_assoc_const() {
 
     // Associated constants
     // A, B, C are resolved as trait items, their traits need to be in scope
-    S::A; //~ ERROR no associated item named `A` found
-    S::B; //~ ERROR no associated item named `B` found
+    S::A; //~ ERROR no associated function or constant named `A` found
+    S::B; //~ ERROR no associated function or constant named `B` found
     S::C; // OK
     // A, B, C are resolved as inherent items, their traits don't need to be in scope
     <dyn C>::A;
-    //~^ ERROR associated constant `A` is private
-    //~| ERROR the trait `assoc_const::C` is not dyn compatible
-    //~| ERROR the trait `assoc_const::C` is not dyn compatible
+    //~^ ERROR the trait `assoc_const::C` is not dyn compatible
     <dyn C>::B;
     //~^ ERROR the trait `assoc_const::C` is not dyn compatible
     C::C; // OK

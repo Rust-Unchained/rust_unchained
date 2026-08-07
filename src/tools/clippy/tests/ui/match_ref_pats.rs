@@ -1,6 +1,5 @@
 #![warn(clippy::match_ref_pats)]
-#![allow(dead_code, unused_variables)]
-#![allow(clippy::enum_variant_names, clippy::equatable_if_let, clippy::uninlined_format_args)]
+#![expect(clippy::diverging_sub_expression, clippy::empty_loop, clippy::enum_variant_names)]
 
 fn ref_pats() {
     {
@@ -116,6 +115,34 @@ mod issue_7740 {
             println!("BarFoo");
         } else {
             println!("Wild");
+        }
+    }
+}
+
+mod issue15378 {
+    fn never_in_match() {
+        match unimplemented!() {
+            &_ => {},
+            &&&42 => {
+                todo!()
+            },
+            _ => {},
+        }
+
+        match panic!() {
+            &_ => {},
+            &&&42 => {
+                todo!()
+            },
+            _ => {},
+        }
+
+        match loop {} {
+            &_ => {},
+            &&&42 => {
+                todo!()
+            },
+            _ => {},
         }
     }
 }

@@ -1,5 +1,5 @@
 //@ check-pass
-//@ add-core-stubs
+//@ add-minicore
 //@ revisions: host
 //@ revisions: i686
 //@[i686] compile-flags: --target i686-unknown-linux-gnu
@@ -13,6 +13,9 @@
 //@ revisions: arm
 //@[arm] compile-flags: --target arm-unknown-linux-gnueabi
 //@[arm] needs-llvm-components: arm
+//@ revisions: thumb
+//@[thumb] compile-flags: --target thumbv8m.main-none-eabi
+//@[thumb] needs-llvm-components: arm
 //@ revisions: aarch64
 //@[aarch64] compile-flags: --target aarch64-unknown-linux-gnu
 //@[aarch64] needs-llvm-components: aarch64
@@ -31,20 +34,27 @@
 //@ revisions: sparc64
 //@[sparc64] compile-flags: --target sparc64-unknown-linux-gnu
 //@[sparc64] needs-llvm-components: sparc
+//@ revisions: powerpc
+//@[powerpc] compile-flags: --target powerpc-unknown-linux-gnu
+//@[powerpc] needs-llvm-components: powerpc
 //@ revisions: powerpc64
 //@[powerpc64] compile-flags: --target powerpc64-unknown-linux-gnu
 //@[powerpc64] needs-llvm-components: powerpc
+//@ revisions: aix
+//@[aix] compile-flags: --target powerpc64-ibm-aix
+//@[aix] needs-llvm-components: powerpc
 //@ revisions: riscv
 //@[riscv] compile-flags: --target riscv64gc-unknown-linux-gnu
 //@[riscv] needs-llvm-components: riscv
+//@ revisions: loongarch32
+//@[loongarch32] compile-flags: --target loongarch32-unknown-none
+//@[loongarch32] needs-llvm-components: loongarch
 //@ revisions: loongarch64
 //@[loongarch64] compile-flags: --target loongarch64-unknown-linux-gnu
 //@[loongarch64] needs-llvm-components: loongarch
-//@[loongarch64] min-llvm-version: 20
-//FIXME: wasm is disabled due to <https://github.com/rust-lang/rust/issues/115666>.
-//FIXME @ revisions: wasm
-//FIXME @[wasm] compile-flags: --target wasm32-unknown-unknown
-//FIXME @[wasm] needs-llvm-components: webassembly
+//@ revisions: wasm
+//@[wasm] compile-flags: --target wasm32-unknown-unknown
+//@[wasm] needs-llvm-components: webassembly
 //@ revisions: wasip1
 //@[wasip1] compile-flags: --target wasm32-wasip1
 //@[wasip1] needs-llvm-components: webassembly
@@ -60,6 +70,7 @@
 //@ revisions: nvptx64
 //@[nvptx64] compile-flags: --target nvptx64-nvidia-cuda
 //@[nvptx64] needs-llvm-components: nvptx
+//@ ignore-backends: gcc
 #![feature(no_core, rustc_attrs, lang_items)]
 #![feature(unsized_fn_params, transparent_unions)]
 #![no_core]
@@ -67,7 +78,6 @@
 
 // FIXME: some targets are broken in various ways.
 // Hence there are `cfg` throughout this test to disable parts of it on those targets.
-// sparc64: https://github.com/rust-lang/rust/issues/115336
 // mips64: https://github.com/rust-lang/rust/issues/115404
 
 extern crate minicore;
@@ -88,29 +98,11 @@ mod prelude {
         fn clone(&self) -> Self;
     }
 
-    #[repr(transparent)]
-    #[rustc_layout_scalar_valid_range_start(1)]
-    #[rustc_nonnull_optimization_guaranteed]
-    pub struct NonNull<T: ?Sized> {
-        pointer: *const T,
-    }
-    impl<T: ?Sized> Copy for NonNull<T> {}
-
-    #[repr(transparent)]
-    #[rustc_layout_scalar_valid_range_start(1)]
-    #[rustc_nonnull_optimization_guaranteed]
-    pub struct NonZero<T>(T);
-
     // This just stands in for a non-trivial type.
     pub struct Vec<T> {
         ptr: NonNull<T>,
         cap: usize,
         len: usize,
-    }
-
-    pub struct Unique<T: ?Sized> {
-        pub pointer: NonNull<T>,
-        pub _marker: PhantomData<T>,
     }
 
     #[lang = "global_alloc_ty"]
@@ -253,7 +245,7 @@ test_transparent!(zst, Zst);
 test_transparent!(unit, ());
 test_transparent!(enum_, Option<i32>);
 test_transparent!(enum_niched, Option<&'static i32>);
-#[cfg(not(any(target_arch = "mips64", target_arch = "sparc64")))]
+#[cfg(not(any(target_arch = "mips64")))]
 mod tuples {
     use super::*;
     // mixing in some floats since they often get special treatment
@@ -267,7 +259,6 @@ mod tuples {
     test_transparent!(tuple, (i32, f32, i64, f64));
 }
 // Some targets have special rules for arrays.
-#[cfg(not(any(target_arch = "mips64", target_arch = "sparc64")))]
 mod arrays {
     use super::*;
     test_transparent!(empty_array, [u32; 0]);
@@ -287,7 +278,8 @@ macro_rules! test_transparent_unsized {
     };
 }
 
-#[cfg(not(any(target_arch = "mips64", target_arch = "sparc64")))]
+// NOTE: non-rustic ABIs do not support unsized types: they are skipped during ABI generation, and
+// will trigger an error if they make it to rustc_monomorphize/src/mono_checks/abi_check.rs
 mod unsized_ {
     use super::*;
     test_transparent_unsized!(str_, str);

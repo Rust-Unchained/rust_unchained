@@ -17,7 +17,7 @@ All contributors are expected to follow the [Rust Code of Conduct].
   - [High level approach](#high-level-approach)
   - [Finding something to fix/improve](#finding-something-to-fiximprove)
   - [Getting code-completion for rustc internals to work](#getting-code-completion-for-rustc-internals-to-work)
-    - [IntelliJ Rust](#intellij-rust)
+    - [RustRover](#rustrover)
     - [Rust Analyzer](#rust-analyzer)
   - [How Clippy works](#how-clippy-works)
   - [Issue and PR triage](#issue-and-pr-triage)
@@ -51,7 +51,7 @@ Clippy team directly by mentioning them in the issue or over on [Zulip]. All
 currently active team members can be found
 [here](https://github.com/rust-lang/rust-clippy/blob/master/triagebot.toml#L18)
 
-Some issues are easier than others. The [`good-first-issue`] label can be used to find the easy
+Some issues are easier than others. The [`good first issue`] label can be used to find the easy
 issues. You can use `@rustbot claim` to assign the issue to yourself.
 
 There are also some abandoned PRs, marked with [`S-inactive-closed`].
@@ -70,16 +70,16 @@ To figure out how this syntax structure is encoded in the AST, it is recommended
 Usually the lint will end up to be a nested series of matches and ifs, [like so][deep-nesting].
 But we can make it nest-less by using [let chains], [like this][nest-less].
 
-[`E-medium`] issues are generally pretty easy too, though it's recommended you work on an [`good-first-issue`]
+[`E-medium`] issues are generally pretty easy too, though it's recommended you work on an [`good first issue`]
 first. Sometimes they are only somewhat involved code wise, but not difficult per-se.
 Note that [`E-medium`] issues may require some knowledge of Clippy internals or some
 debugging to find the actual problem behind the issue.
 
 [`T-middle`] issues can be more involved and require verifying types. The [`ty`] module contains a
 lot of methods that are useful, though one of the most useful would be `expr_ty` (gives the type of
-an AST expression). `match_def_path()` in Clippy's `utils` module can also be useful.
+an AST expression).
 
-[`good-first-issue`]: https://github.com/rust-lang/rust-clippy/labels/good-first-issue
+[`good first issue`]: https://github.com/rust-lang/rust-clippy/labels/good%20first%20issue
 [`S-inactive-closed`]: https://github.com/rust-lang/rust-clippy/pulls?q=is%3Aclosed+label%3AS-inactive-closed
 [`T-AST`]: https://github.com/rust-lang/rust-clippy/labels/T-AST
 [`T-middle`]: https://github.com/rust-lang/rust-clippy/labels/T-middle
@@ -92,22 +92,11 @@ an AST expression). `match_def_path()` in Clippy's `utils` module can also be us
 
 ## Getting code-completion for rustc internals to work
 
-### IntelliJ Rust
-Unfortunately, [`IntelliJ Rust`][IntelliJ_rust_homepage] does not (yet?) understand how Clippy uses compiler-internals
-using `extern crate` and it also needs to be able to read the source files of the rustc-compiler which are not
-available via a `rustup` component at the time of writing.
-To work around this, you need to have a copy of the [rustc-repo][rustc_repo] available which can be obtained via
-`git clone https://github.com/rust-lang/rust/`.
-Then you can run a `cargo dev` command to automatically make Clippy use the rustc-repo via path-dependencies
-which `IntelliJ Rust` will be able to understand.
-Run `cargo dev setup intellij --repo-path <repo-path>` where `<repo-path>` is a path to the rustc repo
-you just cloned.
-The command will add path-dependencies pointing towards rustc-crates inside the rustc repo to
-Clippy's `Cargo.toml`s and should allow `IntelliJ Rust` to understand most of the types that Clippy uses.
-Just make sure to remove the dependencies again before finally making a pull request!
+### RustRover
+Since [`RustRover`][RustRover_homepage] 2026.1, no additional setup is required.
+Just open the project in RustRover as usual.
 
-[rustc_repo]: https://github.com/rust-lang/rust/
-[IntelliJ_rust_homepage]: https://intellij-rust.github.io/
+[RustRover_homepage]: https://www.jetbrains.com/rust/
 
 ### Rust Analyzer
 For [`rust-analyzer`][ra_homepage] to work correctly make sure that in the `rust-analyzer` configuration you set
@@ -135,8 +124,11 @@ To have `rust-analyzer` also work in the `clippy_dev` and `lintcheck` crates, ad
 
 ## How Clippy works
 
-[`clippy_lints/src/lib.rs`][lint_crate_entry] imports all the different lint modules and registers in the [`LintStore`].
-For example, the [`else_if_without_else`][else_if_without_else] lint is registered like this:
+[`clippy_lints/src/lib.rs`][lint_crate_entry] imports all the different lint modules and registers them in the
+[`LintStore`]. All early passes are folded into a single `CombinedEarlyLintPass`, and all late passes into a single
+`CombinedLateLintPass`, each registered once with the store. A pass is added to one of these by listing it in the
+`early_lint_methods!` or `late_lint_methods!` macro invocation. For example, the
+[`else_if_without_else`][else_if_without_else] lint is added like this:
 
 ```rust
 // ./clippy_lints/src/lib.rs
@@ -145,18 +137,21 @@ For example, the [`else_if_without_else`][else_if_without_else] lint is register
 pub mod else_if_without_else;
 // ...
 
-pub fn register_lints(store: &mut rustc_lint::LintStore, conf: &'static Conf) {
-    // ...
-    store.register_early_pass(|| Box::new(else_if_without_else::ElseIfWithoutElse));
-    // ...
-}
+rustc_lint::early_lint_methods!(
+    crate::combined_early_lint_pass,
+    [CombinedEarlyLintPass, (/* ... */), [
+        // ...
+        ElseIfWithoutElse: else_if_without_else::ElseIfWithoutElse = else_if_without_else::ElseIfWithoutElse,
+        // ...
+    ]]
+);
 ```
 
-The [`rustc_lint::LintStore`][`LintStore`] provides two methods to register lints:
-[register_early_pass][reg_early_pass] and [register_late_pass][reg_late_pass]. Both take an object
-that implements an [`EarlyLintPass`][early_lint_pass] or [`LateLintPass`][late_lint_pass] respectively. This is done in
-every single lint. It's worth noting that the majority of `clippy_lints/src/lib.rs` is autogenerated by `cargo dev
-update_lints`. When you are writing your own lint, you can use that script to save you some time.
+Each entry has the form `Field: Type = constructor`, where the constructor builds the pass (passing `conf` when the pass
+needs the user configuration). The combined passes implement [`EarlyLintPass`][early_lint_pass] and
+[`LateLintPass`][late_lint_pass] respectively, so each listed pass must also implement the matching trait. It's worth
+noting that the majority of `clippy_lints/src/lib.rs` is autogenerated by `cargo dev update_lints`. When you are
+writing your own lint, you can use that script to save you some time.
 
 ```rust
 // ./clippy_lints/src/else_if_without_else.rs
@@ -178,14 +173,12 @@ The difference between `EarlyLintPass` and `LateLintPass` is that the methods of
 AST information. The methods of the `LateLintPass` trait are executed after type checking and contain type information
 via the `LateContext` parameter.
 
-That's why the `else_if_without_else` example uses the `register_early_pass` function. Because the
+That's why the `else_if_without_else` example is listed in `early_lint_methods!`. Because the
 [actual lint logic][else_if_without_else] does not depend on any type information.
 
 [lint_crate_entry]: https://github.com/rust-lang/rust-clippy/blob/master/clippy_lints/src/lib.rs
 [else_if_without_else]: https://github.com/rust-lang/rust-clippy/blob/4253aa7137cb7378acc96133c787e49a345c2b3c/clippy_lints/src/else_if_without_else.rs
 [`LintStore`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/struct.LintStore.html
-[reg_early_pass]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/struct.LintStore.html#method.register_early_pass
-[reg_late_pass]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/struct.LintStore.html#method.register_late_pass
 [early_lint_pass]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/trait.EarlyLintPass.html
 [late_lint_pass]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/trait.LateLintPass.html
 
@@ -199,26 +192,34 @@ currently. Between writing new lints, fixing issues, reviewing pull requests and
 responding to issues there may not always be enough time to stay on top of it
 all.
 
-Our highest priority is fixing [ICEs][I-ICE] and [bugs][C-bug], for example
-an ICE in a popular crate that many other crates depend on. We don't
-want Clippy to crash on your code and we want it to be as reliable as the
-suggestions from Rust compiler errors.
+To find things to fix, go to the [tracking issue][tracking_issue], find an issue that you like, 
+and claim it with `@rustbot claim`.
 
-We have prioritization labels and a sync-blocker label, which are described below.
-- [P-low][p-low]: Requires attention (fix/response/evaluation) by a team member but isn't urgent.
-- [P-medium][p-medium]: Should be addressed by a team member until the next sync.
-- [P-high][p-high]: Should be immediately addressed and will require an out-of-cycle sync or a backport.
-- [L-sync-blocker][l-sync-blocker]: An issue that "blocks" a sync.
-Or rather: before the sync this should be addressed,
-e.g. by removing a lint again, so it doesn't hit beta/stable.
+As a general metric and always taking into account your skill and knowledge level, you can use this guide:
+
+- 🟥 [ICEs][search_ice], these are compiler errors that causes Clippy to panic and crash. Usually involves high-level
+debugging, sometimes interacting directly with the upstream compiler. Difficult to fix but a great challenge that
+improves a lot developer workflows!
+
+- 🟧 [Suggestion causes bug][sugg_causes_bug], Clippy suggested code that changed logic in some silent way.
+Unacceptable, as this may have disastrous consequences. Easier to fix than ICEs
+
+- 🟨 [Suggestion causes error][sugg_causes_error], Clippy suggested code snippet that caused a compiler error
+when applied. We need to make sure that Clippy doesn't suggest using a variable twice at the same time or similar
+easy-to-happen occurrences.
+
+- 🟩 [False positives][false_positive], a lint should not have fired, the easiest of them all, as this is "just"
+identifying the root of a false positive and making an exception for those cases.
+
+Note that false negatives do not have priority unless the case is very clear, as they are a feature-request in a
+trench coat.
 
 [triage]: https://forge.rust-lang.org/release/triage-procedure.html
-[I-ICE]: https://github.com/rust-lang/rust-clippy/labels/I-ICE
-[C-bug]: https://github.com/rust-lang/rust-clippy/labels/C-bug
-[p-low]: https://github.com/rust-lang/rust-clippy/labels/P-low
-[p-medium]: https://github.com/rust-lang/rust-clippy/labels/P-medium
-[p-high]: https://github.com/rust-lang/rust-clippy/labels/P-high
-[l-sync-blocker]: https://github.com/rust-lang/rust-clippy/labels/L-sync-blocker
+[search_ice]: https://github.com/rust-lang/rust-clippy/issues?q=sort%3Aupdated-desc+state%3Aopen+label%3A%22I-ICE%22
+[sugg_causes_bug]: https://github.com/rust-lang/rust-clippy/issues?q=sort%3Aupdated-desc%20state%3Aopen%20label%3AI-suggestion-causes-bug
+[sugg_causes_error]: https://github.com/rust-lang/rust-clippy/issues?q=sort%3Aupdated-desc%20state%3Aopen%20label%3AI-suggestion-causes-error%20
+[false_positive]: https://github.com/rust-lang/rust-clippy/issues?q=sort%3Aupdated-desc%20state%3Aopen%20label%3AI-false-positive
+[tracking_issue]: https://github.com/rust-lang/rust-clippy/issues/15086
 
 ## Contributions
 

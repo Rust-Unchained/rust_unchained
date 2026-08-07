@@ -1,7 +1,6 @@
 pub(crate) mod tags;
 
 mod highlights;
-mod injector;
 
 mod escape;
 mod format;
@@ -16,28 +15,28 @@ use std::ops::ControlFlow;
 
 use either::Either;
 use hir::{
-    DefWithBody, HirFileIdExt, InFile, InRealFile, MacroFileIdExt, MacroKind, Name, Semantics,
+    DefWithBody, EditionedFileId, ExpressionStoreOwner, InFile, InRealFile, MacroKind, Semantics,
 };
-use ide_db::{FxHashMap, FxHashSet, Ranker, RootDatabase, SymbolKind};
-use span::EditionedFileId;
+use ide_db::{FxHashMap, FxHashSet, Ranker, RootDatabase, SymbolKind, ra_fixture::RaFixtureConfig};
 use syntax::{
-    ast::{self, IsString},
     AstNode, AstToken, NodeOrToken,
     SyntaxKind::*,
-    SyntaxNode, SyntaxToken, TextRange, WalkEvent, T,
+    SyntaxNode, SyntaxToken, T, TextRange, WalkEvent,
+    ast::{self, IsString},
 };
 
 use crate::{
+    FileId, HlMod, HlOperator, HlPunct, HlTag,
     syntax_highlighting::{
         escape::{highlight_escape_byte, highlight_escape_char, highlight_escape_string},
         format::highlight_format_string,
         highlights::Highlights,
         tags::Highlight,
     },
-    FileId, HlMod, HlOperator, HlPunct, HlTag,
 };
 
 pub(crate) use html::highlight_as_html;
+pub(crate) use html::highlight_as_html_with_config;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HlRange {
@@ -46,10 +45,12 @@ pub struct HlRange {
     pub binding_hash: Option<u64>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct HighlightConfig {
+#[derive(Copy, Clone, Debug)]
+pub struct HighlightConfig<'a> {
     /// Whether to highlight strings
     pub strings: bool,
+    /// Whether to highlight comments
+    pub comments: bool,
     /// Whether to highlight punctuation
     pub punctuation: bool,
     /// Whether to specialize punctuation highlights
@@ -64,6 +65,7 @@ pub struct HighlightConfig {
     pub macro_bang: bool,
     /// Whether to highlight unresolved things be their syntax
     pub syntactic_name_ref_highlighting: bool,
+    pub ra_fixture: RaFixtureConfig<'a>,
 }
 
 // Feature: Semantic Syntax Highlighting
@@ -114,9 +116,9 @@ pub struct HighlightConfig {
 // |-----------|--------------------------------|
 // |operator| Emitted for general operators.|
 // |arithmetic| Emitted for the arithmetic operators `+`, `-`, `*`, `/`, `+=`, `-=`, `*=`, `/=`.|
-// |bitwise| Emitted for the bitwise operators `|`, `&`, `!`, `^`, `|=`, `&=`, `^=`.|
+// |bitwise| Emitted for the bitwise operators `\|`, `&`, `!`, `^`, `\|=`, `&=`, `^=`.|
 // |comparison| Emitted for the comparison oerators `>`, `<`, `==`, `>=`, `<=`, `!=`.|
-// |logical| Emitted for the logical operatos `||`, `&&`, `!`.|
+// |logical| Emitted for the logical operators `\|\|`, `&&`, `!`.|
 //
 // - For punctuation:
 //
@@ -172,34 +174,32 @@ pub struct HighlightConfig {
 // |constant| Emitted for const.|
 // |consuming| Emitted for locals that are being consumed when use in a function call.|
 // |controlFlow| Emitted for control-flow related tokens, this includes th `?` operator.|
-// |crateRoot| Emitted for crate names, like `serde` and `crate.|
+// |crateRoot| Emitted for crate names, like `serde` and `crate`.|
 // |declaration| Emitted for names of definitions, like `foo` in `fn foo(){}`.|
-// |defaultLibrary| Emitted for items from built-in crates (std, core, allc, test and proc_macro).|
+// |defaultLibrary| Emitted for items from built-in crates (std, core, alloc, test and proc_macro).|
 // |documentation| Emitted for documentation comment.|
 // |injected| Emitted for doc-string injected highlighting like rust source blocks in documentation.|
 // |intraDocLink| Emitted for intra doc links in doc-string.|
-// |library| Emitted for items that are defined outside of the current crae.|
+// |library| Emitted for items that are defined outside of the current crate.|
 // |macro|  Emitted for tokens inside macro call.|
 // |mutable| Emitted for mutable locals and statics as well as functions taking `&mut self`.|
-// |public| Emitted for items that are from the current crate and are `pub.|
-// |reference| Emitted for locals behind a reference and functions taking self` by reference.|
-// |static| Emitted for "static" functions, also known as functions that d not take a `self` param, as well as statics and consts.|
+// |public| Emitted for items that are from the current crate and are `pub`.|
+// |reference| Emitted for locals behind a reference and functions taking `self` by reference.|
+// |static| Emitted for "static" functions, also known as functions that do not take a `self` param, as well as statics and consts.|
 // |trait| Emitted for associated trait item.|
-// |unsafe| Emitted for unsafe operations, like unsafe function calls, as ell as the `unsafe` token.|
+// |unsafe| Emitted for unsafe operations, like unsafe function calls, as well as the `unsafe` token.|
 //
 // ![Semantic Syntax Highlighting](https://user-images.githubusercontent.com/48062697/113164457-06cfb980-9239-11eb-819b-0f93e646acf8.png)
 // ![Semantic Syntax Highlighting](https://user-images.githubusercontent.com/48062697/113187625-f7f50100-9250-11eb-825e-91c58f236071.png)
 pub(crate) fn highlight(
     db: &RootDatabase,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     file_id: FileId,
     range_to_highlight: Option<TextRange>,
 ) -> Vec<HlRange> {
     let _p = tracing::info_span!("highlight").entered();
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
+    let file_id = sema.attach_first_edition(file_id);
 
     // Determine the root based on the given range.
     let (root, range_to_highlight) = {
@@ -218,10 +218,7 @@ pub(crate) fn highlight(
     };
 
     let mut hl = highlights::Highlights::new(root.text_range());
-    let krate = match sema.scope(&root) {
-        Some(it) => it.krate(),
-        None => return hl.to_vec(),
-    };
+    let krate = sema.scope(&root).map(|it| it.krate());
     traverse(&mut hl, &sema, config, InRealFile::new(file_id, &root), krate, range_to_highlight);
     hl.to_vec()
 }
@@ -229,12 +226,12 @@ pub(crate) fn highlight(
 fn traverse(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     InRealFile { file_id, value: root }: InRealFile<&SyntaxNode>,
-    krate: hir::Crate,
+    krate: Option<hir::Crate>,
     range_to_highlight: TextRange,
 ) {
-    let is_unlinked = sema.file_to_module_def(file_id).is_none();
+    let is_unlinked = sema.file_to_module_def(file_id.file_id(sema.db)).is_none();
 
     enum AttrOrDerive {
         Attr(ast::Item),
@@ -261,9 +258,8 @@ fn traverse(
     let mut inside_attribute = false;
 
     // FIXME: accommodate range highlighting
-    let mut body_stack: Vec<Option<DefWithBody>> = vec![];
-    let mut per_body_cache: FxHashMap<DefWithBody, (FxHashSet<_>, FxHashMap<Name, u32>)> =
-        FxHashMap::default();
+    let mut body_stack: Vec<Option<ExpressionStoreOwner>> = vec![];
+    let mut per_body_cache: FxHashMap<ExpressionStoreOwner, FxHashSet<_>> = FxHashMap::default();
 
     // Walk all nodes, keeping track of whether we are inside a macro or not.
     // If in macro, expand it first and highlight the expanded code.
@@ -294,19 +290,18 @@ fn traverse(
                 inside_attribute = false
             }
             Enter(NodeOrToken::Node(node)) => {
+                // FIXME: ExpressionStore signatures and variant fields
+                // Maybe we can re-use child container stuff here
                 if let Some(item) = <Either<ast::Item, ast::Variant>>::cast(node.clone()) {
                     match item {
                         Either::Left(item) => {
                             match &item {
-                                ast::Item::Fn(it) => {
-                                    body_stack.push(sema.to_def(it).map(Into::into))
-                                }
-                                ast::Item::Const(it) => {
-                                    body_stack.push(sema.to_def(it).map(Into::into))
-                                }
-                                ast::Item::Static(it) => {
-                                    body_stack.push(sema.to_def(it).map(Into::into))
-                                }
+                                ast::Item::Fn(it) => body_stack
+                                    .push(sema.to_def(it).map(DefWithBody::from).map(Into::into)),
+                                ast::Item::Const(it) => body_stack
+                                    .push(sema.to_def(it).map(DefWithBody::from).map(Into::into)),
+                                ast::Item::Static(it) => body_stack
+                                    .push(sema.to_def(it).map(DefWithBody::from).map(Into::into)),
                                 _ => (),
                             }
 
@@ -335,7 +330,9 @@ fn traverse(
                                 }
                             }
                         }
-                        Either::Right(it) => body_stack.push(sema.to_def(&it).map(Into::into)),
+                        Either::Right(it) => {
+                            body_stack.push(sema.to_def(&it).map(DefWithBody::from).map(Into::into))
+                        }
                     }
                 }
             }
@@ -398,11 +395,11 @@ fn traverse(
                 let descended = descend_token(sema, InRealFile::new(file_id, token));
                 let body = match &descended.value {
                     NodeOrToken::Node(n) => {
-                        sema.body_for(InFile::new(descended.file_id, n.syntax()))
+                        sema.store_owner_for(InFile::new(descended.file_id, n.syntax()))
                     }
-                    NodeOrToken::Token(t) => {
-                        t.parent().and_then(|it| sema.body_for(InFile::new(descended.file_id, &it)))
-                    }
+                    NodeOrToken::Token(t) => t
+                        .parent()
+                        .and_then(|it| sema.store_owner_for(InFile::new(descended.file_id, &it))),
                 };
                 (descended, body)
             }
@@ -427,14 +424,11 @@ fn traverse(
         }
 
         let edition = descended_element.file_id.edition(sema.db);
-        let (unsafe_ops, bindings_shadow_count) = match current_body {
-            Some(current_body) => {
-                let (ops, bindings) = per_body_cache
-                    .entry(current_body)
-                    .or_insert_with(|| (sema.get_unsafe_ops(current_body), Default::default()));
-                (&*ops, Some(bindings))
-            }
-            None => (&empty, None),
+        let unsafe_ops = match current_body {
+            Some(current_body) => per_body_cache
+                .entry(current_body)
+                .or_insert_with(|| sema.get_unsafe_ops(current_body)),
+            None => &empty,
         };
         let is_unsafe_node =
             |node| unsafe_ops.contains(&InFile::new(descended_element.file_id, node));
@@ -443,7 +437,6 @@ fn traverse(
                 let hl = highlight::name_like(
                     sema,
                     krate,
-                    bindings_shadow_count,
                     &is_unsafe_node,
                     config.syntactic_name_ref_highlighting,
                     name_like,
@@ -492,9 +485,9 @@ fn traverse(
 fn string_injections(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     file_id: EditionedFileId,
-    krate: hir::Crate,
+    krate: Option<hir::Crate>,
     token: SyntaxToken,
     descended_token: &SyntaxToken,
 ) -> ControlFlow<()> {
@@ -508,24 +501,31 @@ fn string_injections(
             {
                 return ControlFlow::Break(());
             }
-            highlight_format_string(hl, sema, krate, &string, &descended_string, file_id.edition());
+            highlight_format_string(
+                hl,
+                sema,
+                krate,
+                &string,
+                &descended_string,
+                file_id.edition(sema.db),
+            );
 
             if !string.is_raw() {
-                highlight_escape_string(hl, &string);
+                highlight_escape_string(hl, config, &string);
             }
         }
     } else if let Some(byte_string) = ast::ByteString::cast(token.clone()) {
         if !byte_string.is_raw() {
-            highlight_escape_string(hl, &byte_string);
+            highlight_escape_string(hl, config, &byte_string);
         }
     } else if let Some(c_string) = ast::CString::cast(token.clone()) {
         if !c_string.is_raw() {
-            highlight_escape_string(hl, &c_string);
+            highlight_escape_string(hl, config, &c_string);
         }
     } else if let Some(char) = ast::Char::cast(token.clone()) {
-        highlight_escape_char(hl, &char)
+        highlight_escape_char(hl, config, &char)
     } else if let Some(byte) = ast::Byte::cast(token) {
-        highlight_escape_byte(hl, &byte)
+        highlight_escape_byte(hl, config, &byte)
     }
     ControlFlow::Continue(())
 }
@@ -541,7 +541,7 @@ fn descend_token(
 
     let mut t = None;
     let mut r = 0;
-    sema.descend_into_macros_breakable(token.clone(), |tok, _ctx| {
+    sema.descend_into_macros_breakable(token.clone().into(), |tok, _ctx| {
         // FIXME: Consider checking ctx transparency for being opaque?
         let my_rank = ranker.rank_token(&tok.value);
 
@@ -582,9 +582,14 @@ fn descend_token(
     })
 }
 
-fn filter_by_config(highlight: &mut Highlight, config: HighlightConfig) -> bool {
+fn filter_by_config(highlight: &mut Highlight, config: &HighlightConfig<'_>) -> bool {
     match &mut highlight.tag {
-        HlTag::StringLiteral if !config.strings => return false,
+        HlTag::StringLiteral | HlTag::EscapeSequence | HlTag::InvalidEscapeSequence
+            if !config.strings =>
+        {
+            return false;
+        }
+        HlTag::Comment if !config.comments => return false,
         // If punctuation is disabled, make the macro bang part of the macro call again.
         tag @ HlTag::Punctuation(HlPunct::MacroBang) => {
             if !config.macro_bang {

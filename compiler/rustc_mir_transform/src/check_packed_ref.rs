@@ -3,7 +3,7 @@ use rustc_middle::mir::*;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self, TyCtxt};
 
-use crate::{errors, util};
+use crate::{diagnostics, util};
 
 pub(super) struct CheckPackedRef;
 
@@ -37,10 +37,12 @@ impl<'tcx> Visitor<'tcx> for PackedRefChecker<'_, 'tcx> {
     }
 
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _location: Location) {
-        if context.is_borrow() && util::is_disaligned(self.tcx, self.body, self.typing_env, *place)
+        if context.is_borrow()
+            && let Some((adt, pack)) =
+                util::place_unalignment(self.tcx, self.body, self.typing_env, *place)
         {
             let def_id = self.body.source.instance.def_id();
-            if let Some(impl_def_id) = self.tcx.impl_of_method(def_id)
+            if let Some(impl_def_id) = self.tcx.trait_impl_of_assoc(def_id)
                 && self.tcx.is_builtin_derived(impl_def_id)
             {
                 // If we ever reach here it means that the generated derive
@@ -48,7 +50,11 @@ impl<'tcx> Visitor<'tcx> for PackedRefChecker<'_, 'tcx> {
                 // shouldn't do.
                 span_bug!(self.source_info.span, "builtin derive created an unaligned reference");
             } else {
-                self.tcx.dcx().emit_err(errors::UnalignedPackedRef { span: self.source_info.span });
+                self.tcx.dcx().emit_err(diagnostics::UnalignedPackedRef {
+                    span: self.source_info.span,
+                    ty_descr: adt.descr(),
+                    align: pack.bytes(),
+                });
             }
         }
     }

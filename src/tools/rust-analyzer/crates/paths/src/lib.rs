@@ -1,5 +1,5 @@
-//! Thin wrappers around [`camino::path`], distinguishing between absolute and
-//! relative paths.
+//! Thin wrappers around [`camino::Utf8PathBuf`], distinguishing
+//! between absolute and relative paths.
 
 use std::{
     borrow::Borrow,
@@ -248,7 +248,9 @@ impl AbsPath {
     }
 
     pub fn canonicalize(&self) -> ! {
-        panic!("We explicitly do not provide canonicalization API, as that is almost always a wrong solution, see #14430")
+        panic!(
+            "We explicitly do not provide canonicalization API, as that is almost always a wrong solution, see #14430"
+        )
     }
 
     /// Equivalent of [`Utf8Path::strip_prefix`] for `AbsPath`.

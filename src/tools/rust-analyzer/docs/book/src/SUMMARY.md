@@ -6,6 +6,7 @@
   - [rust-analyzer Binary](rust_analyzer_binary.md)
   - [Other Editors](other_editors.md)
 - [Troubleshooting](troubleshooting.md)
+  - [FAQ](faq.md)
 - [Configuration](configuration.md)
   - [Non-Cargo Based Projects](non_cargo_based_projects.md)
 - [Security](security.md)
@@ -22,3 +23,4 @@
   - [Setup](contributing/setup.md)
   - [Style](contributing/style.md)
   - [Syntax](contributing/syntax.md)
+  - [Writing Tests](contributing/testing.md)

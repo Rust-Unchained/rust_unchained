@@ -51,41 +51,43 @@ check-aux:
 	$(Q)$(BOOTSTRAP) test --stage 2 \
 		src/tools/cargo \
 		src/tools/cargotest \
-		src/etc/test-float-parse \
+		src/tools/test-float-parse \
+		$(BOOTSTRAP_ARGS)
+	# The build-std suite is off by default because it is uncommonly slow
+	# and memory-hungry.
+	$(Q)$(BOOTSTRAP) test --stage 2 \
+		build-std \
 		$(BOOTSTRAP_ARGS)
 	# Run standard library tests in Miri.
-	$(Q)$(BOOTSTRAP) miri --stage 2 \
-		library/coretests \
-		library/alloctests \
+	$(Q)MIRIFLAGS="-Zmiri-strict-provenance" \
+		$(BOOTSTRAP) miri --stage 2 \
+		library/core \
 		library/alloc \
 		$(BOOTSTRAP_ARGS) \
-		--no-doc
-	# Some doctests use file system operations to demonstrate dealing with `Result`.
+		--tests # exclude doc tests
+	# Some doctests use file system operations to demonstrate dealing with `Result`,
+	# so we have to run them with isolation disabled.
 	$(Q)MIRIFLAGS="-Zmiri-disable-isolation" \
 		$(BOOTSTRAP) miri --stage 2 \
-		library/coretests \
-		library/alloctests \
+		library/core \
 		library/alloc \
 		$(BOOTSTRAP_ARGS) \
 		--doc
 	# In `std` we cannot test everything, so we skip some modules.
 	$(Q)MIRIFLAGS="-Zmiri-disable-isolation" \
-		$(BOOTSTRAP) miri --stage 2 library/std \
+		$(BOOTSTRAP) miri --stage 2 \
+		library/std \
 		$(BOOTSTRAP_ARGS) \
-		--no-doc -- \
-		--skip fs:: --skip net:: --skip process:: --skip sys::fd:: --skip sys::pal::
-	$(Q)MIRIFLAGS="-Zmiri-disable-isolation" \
-		$(BOOTSTRAP) miri --stage 2 library/std \
-		$(BOOTSTRAP_ARGS) \
-		--doc -- \
-		--skip fs:: --skip net:: --skip process:: --skip sys::fd:: --skip sys::pal::
+		-- \
+		--skip fs:: --skip net:: --skip process:: --skip sys::
 	# Also test some very target-specific modules on other targets
 	# (making sure to cover an i686 target as well).
 	$(Q)MIRIFLAGS="-Zmiri-disable-isolation" BOOTSTRAP_SKIP_TARGET_SANITY=1 \
-		$(BOOTSTRAP) miri --stage 2 library/std \
-		$(BOOTSTRAP_ARGS) \
+		$(BOOTSTRAP) miri --stage 2 \
+		library/std \
 		--target aarch64-apple-darwin,i686-pc-windows-msvc \
-		--no-doc -- \
+		$(BOOTSTRAP_ARGS) \
+		-- \
 		time:: sync:: thread:: env::
 dist:
 	$(Q)$(BOOTSTRAP) dist $(BOOTSTRAP_ARGS)
@@ -104,15 +106,15 @@ prepare:
 SKIP_COMPILER := --skip=compiler
 SKIP_SRC := --skip=src
 TEST_SET1 := $(SKIP_COMPILER) $(SKIP_SRC)
-TEST_SET2 := --skip=tests --skip=coverage-map --skip=coverage-run --skip=library --skip=tidyselftest
+TEST_SET2 := --skip=tests --skip=library --skip=tidyselftest
 
 ## MSVC native builders
 
 # this intentionally doesn't use `$(BOOTSTRAP)` so we can test the shebang on Windows
 ci-msvc-py:
-	$(Q)$(CFG_SRC_DIR)/x.py test --stage 2 $(TEST_SET1)
+	$(Q)$(CFG_SRC_DIR)/x.py test --stage 2 $(TEST_SET1) --skip=src/tools/linkchecker
 ci-msvc-ps1:
-	$(Q)$(CFG_SRC_DIR)/x.ps1 test --stage 2 $(TEST_SET2)
+	$(Q)$(CFG_SRC_DIR)/x.ps1 test --stage 2 $(TEST_SET2) --skip=src/tools/linkchecker
 ci-msvc: ci-msvc-py ci-msvc-ps1
 
 ## MingW native builders

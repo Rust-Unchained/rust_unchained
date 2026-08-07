@@ -19,12 +19,12 @@ fn evaluate_obligation<'tcx>(
 ) -> Result<EvaluationResult, OverflowError> {
     assert!(!tcx.next_trait_solver_globally());
     debug!("evaluate_obligation(canonical_goal={:#?})", canonical_goal);
-    let (ref infcx, goal, _canonical_inference_vars) =
+    let (ref infcx, goal, _var_values) =
         tcx.infer_ctxt().build_with_canonical(DUMMY_SP, &canonical_goal);
     debug!("evaluate_obligation: goal={:#?}", goal);
     let ParamEnvAnd { param_env, value: predicate } = goal;
 
-    if sizedness_fast_path(tcx, predicate) {
+    if !tcx.disable_trait_solver_fast_paths() && sizedness_fast_path(tcx, predicate, param_env) {
         return Ok(EvaluationResult::EvaluatedToOk);
     }
 

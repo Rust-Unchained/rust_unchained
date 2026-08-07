@@ -6,10 +6,14 @@ edition = "2024"
 [lib]
 proc-macro = true
 
+[features]
+nightly = []
+
 [dependencies]
 # tidy-alphabetical-start
+indexmap = "2.4.0"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2.0.9", features = ["full"] }
+syn = { version = "2.0.9", features = ["full", "visit-mut"] }
 synstructure = "0.13.0"
 # tidy-alphabetical-end

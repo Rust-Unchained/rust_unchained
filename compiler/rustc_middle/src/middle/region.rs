@@ -7,17 +7,16 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
 use std::fmt;
-use std::ops::Deref;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
-use rustc_hir::{HirId, HirIdMap, Node};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_hir::{HirId, ItemLocalMap, Node};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
-use crate::ty::TyCtxt;
+use crate::ty::{self, TyCtxt};
 
 /// Represents a statically-describable scope that can be used to
 /// bound the lifetime/region for values.
@@ -82,7 +81,7 @@ use crate::ty::TyCtxt;
 // actually attach a more meaningful ordering to scopes than the one
 // generated via deriving here.
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Copy, TyEncodable, TyDecodable)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct Scope {
     pub local_id: hir::ItemLocalId,
     pub data: ScopeData,
@@ -97,6 +96,7 @@ impl fmt::Debug for Scope {
             ScopeData::Destruction => write!(fmt, "Destruction({:?})", self.local_id),
             ScopeData::IfThen => write!(fmt, "IfThen({:?})", self.local_id),
             ScopeData::IfThenRescope => write!(fmt, "IfThen[edition2024]({:?})", self.local_id),
+            ScopeData::MatchGuard => write!(fmt, "MatchGuard({:?})", self.local_id),
             ScopeData::Remainder(fsi) => write!(
                 fmt,
                 "Remainder {{ block: {:?}, first_statement_index: {}}}",
@@ -108,7 +108,7 @@ impl fmt::Debug for Scope {
 }
 
 #[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy, TyEncodable, TyDecodable)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub enum ScopeData {
     Node,
 
@@ -132,6 +132,11 @@ pub enum ScopeData {
     /// whose lifetimes do not cross beyond this scope.
     IfThenRescope,
 
+    /// Scope of the condition and body of a match arm with a guard
+    /// Used for variables introduced in an if-let guard,
+    /// whose lifetimes do not cross beyond this scope.
+    MatchGuard,
+
     /// Scope following a `let id = expr;` binding in a block.
     Remainder(FirstStatementIndex),
 }
@@ -154,7 +159,7 @@ rustc_index::newtype_index! {
     ///
     /// * The subscope with `first_statement_index == 1` is scope of `c`,
     ///   and thus does not include EXPR_2, but covers the `...`.
-    #[derive(HashStable)]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     pub struct FirstStatementIndex {}
@@ -176,23 +181,22 @@ impl Scope {
             return DUMMY_SP;
         };
         let span = tcx.hir_span(hir_id);
-        if let ScopeData::Remainder(first_statement_index) = self.data {
-            if let Node::Block(blk) = tcx.hir_node(hir_id) {
-                // Want span for scope starting after the
-                // indexed statement and ending at end of
-                // `blk`; reuse span of `blk` and shift `lo`
-                // forward to end of indexed statement.
-                //
-                // (This is the special case alluded to in the
-                // doc-comment for this method)
+        if let ScopeData::Remainder(first_statement_index) = self.data
+            // Want span for scope starting after the
+            // indexed statement and ending at end of
+            // `blk`; reuse span of `blk` and shift `lo`
+            // forward to end of indexed statement.
+            //
+            // (This is the special case alluded to in the
+            // doc-comment for this method)
+            && let Node::Block(blk) = tcx.hir_node(hir_id)
+        {
+            let stmt_span = blk.stmts[first_statement_index.index()].span;
 
-                let stmt_span = blk.stmts[first_statement_index.index()].span;
-
-                // To avoid issues with macro-generated spans, the span
-                // of the statement must be nested in that of the block.
-                if span.lo() <= stmt_span.lo() && stmt_span.lo() <= span.hi() {
-                    return span.with_lo(stmt_span.lo());
-                }
+            // To avoid issues with macro-generated spans, the span
+            // of the statement must be nested in that of the block.
+            if span.lo() <= stmt_span.lo() && stmt_span.lo() <= span.hi() {
+                return span.with_lo(stmt_span.lo());
             }
         }
         span
@@ -200,7 +204,7 @@ impl Scope {
 }
 
 /// The region scope tree encodes information about region relationships.
-#[derive(Default, Debug, HashStable)]
+#[derive(Default, Debug, StableHash)]
 pub struct ScopeTree {
     /// If not empty, this body is the root of this region hierarchy.
     pub root_body: Option<HirId>,
@@ -217,112 +221,28 @@ pub struct ScopeTree {
     /// variable is declared.
     var_map: FxIndexMap<hir::ItemLocalId, Scope>,
 
-    /// Identifies expressions which, if captured into a temporary, ought to
-    /// have a temporary whose lifetime extends to the end of the enclosing *block*,
-    /// and not the enclosing *statement*. Expressions that are not present in this
-    /// table are not rvalue candidates. The set of rvalue candidates is computed
-    /// during type check based on a traversal of the AST.
-    pub rvalue_candidates: HirIdMap<RvalueCandidate>,
+    /// Tracks expressions with extended temporary scopes, based on the syntactic rules for
+    /// temporary lifetime extension. Further details may be found in
+    /// `rustc_hir_analysis::check::region` and in the [Reference].
+    ///
+    /// [Reference]: https://doc.rust-lang.org/nightly/reference/destructors.html#temporary-lifetime-extension
+    extended_temp_scopes: ItemLocalMap<Option<Scope>>,
 
     /// Backwards incompatible scoping that will be introduced in future editions.
     /// This information is used later for linting to identify locals and
     /// temporary values that will receive backwards-incompatible drop orders.
     pub backwards_incompatible_scope: UnordMap<hir::ItemLocalId, Scope>,
-
-    /// If there are any `yield` nested within a scope, this map
-    /// stores the `Span` of the last one and its index in the
-    /// postorder of the Visitor traversal on the HIR.
-    ///
-    /// HIR Visitor postorder indexes might seem like a peculiar
-    /// thing to care about. but it turns out that HIR bindings
-    /// and the temporary results of HIR expressions are never
-    /// storage-live at the end of HIR nodes with postorder indexes
-    /// lower than theirs, and therefore don't need to be suspended
-    /// at yield-points at these indexes.
-    ///
-    /// For an example, suppose we have some code such as:
-    /// ```rust,ignore (example)
-    ///     foo(f(), yield y, bar(g()))
-    /// ```
-    ///
-    /// With the HIR tree (calls numbered for expository purposes)
-    ///
-    /// ```text
-    ///     Call#0(foo, [Call#1(f), Yield(y), Call#2(bar, Call#3(g))])
-    /// ```
-    ///
-    /// Obviously, the result of `f()` was created before the yield
-    /// (and therefore needs to be kept valid over the yield) while
-    /// the result of `g()` occurs after the yield (and therefore
-    /// doesn't). If we want to infer that, we can look at the
-    /// postorder traversal:
-    /// ```plain,ignore
-    ///     `foo` `f` Call#1 `y` Yield `bar` `g` Call#3 Call#2 Call#0
-    /// ```
-    ///
-    /// In which we can easily see that `Call#1` occurs before the yield,
-    /// and `Call#3` after it.
-    ///
-    /// To see that this method works, consider:
-    ///
-    /// Let `D` be our binding/temporary and `U` be our other HIR node, with
-    /// `HIR-postorder(U) < HIR-postorder(D)`. Suppose, as in our example,
-    /// U is the yield and D is one of the calls.
-    /// Let's show that `D` is storage-dead at `U`.
-    ///
-    /// Remember that storage-live/storage-dead refers to the state of
-    /// the *storage*, and does not consider moves/drop flags.
-    ///
-    /// Then:
-    ///
-    ///   1. From the ordering guarantee of HIR visitors (see
-    ///   `rustc_hir::intravisit`), `D` does not dominate `U`.
-    ///
-    ///   2. Therefore, `D` is *potentially* storage-dead at `U` (because
-    ///   we might visit `U` without ever getting to `D`).
-    ///
-    ///   3. However, we guarantee that at each HIR point, each
-    ///   binding/temporary is always either always storage-live
-    ///   or always storage-dead. This is what is being guaranteed
-    ///   by `terminating_scopes` including all blocks where the
-    ///   count of executions is not guaranteed.
-    ///
-    ///   4. By `2.` and `3.`, `D` is *statically* storage-dead at `U`,
-    ///   QED.
-    ///
-    /// This property ought to not on (3) in an essential way -- it
-    /// is probably still correct even if we have "unrestricted" terminating
-    /// scopes. However, why use the complicated proof when a simple one
-    /// works?
-    ///
-    /// A subtle thing: `box` expressions, such as `box (&x, yield 2, &y)`. It
-    /// might seem that a `box` expression creates a `Box<T>` temporary
-    /// when it *starts* executing, at `HIR-preorder(BOX-EXPR)`. That might
-    /// be true in the MIR desugaring, but it is not important in the semantics.
-    ///
-    /// The reason is that semantically, until the `box` expression returns,
-    /// the values are still owned by their containing expressions. So
-    /// we'll see that `&x`.
-    pub yield_in_scope: UnordMap<Scope, Vec<YieldData>>,
 }
 
-/// See the `rvalue_candidates` field for more information on rvalue
-/// candidates in general.
-/// The `lifetime` field is None to indicate that certain expressions escape
-/// into 'static and should have no local cleanup scope.
-#[derive(Debug, Copy, Clone, HashStable)]
-pub struct RvalueCandidate {
-    pub target: hir::ItemLocalId,
-    pub lifetime: Option<Scope>,
-}
-
-#[derive(Debug, Copy, Clone, HashStable)]
-pub struct YieldData {
-    /// The `Span` of the yield.
-    pub span: Span,
-    /// The number of expressions and patterns appearing before the `yield` in the body, plus one.
-    pub expr_and_pat_count: usize,
-    pub source: hir::YieldSource,
+/// Temporary lifetime information for expressions, used when lowering to MIR.
+#[derive(Clone, Copy, Debug, StableHash)]
+pub struct TempLifetime {
+    /// The scope in which a temporary should be dropped. If `None`, no drop is scheduled; this is
+    /// the case for lifetime-extended temporaries extended by a const/static item or const block.
+    pub temp_lifetime: Option<Scope>,
+    /// If `Some(lt)`, indicates that the lifetime of this temporary will change to `lt` in a future edition.
+    /// If `None`, then no changes are expected, or lints are disabled.
+    pub backwards_incompatible: Option<Scope>,
 }
 
 impl ScopeTree {
@@ -341,12 +261,13 @@ impl ScopeTree {
         self.var_map.insert(var, lifetime);
     }
 
-    pub fn record_rvalue_candidate(&mut self, var: HirId, candidate: RvalueCandidate) {
-        debug!("record_rvalue_candidate(var={var:?}, candidate={candidate:?})");
-        if let Some(lifetime) = &candidate.lifetime {
-            assert!(var.local_id != lifetime.local_id)
+    /// Make an association between a sub-expression and an extended lifetime
+    pub fn record_extended_temp_scope(&mut self, var: hir::ItemLocalId, lifetime: Option<Scope>) {
+        debug!(?var, ?lifetime);
+        if let Some(lifetime) = lifetime {
+            assert!(var != lifetime.local_id);
         }
-        self.rvalue_candidates.insert(var, candidate);
+        self.extended_temp_scopes.insert(var, lifetime);
     }
 
     /// Returns the narrowest scope that encloses `id`, if any.
@@ -381,9 +302,57 @@ impl ScopeTree {
         true
     }
 
-    /// Checks whether the given scope contains a `yield`. If so,
-    /// returns `Some(YieldData)`. If not, returns `None`.
-    pub fn yield_in_scope(&self, scope: Scope) -> Option<&[YieldData]> {
-        self.yield_in_scope.get(&scope).map(Deref::deref)
+    /// Returns the scope of non-lifetime-extended temporaries within a given scope, as well as
+    /// whether we've recorded a potential backwards-incompatible change to lint on.
+    /// Panics if no enclosing temporary scope is found.
+    pub fn default_temporary_scope(&self, inner: Scope) -> (Scope, Option<Scope>) {
+        let mut id = inner;
+        let mut backwards_incompatible = None;
+
+        while let Some(&p) = self.parent_map.get(&id) {
+            match p.data {
+                ScopeData::Destruction => {
+                    debug!("temporary_scope({inner:?}) = {id:?} [enclosing]");
+                    return (id, backwards_incompatible);
+                }
+                ScopeData::IfThenRescope | ScopeData::MatchGuard => {
+                    debug!("temporary_scope({inner:?}) = {p:?} [enclosing]");
+                    return (p, backwards_incompatible);
+                }
+                ScopeData::Node
+                | ScopeData::CallSite
+                | ScopeData::Arguments
+                | ScopeData::IfThen
+                | ScopeData::Remainder(_) => {
+                    // If we haven't already passed through a backwards-incompatible node,
+                    // then check if we are passing through one now and record it if so.
+                    // This is for now only working for cases where a temporary lifetime is
+                    // *shortened*.
+                    if backwards_incompatible.is_none() {
+                        backwards_incompatible =
+                            self.backwards_incompatible_scope.get(&p.local_id).copied();
+                    }
+                    id = p
+                }
+            }
+        }
+
+        span_bug!(ty::tls::with(|tcx| inner.span(tcx, self)), "no enclosing temporary scope")
+    }
+
+    /// Returns the scope when the temp created by `expr_id` will be cleaned up.
+    /// It also emits a lint on potential backwards incompatible change to the temporary scope
+    /// which is *for now* always shortening.
+    pub fn temporary_scope(&self, expr_id: hir::ItemLocalId) -> TempLifetime {
+        // Check for a designated extended temporary scope.
+        if let Some(&s) = self.extended_temp_scopes.get(&expr_id) {
+            debug!("temporary_scope({expr_id:?}) = {s:?} [custom]");
+            return TempLifetime { temp_lifetime: s, backwards_incompatible: None };
+        }
+
+        // Otherwise, locate the innermost terminating scope.
+        let (scope, backwards_incompatible) =
+            self.default_temporary_scope(Scope { local_id: expr_id, data: ScopeData::Node });
+        TempLifetime { temp_lifetime: Some(scope), backwards_incompatible }
     }
 }

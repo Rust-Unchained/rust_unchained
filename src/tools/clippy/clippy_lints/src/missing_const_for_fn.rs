@@ -2,12 +2,14 @@ use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::qualify_min_const_fn::is_min_const_fn;
-use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, is_from_proc_macro, is_in_test, trait_ref_of_method};
+use clippy_utils::{
+    fn_has_unsatisfiable_clauses, is_entrypoint_fn, is_from_proc_macro, is_in_test, trait_ref_of_method,
+};
 use rustc_abi::ExternAbi;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::CRATE_DEF_ID;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{self as hir, Body, Constness, FnDecl, GenericParamKind};
+use rustc_hir::{self as hir, Body, Constness, FnDecl, GenericParamKind, OwnerId};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::impl_lint_pass;
@@ -103,8 +105,8 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             return;
         }
 
-        // Building MIR for `fn`s with unsatisfiable preds results in ICE.
-        if fn_has_unsatisfiable_preds(cx, def_id.to_def_id()) {
+        // Building MIR for `fn`s with unsatisfiable clauses results in ICE.
+        if fn_has_unsatisfiable_clauses(cx, def_id.to_def_id()) {
             return;
         }
 
@@ -125,7 +127,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
                 }
             },
             FnKind::Method(_, sig, ..) => {
-                if already_const(sig.header) || trait_ref_of_method(cx, def_id).is_some() {
+                if already_const(sig.header) || trait_ref_of_method(cx, OwnerId { def_id }).is_some() {
                     return;
                 }
             },
@@ -141,7 +143,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             let parent = cx.tcx.hir_get_parent_item(hir_id).def_id;
             if parent != CRATE_DEF_ID
                 && let hir::Node::Item(item) = cx.tcx.hir_node_by_def_id(parent)
-                && let hir::ItemKind::Trait(..) = &item.kind
+                && let hir::ItemKind::Trait { .. } = &item.kind
             {
                 return;
             }
@@ -155,16 +157,26 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             return;
         }
 
-        let mir = cx.tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let mir = cx.tcx.optimized_mir(def_id);
 
-        if let Ok(()) = is_min_const_fn(cx, &mir.borrow(), self.msrv)
-            && let hir::Node::Item(hir::Item { vis_span, .. }) | hir::Node::ImplItem(hir::ImplItem { vis_span, .. }) =
-                cx.tcx.hir_node_by_def_id(def_id)
+        if let Ok(()) = is_min_const_fn(cx, mir, self.msrv)
+            && let node = cx.tcx.hir_node_by_def_id(def_id)
+            && let Some((item_span, vis_span_opt)) = match node {
+                hir::Node::Item(item) => Some((item.span, Some(item.vis_span))),
+                hir::Node::ImplItem(impl_item) => Some((impl_item.span, impl_item.vis_span())),
+                _ => None,
+            }
         {
-            let suggestion = if vis_span.is_empty() { "const " } else { " const" };
+            let (sugg_span, suggestion) = if let Some(vis_span) = vis_span_opt
+                && !vis_span.is_empty()
+            {
+                (vis_span.shrink_to_hi(), " const")
+            } else {
+                (item_span.shrink_to_lo(), "const ")
+            };
             span_lint_and_then(cx, MISSING_CONST_FOR_FN, span, "this could be a `const fn`", |diag| {
                 diag.span_suggestion_verbose(
-                    vis_span.shrink_to_hi(),
+                    sugg_span,
                     "make the function `const`",
                     suggestion,
                     Applicability::MachineApplicable,
@@ -177,7 +189,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
 // We don't have to lint on something that's already `const`
 #[must_use]
 fn already_const(header: hir::FnHeader) -> bool {
-    header.constness == Constness::Const
+    matches!(header.constness, Constness::Const { .. })
 }
 
 fn could_be_const_with_abi(cx: &LateContext<'_>, msrv: Msrv, abi: ExternAbi) -> bool {
@@ -193,11 +205,18 @@ fn could_be_const_with_abi(cx: &LateContext<'_>, msrv: Msrv, abi: ExternAbi) -> 
 /// Return `true` when the given `def_id` is a function that has `impl Trait` ty as one of
 /// its parameter types.
 fn fn_inputs_has_impl_trait_ty(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
-    let inputs = cx.tcx.fn_sig(def_id).instantiate_identity().inputs().skip_binder();
+    let inputs = cx
+        .tcx
+        .fn_sig(def_id)
+        .instantiate_identity()
+        .skip_norm_wip()
+        .inputs()
+        .skip_binder();
     inputs.iter().any(|input| {
         matches!(
             input.kind(),
-            ty::Alias(ty::AliasTyKind::Free, alias_ty) if cx.tcx.type_of(alias_ty.def_id).skip_binder().is_impl_trait()
+            &ty::Alias(_, ty::AliasTy { kind: ty::Free{def_id} , ..})
+                if cx.tcx.type_of(def_id).skip_binder().is_opaque()
         )
     })
 }

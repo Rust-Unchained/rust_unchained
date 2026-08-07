@@ -1,11 +1,5 @@
 #![warn(clippy::invalid_upcast_comparisons)]
-#![allow(
-    unused,
-    clippy::eq_op,
-    clippy::no_effect,
-    clippy::unnecessary_operation,
-    clippy::cast_lossless
-)]
+#![expect(clippy::no_effect)]
 
 fn mk_value<T>() -> T {
     unimplemented!()
@@ -132,4 +126,16 @@ fn main() {
     //~^ invalid_upcast_comparisons
 
     -5 == (u32 as i32);
+}
+
+fn issue15662() {
+    macro_rules! add_one {
+        ($x:expr) => {
+            $x + 1
+        };
+    }
+
+    let x: u8 = 1;
+    (add_one!(x) as u32) > 300;
+    //~^ invalid_upcast_comparisons
 }

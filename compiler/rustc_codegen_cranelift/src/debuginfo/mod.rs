@@ -1,6 +1,7 @@
 //! Handling of everything related to debuginfo.
 
 mod emit;
+mod gcc_except_table;
 mod line_info;
 mod object;
 mod types;
@@ -18,13 +19,15 @@ use indexmap::IndexSet;
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefIdMap;
+use rustc_middle::ty::Unnormalized;
 use rustc_session::Session;
-use rustc_span::{FileNameDisplayPreference, SourceFileHash, StableSourceFileId};
+use rustc_session::config::DebugInfo;
+use rustc_span::{RemapPathScopeComponents, SourceFileHash, StableSourceFileId};
 use rustc_target::callconv::FnAbi;
 
 pub(crate) use self::emit::{DebugReloc, DebugRelocName};
 pub(crate) use self::types::TypeDebugContext;
-pub(crate) use self::unwind::UnwindContext;
+pub(crate) use self::unwind::{EXCEPTION_HANDLER_CATCH, EXCEPTION_HANDLER_CLEANUP, UnwindContext};
 use crate::debuginfo::emit::{address_for_data, address_for_func};
 use crate::prelude::*;
 
@@ -40,33 +43,48 @@ pub(crate) struct DebugContext {
     created_files: FxHashMap<(StableSourceFileId, SourceFileHash), FileId>,
     stack_pointer_register: Register,
     namespace_map: DefIdMap<UnitEntryId>,
-    array_size_type: UnitEntryId,
+    array_size_type: Option<UnitEntryId>,
 
-    filename_display_preference: FileNameDisplayPreference,
+    embed_source: bool,
 }
 
 pub(crate) struct FunctionDebugContext {
-    entry_id: UnitEntryId,
+    entry_id: Option<UnitEntryId>,
     function_source_loc: (FileId, u64, u64),
     source_loc_set: IndexSet<(FileId, u64, u64)>,
 }
 
 impl DebugContext {
-    pub(crate) fn new(tcx: TyCtxt<'_>, isa: &dyn TargetIsa, cgu_name: &str) -> Self {
+    pub(crate) fn new(
+        tcx: TyCtxt<'_>,
+        isa: &dyn TargetIsa,
+        force_disable_debuginfo: bool,
+        cgu_name: &str,
+    ) -> Option<Self> {
+        if tcx.sess.opts.debuginfo == DebugInfo::None
+            || force_disable_debuginfo
+            || tcx.sess.target.options.is_like_windows
+        {
+            return None;
+        }
+
+        let mut requested_dwarf_version = tcx.sess.dwarf_version();
+        if tcx.sess.target.is_like_darwin && requested_dwarf_version > 4 {
+            // Apple’s shipped debuggers still expect DWARF <= 4 by default.
+            // Stay on v4 unless the user explicitly opts into a feature that
+            // only works with v5 (e.g. -Zembed-source).
+            if !tcx.sess.opts.unstable_opts.embed_source {
+                requested_dwarf_version = 4;
+            }
+        }
+
         let encoding = Encoding {
             format: Format::Dwarf32,
-            // FIXME this should be configurable
-            // macOS doesn't seem to support DWARF > 3
-            // 5 version is required for md5 file hash
-            version: if tcx.sess.target.is_like_darwin {
-                3
-            } else {
-                // FIXME change to version 5 once the gdb and lldb shipping with the latest debian
-                // support it.
-                4
-            },
+            version: requested_dwarf_version as u16,
             address_size: isa.frontend_config().pointer_bytes(),
         };
+
+        let embed_source = tcx.sess.opts.unstable_opts.embed_source && encoding.version >= 5;
 
         let endian = match isa.endianness() {
             Endianness::Little => RunTimeEndian::Little,
@@ -84,18 +102,18 @@ impl DebugContext {
 
         let mut dwarf = DwarfUnit::new(encoding);
 
-        use rustc_session::config::RemapPathScopeComponents;
-
-        let filename_display_preference =
-            tcx.sess.filename_display_preference(RemapPathScopeComponents::DEBUGINFO);
-
         let producer = producer(tcx.sess);
-        let comp_dir =
-            tcx.sess.opts.working_dir.to_string_lossy(filename_display_preference).to_string();
+        let comp_dir = tcx
+            .sess
+            .source_map()
+            .working_dir()
+            .path(RemapPathScopeComponents::DEBUGINFO)
+            .to_string_lossy();
 
         let (name, file_info) = match tcx.sess.local_crate_source_file() {
             Some(path) => {
-                let name = path.to_string_lossy(filename_display_preference).to_string();
+                let name =
+                    path.path(RemapPathScopeComponents::DEBUGINFO).to_string_lossy().into_owned();
                 (name, None)
             }
             None => (tcx.crate_name(LOCAL_CRATE).to_string(), None),
@@ -106,16 +124,20 @@ impl DebugContext {
             encoding,
             LineEncoding::default(),
             LineString::new(comp_dir.as_bytes(), encoding, &mut dwarf.line_strings),
+            None,
             LineString::new(name.as_bytes(), encoding, &mut dwarf.line_strings),
             file_info,
         );
         line_program.file_has_md5 = file_has_md5;
+        if embed_source {
+            line_program.file_has_source = true;
+        }
 
         dwarf.unit.line_program = line_program;
 
         {
             let name = dwarf.strings.add(format!("{name}/@/{cgu_name}"));
-            let comp_dir = dwarf.strings.add(comp_dir);
+            let comp_dir = dwarf.strings.add(&*comp_dir);
 
             let root = dwarf.unit.root();
             let root = dwarf.unit.get_mut(root);
@@ -132,20 +154,25 @@ impl DebugContext {
             root.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
         }
 
-        let array_size_type = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_base_type);
-        let array_size_type_entry = dwarf.unit.get_mut(array_size_type);
-        array_size_type_entry.set(
-            gimli::DW_AT_name,
-            AttributeValue::StringRef(dwarf.strings.add("__ARRAY_SIZE_TYPE__")),
-        );
-        array_size_type_entry
-            .set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
-        array_size_type_entry.set(
-            gimli::DW_AT_byte_size,
-            AttributeValue::Udata(isa.frontend_config().pointer_bytes().into()),
-        );
+        let array_size_type = if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            None
+        } else {
+            let array_size_type = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_base_type);
+            let array_size_type_entry = dwarf.unit.get_mut(array_size_type);
+            array_size_type_entry.set(
+                gimli::DW_AT_name,
+                AttributeValue::StringRef(dwarf.strings.add("__ARRAY_SIZE_TYPE__")),
+            );
+            array_size_type_entry
+                .set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
+            array_size_type_entry.set(
+                gimli::DW_AT_byte_size,
+                AttributeValue::Udata(isa.frontend_config().pointer_bytes().into()),
+            );
+            Some(array_size_type)
+        };
 
-        DebugContext {
+        Some(DebugContext {
             endian,
             dwarf,
             unit_range_list: RangeList(Vec::new()),
@@ -153,8 +180,8 @@ impl DebugContext {
             stack_pointer_register,
             namespace_map: DefIdMap::default(),
             array_size_type,
-            filename_display_preference,
-        }
+            embed_source,
+        })
     }
 
     fn item_namespace(&mut self, tcx: TyCtxt<'_>, def_id: DefId) -> UnitEntryId {
@@ -194,6 +221,14 @@ impl DebugContext {
     ) -> FunctionDebugContext {
         let (file_id, line, column) = self.get_span_loc(tcx, function_span, function_span);
 
+        if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            return FunctionDebugContext {
+                entry_id: None,
+                function_source_loc: (file_id, line, column),
+                source_loc_set: IndexSet::new(),
+            };
+        }
+
         let scope = self.item_namespace(tcx, tcx.parent(instance.def_id()));
 
         let mut name = String::new();
@@ -208,9 +243,12 @@ impl DebugContext {
         let generics = tcx.generics_of(enclosing_fn_def_id);
         let args = instance.args.truncate_to(tcx, generics);
 
-        type_names::push_generic_params(
+        type_names::push_generic_args(
             tcx,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), args),
+            tcx.normalize_erasing_regions(
+                ty::TypingEnv::fully_monomorphized(),
+                Unnormalized::new_wip(args),
+            ),
             &mut name,
         );
 
@@ -251,7 +289,7 @@ impl DebugContext {
         }
 
         FunctionDebugContext {
-            entry_id,
+            entry_id: Some(entry_id),
             function_source_loc: (file_id, line, column),
             source_loc_set: IndexSet::new(),
         }
@@ -265,6 +303,10 @@ impl DebugContext {
         def_id: DefId,
         data_id: DataId,
     ) {
+        if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
+            return;
+        }
+
         let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else { bug!() };
         if nested {
             return;
@@ -304,7 +346,7 @@ impl DebugContext {
         entry.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
         entry.set(gimli::DW_AT_decl_line, AttributeValue::Udata(line));
 
-        entry.set(gimli::DW_AT_alignment, AttributeValue::Udata(static_layout.align.abi.bytes()));
+        entry.set(gimli::DW_AT_alignment, AttributeValue::Udata(static_layout.align.bytes()));
 
         let mut expr = Expression::new();
         expr.op_addr(address_for_data(data_id));
@@ -330,10 +372,12 @@ impl FunctionDebugContext {
             .0
             .push(Range::StartLength { begin: address_for_func(func_id), length: u64::from(end) });
 
-        let func_entry = debug_context.dwarf.unit.get_mut(self.entry_id);
-        // Gdb requires both DW_AT_low_pc and DW_AT_high_pc. Otherwise the DW_TAG_subprogram is skipped.
-        func_entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
-        // Using Udata for DW_AT_high_pc requires at least DWARF4
-        func_entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(end)));
+        if let Some(entry_id) = self.entry_id {
+            let entry = debug_context.dwarf.unit.get_mut(entry_id);
+            // Gdb requires both DW_AT_low_pc and DW_AT_high_pc. Otherwise the DW_TAG_subprogram is skipped.
+            entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
+            // Using Udata for DW_AT_high_pc requires at least DWARF4
+            entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(end)));
+        }
     }
 }

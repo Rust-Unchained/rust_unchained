@@ -1,12 +1,10 @@
 //@ run-pass
 //@ needs-unwind
 
-#![allow(stable_features)]
 #![allow(unused_must_use)]
 
 //@ needs-threads
-
-#![feature(std_panic)]
+//@ ignore-backends: gcc
 
 use std::panic;
 use std::thread;

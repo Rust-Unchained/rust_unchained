@@ -1,12 +1,11 @@
+#![cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir")]
 // tidy-alphabetical-start
+#![allow(rustc::direct_use_of_rustc_type_ir)]
 #![allow(rustc::usage_of_ty_tykind)]
 #![allow(rustc::usage_of_type_ir_inherent)]
 #![allow(rustc::usage_of_type_ir_traits)]
-#![cfg_attr(
-    feature = "nightly",
-    feature(associated_type_defaults, never_type, rustc_attrs, negative_impls)
-)]
 #![cfg_attr(feature = "nightly", allow(internal_features))]
+#![cfg_attr(feature = "nightly", feature(associated_type_defaults, rustc_attrs, negative_impls))]
 // tidy-alphabetical-end
 
 extern crate self as rustc_type_ir;
@@ -14,8 +13,9 @@ extern crate self as rustc_type_ir;
 use std::fmt;
 use std::hash::Hash;
 
+use rustc_abi::{FieldIdx, VariantIdx};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
+use rustc_macros::{Decodable, Encodable, StableHash};
 
 // These modules are `pub` since they are not glob-imported.
 pub mod data_structures;
@@ -24,13 +24,16 @@ pub mod error;
 pub mod fast_reject;
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_inherent")]
 pub mod inherent;
+pub mod intern;
 pub mod ir_print;
 pub mod lang_items;
 pub mod lift;
 pub mod outlives;
+pub mod region_constraint;
 pub mod relate;
 pub mod search_graph;
 pub mod solve;
+pub mod sty;
 pub mod walk;
 
 // These modules are not `pub` since they are glob-imported.
@@ -42,6 +45,8 @@ mod const_kind;
 mod flags;
 mod fold;
 mod generic_arg;
+#[cfg(not(feature = "nightly"))]
+mod generic_visit;
 mod infer_ctxt;
 mod interner;
 mod opaque_ty;
@@ -49,23 +54,30 @@ mod pattern;
 mod predicate;
 mod predicate_kind;
 mod region_kind;
+#[cfg(feature = "nightly")]
+mod serialize;
+mod term_kind;
+mod ty;
 mod ty_info;
 mod ty_kind;
+mod universe;
+mod unnormalized;
 mod upcast;
 mod visit;
 
 pub use AliasTyKind::*;
-pub use DynKind::*;
 pub use InferTy::*;
 pub use RegionKind::*;
 pub use TyKind::*;
 pub use Variance::*;
-pub use binder::*;
+pub use binder::{Placeholder, *};
 pub use canonical::*;
 pub use const_kind::*;
 pub use flags::*;
 pub use fold::*;
 pub use generic_arg::*;
+#[cfg(not(feature = "nightly"))]
+pub use generic_visit::*;
 pub use infer_ctxt::*;
 pub use interner::*;
 pub use opaque_ty::*;
@@ -73,9 +85,17 @@ pub use pattern::*;
 pub use predicate::*;
 pub use predicate_kind::*;
 pub use region_kind::*;
-pub use rustc_ast_ir::{Movability, Mutability, Pinnedness};
+pub use rustc_ast_ir::{FloatTy, IntTy, Movability, Mutability, Pinnedness, UintTy};
+use rustc_type_ir_macros::GenericTypeVisitable;
+#[cfg(feature = "nightly")]
+pub use serialize::*;
+pub use sty::*;
+pub use term_kind::*;
+pub use ty::{Alias, *};
 pub use ty_info::*;
 pub use ty_kind::*;
+pub use universe::*;
+pub use unnormalized::Unnormalized;
 pub use upcast::*;
 pub use visit::*;
 
@@ -119,7 +139,7 @@ rustc_index::newtype_index! {
     /// is the outer fn.
     ///
     /// [dbi]: https://en.wikipedia.org/wiki/De_Bruijn_index
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "DebruijnIndex({})"]
@@ -195,18 +215,25 @@ impl DebruijnIndex {
 
 pub fn debug_bound_var<T: std::fmt::Write>(
     fmt: &mut T,
-    debruijn: DebruijnIndex,
+    bound_index: BoundVarIndexKind,
     var: impl std::fmt::Debug,
 ) -> Result<(), std::fmt::Error> {
-    if debruijn == INNERMOST {
-        write!(fmt, "^{var:?}")
-    } else {
-        write!(fmt, "^{}_{:?}", debruijn.index(), var)
+    match bound_index {
+        BoundVarIndexKind::Bound(debruijn) => {
+            if debruijn == INNERMOST {
+                write!(fmt, "^{var:?}")
+            } else {
+                write!(fmt, "^{}_{:?}", debruijn.index(), var)
+            }
+        }
+        BoundVarIndexKind::Canonical => {
+            write!(fmt, "^c_{:?}", var)
+        }
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, HashStable_NoContext))]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, GenericTypeVisitable)]
+#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, StableHash))]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum Variance {
     Covariant,     // T<A> <: T<B> iff A <: B -- e.g., function return type
@@ -322,7 +349,7 @@ rustc_index::newtype_index! {
     /// declared, but a type name in a non-zero universe is a placeholder
     /// type -- an idealized representative of "types in general" that we
     /// use for checking generic functions.
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "U{}"]
@@ -377,22 +404,12 @@ impl Default for UniverseIndex {
 }
 
 rustc_index::newtype_index! {
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "{}"]
     #[gate_rustc_only]
     pub struct BoundVar {}
-}
-
-impl<I: Interner> inherent::BoundVarLike<I> for BoundVar {
-    fn var(self) -> BoundVar {
-        self
-    }
-
-    fn assert_eq(self, _var: I::BoundVarKind) {
-        unreachable!("FIXME: We really should have a separate `BoundConst` for consts")
-    }
 }
 
 /// Represents the various closure traits in the language. This
@@ -402,7 +419,7 @@ impl<I: Interner> inherent::BoundVarLike<I> for BoundVar {
 /// You can get the environment type of a closure using
 /// `tcx.closure_env_ty()`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
+#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, StableHash))]
 pub enum ClosureKind {
     Fn,
     FnMut,
@@ -439,4 +456,13 @@ impl fmt::Display for ClosureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
     }
+}
+
+pub struct FieldInfo<I: Interner> {
+    pub base: I::Ty,
+    pub ty: I::Ty,
+    pub variant: Option<I::Symbol>,
+    pub variant_idx: VariantIdx,
+    pub name: I::Symbol,
+    pub field_idx: FieldIdx,
 }

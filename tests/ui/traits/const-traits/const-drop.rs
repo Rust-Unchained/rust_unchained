@@ -10,19 +10,17 @@ use std::marker::Destruct;
 
 struct S<'a>(&'a mut u8);
 
-impl<'a> const Drop for S<'a> {
+const impl<'a> Drop for S<'a> {
     fn drop(&mut self) {
         *self.0 += 1;
     }
 }
 
-const fn a<T: ~const Destruct>(_: T) {}
-//FIXME ~^ ERROR destructor of
+const fn a<T: [const] Destruct>(_: T) {}
 
 const fn b() -> u8 {
     let mut c = 0;
     let _ = S(&mut c);
-    //FIXME ~^ ERROR destructor of
     a(S(&mut c));
     c
 }
@@ -44,18 +42,17 @@ mod t {
     pub fn foo() {}
     pub struct ConstDrop;
 
-    impl const Drop for ConstDrop {
+    const impl Drop for ConstDrop {
         fn drop(&mut self) {}
     }
 
     pub struct HasConstDrop(pub ConstDrop);
     pub struct TrivialFields(pub u8, pub i8, pub usize, pub isize);
 
-    #[const_trait]
-    pub trait SomeTrait {
+    pub const trait SomeTrait {
         fn foo();
     }
-    impl const SomeTrait for () {
+    const impl SomeTrait for () {
         fn foo() {}
     }
     // non-const impl
@@ -65,7 +62,7 @@ mod t {
 
     pub struct ConstDropWithBound<T: const SomeTrait>(pub core::marker::PhantomData<T>);
 
-    impl<T: const SomeTrait> const Drop for ConstDropWithBound<T> {
+    const impl<T: const SomeTrait> Drop for ConstDropWithBound<T> {
         fn drop(&mut self) {
             T::foo();
         }
@@ -73,7 +70,7 @@ mod t {
 
     pub struct ConstDropWithNonconstBound<T: SomeTrait>(pub core::marker::PhantomData<T>);
 
-    impl<T: SomeTrait> const Drop for ConstDropWithNonconstBound<T> {
+    const impl<T: SomeTrait> Drop for ConstDropWithNonconstBound<T> {
         fn drop(&mut self) {
             // Note: we DON'T use the `T: SomeTrait` bound
         }
@@ -108,7 +105,7 @@ fn main() {
         }
     }
 
-    // These types should pass because ~const in a non-const context should have no effect.
+    // These types should pass because [const] in a non-const context should have no effect.
     a(HasDropGlue(Box::new(0)));
     a(HasDropImpl);
 

@@ -86,19 +86,19 @@ const UNWIND_DATA_REG: (i32, i32) = (0, 1); // R0, R1
 #[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
 const UNWIND_DATA_REG: (i32, i32) = (10, 11); // x10, x11
 
-#[cfg(target_arch = "loongarch64")]
+#[cfg(any(target_arch = "loongarch32", target_arch = "loongarch64"))]
 const UNWIND_DATA_REG: (i32, i32) = (4, 5); // a0, a1
 
 // The following code is based on GCC's C and C++ personality routines.  For reference, see:
 // https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/libsupc++/eh_personality.cc
 // https://github.com/gcc-mirror/gcc/blob/trunk/libgcc/unwind-c.c
 
-cfg_if::cfg_if! {
-    if #[cfg(all(
+cfg_select! {
+    all(
         target_arch = "arm",
         not(target_vendor = "apple"),
         not(target_os = "netbsd"),
-    ))] {
+    ) => {
         /// personality fn called by [ARM EHABI][armeabi-eh]
         ///
         /// 32-bit ARM on iOS/tvOS/watchOS does not use ARM EHABI, it uses
@@ -202,7 +202,37 @@ cfg_if::cfg_if! {
                 }
             }
         }
-    } else {
+    }
+    _ => {
+        #[rustc_force_inline]
+        unsafe fn sign_lpad(context: *mut uw::_Unwind_Context, lpad: *const u8) -> *const u8 {
+            cfg_select! {
+                all(target_abi = "pauthtest", target_arch = "aarch64") => {
+                    // DWARF register number for SP on AArch64.
+                    const SP_REG: i32 = 31;
+
+                    unsafe {
+                        let sp = uw::_Unwind_GetGR(context, SP_REG).addr() as u64;
+                        let mut addr = lpad.addr();
+
+                        // `pacib` corresponds to `ptrauth_key_process_dependent_code` in <ptrauth.h>.
+                        core::arch::asm!(
+                            "pacib {addr}, {sp}",
+                            addr = inout(reg) addr,
+                            sp = in(reg) sp,
+                            options(nostack, preserves_flags)
+                        );
+
+                        lpad.with_addr(addr)
+                    }
+                }
+                _ => {
+                    let _ = context;
+                    lpad
+                }
+            }
+        }
+
         /// Default personality routine, which is used directly on most targets
         /// and indirectly on Windows x86_64 and AArch64 via SEH.
         unsafe extern "C" fn rust_eh_personality_impl(
@@ -238,7 +268,8 @@ cfg_if::cfg_if! {
                                 exception_object.cast(),
                             );
                             uw::_Unwind_SetGR(context, UNWIND_DATA_REG.1, core::ptr::null());
-                            uw::_Unwind_SetIP(context, lpad);
+                            let maybe_signed_lpad = sign_lpad(context, lpad);
+                            uw::_Unwind_SetIP(context, maybe_signed_lpad);
                             uw::_URC_INSTALL_CONTEXT
                         }
                         EHAction::Terminate => uw::_URC_FATAL_PHASE2_ERROR,
@@ -247,11 +278,11 @@ cfg_if::cfg_if! {
             }
         }
 
-        cfg_if::cfg_if! {
-            if #[cfg(any(
-                    all(windows, any(target_arch = "aarch64", target_arch = "x86_64"), target_env = "gnu"),
-                    target_os = "cygwin",
-                ))] {
+        cfg_select! {
+            any(
+                all(windows, any(target_arch = "aarch64", target_arch = "x86_64"), target_env = "gnu"),
+                target_os = "cygwin",
+            ) => {
                 /// personality fn called by [Windows Structured Exception Handling][windows-eh]
                 ///
                 /// On x86_64 and AArch64 MinGW targets, the unwinding mechanism is SEH,
@@ -279,7 +310,8 @@ cfg_if::cfg_if! {
                         )
                     }
                 }
-            } else {
+            }
+            _ => {
                 /// personality fn called by [Itanium C++ ABI Exception Handling][itanium-eh]
                 ///
                 /// The personality routine for most non-Windows targets. This will be called by

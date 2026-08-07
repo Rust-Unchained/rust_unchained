@@ -1,7 +1,5 @@
-//@no-rustfix
-
 #![deny(clippy::transmute_ptr_to_ptr)]
-#![allow(dead_code, clippy::missing_transmute_annotations)]
+#![allow(dead_code, clippy::missing_transmute_annotations, clippy::cast_slice_different_sizes)]
 
 fn main() {
     unsafe {
@@ -15,6 +13,26 @@ fn main() {
 
         let bytes = &[1u8, 2u8, 3u8, 4u8] as &[u8];
         let alt_slice: &[u32] = unsafe { std::mem::transmute(bytes) };
+        //~^ transmute_ptr_to_ptr
+    }
+}
+
+fn issue16104(make_ptr: fn() -> *const u32) {
+    macro_rules! call {
+        ($x:expr) => {
+            $x()
+        };
+    }
+    macro_rules! take_ref {
+        ($x:expr) => {
+            &$x
+        };
+    }
+
+    unsafe {
+        let _: *const f32 = std::mem::transmute(call!(make_ptr));
+        //~^ transmute_ptr_to_ptr
+        let _: &f32 = std::mem::transmute(take_ref!(1u32));
         //~^ transmute_ptr_to_ptr
     }
 }

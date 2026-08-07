@@ -1,7 +1,7 @@
-#![allow(clippy::uninlined_format_args, clippy::useless_vec)]
-#![allow(clippy::needless_if, clippy::uninlined_format_args)]
 #![warn(clippy::needless_collect)]
-//@no-rustfix
+#![allow(clippy::iter_count, clippy::iter_next_slice)]
+#![expect(clippy::needless_ifs, clippy::useless_vec)]
+
 use std::collections::{BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
 
 fn main() {

@@ -1,5 +1,4 @@
 use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::infer::canonical::{Canonical, QueryResponse};
 use rustc_middle::bug;
@@ -7,6 +6,7 @@ use rustc_middle::query::Providers;
 use rustc_middle::traits::query::{DropckConstraint, DropckOutlivesResult};
 use rustc_middle::ty::{self, GenericArgs, TyCtxt};
 use rustc_span::DUMMY_SP;
+use rustc_span::def_id::DefId;
 use rustc_trait_selection::infer::InferCtxtBuilderExt;
 use rustc_trait_selection::traits::query::dropck_outlives::{
     compute_dropck_outlives_inner, dtorck_constraint_for_ty_inner,
@@ -54,7 +54,7 @@ pub(crate) fn adt_dtorck_constraint(tcx: TyCtxt<'_>, def_id: DefId) -> &DropckCo
 
     let mut result = DropckConstraint::empty();
     for field in def.all_fields() {
-        let fty = tcx.type_of(field.did).instantiate_identity();
+        let fty = tcx.type_of(field.did).instantiate_identity().skip_norm_wip();
         dtorck_constraint_for_ty_inner(tcx, typing_env, span, 0, fty, &mut result);
     }
     result.outlives.extend(tcx.destructor_constraints(def));

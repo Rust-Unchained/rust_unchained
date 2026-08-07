@@ -25,15 +25,36 @@ impl Drop for Handler {
     }
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "freebsd",
-    target_os = "hurd",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-    target_os = "illumos",
+#[cfg(all(
+    not(miri),
+    any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "hurd",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+    ),
+))]
+mod thread_info;
+
+// miri doesn't model signals nor stack overflows and this code has some
+// synchronization properties that we don't want to expose to user code,
+// hence we disable it on miri.
+#[cfg(all(
+    not(miri),
+    any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "hurd",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+    )
 ))]
 mod imp {
     use libc::{
@@ -46,22 +67,11 @@ mod imp {
     use libc::{mmap64, mprotect, munmap};
 
     use super::Handler;
-    use crate::cell::Cell;
+    use super::thread_info::{delete_current_info, set_current_info, with_current_info};
     use crate::ops::Range;
-    use crate::sync::OnceLock;
     use crate::sync::atomic::{Atomic, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-    use crate::sys::pal::unix::os;
-    use crate::{io, mem, ptr, thread};
-
-    // We use a TLS variable to store the address of the guard page. While TLS
-    // variables are not guaranteed to be signal-safe, this works out in practice
-    // since we make sure to write to the variable before the signal stack is
-    // installed, thereby ensuring that the variable is always allocated when
-    // the signal handler is called.
-    thread_local! {
-        // FIXME: use `Range` once that implements `Copy`.
-        static GUARD: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    }
+    use crate::sys::pal::unix::conf;
+    use crate::{io, mem, ptr};
 
     // Signal handler for the SIGSEGV and SIGBUS handlers. We've got guard pages
     // (unmapped pages) at the end of every thread's stack, so if a thread ends
@@ -93,29 +103,43 @@ mod imp {
         info: *mut libc::siginfo_t,
         _data: *mut libc::c_void,
     ) {
-        let (start, end) = GUARD.get();
         // SAFETY: this pointer is provided by the system and will always point to a valid `siginfo_t`.
-        let addr = unsafe { (*info).si_addr().addr() };
+        let fault_addr = unsafe { (*info).si_addr().addr() };
 
-        // If the faulting address is within the guard page, then we print a
-        // message saying so and abort.
-        if start <= addr && addr < end {
-            thread::with_current_name(|name| {
-                let name = name.unwrap_or("<unknown>");
-                rtprintpanic!("\nthread '{name}' has overflowed its stack\n");
-            });
-
-            rtabort!("stack overflow");
-        } else {
-            // Unregister ourselves by reverting back to the default behavior.
-            // SAFETY: assuming all platforms define struct sigaction as "zero-initializable"
-            let mut action: sigaction = unsafe { mem::zeroed() };
-            action.sa_sigaction = SIG_DFL;
-            // SAFETY: pray this is a well-behaved POSIX implementation of fn sigaction
-            unsafe { sigaction(signum, &action, ptr::null_mut()) };
-
-            // See comment above for why this function returns.
+        // `with_current_info` expects that the process aborts after it is
+        // called. If the signal was not caused by a memory access, this might
+        // not be true. We detect this by noticing that the `si_addr` field is
+        // zero if the signal is synthetic.
+        if fault_addr != 0 {
+            with_current_info(|thread_info| {
+                // If the faulting address is within the guard page, then we print a
+                // message saying so and abort.
+                if let Some(thread_info) = thread_info
+                    && thread_info.guard_page_range.contains(&fault_addr)
+                {
+                    // Hey you! Yes, you modifying the stack overflow message!
+                    // Please make sure that all functions called here are
+                    // actually async-signal-safe. If they're not, try retrieving
+                    // the information beforehand and storing it in `ThreadInfo`.
+                    // Thank you!
+                    // - says Jonas after having had to watch his carefully
+                    //   written code get made unsound again.
+                    let tid = thread_info.tid;
+                    let name = thread_info.name.as_deref().unwrap_or("<unknown>");
+                    rtprintpanic!("\nthread '{name}' ({tid}) has overflowed its stack\n");
+                    rtabort!("stack overflow");
+                }
+            })
         }
+
+        // Unregister ourselves by reverting back to the default behavior.
+        // SAFETY: assuming all platforms define struct sigaction as "zero-initializable"
+        let mut action: sigaction = unsafe { mem::zeroed() };
+        action.sa_sigaction = SIG_DFL;
+        // SAFETY: pray this is a well-behaved POSIX implementation of fn sigaction
+        unsafe { sigaction(signum, &action, ptr::null_mut()) };
+
+        // See comment above for why this function returns.
     }
 
     static PAGE_SIZE: Atomic<usize> = AtomicUsize::new(0);
@@ -126,11 +150,16 @@ mod imp {
     /// Must be called only once
     #[forbid(unsafe_op_in_unsafe_fn)]
     pub unsafe fn init() {
-        PAGE_SIZE.store(os::page_size(), Ordering::Relaxed);
+        PAGE_SIZE.store(conf::page_size(), Ordering::Relaxed);
 
-        // Always write to GUARD to ensure the TLS variable is allocated.
-        let guard = unsafe { install_main_guard().unwrap_or(0..0) };
-        GUARD.set((guard.start, guard.end));
+        let mut guard_page_range = unsafe { install_main_guard() };
+
+        // Even for panic=immediate-abort, installing the guard pages is important for soundness.
+        // That said, we do not care about giving nice stackoverflow messages via our custom
+        // signal handler, just exit early and let the user enjoy the segfault.
+        if cfg!(panic = "immediate-abort") {
+            return;
+        }
 
         // SAFETY: assuming all platforms define struct sigaction as "zero-initializable"
         let mut action: sigaction = unsafe { mem::zeroed() };
@@ -145,9 +174,16 @@ mod imp {
                     let handler = unsafe { make_handler(true) };
                     MAIN_ALTSTACK.store(handler.data, Ordering::Relaxed);
                     mem::forget(handler);
+
+                    if let Some(guard_page_range) = guard_page_range.take() {
+                        set_current_info(guard_page_range);
+                    }
                 }
+
                 action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-                action.sa_sigaction = signal_handler as sighandler_t;
+                action.sa_sigaction = signal_handler
+                    as unsafe extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void)
+                    as sighandler_t;
                 // SAFETY: only overriding signals if the default is set
                 unsafe { sigaction(signal, &action, ptr::null_mut()) };
             }
@@ -158,6 +194,9 @@ mod imp {
     /// Must be called only once
     #[forbid(unsafe_op_in_unsafe_fn)]
     pub unsafe fn cleanup() {
+        if cfg!(panic = "immediate-abort") {
+            return;
+        }
         // FIXME: I probably cause more bugs than I'm worth!
         // see https://github.com/rust-lang/rust/issues/111272
         unsafe { drop_handler(MAIN_ALTSTACK.load(Ordering::Relaxed)) };
@@ -209,14 +248,14 @@ mod imp {
     /// Mutates the alternate signal stack
     #[forbid(unsafe_op_in_unsafe_fn)]
     pub unsafe fn make_handler(main_thread: bool) -> Handler {
-        if !NEED_ALTSTACK.load(Ordering::Acquire) {
+        if cfg!(panic = "immediate-abort") || !NEED_ALTSTACK.load(Ordering::Acquire) {
             return Handler::null();
         }
 
         if !main_thread {
-            // Always write to GUARD to ensure the TLS variable is allocated.
-            let guard = unsafe { current_guard() }.unwrap_or(0..0);
-            GUARD.set((guard.start, guard.end));
+            if let Some(guard_page_range) = unsafe { current_guard() } {
+                set_current_info(guard_page_range);
+            }
         }
 
         // SAFETY: assuming stack_t is zero-initializable
@@ -261,10 +300,12 @@ mod imp {
             // a mapping that started one page earlier, so walk back a page and unmap from there.
             unsafe { munmap(data.sub(page_size), sigstack_size + page_size) };
         }
+
+        delete_current_info();
     }
 
     /// Modern kernels on modern hardware can have dynamic signal stack sizes.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc")))]
     fn sigstack_size() -> usize {
         let dynamic_sigstksz = unsafe { libc::getauxval(libc::AT_MINSIGSTKSZ) };
         // If getauxval couldn't find the entry, it returns 0,
@@ -274,7 +315,7 @@ mod imp {
     }
 
     /// Not all OS support hardware where this is needed.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc"))))]
     fn sigstack_size() -> usize {
         libc::SIGSTKSZ
     }
@@ -373,6 +414,10 @@ mod imp {
             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
                 install_main_guard_linux_musl(page_size)
             } else if cfg!(target_os = "freebsd") {
+                #[cfg(not(target_os = "freebsd"))]
+                return None;
+                // The FreeBSD code cannot be checked on non-BSDs.
+                #[cfg(target_os = "freebsd")]
                 install_main_guard_freebsd(page_size)
             } else if cfg!(any(target_os = "netbsd", target_os = "openbsd")) {
                 install_main_guard_bsds(page_size)
@@ -384,6 +429,11 @@ mod imp {
 
     #[forbid(unsafe_op_in_unsafe_fn)]
     unsafe fn install_main_guard_linux(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in init().
+        // Avoid stack_start_aligned, which makes slow syscalls to read /proc/self/maps
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // Linux doesn't allocate the whole stack right away, and
         // the kernel has its own stack-guard mechanism to fault
         // when growing too close to an existing mapping. If we map
@@ -409,7 +459,12 @@ mod imp {
     }
 
     #[forbid(unsafe_op_in_unsafe_fn)]
+    #[cfg(target_os = "freebsd")]
     unsafe fn install_main_guard_freebsd(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in install_main_guard_linux().
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // FreeBSD's stack autogrows, and optionally includes a guard page
         // at the bottom. If we try to remap the bottom of the stack
         // ourselves, FreeBSD's guard page moves upwards. So we'll just use
@@ -420,44 +475,33 @@ mod imp {
         // by the security.bsd.stack_guard_page sysctl.
         // By default it is 1, checking once is enough since it is
         // a boot time config value.
-        static PAGES: OnceLock<usize> = OnceLock::new();
+        static PAGES: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
 
         let pages = PAGES.get_or_init(|| {
-            use crate::sys::weak::dlsym;
-            dlsym!(
-                fn sysctlbyname(
-                    name: *const libc::c_char,
-                    oldp: *mut libc::c_void,
-                    oldlenp: *mut libc::size_t,
-                    newp: *const libc::c_void,
-                    newlen: libc::size_t,
-                ) -> libc::c_int;
-            );
             let mut guard: usize = 0;
             let mut size = size_of_val(&guard);
             let oid = c"security.bsd.stack_guard_page";
-            match sysctlbyname.get() {
-                Some(fcn)
-                    if unsafe {
-                        fcn(
-                            oid.as_ptr(),
-                            (&raw mut guard).cast(),
-                            &raw mut size,
-                            ptr::null_mut(),
-                            0,
-                        ) == 0
-                    } =>
-                {
-                    guard
-                }
-                _ => 1,
-            }
+
+            let r = unsafe {
+                libc::sysctlbyname(
+                    oid.as_ptr(),
+                    (&raw mut guard).cast(),
+                    &raw mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if r == 0 { guard } else { 1 }
         });
         Some(guardaddr..guardaddr + pages * page_size)
     }
 
     #[forbid(unsafe_op_in_unsafe_fn)]
     unsafe fn install_main_guard_bsds(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in install_main_guard_linux().
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // OpenBSD stack already includes a guard page, and stack is
         // immutable.
         // NetBSD stack includes the guard page.
@@ -590,17 +634,20 @@ mod imp {
 // usually have fewer qualms about forwards compatibility, since the runtime
 // is shipped with the OS):
 // <https://github.com/apple/swift/blob/swift-5.10-RELEASE/stdlib/public/runtime/CrashHandlerMacOS.cpp>
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "freebsd",
-    target_os = "hurd",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-    target_os = "illumos",
-    target_os = "cygwin",
-)))]
+#[cfg(any(
+    miri,
+    not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "hurd",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "cygwin",
+    ))
+))]
 mod imp {
     pub unsafe fn init() {}
 
@@ -668,7 +715,8 @@ mod imp {
             if code == c::EXCEPTION_STACK_OVERFLOW {
                 crate::thread::with_current_name(|name| {
                     let name = name.unwrap_or("<unknown>");
-                    rtprintpanic!("\nthread '{name}' has overflowed its stack\n");
+                    let tid = crate::thread::current_os_id();
+                    rtprintpanic!("\nthread '{name}' ({tid}) has overflowed its stack\n");
                 });
             }
             c::EXCEPTION_CONTINUE_SEARCH

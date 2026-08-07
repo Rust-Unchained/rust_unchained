@@ -1,12 +1,6 @@
 #![warn(clippy::to_string_in_format_args)]
-#![allow(unused)]
-#![allow(
-    clippy::assertions_on_constants,
-    clippy::double_parens,
-    clippy::eq_op,
-    clippy::print_literal,
-    clippy::uninlined_format_args
-)]
+#![allow(clippy::double_parens)]
+#![expect(clippy::assertions_on_constants, clippy::eq_op, clippy::print_literal)]
 
 use std::io::{Write, stdout};
 use std::ops::Deref;
@@ -155,7 +149,6 @@ fn issue8643(vendor_id: usize, product_id: usize, name: &str) {
 
 // https://github.com/rust-lang/rust-clippy/issues/8855
 mod issue_8855 {
-    #![allow(dead_code)]
 
     struct A {}
 
@@ -180,7 +173,6 @@ mod issue_8855 {
 
 // https://github.com/rust-lang/rust-clippy/issues/9256
 mod issue_9256 {
-    #![allow(dead_code)]
 
     fn print_substring(original: &str) {
         assert!(original.len() > 10);
@@ -190,5 +182,15 @@ mod issue_9256 {
 
     fn main() {
         print_substring("Hello, world!");
+    }
+}
+
+mod issue14952 {
+    use std::path::Path;
+    struct Foo(Path);
+    impl std::fmt::Debug for Foo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:?}", &self.0)
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::{ffi, panic};
 
 use build_helper::drop_bomb::DropBomb;
 
-use crate::util::handle_failed_output;
+use crate::util::{handle_failed_output, verbose_print_command};
 use crate::{
     assert_contains, assert_contains_regex, assert_equals, assert_not_contains,
     assert_not_contains_regex,
@@ -46,6 +46,8 @@ pub struct Command {
     // Emulate linear type semantics.
     drop_bomb: DropBomb,
     already_executed: bool,
+
+    context: String,
 }
 
 impl Command {
@@ -60,7 +62,24 @@ impl Command {
             stdout: None,
             stderr: None,
             already_executed: false,
+            context: String::new(),
         }
+    }
+
+    // Internal-only.
+    pub(crate) fn into_raw_command(mut self) -> std::process::Command {
+        self.drop_bomb.defuse();
+        self.cmd
+    }
+
+    pub(crate) fn get_context(&self) -> &str {
+        &self.context
+    }
+
+    /// Appends context to the command, to provide a better error message if the command fails.
+    pub fn context(&mut self, ctx: &str) -> &mut Self {
+        self.context.push_str(&format!("{ctx}\n"));
+        self
     }
 
     /// Specify a stdin input buffer. This is a convenience helper,
@@ -137,7 +156,7 @@ impl Command {
 
     /// Inspect what the underlying [`std::process::Command`] is up to the
     /// current construction.
-    pub fn inspect<I>(&mut self, inspector: I) -> &mut Self
+    pub fn inspect<I>(&self, inspector: I) -> &Self
     where
         I: FnOnce(&StdCommand),
     {
@@ -214,6 +233,8 @@ impl Command {
         let output = self.command_output();
         if !output.status().success() {
             handle_failed_output(&self, output, panic::Location::caller().line());
+        } else {
+            verbose_print_command(self, &output);
         }
         output
     }
@@ -226,6 +247,8 @@ impl Command {
         let output = self.command_output();
         if output.status().success() {
             handle_failed_output(&self, output, panic::Location::caller().line());
+        } else {
+            verbose_print_command(self, &output);
         }
         output
     }
@@ -378,6 +401,13 @@ impl CompletedProcess {
     #[track_caller]
     pub fn assert_stderr_not_contains<S: AsRef<str>>(&self, unexpected: S) -> &Self {
         assert_not_contains(&self.stderr_utf8(), unexpected);
+        self
+    }
+
+    /// Checks that `stderr` doesn't contain the Internal Compiler Error message.
+    #[track_caller]
+    pub fn assert_not_ice(&self) -> &Self {
+        self.assert_stderr_not_contains("error: the compiler unexpectedly panicked. this is a bug");
         self
     }
 

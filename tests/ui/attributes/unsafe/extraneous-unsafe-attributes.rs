@@ -1,9 +1,9 @@
 //@ edition: 2024
 
-#[unsafe(cfg(any()))] //~ ERROR: is not an unsafe attribute
+#[unsafe(cfg(false))] //~ ERROR: is not an unsafe attribute
 fn a() {}
 
-#[unsafe(cfg_attr(any(), allow(dead_code)))] //~ ERROR: is not an unsafe attribute
+#[unsafe(cfg_attr(false, allow(dead_code)))] //~ ERROR: is not an unsafe attribute
 fn b() {}
 
 #[unsafe(test)] //~ ERROR: is not an unsafe attribute
@@ -29,5 +29,5 @@ static FOO: usize = 0;
 fn main() {
     let _a = cfg!(unsafe(foo));
     //~^ ERROR: expected identifier, found keyword `unsafe`
-    //~^^ ERROR: invalid predicate `r#unsafe`
+    //~^^ ERROR: malformed `cfg` macro input [E0539]
 }

@@ -2,7 +2,8 @@ use clippy_config::Conf;
 use clippy_config::types::PubUnderscoreFieldsBehaviour;
 use clippy_utils::attrs::is_doc_hidden;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::is_path_lang_item;
+use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::sym::PhantomPinned;
 use rustc_hir::{FieldDef, Item, ItemKind, LangItem};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
@@ -42,11 +43,11 @@ declare_clippy_lint! {
     "struct field prefixed with underscore and marked public"
 }
 
+impl_lint_pass!(PubUnderscoreFields => [PUB_UNDERSCORE_FIELDS]);
+
 pub struct PubUnderscoreFields {
     behavior: PubUnderscoreFieldsBehaviour,
 }
-impl_lint_pass!(PubUnderscoreFields => [PUB_UNDERSCORE_FIELDS]);
-
 impl PubUnderscoreFields {
     pub fn new(conf: &'static Conf) -> Self {
         Self {
@@ -58,7 +59,7 @@ impl PubUnderscoreFields {
 impl<'tcx> LateLintPass<'tcx> for PubUnderscoreFields {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
         // This lint only pertains to structs.
-        let ItemKind::Struct(_, variant_data, _) = &item.kind else {
+        let ItemKind::Struct(_, _, variant_data) = &item.kind else {
             return;
         };
 
@@ -75,8 +76,9 @@ impl<'tcx> LateLintPass<'tcx> for PubUnderscoreFields {
             if field.ident.as_str().starts_with('_') && is_visible(field)
                 // We ignore fields that have `#[doc(hidden)]`.
                 && !is_doc_hidden(cx.tcx.hir_attrs(field.hir_id))
-                // We ignore fields that are `PhantomData`.
-                && !is_path_lang_item(cx, field.ty, LangItem::PhantomData)
+                // We ignore fields that are `PhantomData` and `PhantomPinned`.
+                && !field.ty.basic_res().is_lang_item(cx, LangItem::PhantomData)
+                && !field.ty.basic_res().is_diag_item(cx, PhantomPinned)
             {
                 span_lint_hir_and_then(
                     cx,

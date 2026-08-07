@@ -1,20 +1,25 @@
-error: `~const` is not allowed here
-  --> $DIR/super-traits-fail-2.rs:11:12
+error: `[const]` is not allowed here
+  --> $DIR/super-traits-fail-2.rs:14:32
    |
-LL | trait Bar: ~const Foo {}
-   |            ^^^^^^
+LL | #[cfg(any(yn, nn))] trait Bar: [const] Foo {}
+   |                                ^^^^^^^
    |
-note: this trait is not a `#[const_trait]`, so it cannot have `~const` trait bounds
-  --> $DIR/super-traits-fail-2.rs:11:1
+note: this trait is not `const`, so it cannot have `[const]` trait bounds
+  --> $DIR/super-traits-fail-2.rs:14:21
    |
-LL | trait Bar: ~const Foo {}
-   | ^^^^^^^^^^^^^^^^^^^^^^^^
+LL | #[cfg(any(yn, nn))] trait Bar: [const] Foo {}
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0277]: the trait bound `T: ~const Foo` is not satisfied
-  --> $DIR/super-traits-fail-2.rs:20:7
+error[E0277]: the trait bound `T: [const] Foo` is not satisfied
+  --> $DIR/super-traits-fail-2.rs:21:7
    |
 LL |     x.a();
    |       ^
+   |
+help: consider further restricting type parameter `T` with trait `Foo`
+   |
+LL | const fn foo<T: Bar + [const] Foo>(x: &T) {
+   |                     +++++++++++++
 
 error: aborting due to 2 previous errors
 

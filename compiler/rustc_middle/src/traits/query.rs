@@ -5,69 +5,73 @@
 //! The providers for the queries defined here can be found in
 //! `rustc_traits`.
 
-use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TypeFoldable, TypeVisitable};
 use rustc_span::Span;
 
 use crate::error::DropCheckOverflow;
 use crate::infer::canonical::{Canonical, CanonicalQueryInput, QueryResponse};
+use crate::traits::solve;
 pub use crate::traits::solve::NoSolution;
 use crate::ty::{self, GenericArg, Ty, TyCtxt};
 
 pub mod type_op {
-    use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
+    use rustc_macros::{StableHash, TypeFoldable, TypeVisitable};
 
-    use crate::ty::{Predicate, Ty, UserType};
+    use crate::ty::{Predicate, Ty, Unnormalized, UserType};
 
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct AscribeUserType<'tcx> {
         pub mir_ty: Ty<'tcx>,
         pub user_ty: UserType<'tcx>,
     }
 
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct Eq<'tcx> {
         pub a: Ty<'tcx>,
         pub b: Ty<'tcx>,
     }
 
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct Subtype<'tcx> {
         pub sub: Ty<'tcx>,
         pub sup: Ty<'tcx>,
     }
 
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct ProvePredicate<'tcx> {
         pub predicate: Predicate<'tcx>,
     }
 
-    /// Normalizes, but not in the new solver.
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
-    pub struct Normalize<T> {
-        pub value: T,
+    /// Normalizes a value that may contain unnormalized aliases.
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
+    pub struct Normalize<'tcx, T> {
+        pub value: Unnormalized<'tcx, T>,
     }
 
-    /// Normalizes, and deeply normalizes in the new solver.
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
-    pub struct DeeplyNormalize<T> {
-        pub value: T,
-    }
-
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct ImpliedOutlivesBounds<'tcx> {
         pub ty: Ty<'tcx>,
     }
 
-    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, HashStable, TypeFoldable, TypeVisitable)]
+    #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
     pub struct DropckOutlives<'tcx> {
         pub dropped_ty: Ty<'tcx>,
     }
 }
 
 pub type CanonicalAliasGoal<'tcx> =
-    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, ty::AliasTy<'tcx>>>;
+    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, ty::AliasTerm<'tcx>>>;
 
-pub type CanonicalTyGoal<'tcx> = CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, Ty<'tcx>>>;
+pub type CanonicalMethodAutoderefStepsGoal<'tcx> =
+    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, MethodAutoderefSteps<'tcx>>>;
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, StableHash, TypeFoldable, TypeVisitable)]
+pub struct MethodAutoderefSteps<'tcx> {
+    /// The list of opaque types currently in the storage.
+    ///
+    /// Only used by the new solver for now.
+    pub predefined_opaques_in_body: solve::PredefinedOpaques<'tcx>,
+    pub self_ty: Ty<'tcx>,
+}
 
 pub type CanonicalPredicateGoal<'tcx> =
     CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, ty::Predicate<'tcx>>>;
@@ -79,10 +83,7 @@ pub type CanonicalTypeOpProvePredicateGoal<'tcx> =
     CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::ProvePredicate<'tcx>>>;
 
 pub type CanonicalTypeOpNormalizeGoal<'tcx, T> =
-    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::Normalize<T>>>;
-
-pub type CanonicalTypeOpDeeplyNormalizeGoal<'tcx, T> =
-    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::DeeplyNormalize<T>>>;
+    CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::Normalize<'tcx, T>>>;
 
 pub type CanonicalImpliedOutlivesBoundsGoal<'tcx> =
     CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::ImpliedOutlivesBounds<'tcx>>>;
@@ -90,7 +91,7 @@ pub type CanonicalImpliedOutlivesBoundsGoal<'tcx> =
 pub type CanonicalDropckOutlivesGoal<'tcx> =
     CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::DropckOutlives<'tcx>>>;
 
-#[derive(Clone, Debug, Default, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Debug, Default, StableHash, TypeFoldable, TypeVisitable)]
 pub struct DropckOutlivesResult<'tcx> {
     pub kinds: Vec<GenericArg<'tcx>>,
     pub overflows: Vec<Ty<'tcx>>,
@@ -106,7 +107,7 @@ impl<'tcx> DropckOutlivesResult<'tcx> {
 
 /// A set of constraints that need to be satisfied in order for
 /// a type to be valid for destruction.
-#[derive(Clone, Debug, HashStable)]
+#[derive(Clone, Debug, StableHash)]
 pub struct DropckConstraint<'tcx> {
     /// Types that are required to be alive in order for this
     /// type to be valid for destruction.
@@ -141,9 +142,10 @@ impl<'tcx> FromIterator<DropckConstraint<'tcx>> for DropckConstraint<'tcx> {
     }
 }
 
-#[derive(Debug, HashStable)]
+#[derive(Debug, StableHash)]
 pub struct CandidateStep<'tcx> {
     pub self_ty: Canonical<'tcx, QueryResponse<'tcx, Ty<'tcx>>>,
+    pub self_ty_is_opaque: bool,
     pub autoderefs: usize,
     /// `true` if the type results from a dereference of a raw pointer.
     /// when assembling candidates, we include these steps, but not when
@@ -163,7 +165,7 @@ pub struct CandidateStep<'tcx> {
     pub reachable_via_deref: bool,
 }
 
-#[derive(Copy, Clone, Debug, HashStable)]
+#[derive(Copy, Clone, Debug, StableHash)]
 pub struct MethodAutoderefStepsResult<'tcx> {
     /// The valid autoderef steps that could be found by following a chain
     /// of `Receiver<Target=T>` or `Deref<Target=T>` trait implementations.
@@ -175,17 +177,17 @@ pub struct MethodAutoderefStepsResult<'tcx> {
     pub reached_recursion_limit: bool,
 }
 
-#[derive(Debug, HashStable)]
+#[derive(Debug, StableHash)]
 pub struct MethodAutoderefBadTy<'tcx> {
     pub reached_raw_pointer: bool,
     pub ty: Canonical<'tcx, QueryResponse<'tcx, Ty<'tcx>>>,
 }
 
-/// Result of the `normalize_canonicalized_{{,inherent_}projection,free}_ty` queries.
-#[derive(Clone, Debug, HashStable, TypeFoldable, TypeVisitable)]
+/// Result of the `normalize_canonicalized_{{,inherent_}projection,free}` queries.
+#[derive(Clone, Debug, StableHash, TypeFoldable, TypeVisitable)]
 pub struct NormalizationResult<'tcx> {
     /// Result of the normalization.
-    pub normalized_ty: Ty<'tcx>,
+    pub normalized_term: ty::Term<'tcx>,
 }
 
 /// Outlives bounds are relationships between generic parameters,
@@ -195,7 +197,7 @@ pub struct NormalizationResult<'tcx> {
 /// case they are called implied bounds). They are fed to the
 /// `OutlivesEnv` which in turn is supplied to the region checker and
 /// other parts of the inference system.
-#[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable, HashStable)]
+#[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable, StableHash)]
 pub enum OutlivesBound<'tcx> {
     RegionSubRegion(ty::Region<'tcx>, ty::Region<'tcx>),
     RegionSubParam(ty::Region<'tcx>, ty::ParamTy),

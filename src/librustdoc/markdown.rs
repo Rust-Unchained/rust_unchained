@@ -8,11 +8,13 @@
 //!
 //! [docs]: https://doc.rust-lang.org/stable/rustdoc/#using-standalone-markdown-files
 
-use std::fmt::Write as _;
-use std::fs::{File, create_dir_all, read_to_string};
+use std::fmt::{self, Write as _};
+use std::fs::{File, create_dir_all};
 use std::io::prelude::*;
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use rustc_span::SourceFile;
 use rustc_span::edition::Edition;
 
 use crate::config::RenderOptions;
@@ -43,8 +45,8 @@ fn extract_leading_metadata(s: &str) -> (Vec<&str>, &str) {
 /// (e.g., output = "bar" => "bar/foo.html").
 ///
 /// Requires session globals to be available, for symbol interning.
-pub(crate) fn render_and_write<P: AsRef<Path>>(
-    input: P,
+pub(crate) fn render_and_write(
+    input: Arc<SourceFile>,
     options: RenderOptions,
     edition: Edition,
 ) -> Result<(), String> {
@@ -52,9 +54,9 @@ pub(crate) fn render_and_write<P: AsRef<Path>>(
         return Err(format!("{output}: {e}", output = options.output.display()));
     }
 
-    let input = input.as_ref();
+    let input_path = input.name.clone().into_local_path().unwrap_or(PathBuf::new());
     let mut output = options.output;
-    output.push(input.file_name().unwrap());
+    output.push(input_path.file_name().unwrap());
     output.set_extension("html");
 
     let mut css = String::new();
@@ -63,46 +65,47 @@ pub(crate) fn render_and_write<P: AsRef<Path>>(
             .expect("Writing to a String can't fail");
     }
 
-    let input_str =
-        read_to_string(input).map_err(|err| format!("{input}: {err}", input = input.display()))?;
+    let input_str = input.src.as_ref().map(|src| &src[..]).unwrap_or("");
     let playground_url = options.markdown_playground_url.or(options.playground_url);
     let playground = playground_url.map(|url| markdown::Playground { crate_name: None, url });
-
-    let mut out =
-        File::create(&output).map_err(|e| format!("{output}: {e}", output = output.display()))?;
 
     let (metadata, text) = extract_leading_metadata(&input_str);
     if metadata.is_empty() {
         return Err("invalid markdown file: no initial lines starting with `# ` or `%`".to_owned());
     }
+
+    let mut out =
+        File::create(&output).map_err(|e| format!("{output}: {e}", output = output.display()))?;
+
     let title = metadata[0];
 
-    let mut ids = IdMap::new();
     let error_codes = ErrorCodes::from(options.unstable_features.is_nightly_build());
-    let text = if !options.markdown_no_toc {
-        MarkdownWithToc {
-            content: text,
-            links: &[],
-            ids: &mut ids,
-            error_codes,
-            edition,
-            playground: &playground,
+    let text = fmt::from_fn(|f| {
+        if !options.markdown_no_toc {
+            MarkdownWithToc {
+                content: text,
+                links: &[],
+                ids: &mut IdMap::new(),
+                error_codes,
+                edition,
+                playground: &playground,
+            }
+            .write_into(f)
+        } else {
+            Markdown {
+                content: text,
+                links: &[],
+                ids: &mut IdMap::new(),
+                error_codes,
+                edition,
+                playground: &playground,
+                heading_offset: HeadingOffset::H1,
+            }
+            .write_into(f)
         }
-        .into_string()
-    } else {
-        Markdown {
-            content: text,
-            links: &[],
-            ids: &mut ids,
-            error_codes,
-            edition,
-            playground: &playground,
-            heading_offset: HeadingOffset::H1,
-        }
-        .into_string()
-    };
+    });
 
-    let err = write!(
+    let res = write!(
         &mut out,
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -130,15 +133,10 @@ pub(crate) fn render_and_write<P: AsRef<Path>>(
 </body>
 </html>"#,
         title = Escape(title),
-        css = css,
         in_header = options.external_html.in_header,
         before_content = options.external_html.before_content,
-        text = text,
         after_content = options.external_html.after_content,
     );
 
-    match err {
-        Err(e) => Err(format!("cannot write to `{output}`: {e}", output = output.display())),
-        Ok(_) => Ok(()),
-    }
+    res.map_err(|e| format!("cannot write to `{output}`: {e}", output = output.display()))
 }

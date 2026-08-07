@@ -7,6 +7,12 @@ LL |         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}
    |         |                      |    pattern doesn't bind `b`
    |         |                      variable not in all patterns
    |         pattern doesn't bind `b`
+   |
+help: you might have meant to use the similarly named previously used binding `a`
+   |
+LL -         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}", a); }
+LL +         T::T1(a, d) | T::T2(d, a) | T::T3(c) | T::T4(a) => { println!("{:?}", a); }
+   |
 
 error[E0408]: variable `c` is not bound in all patterns
   --> $DIR/issue-39698.rs:10:9
@@ -17,6 +23,12 @@ LL |         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}
    |         |             |                   variable not in all patterns
    |         |             pattern doesn't bind `c`
    |         pattern doesn't bind `c`
+   |
+help: you might have meant to use the similarly named previously used binding `a`
+   |
+LL -         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}", a); }
+LL +         T::T1(a, d) | T::T2(d, b) | T::T3(a) | T::T4(a) => { println!("{:?}", a); }
+   |
 
 error[E0408]: variable `a` is not bound in all patterns
   --> $DIR/issue-39698.rs:10:23
@@ -27,6 +39,12 @@ LL |         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}
    |               |       |             pattern doesn't bind `a`
    |               |       pattern doesn't bind `a`
    |               variable not in all patterns
+   |
+help: you might have meant to use the similarly named previously used binding `b`
+   |
+LL -         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}", a); }
+LL +         T::T1(b, d) | T::T2(d, b) | T::T3(c) | T::T4(b) => { println!("{:?}", a); }
+   |
 
 error[E0408]: variable `d` is not bound in all patterns
   --> $DIR/issue-39698.rs:10:37
@@ -47,8 +65,6 @@ LL |         T::T1(a, d) | T::T2(d, b) | T::T3(c) | T::T4(a) => { println!("{:?}
    |               |                                      binding initialized here in some conditions
    |               binding initialized here in some conditions
    |               binding declared here but left uninitialized
-   |
-   = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: aborting due to 5 previous errors
 

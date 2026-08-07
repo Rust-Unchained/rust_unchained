@@ -125,7 +125,7 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                     // if the expression consists of a single number, like "0" or "12", it can refer to
                     // format args in the order they are specified.
                     // see: https://doc.rust-lang.org/std/fmt/#positional-parameters
-                    if trimmed.chars().fold(true, |only_num, c| c.is_ascii_digit() && only_num) {
+                    if trimmed.chars().all(|c| c.is_ascii_digit()) {
                         output.push_str(trimmed);
                     } else if matches!(state, State::Expr) {
                         extracted_expressions.push(Arg::Expr(trimmed.into()));
@@ -183,7 +183,7 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
 
     fn check(input: &str, expect: &Expect) {
         let (output, exprs) = parse_format_exprs(input).unwrap_or(("-".to_owned(), vec![]));

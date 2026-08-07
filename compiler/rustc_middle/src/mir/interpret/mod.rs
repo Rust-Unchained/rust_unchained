@@ -13,20 +13,20 @@ use std::num::NonZero;
 use std::{fmt, io};
 
 use rustc_abi::{AddressSpace, Align, Endian, HasDataLayout, Size};
-use rustc_ast::{LitKind, Mutability};
+use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sharded::ShardedHashMap;
 use rustc_data_structures::sync::{AtomicU64, Lock};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_serialize::{Decodable, Encodable};
 use tracing::{debug, trace};
 // Also make the error macros available from this module.
 pub use {
-    err_exhaust, err_inval, err_machine_stop, err_ub, err_ub_custom, err_ub_format, err_unsup,
-    err_unsup_format, throw_exhaust, throw_inval, throw_machine_stop, throw_ub, throw_ub_custom,
-    throw_ub_format, throw_unsup, throw_unsup_format,
+    err_exhaust, err_inval, err_machine_stop, err_ub, err_ub_format, err_unsup, err_unsup_format,
+    throw_exhaust, throw_inval, throw_machine_stop, throw_ub, throw_ub_format, throw_unsup,
+    throw_unsup_format,
 };
 
 pub use self::allocation::{
@@ -35,11 +35,10 @@ pub use self::allocation::{
 };
 pub use self::error::{
     BadBytesAccess, CheckAlignMsg, CheckInAllocMsg, ErrorHandled, EvalStaticInitializerRawResult,
-    EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, ExpectedKind,
-    InterpErrorInfo, InterpErrorKind, InterpResult, InvalidMetaKind, InvalidProgramInfo,
-    MachineStopType, Misalignment, PointerKind, ReportedErrorInfo, ResourceExhaustionInfo,
-    ScalarSizeMismatch, UndefinedBehaviorInfo, UnsupportedOpInfo, ValidationErrorInfo,
-    ValidationErrorKind, interp_ok,
+    EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, InterpErrorInfo,
+    InterpErrorKind, InterpResult, InvalidMetaKind, InvalidProgramInfo, MachineStopType,
+    Misalignment, ReportedErrorInfo, ResourceExhaustionInfo, ScalarSizeMismatch,
+    UndefinedBehaviorInfo, UnsupportedOpInfo, ValTreeCreationError, interp_ok,
 };
 pub use self::pointer::{CtfeProvenance, Pointer, PointerArithmetic, Provenance};
 pub use self::value::Scalar;
@@ -52,7 +51,7 @@ use crate::ty::{self, Instance, Ty, TyCtxt};
 /// - A constant
 /// - A static
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable, TypeFoldable, TypeVisitable)]
+#[derive(StableHash, TypeFoldable, TypeVisitable)]
 pub struct GlobalId<'tcx> {
     /// For a constant or static, the `Instance` of the item itself.
     /// For a promoted global, the `Instance` of the function they belong to.
@@ -73,29 +72,24 @@ impl<'tcx> GlobalId<'tcx> {
     }
 }
 
-/// Input argument for `tcx.lit_to_const`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, HashStable)]
-pub struct LitToConstInput<'tcx> {
-    /// The absolute value of the resultant constant.
-    pub lit: &'tcx LitKind,
-    /// The type of the constant.
-    pub ty: Ty<'tcx>,
-    /// If the constant is negative.
-    pub neg: bool,
-}
-
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AllocId(pub NonZero<u64>);
 
-// We want the `Debug` output to be readable as it is used by `derive(Debug)` for
-// all the Miri types.
-impl fmt::Debug for AllocId {
+// AllocId show up in const-eval error messages
+impl fmt::Display for AllocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() { write!(f, "a{}", self.0) } else { write!(f, "alloc{}", self.0) }
     }
 }
 
-// No "Display" since AllocIds are not usually user-visible.
+// We want the `Debug` output to be readable as it is used by `derive(Debug)` for
+// all the Miri types.
+impl fmt::Debug for AllocId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Dispatch to `Display` impl.
+        fmt::Display::fmt(self, f)
+    }
+}
 
 #[derive(TyDecodable, TyEncodable)]
 enum AllocDiscriminant {
@@ -103,6 +97,7 @@ enum AllocDiscriminant {
     Fn,
     VTable,
     Static,
+    Type,
 }
 
 pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<'tcx>>(
@@ -126,6 +121,11 @@ pub fn specialized_encode_alloc_id<'tcx, E: TyEncoder<'tcx>>(
             AllocDiscriminant::VTable.encode(encoder);
             ty.encode(encoder);
             poly_trait_ref.encode(encoder);
+        }
+        GlobalAlloc::TypeId { ty } => {
+            trace!("encoding {alloc_id:?} with {ty:#?}");
+            AllocDiscriminant::Type.encode(encoder);
+            ty.encode(encoder);
         }
         GlobalAlloc::Static(did) => {
             assert!(!tcx.is_thread_local_static(did));
@@ -228,6 +228,12 @@ impl<'s> AllocDecodingSession<'s> {
                 trace!("decoded vtable alloc instance: {ty:?}, {poly_trait_ref:?}");
                 decoder.interner().reserve_and_set_vtable_alloc(ty, poly_trait_ref, CTFE_ALLOC_SALT)
             }
+            AllocDiscriminant::Type => {
+                trace!("creating typeid alloc ID");
+                let ty = Decodable::decode(decoder);
+                trace!("decoded typid: {ty:?}");
+                decoder.interner().reserve_and_set_type_id_alloc(ty)
+            }
             AllocDiscriminant::Static => {
                 trace!("creating extern static alloc ID");
                 let did = <DefId as Decodable<D>>::decode(decoder);
@@ -244,7 +250,7 @@ impl<'s> AllocDecodingSession<'s> {
 
 /// An allocation in the global (tcx-managed) memory can be either a function pointer,
 /// a static, or a "real" allocation with some data in it.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, TyDecodable, TyEncodable, HashStable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, TyDecodable, TyEncodable, StableHash)]
 pub enum GlobalAlloc<'tcx> {
     /// The alloc ID is used as a function pointer.
     Function { instance: Instance<'tcx> },
@@ -258,6 +264,9 @@ pub enum GlobalAlloc<'tcx> {
     Static(DefId),
     /// The alloc ID points to memory.
     Memory(ConstAllocation<'tcx>),
+    /// The first pointer-sized segment of a type id. On 64 bit systems, the 128 bit type id
+    /// is split into two segments, on 32 bit systems there are 4 segments, and so on.
+    TypeId { ty: Ty<'tcx> },
 }
 
 impl<'tcx> GlobalAlloc<'tcx> {
@@ -296,15 +305,16 @@ impl<'tcx> GlobalAlloc<'tcx> {
     pub fn address_space(&self, cx: &impl HasDataLayout) -> AddressSpace {
         match self {
             GlobalAlloc::Function { .. } => cx.data_layout().instruction_address_space,
-            GlobalAlloc::Static(..) | GlobalAlloc::Memory(..) | GlobalAlloc::VTable(..) => {
-                AddressSpace::DATA
-            }
+            GlobalAlloc::TypeId { .. }
+            | GlobalAlloc::Static(..)
+            | GlobalAlloc::Memory(..)
+            | GlobalAlloc::VTable(..) => AddressSpace::ZERO,
         }
     }
 
     pub fn mutability(&self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Mutability {
         // Let's see what kind of memory we are.
-        match self {
+        match *self {
             GlobalAlloc::Static(did) => {
                 let DefKind::Static { safety: _, mutability, nested } = tcx.def_kind(did) else {
                     bug!()
@@ -334,7 +344,7 @@ impl<'tcx> GlobalAlloc<'tcx> {
                 }
             }
             GlobalAlloc::Memory(alloc) => alloc.inner().mutability,
-            GlobalAlloc::Function { .. } | GlobalAlloc::VTable(..) => {
+            GlobalAlloc::TypeId { .. } | GlobalAlloc::Function { .. } | GlobalAlloc::VTable(..) => {
                 // These are immutable.
                 Mutability::Not
             }
@@ -346,7 +356,7 @@ impl<'tcx> GlobalAlloc<'tcx> {
         tcx: TyCtxt<'tcx>,
         typing_env: ty::TypingEnv<'tcx>,
     ) -> (Size, Align) {
-        match self {
+        match *self {
             GlobalAlloc::Static(def_id) => {
                 let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else {
                     bug!("GlobalAlloc::Static is not a static")
@@ -370,7 +380,16 @@ impl<'tcx> GlobalAlloc<'tcx> {
                         .expect("statics should not have generic parameters");
                     let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
                     assert!(layout.is_sized());
-                    (layout.size, layout.align.abi)
+
+                    // Take over-alignment from attributes into account.
+                    let align = match tcx.codegen_fn_attrs(def_id).alignment {
+                        Some(align_from_attribute) => {
+                            Ord::max(align_from_attribute, layout.align.abi)
+                        }
+                        None => layout.align.abi,
+                    };
+
+                    (layout.size, align)
                 }
             }
             GlobalAlloc::Memory(alloc) => {
@@ -380,8 +399,10 @@ impl<'tcx> GlobalAlloc<'tcx> {
             GlobalAlloc::Function { .. } => (Size::ZERO, Align::ONE),
             GlobalAlloc::VTable(..) => {
                 // No data to be accessed here. But vtables are pointer-aligned.
-                return (Size::ZERO, tcx.data_layout.pointer_align.abi);
+                (Size::ZERO, tcx.data_layout.pointer_align().abi)
             }
+            // Fake allocation, there's nothing to access here.
+            GlobalAlloc::TypeId { .. } => (Size::ZERO, Align::ONE),
         }
     }
 }
@@ -452,9 +473,8 @@ impl<'tcx> TyCtxt<'tcx> {
         }
         let id = self.alloc_map.reserve();
         debug!("creating alloc {:?} with id {id:?}", alloc_salt.0);
-        let had_previous = self.alloc_map.to_alloc.insert(id, alloc_salt.0.clone()).is_some();
         // We just reserved, so should always be unique.
-        assert!(!had_previous);
+        self.alloc_map.to_alloc.insert_unique(id, alloc_salt.0.clone());
         dedup.insert(alloc_salt, id);
         id
     }
@@ -485,6 +505,11 @@ impl<'tcx> TyCtxt<'tcx> {
         salt: usize,
     ) -> AllocId {
         self.reserve_and_set_dedup(GlobalAlloc::VTable(ty, dyn_ty), salt)
+    }
+
+    /// Generates an [AllocId] for a [core::any::TypeId]. Will get deduplicated.
+    pub fn reserve_and_set_type_id_alloc(self, ty: Ty<'tcx>) -> AllocId {
+        self.reserve_and_set_dedup(GlobalAlloc::TypeId { ty }, 0)
     }
 
     /// Interns the `Allocation` and return a new `AllocId`, even if there's already an identical
@@ -522,21 +547,17 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Freezes an `AllocId` created with `reserve` by pointing it at an `Allocation`. Trying to
-    /// call this function twice, even with the same `Allocation` will ICE the compiler.
+    /// call this function twice, even with the same `Allocation` will ICE the compiler if
+    /// debug_assertions are enabled.
     pub fn set_alloc_id_memory(self, id: AllocId, mem: ConstAllocation<'tcx>) {
-        if let Some(old) = self.alloc_map.to_alloc.insert(id, GlobalAlloc::Memory(mem)) {
-            bug!("tried to set allocation ID {id:?}, but it was already existing as {old:#?}");
-        }
+        self.alloc_map.to_alloc.insert_unique(id, GlobalAlloc::Memory(mem))
     }
 
     /// Freezes an `AllocId` created with `reserve` by pointing it at a static item. Trying to
-    /// call this function twice, even with the same `DefId` will ICE the compiler.
+    /// call this function twice, even with the same `DefId` will ICE the compiler if
+    /// debug_assertions are enabled.
     pub fn set_nested_alloc_id_static(self, id: AllocId, def_id: LocalDefId) {
-        if let Some(old) =
-            self.alloc_map.to_alloc.insert(id, GlobalAlloc::Static(def_id.to_def_id()))
-        {
-            bug!("tried to set allocation ID {id:?}, but it was already existing as {old:#?}");
-        }
+        self.alloc_map.to_alloc.insert_unique(id, GlobalAlloc::Static(def_id.to_def_id()))
     }
 }
 

@@ -2,17 +2,18 @@
 
 use crate::ffi::{CStr, CString, OsStr, OsString};
 use crate::fmt;
+use crate::fs::TryLockError;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::mem::MaybeUninit;
 use crate::os::raw::{c_int, c_short};
 use crate::os::solid::ffi::OsStrExt;
 use crate::path::{Path, PathBuf};
 use crate::sync::Arc;
-pub use crate::sys::fs::common::exists;
+pub use crate::sys::fs::common::{Dir, exists};
+use crate::sys::helpers::ignore_notfound;
 use crate::sys::pal::{abi, error};
 use crate::sys::time::SystemTime;
-use crate::sys::unsupported;
-use crate::sys_common::ignore_notfound;
+use crate::sys::{unsupported, unsupported_err};
 
 type CIntNotMinusOne = core::num::niche_types::NotAllOnes<c_int>;
 
@@ -352,12 +353,12 @@ impl File {
         unsupported()
     }
 
-    pub fn try_lock(&self) -> io::Result<bool> {
-        unsupported()
+    pub fn try_lock(&self) -> Result<(), TryLockError> {
+        Err(TryLockError::Error(unsupported_err()))
     }
 
-    pub fn try_lock_shared(&self) -> io::Result<bool> {
-        unsupported()
+    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
+        Err(TryLockError::Error(unsupported_err()))
     }
 
     pub fn unlock(&self) -> io::Result<()> {
@@ -382,7 +383,7 @@ impl File {
         }
     }
 
-    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         unsafe {
             let len = cursor.capacity();
             let mut out_num_bytes = MaybeUninit::uninit();
@@ -400,7 +401,7 @@ impl File {
 
             // Safety: `num_bytes_read` bytes were written to the unfilled
             // portion of the buffer
-            cursor.advance_unchecked(num_bytes_read);
+            cursor.advance(num_bytes_read);
 
             Ok(())
         }
@@ -456,6 +457,10 @@ impl File {
         .map_err(|e| e.as_io_error())?;
         // Get the new offset
         self.tell()
+    }
+
+    pub fn size(&self) -> Option<io::Result<u64>> {
+        None
     }
 
     pub fn tell(&self) -> io::Result<u64> {
@@ -526,11 +531,24 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
 }
 
 pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
+    // Solid does not support symlinks
+    set_perm_nofollow(p, perm)
+}
+
+pub fn set_perm_nofollow(p: &Path, perm: FilePermissions) -> io::Result<()> {
     error::SolidError::err_if_negative(unsafe {
         abi::SOLID_FS_Chmod(cstr(p)?.as_ptr(), perm.0.into())
     })
     .map_err(|e| e.as_io_error())?;
     Ok(())
+}
+
+pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
+    unsupported()
 }
 
 pub fn rmdir(p: &Path) -> io::Result<()> {

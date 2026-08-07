@@ -3,7 +3,7 @@ use std::cmp::min;
 
 use itertools::Itertools;
 use rustc_ast::token::{Delimiter, Lit, LitKind};
-use rustc_ast::{ForLoopKind, MatchKind, ast, ptr, token};
+use rustc_ast::{ForLoopKind, MatchKind, ast, token};
 use rustc_span::{BytePos, Span};
 use tracing::debug;
 
@@ -13,8 +13,8 @@ use crate::comment::{
     CharClasses, FindUncommented, combine_strs_with_missing_comments, contains_comment,
     recover_comment_removed, rewrite_comment, rewrite_missing_comment,
 };
-use crate::config::lists::*;
-use crate::config::{Config, ControlBraceStyle, HexLiteralCase, IndentStyle, LetElseStyle, StyleEdition};
+use crate::config::{Config, ControlBraceStyle, HexLiteralCase, IndentStyle, StyleEdition, LetElseStyle};
+use crate::config::{FloatLiteralTrailingZero, lists::*};
 use crate::lists::{
     ListFormatting, Separator, definitive_tactic, itemize_list, shape_for_tactic,
     struct_lit_formatting, struct_lit_shape, struct_lit_tactic, write_list,
@@ -23,6 +23,7 @@ use crate::macros::{MacroPosition, rewrite_macro};
 use crate::matches::rewrite_match;
 use crate::overflow::{self, IntoOverflowableItem, OverflowableItem};
 use crate::pairs::{PairParts, rewrite_all_pairs, rewrite_pair};
+use crate::range::rewrite_range;
 use crate::rewrite::{Rewrite, RewriteContext, RewriteError, RewriteErrorExt, RewriteResult};
 use crate::shape::{Indent, Shape};
 use crate::source_map::{LineRangeUtils, SpanUtils};
@@ -54,8 +55,32 @@ pub(crate) enum ExprType {
     SubExpression,
 }
 
-pub(crate) fn lit_ends_in_dot(lit: &Lit) -> bool {
-    matches!(lit, Lit { kind: LitKind::Float, suffix: None, symbol } if symbol.as_str().ends_with('.'))
+pub(crate) fn lit_ends_in_dot(lit: &Lit, context: &RewriteContext<'_>) -> bool {
+    match lit.kind {
+        LitKind::Float => float_lit_ends_in_dot(
+            lit.symbol.as_str(),
+            lit.suffix.as_ref().map(|s| s.as_str()),
+            context.config.float_literal_trailing_zero(),
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn float_lit_ends_in_dot(
+    symbol: &str,
+    suffix: Option<&str>,
+    float_literal_trailing_zero: FloatLiteralTrailingZero,
+) -> bool {
+    match float_literal_trailing_zero {
+        FloatLiteralTrailingZero::Preserve => symbol.ends_with('.') && suffix.is_none(),
+        FloatLiteralTrailingZero::IfNoPostfix | FloatLiteralTrailingZero::Always => false,
+        FloatLiteralTrailingZero::Never => {
+            let float_parts = parse_float_symbol(symbol).unwrap();
+            let has_postfix = float_parts.exponent.is_some() || suffix.is_some();
+            let fractional_part_zero = float_parts.is_fractional_part_zero();
+            !has_postfix && fractional_part_zero
+        }
+    }
 }
 
 pub(crate) fn format_expr(
@@ -70,7 +95,7 @@ pub(crate) fn format_expr(
         return Ok(context.snippet(expr.span()).to_owned());
     }
     let shape = if expr_type == ExprType::Statement && semicolon_for_expr(context, expr) {
-        shape.sub_width(1).max_width_error(shape.width, expr.span)?
+        shape.sub_width(1, expr.span)?
     } else {
         shape
     };
@@ -100,6 +125,16 @@ pub(crate) fn format_expr(
             let inner_span = mk_sp(callee.span.hi(), expr.span.hi());
             let callee_str = callee.rewrite_result(context, shape)?;
             rewrite_call(context, &callee_str, args, inner_span, shape)
+        }
+        ast::ExprKind::Move(ref subexpr, move_kw_span) => {
+            let inner_span = mk_sp(move_kw_span.hi(), expr.span.hi());
+            rewrite_call(
+                context,
+                "move",
+                std::slice::from_ref(subexpr),
+                inner_span,
+                shape,
+            )
         }
         ast::ExprKind::Paren(ref subexpr) => rewrite_paren(context, subexpr, shape, expr.span),
         ast::ExprKind::Binary(op, ref lhs, ref rhs) => {
@@ -136,10 +171,6 @@ pub(crate) fn format_expr(
         }
         ast::ExprKind::Tup(ref items) => {
             rewrite_tuple(context, items.iter(), expr.span, shape, items.len() == 1)
-        }
-        ast::ExprKind::Use(_, _) => {
-            // FIXME: properly implement this
-            Ok(context.snippet(expr.span()).to_owned())
         }
         ast::ExprKind::Let(ref pat, ref expr, _span, _) => rewrite_let(context, shape, pat, expr),
         ast::ExprKind::If(..)
@@ -204,14 +235,22 @@ pub(crate) fn format_expr(
         }
         ast::ExprKind::Continue(ref opt_label) => {
             let id_str = match *opt_label {
-                Some(label) => format!(" {}", label.ident),
+                Some(label) => {
+                    // Ident lose the `r#` prefix in raw labels,　so use the original snippet
+                    let label_name = context.snippet(label.ident.span);
+                    format!(" {}", label_name)
+                }
                 None => String::new(),
             };
             Ok(format!("continue{id_str}"))
         }
         ast::ExprKind::Break(ref opt_label, ref opt_expr) => {
             let id_str = match *opt_label {
-                Some(label) => format!(" {}", label.ident),
+                Some(label) => {
+                    // Ident lose the `r#` prefix in raw labels,　so use the original snippet
+                    let label_name = context.snippet(label.ident.span);
+                    format!(" {}", label_name)
+                }
                 None => String::new(),
             };
 
@@ -244,6 +283,7 @@ pub(crate) fn format_expr(
         | ast::ExprKind::Field(..)
         | ast::ExprKind::MethodCall(..)
         | ast::ExprKind::Await(_, _)
+        | ast::ExprKind::Use(_, _)
         | ast::ExprKind::Yield(ast::YieldKind::Postfix(_)) => rewrite_chain(expr, context, shape),
         ast::ExprKind::MacCall(ref mac) => {
             rewrite_macro(mac, context, shape, MacroPosition::Expression).or_else(|_| {
@@ -286,94 +326,57 @@ pub(crate) fn format_expr(
             shape,
             SeparatorPlace::Back,
         ),
-        ast::ExprKind::Range(ref lhs, ref rhs, limits) => {
-            let delim = match limits {
-                ast::RangeLimits::HalfOpen => "..",
-                ast::RangeLimits::Closed => "..=",
-            };
-
-            fn needs_space_before_range(context: &RewriteContext<'_>, lhs: &ast::Expr) -> bool {
-                match lhs.kind {
-                    ast::ExprKind::Lit(token_lit) => lit_ends_in_dot(&token_lit),
-                    ast::ExprKind::Unary(_, ref expr) => needs_space_before_range(context, expr),
-                    ast::ExprKind::Binary(_, _, ref rhs_expr) => {
-                        needs_space_before_range(context, rhs_expr)
-                    }
-                    _ => false,
-                }
-            }
-
-            fn needs_space_after_range(rhs: &ast::Expr) -> bool {
-                // Don't format `.. ..` into `....`, which is invalid.
-                //
-                // This check is unnecessary for `lhs`, because a range
-                // starting from another range needs parentheses as `(x ..) ..`
-                // (`x .. ..` is a range from `x` to `..`).
-                matches!(rhs.kind, ast::ExprKind::Range(None, _, _))
-            }
-
-            let default_sp_delim = |lhs: Option<&ast::Expr>, rhs: Option<&ast::Expr>| {
-                let space_if = |b: bool| if b { " " } else { "" };
-
-                format!(
-                    "{}{}{}",
-                    lhs.map_or("", |lhs| space_if(needs_space_before_range(context, lhs))),
-                    delim,
-                    rhs.map_or("", |rhs| space_if(needs_space_after_range(rhs))),
-                )
-            };
-
-            match (lhs.as_ref().map(|x| &**x), rhs.as_ref().map(|x| &**x)) {
-                (Some(lhs), Some(rhs)) => {
-                    let sp_delim = if context.config.spaces_around_ranges() {
-                        format!(" {delim} ")
-                    } else {
-                        default_sp_delim(Some(lhs), Some(rhs))
-                    };
-                    rewrite_pair(
-                        &*lhs,
-                        &*rhs,
-                        PairParts::infix(&sp_delim),
-                        context,
-                        shape,
-                        context.config.binop_separator(),
-                    )
-                }
-                (None, Some(rhs)) => {
-                    let sp_delim = if context.config.spaces_around_ranges() {
-                        format!("{delim} ")
-                    } else {
-                        default_sp_delim(None, Some(rhs))
-                    };
-                    rewrite_unary_prefix(context, &sp_delim, &*rhs, shape)
-                }
-                (Some(lhs), None) => {
-                    let sp_delim = if context.config.spaces_around_ranges() {
-                        format!(" {delim}")
-                    } else {
-                        default_sp_delim(Some(lhs), None)
-                    };
-                    rewrite_unary_suffix(context, &sp_delim, &*lhs, shape)
-                }
-                (None, None) => Ok(delim.to_owned()),
-            }
-        }
+        ast::ExprKind::Range(ref lhs, ref rhs, limits) => rewrite_range(
+            context,
+            shape,
+            lhs.as_deref(),
+            rhs.as_deref(),
+            limits.as_str(),
+        ),
         // We do not format these expressions yet, but they should still
         // satisfy our width restrictions.
         // Style Guide RFC for InlineAsm variant pending
         // https://github.com/rust-dev-tools/fmt-rfcs/issues/152
         ast::ExprKind::InlineAsm(..) => Ok(context.snippet(expr.span).to_owned()),
-        ast::ExprKind::TryBlock(ref block) => {
+        ast::ExprKind::TryBlock(ref block, None) => {
             if let rw @ Ok(_) =
                 rewrite_single_line_block(context, "try ", block, Some(&expr.attrs), None, shape)
             {
                 rw
             } else {
+                // FIXME: 9 sounds like `"do catch ".len()`, so may predate the rename
                 // 9 = `try `
                 let budget = shape.width.saturating_sub(9);
                 Ok(format!(
                     "{}{}",
                     "try ",
+                    rewrite_block(
+                        block,
+                        Some(&expr.attrs),
+                        None,
+                        context,
+                        Shape::legacy(budget, shape.indent)
+                    )?
+                ))
+            }
+        }
+        ast::ExprKind::TryBlock(ref block, Some(ref ty)) => {
+            let keyword = "try bikeshed ";
+            // 2 = " {".len()
+            let ty_shape = shape
+                .shrink_left(keyword.len(), expr.span)
+                .and_then(|shape| shape.sub_width(2, expr.span))?;
+
+            let ty_str = ty.rewrite_result(context, ty_shape)?;
+            let prefix = format!("{keyword}{ty_str} ");
+            if let rw @ Ok(_) =
+                rewrite_single_line_block(context, &prefix, block, Some(&expr.attrs), None, shape)
+            {
+                rw
+            } else {
+                let budget = shape.width.saturating_sub(prefix.len());
+                Ok(format!(
+                    "{prefix}{}",
                     rewrite_block(
                         block,
                         Some(&expr.attrs),
@@ -419,7 +422,8 @@ pub(crate) fn format_expr(
         | ast::ExprKind::Type(..)
         | ast::ExprKind::IncludedBytes(..)
         | ast::ExprKind::OffsetOf(..)
-        | ast::ExprKind::UnsafeBinderCast(..) => {
+        | ast::ExprKind::UnsafeBinderCast(..)
+        | ast::ExprKind::DirectConstArg(..) => {
             // These don't normally occur in the AST because macros aren't expanded. However,
             // rustfmt tries to parse macro arguments when formatting macros, so it's not totally
             // impossible for rustfmt to come across one of these nodes when formatting a file.
@@ -540,9 +544,7 @@ fn rewrite_single_line_block(
     shape: Shape,
 ) -> RewriteResult {
     if let Some(block_expr) = stmt::Stmt::from_simple_block(context, block, attrs) {
-        let expr_shape = shape
-            .offset_left(last_line_width(prefix))
-            .max_width_error(shape.width, block_expr.span())?;
+        let expr_shape = shape.offset_left(last_line_width(prefix), block_expr.span())?;
         let expr_str = block_expr.rewrite_result(context, expr_shape)?;
         let label_str = rewrite_label(context, label);
         let result = format!("{prefix}{label_str}{{ {expr_str} }}");
@@ -569,6 +571,7 @@ pub(crate) fn rewrite_block_with_visitor(
     let mut visitor = FmtVisitor::from_context(context);
     visitor.block_indent = shape.indent;
     visitor.is_if_else_block = context.is_if_else_block();
+    visitor.is_loop_block = context.is_loop_block();
     match (block.rules, label) {
         (ast::BlockCheckMode::Unsafe(..), _) | (ast::BlockCheckMode::Default, Some(_)) => {
             let snippet = context.snippet(block.span);
@@ -656,8 +659,8 @@ pub(crate) fn rewrite_cond(
         ast::ExprKind::Match(ref cond, _, MatchKind::Prefix) => {
             // `match `cond` {`
             let cond_shape = match context.config.indent_style() {
-                IndentStyle::Visual => shape.shrink_left(6).and_then(|s| s.sub_width(2))?,
-                IndentStyle::Block => shape.offset_left(8)?,
+                IndentStyle::Visual => shape.shrink_left_opt(6).and_then(|s| s.sub_width_opt(2))?,
+                IndentStyle::Block => shape.offset_left_opt(8)?,
             };
             cond.rewrite(context, cond_shape)
         }
@@ -686,6 +689,7 @@ struct ControlFlow<'a> {
     allow_single_line: bool,
     // HACK: `true` if this is an `if` expression in an `else if`.
     nested_if: bool,
+    is_loop: bool,
     span: Span,
 }
 
@@ -711,14 +715,8 @@ fn to_control_flow(expr: &ast::Expr, expr_type: ExprType) -> Option<ControlFlow<
                 expr.span,
             ))
         }
-        ast::ExprKind::ForLoop {
-            ref pat,
-            ref iter,
-            ref body,
-            label,
-            kind,
-        } => Some(ControlFlow::new_for(
-            pat, iter, body, label, expr.span, kind,
+        ast::ExprKind::ForLoop(ref f) => Some(ControlFlow::new_for(
+            &f.pat, &f.iter, &f.body, f.label, expr.span, f.kind,
         )),
         ast::ExprKind::Loop(ref block, label, _) => {
             Some(ControlFlow::new_loop(block, label, expr.span))
@@ -757,6 +755,7 @@ impl<'a> ControlFlow<'a> {
             connector: " =",
             allow_single_line,
             nested_if,
+            is_loop: false,
             span,
         }
     }
@@ -773,6 +772,7 @@ impl<'a> ControlFlow<'a> {
             connector: "",
             allow_single_line: false,
             nested_if: false,
+            is_loop: true,
             span,
         }
     }
@@ -796,6 +796,7 @@ impl<'a> ControlFlow<'a> {
             connector: " =",
             allow_single_line: false,
             nested_if: false,
+            is_loop: true,
             span,
         }
     }
@@ -822,6 +823,7 @@ impl<'a> ControlFlow<'a> {
             connector: " in",
             allow_single_line: false,
             nested_if: false,
+            is_loop: true,
             span,
         }
     }
@@ -894,9 +896,7 @@ impl<'a> ControlFlow<'a> {
     ) -> RewriteResult {
         debug!("rewrite_pat_expr {:?} {:?} {:?}", shape, self.pat, expr);
 
-        let cond_shape = shape
-            .offset_left(offset)
-            .max_width_error(shape.width, expr.span)?;
+        let cond_shape = shape.offset_left(offset, expr.span)?;
         if let Some(pat) = self.pat {
             let matcher = if self.matcher.is_empty() {
                 self.matcher.to_owned()
@@ -904,9 +904,8 @@ impl<'a> ControlFlow<'a> {
                 format!("{} ", self.matcher)
             };
             let pat_shape = cond_shape
-                .offset_left(matcher.len())
-                .and_then(|s| s.sub_width(self.connector.len()))
-                .max_width_error(cond_shape.width, pat.span)?;
+                .offset_left(matcher.len(), pat.span)?
+                .sub_width(self.connector.len(), pat.span)?;
             let pat_string = pat.rewrite_result(context, pat_shape)?;
             let comments_lo = context
                 .snippet_provider
@@ -956,9 +955,7 @@ impl<'a> ControlFlow<'a> {
         let constr_shape = if self.nested_if {
             // We are part of an if-elseif-else chain. Our constraints are tightened.
             // 7 = "} else " .len()
-            fresh_shape
-                .offset_left(7)
-                .max_width_error(fresh_shape.width, self.span)?
+            fresh_shape.offset_left(7, self.span)?
         } else {
             fresh_shape
         };
@@ -1151,8 +1148,10 @@ impl<'a> Rewrite for ControlFlow<'a> {
         };
         let block_str = {
             let old_val = context.is_if_else_block.replace(self.else_block.is_some());
+            let old_is_loop = context.is_loop_block.replace(self.is_loop);
             let result =
                 rewrite_block_with_visitor(context, "", self.block, None, None, block_shape, true);
+            context.is_loop_block.replace(old_is_loop);
             context.is_if_else_block.replace(old_val);
             result?
         };
@@ -1292,6 +1291,7 @@ pub(crate) fn rewrite_literal(
     match token_lit.kind {
         token::LitKind::Str => rewrite_string_lit(context, span, shape),
         token::LitKind::Integer => rewrite_int_lit(context, token_lit, span, shape),
+        token::LitKind::Float => rewrite_float_lit(context, token_lit, span, shape),
         _ => wrap_str(
             context.snippet(span).to_owned(),
             context.config.max_width(),
@@ -1335,6 +1335,10 @@ fn rewrite_int_lit(
     span: Span,
     shape: Shape,
 ) -> RewriteResult {
+    if token_lit.is_semantic_float() {
+        return rewrite_float_lit(context, token_lit, span, shape);
+    }
+
     let symbol = token_lit.symbol.as_str();
 
     if let Some(symbol_stripped) = symbol.strip_prefix("0x") {
@@ -1365,6 +1369,72 @@ fn rewrite_int_lit(
     .max_width_error(shape.width, span)
 }
 
+fn rewrite_float_lit(
+    context: &RewriteContext<'_>,
+    token_lit: token::Lit,
+    span: Span,
+    shape: Shape,
+) -> RewriteResult {
+    if matches!(
+        context.config.float_literal_trailing_zero(),
+        FloatLiteralTrailingZero::Preserve
+    ) {
+        return wrap_str(
+            context.snippet(span).to_owned(),
+            context.config.max_width(),
+            shape,
+        )
+        .max_width_error(shape.width, span);
+    }
+
+    let symbol = token_lit.symbol.as_str();
+    let suffix = token_lit.suffix.as_ref().map(|s| s.as_str());
+
+    let float_parts = parse_float_symbol(symbol).unwrap();
+    let FloatSymbolParts {
+        integer_part,
+        fractional_part,
+        exponent,
+    } = float_parts;
+
+    let has_postfix = exponent.is_some() || suffix.is_some();
+    let fractional_part_nonzero = !float_parts.is_fractional_part_zero();
+
+    let (include_period, include_fractional_part) =
+        match context.config.float_literal_trailing_zero() {
+            FloatLiteralTrailingZero::Preserve => unreachable!("handled above"),
+            FloatLiteralTrailingZero::Always => (true, true),
+            FloatLiteralTrailingZero::IfNoPostfix => (
+                fractional_part_nonzero || !has_postfix,
+                fractional_part_nonzero || !has_postfix,
+            ),
+            FloatLiteralTrailingZero::Never => (
+                fractional_part_nonzero || !has_postfix,
+                fractional_part_nonzero,
+            ),
+        };
+
+    let period = if include_period { "." } else { "" };
+    let fractional_part = if include_fractional_part {
+        fractional_part.unwrap_or("0")
+    } else {
+        ""
+    };
+    wrap_str(
+        format!(
+            "{}{}{}{}{}",
+            integer_part,
+            period,
+            fractional_part,
+            exponent.unwrap_or(""),
+            suffix.unwrap_or(""),
+        ),
+        context.config.max_width(),
+        shape,
+    )
+    .max_width_error(shape.width, span)
+}
+
 fn choose_separator_tactic(context: &RewriteContext<'_>, span: Span) -> Option<SeparatorTactic> {
     if context.inside_macro() {
         if span_ends_with_comma(context, span) {
@@ -1380,7 +1450,7 @@ fn choose_separator_tactic(context: &RewriteContext<'_>, span: Span) -> Option<S
 pub(crate) fn rewrite_call(
     context: &RewriteContext<'_>,
     callee: &str,
-    args: &[ptr::P<ast::Expr>],
+    args: &[Box<ast::Expr>],
     span: Span,
     shape: Shape,
 ) -> RewriteResult {
@@ -1436,7 +1506,10 @@ pub(crate) fn can_be_overflowed_expr(
         }
 
         // Handle always block-like expressions
-        ast::ExprKind::Gen(..) | ast::ExprKind::Block(..) | ast::ExprKind::Closure(..) => true,
+        ast::ExprKind::Gen(..)
+        | ast::ExprKind::Block(..)
+        | ast::ExprKind::Closure(..)
+        | ast::ExprKind::TryBlock(..) => true,
 
         // Handle `[]` and `{}`-like expressions
         ast::ExprKind::Array(..) | ast::ExprKind::Struct(..) => {
@@ -1532,10 +1605,7 @@ pub(crate) fn rewrite_paren(
     }
 
     // 1 = `(` and `)`
-    let sub_shape = shape
-        .offset_left(1)
-        .and_then(|s| s.sub_width(1))
-        .max_width_error(shape.width, span)?;
+    let sub_shape = shape.offset_left(1, span)?.sub_width(1, span)?;
     let subexpr_str = subexpr.rewrite_result(context, sub_shape)?;
     let fits_single_line = !pre_comment.contains("//") && !post_comment.contains("//");
     if fits_single_line {
@@ -1588,18 +1658,21 @@ fn rewrite_index(
     let rhs_overhead = shape.rhs_overhead(context.config);
     let index_shape = if expr_str.contains('\n') {
         Shape::legacy(context.config.max_width(), shape.indent)
-            .offset_left(offset)
-            .and_then(|shape| shape.sub_width(1 + rhs_overhead))
+            .offset_left(offset, index.span())
+            .and_then(|shape| shape.sub_width(1 + rhs_overhead, index.span()))
     } else {
         match context.config.indent_style() {
             IndentStyle::Block => shape
-                .offset_left(offset)
-                .and_then(|shape| shape.sub_width(1)),
-            IndentStyle::Visual => shape.visual_indent(offset).sub_width(offset + 1),
+                .offset_left(offset, index.span())
+                .and_then(|shape| shape.sub_width(1, index.span())),
+            IndentStyle::Visual => shape
+                .visual_indent(offset)
+                .sub_width(offset + 1, index.span()),
         }
-    }
-    .max_width_error(shape.width, index.span());
-    let orig_index_rw = index_shape.and_then(|s| index.rewrite_result(context, s));
+    };
+    let orig_index_rw = index_shape
+        .map_err(RewriteError::from)
+        .and_then(|s| index.rewrite_result(context, s));
 
     // Return if index fits in a single line.
     match orig_index_rw {
@@ -1612,11 +1685,8 @@ fn rewrite_index(
     // Try putting index on the next line and see if it fits in a single line.
     let indent = shape.indent.block_indent(context.config);
     let index_shape = Shape::indented(indent, context.config)
-        .offset_left(1)
-        .max_width_error(shape.width, index.span())?;
-    let index_shape = index_shape
-        .sub_width(1 + rhs_overhead)
-        .max_width_error(index_shape.width, index.span())?;
+        .offset_left(1, index.span())?
+        .sub_width(1 + rhs_overhead, index.span())?;
     let new_index_rw = index.rewrite_result(context, index_shape);
     match (orig_index_rw, new_index_rw) {
         (_, Ok(ref new_index_str)) if !new_index_str.contains('\n') => Ok(format!(
@@ -1646,7 +1716,7 @@ fn struct_lit_can_be_aligned(fields: &[ast::ExprField], has_base: bool) -> bool 
 fn rewrite_struct_lit<'a>(
     context: &RewriteContext<'_>,
     path: &ast::Path,
-    qself: &Option<ptr::P<ast::QSelf>>,
+    qself: &Option<Box<ast::QSelf>>,
     fields: &'a [ast::ExprField],
     struct_rest: &ast::StructRest,
     attrs: &[ast::Attribute],
@@ -1662,7 +1732,7 @@ fn rewrite_struct_lit<'a>(
     }
 
     // 2 = " {".len()
-    let path_shape = shape.sub_width(2).max_width_error(shape.width, span)?;
+    let path_shape = shape.sub_width(2, span)?;
     let path_str = rewrite_path(context, PathContext::Expr, qself, path, path_shape)?;
 
     let has_base_or_rest = match struct_rest {
@@ -1675,8 +1745,7 @@ fn rewrite_struct_lit<'a>(
     };
 
     // Foo { a: Foo } - indent is +3, width is -5.
-    let (h_shape, v_shape) = struct_lit_shape(shape, context, path_str.len() + 3, 2)
-        .max_width_error(shape.width, span)?;
+    let (h_shape, v_shape) = struct_lit_shape(shape, context, path_str.len() + 3, 2, span)?;
 
     let one_line_width = h_shape.map_or(0, |shape| shape.width);
     let body_lo = context.snippet_provider.span_after(span, "{");
@@ -1696,7 +1765,7 @@ fn rewrite_struct_lit<'a>(
             match struct_rest {
                 ast::StructRest::Base(expr) => Some(StructLitField::Base(&**expr)),
                 ast::StructRest::Rest(span) => Some(StructLitField::Rest(*span)),
-                ast::StructRest::None => None,
+                ast::StructRest::None | ast::StructRest::NoneWithError(_) => None,
             }
             .into_iter(),
         );
@@ -1719,22 +1788,12 @@ fn rewrite_struct_lit<'a>(
         let rewrite = |item: &StructLitField<'_>| match *item {
             StructLitField::Regular(field) => {
                 // The 1 taken from the v_budget is for the comma.
-                rewrite_field(
-                    context,
-                    field,
-                    v_shape.sub_width(1).max_width_error(v_shape.width, span)?,
-                    0,
-                )
+                rewrite_field(context, field, v_shape.sub_width(1, span)?, 0)
             }
             StructLitField::Base(expr) => {
                 // 2 = ..
-                expr.rewrite_result(
-                    context,
-                    v_shape
-                        .offset_left(2)
-                        .max_width_error(v_shape.width, span)?,
-                )
-                .map(|s| format!("..{}", s))
+                expr.rewrite_result(context, v_shape.offset_left(2, span)?)
+                    .map(|s| format!("..{}", s))
             }
             StructLitField::Rest(_) => Ok("..".to_owned()),
         };
@@ -1841,9 +1900,7 @@ pub(crate) fn rewrite_field(
             separator.push(' ');
         }
         let overhead = name.len() + separator.len();
-        let expr_shape = shape
-            .offset_left(overhead)
-            .max_width_error(shape.width, field.span)?;
+        let expr_shape = shape.offset_left(overhead, field.span)?;
         let expr = field.expr.rewrite_result(context, expr_shape);
         let is_lit = matches!(field.expr.kind, ast::ExprKind::Lit(_));
         match expr {
@@ -1883,10 +1940,7 @@ fn rewrite_tuple_in_visual_indent_style<'a, T: 'a + IntoOverflowableItem<'a>>(
     debug!("rewrite_tuple_in_visual_indent_style {:?}", shape);
     if is_singleton_tuple {
         // 3 = "(" + ",)"
-        let nested_shape = shape
-            .sub_width(3)
-            .max_width_error(shape.width, span)?
-            .visual_indent(1);
+        let nested_shape = shape.sub_width(3, span)?.visual_indent(1);
         return items
             .next()
             .unwrap()
@@ -1895,10 +1949,7 @@ fn rewrite_tuple_in_visual_indent_style<'a, T: 'a + IntoOverflowableItem<'a>>(
     }
 
     let list_lo = context.snippet_provider.span_after(span, "(");
-    let nested_shape = shape
-        .sub_width(2)
-        .max_width_error(shape.width, span)?
-        .visual_indent(1);
+    let nested_shape = shape.sub_width(2, span)?.visual_indent(1);
     let items = itemize_list(
         context.snippet_provider,
         items,
@@ -1937,9 +1988,11 @@ fn rewrite_let(
     // TODO(ytmimi) comments could appear between `let` and the `pat`
 
     // 4 = "let ".len()
-    let pat_shape = shape
-        .offset_left(4)
-        .max_width_error(shape.width, pat.span)?;
+    let mut pat_shape = shape.offset_left(4, pat.span)?;
+    if context.config.style_edition() >= StyleEdition::Edition2027 {
+        // 2 for the length of " ="
+        pat_shape = pat_shape.sub_width(2, pat.span)?;
+    }
     let pat_str = pat.rewrite_result(context, pat_shape)?;
     result.push_str(&pat_str);
 
@@ -2003,9 +2056,7 @@ pub(crate) fn rewrite_unary_prefix<R: Rewrite + Spanned>(
     rewrite: &R,
     shape: Shape,
 ) -> RewriteResult {
-    let shape = shape
-        .offset_left(prefix.len())
-        .max_width_error(shape.width, rewrite.span())?;
+    let shape = shape.offset_left(prefix.len(), rewrite.span())?;
     rewrite
         .rewrite_result(context, shape)
         .map(|r| format!("{}{}", prefix, r))
@@ -2019,9 +2070,7 @@ pub(crate) fn rewrite_unary_suffix<R: Rewrite + Spanned>(
     rewrite: &R,
     shape: Shape,
 ) -> RewriteResult {
-    let shape = shape
-        .sub_width(suffix.len())
-        .max_width_error(shape.width, rewrite.span())?;
+    let shape = shape.sub_width(suffix.len(), rewrite.span())?;
     rewrite.rewrite_result(context, shape).map(|mut r| {
         r.push_str(suffix);
         r
@@ -2079,9 +2128,7 @@ fn rewrite_assignment(
     };
 
     // 1 = space between lhs and operator.
-    let lhs_shape = shape
-        .sub_width(operator_str.len() + 1)
-        .max_width_error(shape.width, lhs.span())?;
+    let lhs_shape = shape.sub_width(operator_str.len() + 1, lhs.span())?;
     let lhs_str = format!(
         "{} {}",
         lhs.rewrite_result(context, lhs_shape)?,
@@ -2135,7 +2182,7 @@ pub(crate) fn rewrite_assign_rhs_expr<R: Rewrite>(
         0
     });
     // 1 = space between operator and rhs.
-    let orig_shape = shape.offset_left(last_line_width + 1).unwrap_or(Shape {
+    let orig_shape = shape.offset_left_opt(last_line_width + 1).unwrap_or(Shape {
         width: 0,
         offset: shape.offset + last_line_width + 1,
         ..shape
@@ -2183,9 +2230,10 @@ pub(crate) fn rewrite_assign_rhs_with_comments<S: Into<String>, R: Rewrite + Spa
     let lhs = lhs.into();
     let contains_comment = contains_comment(context.snippet(between_span));
     let shape = if contains_comment {
-        shape
-            .block_left(context.config.tab_spaces())
-            .max_width_error(shape.width, between_span.with_hi(ex.span().hi()))?
+        shape.block_left(
+            context.config.tab_spaces(),
+            between_span.with_hi(ex.span().hi()),
+        )?
     } else {
         shape
     };
@@ -2262,10 +2310,10 @@ fn shape_from_rhs_tactic(
     match rhs_tactic {
         RhsTactics::ForceNextLineWithoutIndent => shape
             .with_max_width(context.config)
-            .sub_width(shape.indent.width()),
+            .sub_width_opt(shape.indent.width()),
         RhsTactics::Default | RhsTactics::AllowOverflow => {
             Shape::indented(shape.indent.block_indent(context.config), context.config)
-                .sub_width(shape.rhs_overhead(context.config))
+                .sub_width_opt(shape.rhs_overhead(context.config))
         }
     }
 }
@@ -2301,8 +2349,10 @@ fn rewrite_expr_addrof(
 ) -> RewriteResult {
     let operator_str = match (mutability, borrow_kind) {
         (ast::Mutability::Not, ast::BorrowKind::Ref) => "&",
+        (ast::Mutability::Not, ast::BorrowKind::Pin) => "&pin const ",
         (ast::Mutability::Not, ast::BorrowKind::Raw) => "&raw const ",
         (ast::Mutability::Mut, ast::BorrowKind::Ref) => "&mut ",
+        (ast::Mutability::Mut, ast::BorrowKind::Pin) => "&pin mut ",
         (ast::Mutability::Mut, ast::BorrowKind::Raw) => "&raw mut ",
     };
     rewrite_unary_prefix(context, operator_str, expr, shape)
@@ -2319,9 +2369,45 @@ pub(crate) fn is_method_call(expr: &ast::Expr) -> bool {
     }
 }
 
+/// Indicates the parts of a float literal specified as a string.
+struct FloatSymbolParts<'a> {
+    /// The integer part, e.g. `123` in `123.456e789`.
+    /// Always non-empty, because in Rust `.1` is not a valid floating-point literal:
+    /// <https://doc.rust-lang.org/reference/tokens.html#floating-point-literals>
+    integer_part: &'a str,
+    /// The fractional part excluding the decimal point, e.g. `456` in `123.456e789`.
+    fractional_part: Option<&'a str>,
+    /// The exponent part including the `e` or `E`, e.g. `e789` in `123.456e789`.
+    exponent: Option<&'a str>,
+}
+
+impl FloatSymbolParts<'_> {
+    fn is_fractional_part_zero(&self) -> bool {
+        let zero_literal_regex = static_regex!(r"^[0_]+$");
+        self.fractional_part
+            .is_none_or(|s| zero_literal_regex.is_match(s))
+    }
+}
+
+/// Parses a float literal. The `symbol` must be a valid floating point literal without a type
+/// suffix. Otherwise the function may panic or return wrong result.
+fn parse_float_symbol(symbol: &str) -> Result<FloatSymbolParts<'_>, &'static str> {
+    // This regex may accept invalid float literals (such as `1`, `_` or `2.e3`). That's ok.
+    // We only use it to parse literals whose validity has already been established.
+    let float_literal_regex = static_regex!(r"^([0-9_]+)(?:\.([0-9_]+)?)?([eE][+-]?[0-9_]+)?$");
+    let caps = float_literal_regex
+        .captures(symbol)
+        .ok_or("invalid float literal")?;
+    Ok(FloatSymbolParts {
+        integer_part: caps.get(1).ok_or("missing integer part")?.as_str(),
+        fractional_part: caps.get(2).map(|m| m.as_str()),
+        exponent: caps.get(3).map(|m| m.as_str()),
+    })
+}
+
 #[cfg(test)]
 mod test {
-    use super::last_line_offsetted;
+    use super::*;
 
     #[test]
     fn test_last_line_offsetted() {
@@ -2342,5 +2428,94 @@ mod test {
         assert_eq!(last_line_offsetted(2, lines), true);
         let lines = "one\n two      three";
         assert_eq!(last_line_offsetted(2, lines), false);
+    }
+
+    #[test]
+    fn test_parse_float_symbol() {
+        let parts = parse_float_symbol("123.456e789").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, Some("456"));
+        assert_eq!(parts.exponent, Some("e789"));
+
+        let parts = parse_float_symbol("123.456e+789").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, Some("456"));
+        assert_eq!(parts.exponent, Some("e+789"));
+
+        let parts = parse_float_symbol("123.456e-789").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, Some("456"));
+        assert_eq!(parts.exponent, Some("e-789"));
+
+        let parts = parse_float_symbol("123e789").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, None);
+        assert_eq!(parts.exponent, Some("e789"));
+
+        let parts = parse_float_symbol("123E789").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, None);
+        assert_eq!(parts.exponent, Some("E789"));
+
+        let parts = parse_float_symbol("123.").unwrap();
+        assert_eq!(parts.integer_part, "123");
+        assert_eq!(parts.fractional_part, None);
+        assert_eq!(parts.exponent, None);
+    }
+
+    #[test]
+    fn test_parse_float_symbol_with_underscores() {
+        let parts = parse_float_symbol("_123._456e_789").unwrap();
+        assert_eq!(parts.integer_part, "_123");
+        assert_eq!(parts.fractional_part, Some("_456"));
+        assert_eq!(parts.exponent, Some("e_789"));
+
+        let parts = parse_float_symbol("123_.456_e789_").unwrap();
+        assert_eq!(parts.integer_part, "123_");
+        assert_eq!(parts.fractional_part, Some("456_"));
+        assert_eq!(parts.exponent, Some("e789_"));
+
+        let parts = parse_float_symbol("1_23.4_56e7_89").unwrap();
+        assert_eq!(parts.integer_part, "1_23");
+        assert_eq!(parts.fractional_part, Some("4_56"));
+        assert_eq!(parts.exponent, Some("e7_89"));
+
+        let parts = parse_float_symbol("_1_23_._4_56_e_7_89_").unwrap();
+        assert_eq!(parts.integer_part, "_1_23_");
+        assert_eq!(parts.fractional_part, Some("_4_56_"));
+        assert_eq!(parts.exponent, Some("e_7_89_"));
+    }
+
+    #[test]
+    fn test_float_lit_ends_in_dot() {
+        type TZ = FloatLiteralTrailingZero;
+
+        assert!(float_lit_ends_in_dot("1.", None, TZ::Preserve));
+        assert!(!float_lit_ends_in_dot("1.0", None, TZ::Preserve));
+        assert!(!float_lit_ends_in_dot("1.e2", None, TZ::Preserve));
+        assert!(!float_lit_ends_in_dot("1.0e2", None, TZ::Preserve));
+        assert!(!float_lit_ends_in_dot("1.", Some("f32"), TZ::Preserve));
+        assert!(!float_lit_ends_in_dot("1.0", Some("f32"), TZ::Preserve));
+
+        assert!(!float_lit_ends_in_dot("1.", None, TZ::Always));
+        assert!(!float_lit_ends_in_dot("1.0", None, TZ::Always));
+        assert!(!float_lit_ends_in_dot("1.e2", None, TZ::Always));
+        assert!(!float_lit_ends_in_dot("1.0e2", None, TZ::Always));
+        assert!(!float_lit_ends_in_dot("1.", Some("f32"), TZ::Always));
+        assert!(!float_lit_ends_in_dot("1.0", Some("f32"), TZ::Always));
+
+        assert!(!float_lit_ends_in_dot("1.", None, TZ::IfNoPostfix));
+        assert!(!float_lit_ends_in_dot("1.0", None, TZ::IfNoPostfix));
+        assert!(!float_lit_ends_in_dot("1.e2", None, TZ::IfNoPostfix));
+        assert!(!float_lit_ends_in_dot("1.0e2", None, TZ::IfNoPostfix));
+        assert!(!float_lit_ends_in_dot("1.", Some("f32"), TZ::IfNoPostfix));
+        assert!(!float_lit_ends_in_dot("1.0", Some("f32"), TZ::IfNoPostfix));
+
+        assert!(float_lit_ends_in_dot("1.", None, TZ::Never));
+        assert!(float_lit_ends_in_dot("1.0", None, TZ::Never));
+        assert!(!float_lit_ends_in_dot("1.e2", None, TZ::Never));
+        assert!(!float_lit_ends_in_dot("1.0e2", None, TZ::Never));
+        assert!(!float_lit_ends_in_dot("1.", Some("f32"), TZ::Never));
+        assert!(!float_lit_ends_in_dot("1.0", Some("f32"), TZ::Never));
     }
 }

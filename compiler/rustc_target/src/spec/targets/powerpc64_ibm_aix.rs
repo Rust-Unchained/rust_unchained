@@ -1,11 +1,17 @@
-use crate::spec::{Cc, LinkerFlavor, Target, TargetMetadata, base};
+use crate::spec::{Arch, Cc, LinkerFlavor, Target, TargetMetadata, base};
 
 pub(crate) fn target() -> Target {
     let mut base = base::aix::opts();
     base.max_atomic_width = Some(64);
     base.add_pre_link_args(
         LinkerFlavor::Unix(Cc::No),
-        &["-b64", "-bpT:0x100000000", "-bpD:0x110000000", "-bcdtors:all:0:s"],
+        &[
+            "-b64",
+            "-bpT:0x100000000",
+            "-bpD:0x110000000",
+            "-bcdtors:mbr:0:s",
+            "-bdbg:namedsects:ss", // PGO and ifunc support depends on the named sections linker feature
+        ],
     );
 
     Target {
@@ -17,8 +23,9 @@ pub(crate) fn target() -> Target {
             std: None, // ?
         },
         pointer_width: 64,
-        data_layout: "E-m:a-Fi64-i64:64-i128:128-n32:64-S128-v256:256:256-v512:512:512".into(),
-        arch: "powerpc64".into(),
+        data_layout: "E-m:a-Fi64-i64:64-i128:128-n32:64-f64:32:64-S128-v256:256:256-v512:512:512"
+            .into(),
+        arch: Arch::PowerPC64,
         options: base,
     }
 }

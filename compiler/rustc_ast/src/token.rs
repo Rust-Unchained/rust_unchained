@@ -5,24 +5,45 @@ pub use LitKind::*;
 pub use NtExprKind::*;
 pub use NtPatKind::*;
 pub use TokenKind::*;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::edition::Edition;
-use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, kw, sym};
-#[allow(clippy::useless_attribute)] // FIXME: following use of `hidden_glob_reexports` incorrectly triggers `useless_attribute` lint.
-#[allow(hidden_glob_reexports)]
-use rustc_span::{Ident, Symbol};
+use rustc_span::symbol::IdentPrintMode;
+use rustc_span::{self as sp, DUMMY_SP, ErrorGuaranteed, Span, Symbol, kw, sym};
 
 use crate::ast;
 use crate::util::case::Case;
 
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+/// Represents the kind of doc comment it is, ie `///` or `#[doc = ""]`.
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug, StableHash)]
+pub enum DocFragmentKind {
+    /// A sugared doc comment: `///` or `//!` or `/**` or `/*!`.
+    Sugared(CommentKind),
+    /// A "raw" doc comment: `#[doc = ""]`. The `Span` represents the string literal.
+    Raw(Span),
+}
+
+impl DocFragmentKind {
+    pub fn is_sugared(self) -> bool {
+        matches!(self, Self::Sugared(_))
+    }
+
+    /// If it is `Sugared`, it will return its associated `CommentKind`, otherwise it will return
+    /// `CommentKind::Line`.
+    pub fn comment_kind(self) -> CommentKind {
+        match self {
+            Self::Sugared(kind) => kind,
+            Self::Raw(_) => CommentKind::Line,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub enum CommentKind {
     Line,
     Block,
 }
 
-// This type must not implement `Hash` due to the unusual `PartialEq` impl below.
-#[derive(Copy, Clone, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Encodable, Decodable, StableHash)]
 pub enum InvisibleOrigin {
     // From the expansion of a metavariable in a declarative macro.
     MetaVar(MetaVarKind),
@@ -44,22 +65,8 @@ impl InvisibleOrigin {
     }
 }
 
-impl PartialEq for InvisibleOrigin {
-    #[inline]
-    fn eq(&self, _other: &InvisibleOrigin) -> bool {
-        // When we had AST-based nonterminals we couldn't compare them, and the
-        // old `Nonterminal` type had an `eq` that always returned false,
-        // resulting in this restriction:
-        // https://doc.rust-lang.org/nightly/reference/macros-by-example.html#forwarding-a-matched-fragment
-        // This `eq` emulates that behaviour. We could consider lifting this
-        // restriction now but there are still cases involving invisible
-        // delimiters that make it harder than it first appears.
-        false
-    }
-}
-
 /// Annoyingly similar to `NonterminalKind`, but the slight differences are important.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, StableHash)]
 pub enum MetaVarKind {
     Item,
     Block,
@@ -84,6 +91,7 @@ pub enum MetaVarKind {
     },
     Path,
     Vis,
+    Guard,
     TT,
 }
 
@@ -104,6 +112,7 @@ impl fmt::Display for MetaVarKind {
             MetaVarKind::Meta { .. } => sym::meta,
             MetaVarKind::Path => sym::path,
             MetaVarKind::Vis => sym::vis,
+            MetaVarKind::Guard => sym::guard,
             MetaVarKind::TT => sym::tt,
         };
         write!(f, "{sym}")
@@ -113,7 +122,7 @@ impl fmt::Display for MetaVarKind {
 /// Describes how a sequence of token trees is delimited.
 /// Cannot use `proc_macro::Delimiter` directly because this
 /// structure should implement some additional traits.
-#[derive(Copy, Clone, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub enum Delimiter {
     /// `( ... )`
     Parenthesis,
@@ -141,7 +150,8 @@ impl Delimiter {
         }
     }
 
-    // This exists because `InvisibleOrigin`s should be compared. It is only used for assertions.
+    // This exists because `InvisibleOrigin`s should not be compared. It is only used for
+    // assertions.
     pub fn eq_ignoring_invisible_origin(&self, other: &Delimiter) -> bool {
         match (self, other) {
             (Delimiter::Parenthesis, Delimiter::Parenthesis) => true,
@@ -175,7 +185,7 @@ impl Delimiter {
 // type. This means that float literals like `1f32` are classified by this type
 // as `Int`. Only upon conversion to `ast::LitKind` will such a literal be
 // given the `Float` kind.
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub enum LitKind {
     Bool, // AST only, must never appear in a `Token`
     Byte,
@@ -192,7 +202,7 @@ pub enum LitKind {
 }
 
 /// A literal token.
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub struct Lit {
     pub kind: LitKind,
     pub symbol: Symbol,
@@ -338,10 +348,25 @@ fn ident_can_begin_type(name: Symbol, span: Span, is_raw: IdentIsRaw) -> bool {
             .contains(&name)
 }
 
-#[derive(PartialEq, Encodable, Decodable, Debug, Copy, Clone, HashStable_Generic)]
+#[derive(PartialEq, Eq, Encodable, Decodable, Hash, Debug, Copy, Clone, StableHash)]
 pub enum IdentIsRaw {
     No,
     Yes,
+}
+
+impl IdentIsRaw {
+    pub fn to_print_mode_ident(self) -> IdentPrintMode {
+        match self {
+            IdentIsRaw::No => IdentPrintMode::Normal,
+            IdentIsRaw::Yes => IdentPrintMode::RawIdent,
+        }
+    }
+    pub fn to_print_mode_lifetime(self) -> IdentPrintMode {
+        match self {
+            IdentIsRaw::No => IdentPrintMode::Normal,
+            IdentIsRaw::Yes => IdentPrintMode::RawLifetime,
+        }
+    }
 }
 
 impl From<bool> for IdentIsRaw {
@@ -350,13 +375,7 @@ impl From<bool> for IdentIsRaw {
     }
 }
 
-impl From<IdentIsRaw> for bool {
-    fn from(is_raw: IdentIsRaw) -> bool {
-        matches!(is_raw, IdentIsRaw::Yes)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub enum TokenKind {
     /* Expression-operator symbols. */
     /// `=`
@@ -484,7 +503,7 @@ pub enum TokenKind {
     /// This identifier (and its span) is the identifier passed to the
     /// declarative macro. The span in the surrounding `Token` is the span of
     /// the `ident` metavariable in the macro's RHS.
-    NtIdent(Ident, IdentIsRaw),
+    NtIdent(sp::Ident, IdentIsRaw),
 
     /// Lifetime identifier token.
     /// Do not forget about `NtLifetime` when you want to match on lifetime identifiers.
@@ -495,7 +514,7 @@ pub enum TokenKind {
     /// This identifier (and its span) is the lifetime passed to the
     /// declarative macro. The span in the surrounding `Token` is the span of
     /// the `lifetime` metavariable in the macro's RHS.
-    NtLifetime(Ident, IdentIsRaw),
+    NtLifetime(sp::Ident, IdentIsRaw),
 
     /// A doc comment token.
     /// `Symbol` is the doc comment's data excluding its "quotes" (`///`, `/**`, etc)
@@ -506,7 +525,7 @@ pub enum TokenKind {
     Eof,
 }
 
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, Debug, StableHash)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -605,17 +624,17 @@ impl TokenKind {
 }
 
 impl Token {
-    pub fn new(kind: TokenKind, span: Span) -> Self {
+    pub const fn new(kind: TokenKind, span: Span) -> Self {
         Token { kind, span }
     }
 
     /// Some token that will be thrown away later.
-    pub fn dummy() -> Self {
+    pub const fn dummy() -> Self {
         Token::new(TokenKind::Question, DUMMY_SP)
     }
 
     /// Recovers a `Token` from an `Ident`. This creates a raw identifier if necessary.
-    pub fn from_ast_ident(ident: Ident) -> Self {
+    pub fn from_ast_ident(ident: sp::Ident) -> Self {
         Token::new(Ident(ident.name, ident.is_raw_guess().into()), ident.span)
     }
 
@@ -666,10 +685,10 @@ impl Token {
             Lifetime(..)                      | // labeled loop
             Pound                             => true, // expression attributes
             OpenInvisible(InvisibleOrigin::MetaVar(
-                MetaVarKind::Block |
-                MetaVarKind::Expr { .. } |
-                MetaVarKind::Literal |
-                MetaVarKind::Path
+                MetaVarKind::Block
+                | MetaVarKind::Expr { .. }
+                | MetaVarKind::Literal
+                | MetaVarKind::Path,
             )) => true,
             _ => false,
         }
@@ -677,7 +696,7 @@ impl Token {
 
     /// Returns `true` if the token can appear at the start of a pattern.
     ///
-    /// Shamelessly borrowed from `can_begin_expr`, only used for diagnostics right now.
+    /// Shamelessly borrowed from `can_begin_expr`.
     pub fn can_begin_pattern(&self, pat_kind: NtPatKind) -> bool {
         match &self.uninterpolate().kind {
             // box, ref, mut, and other identifiers (can stricten)
@@ -695,12 +714,12 @@ impl Token {
             Shl => true,                         // path (double UFCS)
             Or => matches!(pat_kind, PatWithOr), // leading vert `|` or-pattern
             OpenInvisible(InvisibleOrigin::MetaVar(
-                MetaVarKind::Expr { .. } |
-                MetaVarKind::Literal |
-                MetaVarKind::Meta { .. } |
-                MetaVarKind::Pat(_) |
-                MetaVarKind::Path |
-                MetaVarKind::Ty { .. }
+                MetaVarKind::Expr { .. }
+                | MetaVarKind::Literal
+                | MetaVarKind::Meta { .. }
+                | MetaVarKind::Pat(_)
+                | MetaVarKind::Path
+                | MetaVarKind::Ty { .. },
             )) => true,
             _ => false,
         }
@@ -711,20 +730,19 @@ impl Token {
         match self.uninterpolate().kind {
             Ident(name, is_raw) =>
                 ident_can_begin_type(name, self.span, is_raw), // type name or keyword
-            OpenParen                         | // tuple
-            OpenBracket                       | // array
-            Bang                              | // never
-            Star                              | // raw pointer
-            And                               | // reference
-            AndAnd                            | // double reference
-            Question                          | // maybe bound in trait object
-            Lifetime(..)                      | // lifetime bound in trait object
-            Lt | Shl                          | // associated path
-            PathSep => true,                    // global path
-            OpenInvisible(InvisibleOrigin::MetaVar(
-                MetaVarKind::Ty { .. } |
-                MetaVarKind::Path
-            )) => true,
+            OpenParen          // tuple
+            | OpenBracket      // array
+            | Bang             // never
+            | Star             // raw pointer
+            | And              // reference
+            | AndAnd           // double reference
+            | Question         // maybe bound in trait object
+            | Lifetime(..)     // lifetime bound in trait object
+            | Lt | Shl         // associated path
+            | PathSep => true, // global path
+            OpenInvisible(InvisibleOrigin::MetaVar(MetaVarKind::Ty { .. } | MetaVarKind::Path)) => {
+                true
+            }
             // For anonymous structs or unions, which only appear in specific positions
             // (type of struct fields or union fields), we don't consider them as regular types
             _ => false,
@@ -824,10 +842,10 @@ impl Token {
 
     /// Returns an identifier if this token is an identifier.
     #[inline]
-    pub fn ident(&self) -> Option<(Ident, IdentIsRaw)> {
+    pub fn ident(&self) -> Option<(sp::Ident, IdentIsRaw)> {
         // We avoid using `Token::uninterpolate` here because it's slow.
         match self.kind {
-            Ident(name, is_raw) => Some((Ident::new(name, self.span), is_raw)),
+            Ident(name, is_raw) => Some((sp::Ident::new(name, self.span), is_raw)),
             NtIdent(ident, is_raw) => Some((ident, is_raw)),
             _ => None,
         }
@@ -835,10 +853,10 @@ impl Token {
 
     /// Returns a lifetime identifier if this token is a lifetime.
     #[inline]
-    pub fn lifetime(&self) -> Option<(Ident, IdentIsRaw)> {
+    pub fn lifetime(&self) -> Option<(sp::Ident, IdentIsRaw)> {
         // We avoid using `Token::uninterpolate` here because it's slow.
         match self.kind {
-            Lifetime(name, is_raw) => Some((Ident::new(name, self.span), is_raw)),
+            Lifetime(name, is_raw) => Some((sp::Ident::new(name, self.span), is_raw)),
             NtLifetime(ident, is_raw) => Some((ident, is_raw)),
             _ => None,
         }
@@ -885,15 +903,15 @@ impl Token {
     }
 
     pub fn is_qpath_start(&self) -> bool {
-        self == &Lt || self == &Shl
+        matches!(self.kind, Lt | Shl)
     }
 
     pub fn is_path_start(&self) -> bool {
-        self == &PathSep
+        self.kind == PathSep
             || self.is_qpath_start()
             || matches!(self.is_metavar_seq(), Some(MetaVarKind::Path))
             || self.is_path_segment_keyword()
-            || self.is_ident() && !self.is_reserved_ident()
+            || self.is_non_reserved_ident()
     }
 
     /// Returns `true` if the token is a given keyword, `kw`.
@@ -913,28 +931,32 @@ impl Token {
     }
 
     pub fn is_path_segment_keyword(&self) -> bool {
-        self.is_non_raw_ident_where(Ident::is_path_segment_keyword)
+        self.is_non_raw_ident_where(sp::Ident::is_path_segment_keyword)
     }
 
     /// Returns true for reserved identifiers used internally for elided lifetimes,
     /// unnamed method parameters, crate root module, error recovery etc.
     pub fn is_special_ident(&self) -> bool {
-        self.is_non_raw_ident_where(Ident::is_special)
+        self.is_non_raw_ident_where(sp::Ident::is_special)
     }
 
     /// Returns `true` if the token is a keyword used in the language.
     pub fn is_used_keyword(&self) -> bool {
-        self.is_non_raw_ident_where(Ident::is_used_keyword)
+        self.is_non_raw_ident_where(sp::Ident::is_used_keyword)
     }
 
     /// Returns `true` if the token is a keyword reserved for possible future use.
     pub fn is_unused_keyword(&self) -> bool {
-        self.is_non_raw_ident_where(Ident::is_unused_keyword)
+        self.is_non_raw_ident_where(sp::Ident::is_unused_keyword)
     }
 
     /// Returns `true` if the token is either a special identifier or a keyword.
     pub fn is_reserved_ident(&self) -> bool {
-        self.is_non_raw_ident_where(Ident::is_reserved)
+        self.is_non_raw_ident_where(sp::Ident::is_reserved)
+    }
+
+    pub fn is_non_reserved_ident(&self) -> bool {
+        self.ident().is_some_and(|(id, raw)| raw == IdentIsRaw::Yes || !sp::Ident::is_reserved(id))
     }
 
     /// Returns `true` if the token is the identifier `true` or `false`.
@@ -955,7 +977,7 @@ impl Token {
     }
 
     /// Returns `true` if the token is a non-raw identifier for which `pred` holds.
-    pub fn is_non_raw_ident_where(&self, pred: impl FnOnce(Ident) -> bool) -> bool {
+    pub fn is_non_raw_ident_where(&self, pred: impl FnOnce(sp::Ident) -> bool) -> bool {
         match self.ident() {
             Some((id, IdentIsRaw::No)) => pred(id),
             _ => false,
@@ -1064,7 +1086,7 @@ impl PartialEq<TokenKind> for Token {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, StableHash)]
 pub enum NtPatKind {
     // Matches or-patterns. Was written using `pat` in edition 2021 or later.
     PatWithOr,
@@ -1074,7 +1096,7 @@ pub enum NtPatKind {
     PatParam { inferred: bool },
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, StableHash)]
 pub enum NtExprKind {
     // Matches expressions using the post-edition 2024. Was written using
     // `expr` in edition 2024 or later.
@@ -1085,7 +1107,8 @@ pub enum NtExprKind {
     Expr2021 { inferred: bool },
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, HashStable_Generic)]
+/// A macro nonterminal, known in documentation as a fragment specifier.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, StableHash)]
 pub enum NonterminalKind {
     Item,
     Block,
@@ -1099,6 +1122,7 @@ pub enum NonterminalKind {
     Meta,
     Path,
     Vis,
+    Guard,
     TT,
 }
 
@@ -1136,6 +1160,7 @@ impl NonterminalKind {
             sym::meta => NonterminalKind::Meta,
             sym::path => NonterminalKind::Path,
             sym::vis => NonterminalKind::Vis,
+            sym::guard => NonterminalKind::Guard,
             sym::tt => NonterminalKind::TT,
             _ => return None,
         })
@@ -1157,6 +1182,7 @@ impl NonterminalKind {
             NonterminalKind::Meta => sym::meta,
             NonterminalKind::Path => sym::path,
             NonterminalKind::Vis => sym::vis,
+            NonterminalKind::Guard => sym::guard,
             NonterminalKind::TT => sym::tt,
         }
     }

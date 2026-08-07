@@ -15,36 +15,35 @@
 //!
 //! More documentation can be found in each respective module below, and you can
 //! also check out the `src/bootstrap/README.md` file for more information.
-#![cfg_attr(test, allow(unused))]
+#![allow(clippy::assertions_on_constants, reason = "false positive for `assert!(cfg!(..))`")]
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use std::{env, fs, io, str};
 
 use build_helper::ci::gha;
-use build_helper::exit;
 use cc::Tool;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use utils::build_stamp::BuildStamp;
 use utils::channel::GitInfo;
+use utils::exec::ExecutionContext;
 
 use crate::core::builder;
 use crate::core::builder::Kind;
-use crate::core::config::{DryRun, LldMode, LlvmLibunwind, TargetSelection, flags};
-use crate::utils::exec::{BehaviorOnFailure, BootstrapCommand, CommandOutput, OutputMode, command};
-use crate::utils::helpers::{
-    self, dir_is_empty, exe, libdir, output, set_file_times, split_debuginfo, symlink_dir,
-};
+use crate::core::config::{BootstrapOverrideLld, DryRun, LlvmLibunwind, TargetSelection, flags};
+use crate::utils::exec::{BootstrapCommand, command};
+use crate::utils::helpers::{self, dir_is_empty, exe, libdir, set_file_times, split_debuginfo};
 
 mod core;
 mod utils;
 
-pub use core::builder::PathSet;
+#[cfg(feature = "tracing")]
+pub use core::builder::STEP_SPAN_TARGET;
+pub use core::builder::{PathSet, StepStack};
 pub use core::config::flags::{Flags, Subcommand};
 pub use core::config::{ChangeId, Config};
 
@@ -53,6 +52,9 @@ use tracing::{instrument, span};
 pub use utils::change_tracker::{
     CONFIG_CHANGE_HISTORY, find_recent_config_change_ids, human_readable_changes,
 };
+pub use utils::helpers::{PanicTracker, symlink_dir};
+#[cfg(feature = "tracing")]
+pub use utils::tracing::setup_tracing;
 
 use crate::core::build_steps::vendor::VENDOR_DIR;
 
@@ -80,11 +82,11 @@ const LLD_FILE_NAMES: &[&str] = &["ld.lld", "ld64.lld", "lld-link", "wasm-ld"];
 /// (Mode restriction, config name, config values (if any))
 #[expect(clippy::type_complexity)] // It's fine for hard-coded list and type is explained above.
 const EXTRA_CHECK_CFGS: &[(Option<Mode>, &str, Option<&[&'static str]>)] = &[
-    (None, "bootstrap", None),
-    (Some(Mode::Rustc), "llvm_enzyme", None),
-    (Some(Mode::Codegen), "llvm_enzyme", None),
-    (Some(Mode::ToolRustc), "llvm_enzyme", None),
-    (Some(Mode::ToolRustc), "rust_analyzer", None),
+    (Some(Mode::Rustc), "bootstrap", None),
+    (Some(Mode::Codegen), "bootstrap", None),
+    (Some(Mode::ToolRustcPrivate), "bootstrap", None),
+    (Some(Mode::ToolStd), "bootstrap", None),
+    (Some(Mode::ToolRustcPrivate), "rust_analyzer", None),
     (Some(Mode::ToolStd), "rust_analyzer", None),
     // Any library specific cfgs like `target_os`, `target_arch` should be put in
     // priority the `[lints.rust.unexpected_cfgs.check-cfg]` table
@@ -119,14 +121,76 @@ impl PartialEq for Compiler {
     }
 }
 
+/// Represents a codegen backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum CodegenBackendKind {
+    #[default]
+    Llvm,
+    Cranelift,
+    Gcc,
+    Custom(String),
+}
+
+impl CodegenBackendKind {
+    /// Name of the codegen backend, as identified in the `compiler` directory
+    /// (`rustc_codegen_<name>`).
+    pub fn name(&self) -> &str {
+        match self {
+            CodegenBackendKind::Llvm => "llvm",
+            CodegenBackendKind::Cranelift => "cranelift",
+            CodegenBackendKind::Gcc => "gcc",
+            CodegenBackendKind::Custom(name) => name,
+        }
+    }
+
+    /// Name of the codegen backend's crate, e.g. `rustc_codegen_cranelift`.
+    pub fn crate_name(&self) -> String {
+        format!("rustc_codegen_{}", self.name())
+    }
+
+    pub fn is_llvm(&self) -> bool {
+        matches!(self, Self::Llvm)
+    }
+
+    pub fn is_cranelift(&self) -> bool {
+        matches!(self, Self::Cranelift)
+    }
+
+    pub fn is_gcc(&self) -> bool {
+        matches!(self, Self::Gcc)
+    }
+}
+
+impl std::str::FromStr for CodegenBackendKind {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "" => Err("Invalid empty backend name"),
+            "gcc" => Ok(Self::Gcc),
+            "llvm" => Ok(Self::Llvm),
+            "cranelift" => Ok(Self::Cranelift),
+            _ => Ok(Self::Custom(s.to_string())),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
-pub enum DocTests {
-    /// Run normal tests and doc tests (default).
-    Yes,
-    /// Do not run any doc tests.
-    No,
+pub enum TestTarget {
+    /// Run unit, integration and doc tests (default).
+    Default,
+    /// Run unit, integration, doc tests, examples, bins, benchmarks (no doc tests).
+    AllTargets,
     /// Only run doc tests.
-    Only,
+    DocOnly,
+    /// Only run unit and integration tests.
+    Tests,
+}
+
+impl TestTarget {
+    fn runs_doctests(&self) -> bool {
+        matches!(self, TestTarget::DocOnly | TestTarget::Default)
+    }
 }
 
 pub enum GitRepo {
@@ -144,7 +208,6 @@ pub enum GitRepo {
 /// although most functions are implemented as free functions rather than
 /// methods specifically on this structure itself (to make it easier to
 /// organize).
-#[derive(Clone)]
 pub struct Build {
     /// User-specified configuration from `bootstrap.toml`.
     config: Config,
@@ -166,11 +229,11 @@ pub struct Build {
     in_tree_gcc_info: GitInfo,
     local_rebuild: bool,
     fail_fast: bool,
-    doc_tests: DocTests,
+    test_target: TestTarget,
     verbosity: usize,
 
     /// Build triple for the pre-compiled snapshot compiler.
-    build: TargetSelection,
+    host_target: TargetSelection,
     /// Which triples to produce a compiler toolchain for.
     hosts: Vec<TargetSelection>,
     /// Which triples to build libraries (core/alloc/std/test/proc_macro) for.
@@ -185,20 +248,24 @@ pub struct Build {
 
     // Runtime state filled in later on
     // C/C++ compilers and archiver for all targets
-    cc: RefCell<HashMap<TargetSelection, cc::Tool>>,
-    cxx: RefCell<HashMap<TargetSelection, cc::Tool>>,
-    ar: RefCell<HashMap<TargetSelection, PathBuf>>,
-    ranlib: RefCell<HashMap<TargetSelection, PathBuf>>,
+    cc: HashMap<TargetSelection, cc::Tool>,
+    cxx: HashMap<TargetSelection, cc::Tool>,
+    ar: HashMap<TargetSelection, PathBuf>,
+    ranlib: HashMap<TargetSelection, PathBuf>,
+    wasi_sdk_path: Option<PathBuf>,
+
     // Miscellaneous
     // allow bidirectional lookups: both name -> path and path -> name
     crates: HashMap<String, Crate>,
     crate_paths: HashMap<PathBuf, String>,
     is_sudo: bool,
-    delayed_failures: RefCell<Vec<String>>,
     prerelease_version: Cell<Option<u32>>,
 
     #[cfg(feature = "build-metrics")]
     metrics: crate::utils::metrics::BuildMetrics,
+
+    #[cfg(feature = "tracing")]
+    step_graph: std::cell::RefCell<crate::utils::step_graph::StepGraph>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +297,7 @@ pub enum DependencyType {
 ///
 /// These entries currently correspond to the various output directories of the
 /// build system, with each mod generating output in a different directory.
-#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Build the standard library, placing output in the "stageN-std" directory.
     Std,
@@ -241,37 +308,68 @@ pub enum Mode {
     /// Build a codegen backend for rustc, placing the output in the "stageN-codegen" directory.
     Codegen,
 
-    /// Build a tool, placing output in the "stage0-bootstrap-tools"
-    /// directory. This is for miscellaneous sets of tools that are built
-    /// using the bootstrap stage0 compiler in its entirety (target libraries
-    /// and all). Typically these tools compile with stable Rust.
+    /// Build a tool, placing output in the "bootstrap-tools"
+    /// directory. This is for miscellaneous sets of tools that extend
+    /// bootstrap.
     ///
-    /// Only works for stage 0.
+    /// These tools are intended to be only executed on the host system that
+    /// invokes bootstrap, and they thus cannot be cross-compiled.
+    ///
+    /// They are always built using the stage0 compiler, and they
+    /// can be compiled with stable Rust.
+    ///
+    /// These tools also essentially do not participate in staging.
     ToolBootstrap,
 
+    /// Build a cross-compilable helper tool. These tools do not depend on unstable features or
+    /// compiler internals, but they might be cross-compilable (so we cannot build them using the
+    /// stage0 compiler, unlike `ToolBootstrap`).
+    ///
+    /// Some of these tools are also shipped in our `dist` archives.
+    /// While we could compile them using the stage0 compiler when not cross-compiling, we instead
+    /// use the in-tree compiler (and std) to build them, so that we can ship e.g. std security
+    /// fixes and avoid depending fully on stage0 for the artifacts that we ship.
+    ///
+    /// This mode is used e.g. for linkers and linker tools invoked by rustc on its host target.
+    ToolTarget,
+
     /// Build a tool which uses the locally built std, placing output in the
-    /// "stageN-tools" directory. Its usage is quite rare, mainly used by
-    /// compiletest which needs libtest.
+    /// "stageN-tools" directory. Its usage is quite rare; historically it was
+    /// needed by compiletest, but now it is mainly used by `test-float-parse`.
     ToolStd,
 
-    /// Build a tool which uses the locally built rustc and the target std,
+    /// Build a tool which uses the `rustc_private` mechanism, and thus
+    /// the locally built rustc rlib artifacts,
     /// placing the output in the "stageN-tools" directory. This is used for
-    /// anything that needs a fully functional rustc, such as rustdoc, clippy,
-    /// cargo, rustfmt, miri, etc.
-    ToolRustc,
+    /// everything that links to rustc as a library, such as rustdoc, clippy,
+    /// rustfmt, miri, etc.
+    ToolRustcPrivate,
 }
 
 impl Mode {
-    pub fn is_tool(&self) -> bool {
-        matches!(self, Mode::ToolBootstrap | Mode::ToolRustc | Mode::ToolStd)
-    }
-
     pub fn must_support_dlopen(&self) -> bool {
-        matches!(self, Mode::Std | Mode::Codegen)
+        match self {
+            Mode::Std | Mode::Codegen => true,
+            Mode::ToolBootstrap
+            | Mode::ToolRustcPrivate
+            | Mode::ToolStd
+            | Mode::ToolTarget
+            | Mode::Rustc => false,
+        }
     }
 }
 
-#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// When `rust.rust_remap_debuginfo` is requested, the compiler needs to know how to
+/// opportunistically unremap compiler vs non-compiler sources. We use two schemes,
+/// [`RemapScheme::Compiler`] and [`RemapScheme::NonCompiler`].
+pub enum RemapScheme {
+    /// The [`RemapScheme::Compiler`] scheme will remap to `/rustc-dev/{hash}`.
+    Compiler,
+    /// The [`RemapScheme::NonCompiler`] scheme will remap to `/rustc/{hash}`.
+    NonCompiler,
+}
+
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 pub enum CLang {
     C,
     Cxx,
@@ -317,14 +415,32 @@ macro_rules! forward {
 }
 
 forward! {
-    verbose(f: impl Fn()),
+    do_if_verbose(f: impl Fn()),
     is_verbose() -> bool,
     create(path: &Path, s: &str),
     remove(f: &Path),
     tempdir() -> PathBuf,
     llvm_link_shared() -> bool,
     download_rustc() -> bool,
-    initial_rustfmt() -> Option<PathBuf>,
+}
+
+/// An alternative way of specifying what target and stage is involved in some bootstrap activity.
+/// Ideally using a `Compiler` directly should be preferred.
+struct TargetAndStage {
+    target: TargetSelection,
+    stage: u32,
+}
+
+impl From<(TargetSelection, u32)> for TargetAndStage {
+    fn from((target, stage): (TargetSelection, u32)) -> Self {
+        Self { target, stage }
+    }
+}
+
+impl From<Compiler> for TargetAndStage {
+    fn from(compiler: Compiler) -> Self {
+        Self { target: compiler.host, stage: compiler.stage }
+    }
 }
 
 impl Build {
@@ -363,19 +479,38 @@ impl Build {
         let in_tree_llvm_info = config.in_tree_llvm_info.clone();
         let in_tree_gcc_info = config.in_tree_gcc_info.clone();
 
-        let initial_target_libdir_str =
-            config.initial_sysroot.join("lib/rustlib").join(config.build).join("lib");
+        let initial_target_libdir = command(&config.initial_rustc)
+            .run_in_dry_run()
+            .args(["--print", "target-libdir"])
+            .run_capture_stdout(&config)
+            .stdout()
+            .trim()
+            .to_owned();
 
-        let initial_target_dir = Path::new(&initial_target_libdir_str).parent().unwrap();
+        let initial_target_dir = Path::new(&initial_target_libdir)
+            .parent()
+            .unwrap_or_else(|| panic!("{initial_target_libdir} has no parent"));
+
         let initial_lld = initial_target_dir.join("bin").join("rust-lld");
 
-        let initial_relative_libdir = initial_target_dir
-            .ancestors()
-            .nth(2)
-            .unwrap()
-            .strip_prefix(&config.initial_sysroot)
-            .expect("Couldn’t determine initial relative libdir.")
-            .to_path_buf();
+        let initial_relative_libdir = if cfg!(test) {
+            // On tests, bootstrap uses the shim rustc, not the one from the stage0 toolchain.
+            PathBuf::default()
+        } else {
+            let ancestor = initial_target_dir.ancestors().nth(2).unwrap_or_else(|| {
+                panic!("Not enough ancestors for {}", initial_target_dir.display())
+            });
+
+            ancestor
+                .strip_prefix(&config.initial_sysroot)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Couldn’t resolve the initial relative libdir from {}",
+                        initial_target_dir.display()
+                    )
+                })
+                .to_path_buf()
+        };
 
         let version = std::fs::read_to_string(src.join("src").join("version"))
             .expect("failed to read src/version");
@@ -391,7 +526,7 @@ impl Build {
         if bootstrap_out.ends_with("deps") {
             bootstrap_out.pop();
         }
-        if !bootstrap_out.join(exe("rustc", config.build)).exists() && !cfg!(test) {
+        if !bootstrap_out.join(exe("rustc", config.host_target)).exists() && !cfg!(test) {
             // this restriction can be lifted whenever https://github.com/rust-lang/rfcs/pull/3028 is implemented
             panic!(
                 "`rustc` not found in {}, run `cargo build --bins` before `cargo run`",
@@ -407,15 +542,15 @@ impl Build {
             initial_lld,
             initial_relative_libdir,
             initial_rustc: config.initial_rustc.clone(),
-            initial_rustdoc: config.initial_rustc.with_file_name(exe("rustdoc", config.build)),
+            initial_rustdoc: config.initial_rustdoc.clone(),
             initial_cargo: config.initial_cargo.clone(),
             initial_sysroot: config.initial_sysroot.clone(),
             local_rebuild: config.local_rebuild,
             fail_fast: config.cmd.fail_fast(),
-            doc_tests: config.cmd.doc_tests(),
-            verbosity: config.verbose,
+            test_target: config.cmd.test_target(),
+            verbosity: config.exec_ctx.verbosity as usize,
 
-            build: config.build,
+            host_target: config.host_target,
             hosts: config.hosts.clone(),
             targets: config.targets.clone(),
 
@@ -433,24 +568,30 @@ impl Build {
             enzyme_info,
             in_tree_llvm_info,
             in_tree_gcc_info,
-            cc: RefCell::new(HashMap::new()),
-            cxx: RefCell::new(HashMap::new()),
-            ar: RefCell::new(HashMap::new()),
-            ranlib: RefCell::new(HashMap::new()),
+            cc: HashMap::new(),
+            cxx: HashMap::new(),
+            ar: HashMap::new(),
+            ranlib: HashMap::new(),
+            wasi_sdk_path: env::var_os("WASI_SDK_PATH").map(PathBuf::from),
             crates: HashMap::new(),
             crate_paths: HashMap::new(),
             is_sudo,
-            delayed_failures: RefCell::new(Vec::new()),
             prerelease_version: Cell::new(None),
 
             #[cfg(feature = "build-metrics")]
             metrics: crate::utils::metrics::BuildMetrics::init(),
+
+            #[cfg(feature = "tracing")]
+            step_graph: std::cell::RefCell::new(crate::utils::step_graph::StepGraph::default()),
         };
 
         // If local-rust is the same major.minor as the current version, then force a
         // local-rebuild
-        let local_version_verbose =
-            output(Command::new(&build.initial_rustc).arg("--version").arg("--verbose"));
+        let local_version_verbose = command(&build.initial_rustc)
+            .run_in_dry_run()
+            .args(["--version", "--verbose"])
+            .run_capture_stdout(&build)
+            .stdout();
         let local_release = local_version_verbose
             .lines()
             .filter_map(|x| x.strip_prefix("release:"))
@@ -458,24 +599,24 @@ impl Build {
             .unwrap()
             .trim();
         if local_release.split('.').take(2).eq(version.split('.').take(2)) {
-            build.verbose(|| println!("auto-detected local-rebuild {local_release}"));
+            build.do_if_verbose(|| println!("auto-detected local-rebuild {local_release}"));
             build.local_rebuild = true;
         }
 
-        build.verbose(|| println!("finding compilers"));
-        utils::cc_detect::find(&build);
+        build.do_if_verbose(|| println!("finding compilers"));
+        utils::cc_detect::fill_compilers(&mut build);
         // When running `setup`, the profile is about to change, so any requirements we have now may
         // be different on the next invocation. Don't check for them until the next time x.py is
         // run. This is ok because `setup` never runs any build commands, so it won't fail if commands are missing.
         //
         // Similarly, for `setup` we don't actually need submodules or cargo metadata.
         if !matches!(build.config.cmd, Subcommand::Setup { .. }) {
-            build.verbose(|| println!("running sanity check"));
+            build.do_if_verbose(|| println!("running sanity check"));
             crate::core::sanity::check(&mut build);
 
             // Make sure we update these before gathering metadata so we don't get an error about missing
             // Cargo.toml files.
-            let rust_submodules = ["library/backtrace", "library/stdarch"];
+            let rust_submodules = ["library/backtrace"];
             for s in rust_submodules {
                 build.require_submodule(
                     s,
@@ -488,12 +629,12 @@ impl Build {
             // Now, update all existing submodules.
             build.update_existing_submodules();
 
-            build.verbose(|| println!("learning about cargo"));
+            build.do_if_verbose(|| println!("learning about cargo"));
             crate::core::metadata::build(&mut build);
         }
 
         // Create symbolic link to use host sysroot from a consistent path (e.g., in the rust-analyzer config file).
-        let build_triple = build.out.join(build.build);
+        let build_triple = build.out.join(build.host_target);
         t!(fs::create_dir_all(&build_triple));
         let host = build.out.join("host");
         if host.is_symlink() {
@@ -534,6 +675,10 @@ impl Build {
             return;
         }
 
+        if self.config.dry_run() {
+            return;
+        }
+
         // When testing bootstrap itself, it is much faster to ignore
         // submodules. Almost all Steps work fine without their submodules.
         if cfg!(test) && !self.config.submodules() {
@@ -555,14 +700,6 @@ impl Build {
                  but it is required for this step{maybe_enable}{err_hint}"
             );
             exit!(1);
-        }
-    }
-
-    /// Updates all submodules, and exits with an error if submodule
-    /// management is disabled and the submodule does not exist.
-    pub fn require_and_update_all_submodules(&self) {
-        for submodule in build_helper::util::parse_gitmodules(&self.src) {
-            self.require_submodule(submodule, None);
         }
     }
 
@@ -600,7 +737,7 @@ impl Build {
             return;
         }
 
-        if GitInfo::new(false, Path::new(submodule)).is_managed_git_subrepository() {
+        if config.git_info(false, Path::new(submodule)).is_managed_git_subrepository() {
             config.update_submodule(submodule);
         }
     }
@@ -613,18 +750,12 @@ impl Build {
             crate::utils::job::setup(self);
         }
 
-        // Download rustfmt early so that it can be used in rust-analyzer configs.
-        trace!("downloading rustfmt early");
-        let _ = &builder::Builder::new(self).initial_rustfmt();
-
         // Handle hard-coded subcommands.
         {
             #[cfg(feature = "tracing")]
-            let _hardcoded_span = span!(
-                tracing::Level::DEBUG,
-                "handling hardcoded subcommands (Format, Suggest, Perf)"
-            )
-            .entered();
+            let _hardcoded_span =
+                span!(tracing::Level::DEBUG, "handling hardcoded subcommands (Format, Perf)")
+                    .entered();
 
             match &self.config.cmd {
                 Subcommand::Format { check, all } => {
@@ -634,9 +765,6 @@ impl Build {
                         *all,
                         &self.config.paths,
                     );
-                }
-                Subcommand::Suggest { run } => {
-                    return core::build_steps::suggest::suggest(&builder::Builder::new(self), *run);
                 }
                 Subcommand::Perf(args) => {
                     return core::build_steps::perf::perf(&builder::Builder::new(self), args);
@@ -659,7 +787,7 @@ impl Build {
                 #[cfg(feature = "tracing")]
                 let _sanity_check_span =
                     span!(tracing::Level::DEBUG, "(1) executing dry-run sanity-check").entered();
-                self.config.dry_run = DryRun::SelfCheck;
+                self.config.set_dry_run(DryRun::SelfCheck);
                 let builder = builder::Builder::new(self);
                 builder.execute_cli();
             }
@@ -669,7 +797,7 @@ impl Build {
                 #[cfg(feature = "tracing")]
                 let _actual_run_span =
                     span!(tracing::Level::DEBUG, "(2) executing actual run").entered();
-                self.config.dry_run = DryRun::Disabled;
+                self.config.set_dry_run(DryRun::Disabled);
                 let builder = builder::Builder::new(self);
                 builder.execute_cli();
             }
@@ -685,14 +813,7 @@ impl Build {
         debug!("checking for postponed test failures from `test  --no-fail-fast`");
 
         // Check for postponed failures from `test --no-fail-fast`.
-        let failures = self.delayed_failures.borrow();
-        if !failures.is_empty() {
-            eprintln!("\n{} command(s) did not execute successfully:\n", failures.len());
-            for failure in failures.iter() {
-                eprintln!("  - {failure}\n");
-            }
-            exit!(1);
-        }
+        self.config.exec_ctx().report_failures_and_exit();
 
         #[cfg(feature = "build-metrics")]
         self.metrics.persist(self);
@@ -741,15 +862,30 @@ impl Build {
             crates.is_empty() || possible_features_by_crates.contains(feature)
         };
         let mut features = vec![];
-        if self.config.jemalloc(target) && check("jemalloc") {
-            features.push("jemalloc");
+
+        if let Some(allocator_feature_name) = self.config.allocator(target).feature_name()
+            && check(allocator_feature_name)
+        {
+            features.push(allocator_feature_name);
         }
         if (self.config.llvm_enabled(target) || kind == Kind::Check) && check("llvm") {
             features.push("llvm");
         }
+        if self.config.llvm_offload {
+            features.push("llvm_offload");
+        }
         // keep in sync with `bootstrap/compile.rs:rustc_cargo_env`
         if self.config.rust_randomize_layout && check("rustc_randomized_layouts") {
             features.push("rustc_randomized_layouts");
+        }
+        if self.config.compile_time_deps && kind == Kind::Check {
+            features.push("check_only");
+        }
+
+        if crates.iter().any(|c| c == "rustc_transmute") {
+            // for `x test rustc_transmute`, this feature isn't enabled automatically by a
+            // dependent crate.
+            features.push("rustc");
         }
 
         // If debug logging is on, then we want the default for tracing:
@@ -766,36 +902,69 @@ impl Build {
 
     /// Component directory that Cargo will produce output into (e.g.
     /// release/debug)
-    fn cargo_dir(&self) -> &'static str {
-        if self.config.rust_optimize.is_release() { "release" } else { "debug" }
+    fn cargo_dir(&self, mode: Mode) -> &'static str {
+        match (mode, self.config.rust_optimize.is_release()) {
+            (Mode::Std, _) => "dist",
+            (_, true) => "release",
+            (_, false) => "debug",
+        }
     }
 
-    fn tools_dir(&self, compiler: Compiler) -> PathBuf {
-        let out = self.out.join(compiler.host).join(format!("stage{}-tools-bin", compiler.stage));
+    fn tools_dir(&self, build_compiler: Compiler) -> PathBuf {
+        let out = self
+            .out
+            .join(build_compiler.host)
+            .join(format!("stage{}-tools-bin", build_compiler.stage + 1));
         t!(fs::create_dir_all(&out));
         out
     }
 
     /// Returns the root directory for all output generated in a particular
-    /// stage when running with a particular host compiler.
+    /// stage when being built with a particular build compiler.
     ///
     /// The mode indicates what the root directory is for.
-    fn stage_out(&self, compiler: Compiler, mode: Mode) -> PathBuf {
-        let suffix = match mode {
-            Mode::Std => "-std",
-            Mode::Rustc => "-rustc",
-            Mode::Codegen => "-codegen",
-            Mode::ToolBootstrap => "-bootstrap-tools",
-            Mode::ToolStd | Mode::ToolRustc => "-tools",
+    fn stage_out(&self, build_compiler: Compiler, mode: Mode) -> PathBuf {
+        use std::fmt::Write;
+
+        fn bootstrap_tool() -> (Option<u32>, &'static str) {
+            (None, "bootstrap-tools")
+        }
+        fn staged_tool(build_compiler: Compiler) -> (Option<u32>, &'static str) {
+            (Some(build_compiler.stage + 1), "tools")
+        }
+
+        let (stage, suffix) = match mode {
+            // Std is special, stage N std is built with stage N rustc
+            Mode::Std => (Some(build_compiler.stage), "std"),
+            // The rest of things are built with stage N-1 rustc
+            Mode::Rustc => (Some(build_compiler.stage + 1), "rustc"),
+            Mode::Codegen => (Some(build_compiler.stage + 1), "codegen"),
+            Mode::ToolBootstrap => bootstrap_tool(),
+            Mode::ToolStd | Mode::ToolRustcPrivate => (Some(build_compiler.stage + 1), "tools"),
+            Mode::ToolTarget => {
+                // If we're not cross-compiling (the common case), share the target directory with
+                // bootstrap tools to reuse the build cache.
+                if build_compiler.stage == 0 {
+                    bootstrap_tool()
+                } else {
+                    staged_tool(build_compiler)
+                }
+            }
         };
-        self.out.join(compiler.host).join(format!("stage{}{}", compiler.stage, suffix))
+        let path = self.out.join(build_compiler.host);
+        let mut dir_name = String::new();
+        if let Some(stage) = stage {
+            write!(dir_name, "stage{stage}-").unwrap();
+        }
+        dir_name.push_str(suffix);
+        path.join(dir_name)
     }
 
     /// Returns the root output directory for all Cargo output in a given stage,
     /// running a particular compiler, whether or not we're building the
     /// standard library, and targeting the specified architecture.
-    fn cargo_out(&self, compiler: Compiler, mode: Mode, target: TargetSelection) -> PathBuf {
-        self.stage_out(compiler, mode).join(target).join(self.cargo_dir())
+    fn cargo_out(&self, build_compiler: Compiler, mode: Mode, target: TargetSelection) -> PathBuf {
+        self.stage_out(build_compiler, mode).join(target).join(self.cargo_dir(mode))
     }
 
     /// Root output directory of LLVM for `target`
@@ -814,8 +983,8 @@ impl Build {
         self.out.join(&*target.triple).join("enzyme")
     }
 
-    fn gcc_out(&self, target: TargetSelection) -> PathBuf {
-        self.out.join(&*target.triple).join("gcc")
+    fn offload_out(&self, target: TargetSelection) -> PathBuf {
+        self.out.join(&*target.triple).join("offload")
     }
 
     fn lld_out(&self, target: TargetSelection) -> PathBuf {
@@ -915,160 +1084,26 @@ impl Build {
 
     /// Returns the libdir of the snapshot compiler.
     fn rustc_snapshot_libdir(&self) -> PathBuf {
-        self.rustc_snapshot_sysroot().join(libdir(self.config.build))
+        self.rustc_snapshot_sysroot().join(libdir(self.config.host_target))
     }
 
     /// Returns the sysroot of the snapshot compiler.
     fn rustc_snapshot_sysroot(&self) -> &Path {
         static SYSROOT_CACHE: OnceLock<PathBuf> = OnceLock::new();
         SYSROOT_CACHE.get_or_init(|| {
-            let mut rustc = Command::new(&self.initial_rustc);
-            rustc.args(["--print", "sysroot"]);
-            output(&mut rustc).trim().into()
+            command(&self.initial_rustc)
+                .run_in_dry_run()
+                .args(["--print", "sysroot"])
+                .run_capture_stdout(self)
+                .stdout()
+                .trim()
+                .to_owned()
+                .into()
         })
     }
 
-    /// Execute a command and return its output.
-    /// Note: Ideally, you should use one of the BootstrapCommand::run* functions to
-    /// execute commands. They internally call this method.
-    #[track_caller]
-    fn run(
-        &self,
-        command: &mut BootstrapCommand,
-        stdout: OutputMode,
-        stderr: OutputMode,
-    ) -> CommandOutput {
-        command.mark_as_executed();
-        if self.config.dry_run() && !command.run_always {
-            return CommandOutput::default();
-        }
-
-        #[cfg(feature = "tracing")]
-        let _run_span = trace_cmd!(command);
-
-        let created_at = command.get_created_location();
-        let executed_at = std::panic::Location::caller();
-
-        self.verbose(|| {
-            println!("running: {command:?} (created at {created_at}, executed at {executed_at})")
-        });
-
-        let cmd = command.as_command_mut();
-        cmd.stdout(stdout.stdio());
-        cmd.stderr(stderr.stdio());
-
-        let output = cmd.output();
-
-        use std::fmt::Write;
-
-        let mut message = String::new();
-        let output: CommandOutput = match output {
-            // Command has succeeded
-            Ok(output) if output.status.success() => {
-                CommandOutput::from_output(output, stdout, stderr)
-            }
-            // Command has started, but then it failed
-            Ok(output) => {
-                writeln!(
-                    message,
-                    r#"
-Command {command:?} did not execute successfully.
-Expected success, got {}
-Created at: {created_at}
-Executed at: {executed_at}"#,
-                    output.status,
-                )
-                .unwrap();
-
-                let output: CommandOutput = CommandOutput::from_output(output, stdout, stderr);
-
-                // If the output mode is OutputMode::Capture, we can now print the output.
-                // If it is OutputMode::Print, then the output has already been printed to
-                // stdout/stderr, and we thus don't have anything captured to print anyway.
-                if stdout.captures() {
-                    writeln!(message, "\nSTDOUT ----\n{}", output.stdout().trim()).unwrap();
-                }
-                if stderr.captures() {
-                    writeln!(message, "\nSTDERR ----\n{}", output.stderr().trim()).unwrap();
-                }
-                output
-            }
-            // The command did not even start
-            Err(e) => {
-                writeln!(
-                    message,
-                    "\n\nCommand {command:?} did not execute successfully.\
-            \nIt was not possible to execute the command: {e:?}"
-                )
-                .unwrap();
-                CommandOutput::did_not_start(stdout, stderr)
-            }
-        };
-
-        let fail = |message: &str, output: CommandOutput| -> ! {
-            if self.is_verbose() {
-                println!("{message}");
-            } else {
-                let (stdout, stderr) = (output.stdout_if_present(), output.stderr_if_present());
-                // If the command captures output, the user would not see any indication that
-                // it has failed. In this case, print a more verbose error, since to provide more
-                // context.
-                if stdout.is_some() || stderr.is_some() {
-                    if let Some(stdout) =
-                        output.stdout_if_present().take_if(|s| !s.trim().is_empty())
-                    {
-                        println!("STDOUT:\n{stdout}\n");
-                    }
-                    if let Some(stderr) =
-                        output.stderr_if_present().take_if(|s| !s.trim().is_empty())
-                    {
-                        println!("STDERR:\n{stderr}\n");
-                    }
-                    println!("Command {command:?} has failed. Rerun with -v to see more details.");
-                } else {
-                    println!("Command has failed. Rerun with -v to see more details.");
-                }
-            }
-            exit!(1);
-        };
-
-        if !output.is_success() {
-            match command.failure_behavior {
-                BehaviorOnFailure::DelayFail => {
-                    if self.fail_fast {
-                        fail(&message, output);
-                    }
-
-                    let mut failures = self.delayed_failures.borrow_mut();
-                    failures.push(message);
-                }
-                BehaviorOnFailure::Exit => {
-                    fail(&message, output);
-                }
-                BehaviorOnFailure::Ignore => {
-                    // If failures are allowed, either the error has been printed already
-                    // (OutputMode::Print) or the user used a capture output mode and wants to
-                    // handle the error output on their own.
-                }
-            }
-        }
-        output
-    }
-
-    /// Check if verbosity is greater than the `level`
-    pub fn is_verbose_than(&self, level: usize) -> bool {
-        self.verbosity > level
-    }
-
-    /// Runs a function if verbosity is greater than `level`.
-    fn verbose_than(&self, level: usize, f: impl Fn()) {
-        if self.is_verbose_than(level) {
-            f()
-        }
-    }
-
     fn info(&self, msg: &str) {
-        match self.config.dry_run {
+        match self.config.get_dry_run() {
             DryRun::SelfCheck => (),
             DryRun::Disabled | DryRun::UserSelected => {
                 println!("{msg}");
@@ -1076,49 +1111,15 @@ Executed at: {executed_at}"#,
         }
     }
 
-    #[must_use = "Groups should not be dropped until the Step finishes running"]
-    #[track_caller]
-    fn msg_clippy(
-        &self,
-        what: impl Display,
-        target: impl Into<Option<TargetSelection>>,
-    ) -> Option<gha::Group> {
-        self.msg(Kind::Clippy, self.config.stage, what, self.config.build, target)
-    }
-
-    #[must_use = "Groups should not be dropped until the Step finishes running"]
-    #[track_caller]
-    fn msg_check(
-        &self,
-        what: impl Display,
-        target: impl Into<Option<TargetSelection>>,
-    ) -> Option<gha::Group> {
-        self.msg(Kind::Check, self.config.stage, what, self.config.build, target)
-    }
-
-    #[must_use = "Groups should not be dropped until the Step finishes running"]
-    #[track_caller]
-    fn msg_doc(
-        &self,
-        compiler: Compiler,
-        what: impl Display,
-        target: impl Into<Option<TargetSelection>> + Copy,
-    ) -> Option<gha::Group> {
-        self.msg(Kind::Doc, compiler.stage, what, compiler.host, target.into())
-    }
-
-    #[must_use = "Groups should not be dropped until the Step finishes running"]
-    #[track_caller]
-    fn msg_build(
-        &self,
-        compiler: Compiler,
-        what: impl Display,
-        target: impl Into<Option<TargetSelection>>,
-    ) -> Option<gha::Group> {
-        self.msg(Kind::Build, compiler.stage, what, compiler.host, target)
-    }
-
-    /// Return a `Group` guard for a [`Step`] that is built for each `--stage`.
+    /// Return a `Group` guard for a [`Step`] that:
+    /// - Performs `action`
+    ///   - If the action is `Kind::Test`, use [`Build::msg_test`] instead.
+    /// - On `what`
+    ///   - Where `what` possibly corresponds to a `mode`
+    /// - `action` is performed with/on the given compiler (`target_and_stage`).
+    ///   - Since for some steps it is not possible to pass a single compiler here, it is also
+    ///     possible to pass the host and stage explicitly.
+    /// - With a given `target`.
     ///
     /// [`Step`]: crate::core::builder::Step
     #[must_use = "Groups should not be dropped until the Step finishes running"]
@@ -1126,23 +1127,68 @@ Executed at: {executed_at}"#,
     fn msg(
         &self,
         action: impl Into<Kind>,
-        stage: u32,
         what: impl Display,
-        host: impl Into<Option<TargetSelection>>,
+        mode: impl Into<Option<Mode>>,
+        target_and_stage: impl Into<TargetAndStage>,
         target: impl Into<Option<TargetSelection>>,
     ) -> Option<gha::Group> {
-        let action = action.into().description();
-        let msg = |fmt| format!("{action} stage{stage} {what}{fmt}");
+        let target_and_stage = target_and_stage.into();
+        let action = action.into();
+        assert!(
+            action != Kind::Test,
+            "Please use `Build::msg_test` instead of `Build::msg(Kind::Test)`"
+        );
+
+        let actual_stage = match mode.into() {
+            // Std has the same stage as the compiler that builds it
+            Some(Mode::Std) => target_and_stage.stage,
+            // Other things have stage corresponding to their build compiler + 1
+            Some(
+                Mode::Rustc
+                | Mode::Codegen
+                | Mode::ToolBootstrap
+                | Mode::ToolTarget
+                | Mode::ToolStd
+                | Mode::ToolRustcPrivate,
+            )
+            | None => target_and_stage.stage + 1,
+        };
+
+        let action = action.description();
+        let what = what.to_string();
+        let msg = |fmt| {
+            let space = if !what.is_empty() { " " } else { "" };
+            format!("{action} stage{actual_stage} {what}{space}{fmt}")
+        };
         let msg = if let Some(target) = target.into() {
-            let host = host.into().unwrap();
+            let build_stage = target_and_stage.stage;
+            let host = target_and_stage.target;
             if host == target {
-                msg(format_args!(" ({target})"))
+                msg(format_args!("(stage{build_stage} -> stage{actual_stage}, {target})"))
             } else {
-                msg(format_args!(" ({host} -> {target})"))
+                msg(format_args!("(stage{build_stage}:{host} -> stage{actual_stage}:{target})"))
             }
         } else {
             msg(format_args!(""))
         };
+        self.group(&msg)
+    }
+
+    /// Return a `Group` guard for a [`Step`] that tests `what` with the given `stage` and `target`.
+    /// Use this instead of [`Build::msg`] for test steps, because for them it is not always clear
+    /// what exactly is a build compiler.
+    ///
+    /// [`Step`]: crate::core::builder::Step
+    #[must_use = "Groups should not be dropped until the Step finishes running"]
+    #[track_caller]
+    fn msg_test(
+        &self,
+        what: impl Display,
+        target: TargetSelection,
+        stage: u32,
+    ) -> Option<gha::Group> {
+        let action = Kind::Test.description();
+        let msg = format!("{action} stage{stage} {what} ({target})");
         self.group(&msg)
     }
 
@@ -1162,29 +1208,9 @@ Executed at: {executed_at}"#,
         self.group(&msg)
     }
 
-    #[must_use = "Groups should not be dropped until the Step finishes running"]
-    #[track_caller]
-    fn msg_sysroot_tool(
-        &self,
-        action: impl Into<Kind>,
-        stage: u32,
-        what: impl Display,
-        host: TargetSelection,
-        target: TargetSelection,
-    ) -> Option<gha::Group> {
-        let action = action.into().description();
-        let msg = |fmt| format!("{action} {what} {fmt}");
-        let msg = if host == target {
-            msg(format_args!("(stage{stage} -> stage{}, {target})", stage + 1))
-        } else {
-            msg(format_args!("(stage{stage}:{host} -> stage{}:{target})", stage + 1))
-        };
-        self.group(&msg)
-    }
-
     #[track_caller]
     fn group(&self, msg: &str) -> Option<gha::Group> {
-        match self.config.dry_run {
+        match self.config.get_dry_run() {
             DryRun::SelfCheck => None,
             DryRun::Disabled | DryRun::UserSelected => Some(gha::group(msg)),
         }
@@ -1198,7 +1224,7 @@ Executed at: {executed_at}"#,
         })
     }
 
-    fn debuginfo_map_to(&self, which: GitRepo) -> Option<String> {
+    fn debuginfo_map_to(&self, which: GitRepo, remap_scheme: RemapScheme) -> Option<String> {
         if !self.config.rust_remap_debuginfo {
             return None;
         }
@@ -1206,7 +1232,24 @@ Executed at: {executed_at}"#,
         match which {
             GitRepo::Rustc => {
                 let sha = self.rust_sha().unwrap_or(&self.version);
-                Some(format!("/rustc/{sha}"))
+
+                match remap_scheme {
+                    RemapScheme::Compiler => {
+                        // For compiler sources, remap via `/rustc-dev/{sha}` to allow
+                        // distinguishing between compiler sources vs library sources, since
+                        // `rustc-dev` dist component places them under
+                        // `$sysroot/lib/rustlib/rustc-src/rust` as opposed to `rust-src`'s
+                        // `$sysroot/lib/rustlib/src/rust`.
+                        //
+                        // Keep this scheme in sync with `rustc_metadata::rmeta::decoder`'s
+                        // `try_to_translate_virtual_to_real`.
+                        Some(format!("/rustc-dev/{sha}"))
+                    }
+                    RemapScheme::NonCompiler => {
+                        // For non-compiler sources, use `/rustc/{sha}` remapping scheme.
+                        Some(format!("/rustc/{sha}"))
+                    }
+                }
             }
             GitRepo::Llvm => Some(String::from("/rustc/llvm")),
         }
@@ -1217,28 +1260,28 @@ Executed at: {executed_at}"#,
         if self.config.dry_run() {
             return PathBuf::new();
         }
-        self.cc.borrow()[&target].path().into()
+        self.cc[&target].path().into()
     }
 
     /// Returns the internal `cc::Tool` for the C compiler.
     fn cc_tool(&self, target: TargetSelection) -> Tool {
-        self.cc.borrow()[&target].clone()
+        self.cc[&target].clone()
     }
 
     /// Returns the internal `cc::Tool` for the C++ compiler.
     fn cxx_tool(&self, target: TargetSelection) -> Tool {
-        self.cxx.borrow()[&target].clone()
+        self.cxx[&target].clone()
     }
 
     /// Returns C flags that `cc-rs` thinks should be enabled for the
     /// specified target by default.
-    fn cc_handled_clags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
+    fn cc_handled_cflags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
         if self.config.dry_run() {
             return Vec::new();
         }
         let base = match c {
-            CLang::C => self.cc.borrow()[&target].clone(),
-            CLang::Cxx => self.cxx.borrow()[&target].clone(),
+            CLang::C => self.cc[&target].clone(),
+            CLang::Cxx => self.cxx[&target].clone(),
         };
 
         // Filter out -O and /O (the optimization flags) that we picked up
@@ -1273,12 +1316,12 @@ Executed at: {executed_at}"#,
             base.push("-fno-omit-frame-pointer".into());
         }
 
-        if let Some(map_to) = self.debuginfo_map_to(which) {
+        if let Some(map_to) = self.debuginfo_map_to(which, RemapScheme::NonCompiler) {
             let map = format!("{}={}", self.src.display(), map_to);
-            let cc = self.cc(target);
-            if cc.ends_with("clang") || cc.ends_with("gcc") {
+            let cc = self.cc_tool(target);
+            if cc.is_like_clang() || cc.is_like_gnu() {
                 base.push(format!("-fdebug-prefix-map={map}"));
-            } else if cc.ends_with("clang-cl.exe") {
+            } else if cc.is_like_clang_cl() {
                 base.push("-Xclang".into());
                 base.push(format!("-fdebug-prefix-map={map}"));
             }
@@ -1291,7 +1334,7 @@ Executed at: {executed_at}"#,
         if self.config.dry_run() {
             return None;
         }
-        self.ar.borrow().get(&target).cloned()
+        self.ar.get(&target).cloned()
     }
 
     /// Returns the path to the `ranlib` utility for the target specified.
@@ -1299,7 +1342,7 @@ Executed at: {executed_at}"#,
         if self.config.dry_run() {
             return None;
         }
-        self.ranlib.borrow().get(&target).cloned()
+        self.ranlib.get(&target).cloned()
     }
 
     /// Returns the path to the C++ compiler for the target specified.
@@ -1307,7 +1350,7 @@ Executed at: {executed_at}"#,
         if self.config.dry_run() {
             return Ok(PathBuf::new());
         }
-        match self.cxx.borrow().get(&target) {
+        match self.cxx.get(&target) {
             Some(p) => Ok(p.path().into()),
             None => Err(format!("target `{target}` is not configured as a host, only as a target")),
         }
@@ -1324,20 +1367,20 @@ Executed at: {executed_at}"#,
         } else if target.contains("vxworks") {
             // need to use CXX compiler as linker to resolve the exception functions
             // that are only existed in CXX libraries
-            Some(self.cxx.borrow()[&target].path().into())
+            Some(self.cxx[&target].path().into())
         } else if !self.config.is_host_target(target)
             && helpers::use_host_linker(target)
             && !target.is_msvc()
         {
             Some(self.cc(target))
-        } else if self.config.lld_mode.is_used()
+        } else if self.config.bootstrap_override_lld.is_used()
             && self.is_lld_direct_linker(target)
-            && self.build == target
+            && self.host_target == target
         {
-            match self.config.lld_mode {
-                LldMode::SelfContained => Some(self.initial_lld.clone()),
-                LldMode::External => Some("lld".into()),
-                LldMode::Unused => None,
+            match self.config.bootstrap_override_lld {
+                BootstrapOverrideLld::SelfContained => Some(self.initial_lld.clone()),
+                BootstrapOverrideLld::External => Some("lld".into()),
+                BootstrapOverrideLld::None => None,
             }
         } else {
             None
@@ -1359,23 +1402,33 @@ Executed at: {executed_at}"#,
         }
     }
 
-    /// Returns the "musl root" for this `target`, if defined
+    /// Returns the "musl root" for this `target`, if defined.
+    ///
+    /// If this is a native target (host is also musl) and no musl-root is given,
+    /// it falls back to the system toolchain in /usr.
     fn musl_root(&self, target: TargetSelection) -> Option<&Path> {
-        self.config
+        let configured_root = self
+            .config
             .target_config
             .get(&target)
             .and_then(|t| t.musl_root.as_ref())
             .or(self.config.musl_root.as_ref())
-            .map(|p| &**p)
+            .map(|p| &**p);
+
+        if self.config.is_host_target(target) && configured_root.is_none() {
+            Some(Path::new("/usr"))
+        } else {
+            configured_root
+        }
     }
 
     /// Returns the "musl libdir" for this `target`.
     fn musl_libdir(&self, target: TargetSelection) -> Option<PathBuf> {
-        let t = self.config.target_config.get(&target)?;
-        if let libdir @ Some(_) = &t.musl_libdir {
-            return libdir.clone();
-        }
-        self.musl_root(target).map(|root| root.join("lib"))
+        self.config
+            .target_config
+            .get(&target)
+            .and_then(|t| t.musl_libdir.clone())
+            .or_else(|| self.musl_root(target).map(|root| root.join("lib")))
     }
 
     /// Returns the `lib` directory for the WASI target specified, if
@@ -1390,7 +1443,7 @@ Executed at: {executed_at}"#,
         if let Some(path) = configured {
             return Some(path.join("lib").join(target.to_string()));
         }
-        let mut env_root = PathBuf::from(std::env::var_os("WASI_SDK_PATH")?);
+        let mut env_root = self.wasi_sdk_path.clone()?;
         env_root.push("share");
         env_root.push("wasi-sysroot");
         env_root.push("lib");
@@ -1439,23 +1492,23 @@ Executed at: {executed_at}"#,
         // Look for Wasmtime, and for its default options be sure to disable
         // its caching system since we're executing quite a lot of tests and
         // ideally shouldn't pollute the cache too much.
-        if let Some(path) = finder.maybe_have("wasmtime") {
-            if let Ok(mut path) = path.into_os_string().into_string() {
-                path.push_str(" run -C cache=n --dir .");
-                // Make sure that tests have access to RUSTC_BOOTSTRAP. This (for example) is
-                // required for libtest to work on beta/stable channels.
-                //
-                // NB: with Wasmtime 20 this can change to `-S inherit-env` to
-                // inherit the entire environment rather than just this single
-                // environment variable.
-                path.push_str(" --env RUSTC_BOOTSTRAP");
+        if let Some(path) = finder.maybe_have("wasmtime")
+            && let Ok(mut path) = path.into_os_string().into_string()
+        {
+            path.push_str(" run -Wexceptions -C cache=n --dir .");
+            // Make sure that tests have access to RUSTC_BOOTSTRAP. This (for example) is
+            // required for libtest to work on beta/stable channels.
+            //
+            // NB: with Wasmtime 20 this can change to `-S inherit-env` to
+            // inherit the entire environment rather than just this single
+            // environment variable.
+            path.push_str(" --env RUSTC_BOOTSTRAP");
 
-                if target.contains("wasip2") {
-                    path.push_str(" --wasi inherit-network --wasi allow-ip-name-lookup");
-                }
-
-                return Some(path);
+            if target.contains("wasip2") {
+                path.push_str(" --wasi inherit-network --wasi allow-ip-name-lookup");
             }
+
+            return Some(path);
         }
 
         None
@@ -1482,21 +1535,6 @@ Executed at: {executed_at}"#,
     /// emulated with QEMU and binaries will need to be shipped to the emulator.
     fn qemu_rootfs(&self, target: TargetSelection) -> Option<&Path> {
         self.config.target_config.get(&target).and_then(|t| t.qemu_rootfs.as_ref()).map(|p| &**p)
-    }
-
-    /// Path to the python interpreter to use
-    fn python(&self) -> &Path {
-        if self.config.build.ends_with("apple-darwin") {
-            // Force /usr/bin/python3 on macOS for LLDB tests because we're loading the
-            // LLDB plugin's compiled module which only works with the system python
-            // (namely not Homebrew-installed python)
-            Path::new("/usr/bin/python3")
-        } else {
-            self.config
-                .python
-                .as_ref()
-                .expect("python is required for running LLDB or rustdoc tests")
-        }
     }
 
     /// Temporary directory that extended error information is emitted to.
@@ -1526,7 +1564,7 @@ Executed at: {executed_at}"#,
         !self.config.full_bootstrap
             && !self.config.download_rustc()
             && stage >= 2
-            && (self.hosts.contains(&target) || target == self.build)
+            && (self.hosts.contains(&target) || target == self.host_target)
     }
 
     /// Checks whether the `compiler` compiling for `target` should be forced to
@@ -1573,7 +1611,7 @@ Executed at: {executed_at}"#,
         // If available, we read the beta revision from that file.
         // This only happens when building from a source tarball when Git should not be used.
         let count = extract_beta_rev_from_file(self.src.join("version")).unwrap_or_else(|| {
-            // Figure out how many merge commits happened since we branched off master.
+            // Figure out how many merge commits happened since we branched off main.
             // That's our beta number!
             // (Note that we use a `..` range, not the `...` symmetric difference.)
             helpers::git(Some(&self.src))
@@ -1584,7 +1622,7 @@ Executed at: {executed_at}"#,
                     "refs/remotes/origin/{}..HEAD",
                     self.config.stage0_metadata.config.nightly_branch
                 ))
-                .run_always()
+                .run_in_dry_run()
                 .run_capture(self)
                 .stdout()
         });
@@ -1598,24 +1636,18 @@ Executed at: {executed_at}"#,
         self.release(&self.version)
     }
 
-    /// Returns the "package version" for a component given the `num` release
-    /// number.
+    /// Returns the "package version" for a component.
     ///
     /// The package version is typically what shows up in the names of tarballs.
-    /// For channels like beta/nightly it's just the channel name, otherwise
-    /// it's the `num` provided.
-    fn package_vers(&self, num: &str) -> String {
+    /// For channels like beta/nightly it's just the channel name, otherwise it's the release
+    /// version.
+    fn rust_package_vers(&self) -> String {
         match &self.config.channel[..] {
-            "stable" => num.to_string(),
+            "stable" => self.version.to_string(),
             "beta" => "beta".to_string(),
             "nightly" => "nightly".to_string(),
-            _ => format!("{num}-dev"),
+            _ => format!("{}-dev", self.version),
         }
-    }
-
-    /// Returns the value of `package_vers` above for Rust itself.
-    fn rust_package_vers(&self) -> String {
-        self.package_vers(&self.version)
     }
 
     /// Returns the `version` string associated with this compiler for Rust
@@ -1625,12 +1657,12 @@ Executed at: {executed_at}"#,
     /// sha, version, etc.
     fn rust_version(&self) -> String {
         let mut version = self.rust_info().version(self, &self.version);
-        if let Some(ref s) = self.config.description {
-            if !s.is_empty() {
-                version.push_str(" (");
-                version.push_str(s);
-                version.push(')');
-            }
+        if let Some(ref s) = self.config.description
+            && !s.is_empty()
+        {
+            version.push_str(" (");
+            version.push_str(s);
+            version.push(')');
         }
         version
     }
@@ -1642,6 +1674,9 @@ Executed at: {executed_at}"#,
 
     /// Returns the `a.b.c` version that the given package is at.
     fn release_num(&self, package: &str) -> String {
+        if self.config.dry_run() {
+            return "0.0.0 (dry-run)".into();
+        }
         let toml_file_name = self.src.join(format!("src/tools/{package}/Cargo.toml"));
         let toml = t!(fs::read_to_string(toml_file_name));
         for line in toml.lines() {
@@ -1696,7 +1731,9 @@ Executed at: {executed_at}"#,
                 }
             }
         }
-        ret.sort_unstable_by_key(|krate| krate.name.clone()); // reproducible order needed for tests
+
+        // Sort the crates so that bootstrap unit tests can assume a deterministic order.
+        ret.sort_unstable_by(|a, b| Ord::cmp(&a.name, &b.name));
         ret
     }
 
@@ -1737,6 +1774,7 @@ Executed at: {executed_at}"#,
     ///
     /// If `src` is a symlink, `src` will be resolved to the actual path
     /// and copied to `dst` instead of the symlink itself.
+    #[track_caller]
     pub fn resolve_symlink_and_copy(&self, src: &Path, dst: &Path) {
         self.copy_link_internal(src, dst, true);
     }
@@ -1745,41 +1783,48 @@ Executed at: {executed_at}"#,
     /// Attempts to use hard links if possible, falling back to copying.
     /// You can neither rely on this being a copy nor it being a link,
     /// so do not write to dst.
+    #[track_caller]
     pub fn copy_link(&self, src: &Path, dst: &Path, file_type: FileType) {
         self.copy_link_internal(src, dst, false);
 
-        if file_type.could_have_split_debuginfo() {
-            if let Some(dbg_file) = split_debuginfo(src) {
-                self.copy_link_internal(
-                    &dbg_file,
-                    &dst.with_extension(dbg_file.extension().unwrap()),
-                    false,
-                );
-            }
+        if file_type.could_have_split_debuginfo()
+            && let Some(dbg_file) = split_debuginfo(src)
+        {
+            self.copy_link_internal(
+                &dbg_file,
+                &dst.with_extension(dbg_file.extension().unwrap()),
+                false,
+            );
         }
     }
 
+    #[track_caller]
     fn copy_link_internal(&self, src: &Path, dst: &Path, dereference_symlinks: bool) {
         if self.config.dry_run() {
             return;
         }
-        self.verbose_than(1, || println!("Copy/Link {src:?} to {dst:?}"));
         if src == dst {
             return;
         }
-        if let Err(e) = fs::remove_file(dst) {
-            if cfg!(windows) && e.kind() != io::ErrorKind::NotFound {
-                // workaround for https://github.com/rust-lang/rust/issues/127126
-                // if removing the file fails, attempt to rename it instead.
-                let now = t!(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH));
-                let _ = fs::rename(dst, format!("{}-{}", dst.display(), now.as_nanos()));
-            }
+
+        #[cfg(feature = "tracing")]
+        let _span = trace_io!("file-copy-link", ?src, ?dst);
+
+        if let Err(e) = fs::remove_file(dst)
+            && cfg!(windows)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            // workaround for https://github.com/rust-lang/rust/issues/127126
+            // if removing the file fails, attempt to rename it instead.
+            let now = t!(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH));
+            let _ = fs::rename(dst, format!("{}-{}", dst.display(), now.as_nanos()));
         }
-        let metadata = t!(src.symlink_metadata(), format!("src = {}", src.display()));
+        let mut metadata = t!(src.symlink_metadata(), format!("src = {}", src.display()));
         let mut src = src.to_path_buf();
         if metadata.file_type().is_symlink() {
             if dereference_symlinks {
                 src = t!(fs::canonicalize(src));
+                metadata = t!(fs::metadata(&src), format!("target = {}", src.display()));
             } else {
                 let link = t!(fs::read_link(src));
                 t!(self.symlink_file(link, dst));
@@ -1807,6 +1852,7 @@ Executed at: {executed_at}"#,
     /// Links the `src` directory recursively to `dst`. Both are assumed to exist
     /// when this function is called.
     /// Will attempt to use hard links if possible and fall back to copying.
+    #[track_caller]
     pub fn cp_link_r(&self, src: &Path, dst: &Path) {
         if self.config.dry_run() {
             return;
@@ -1829,12 +1875,14 @@ Executed at: {executed_at}"#,
     /// Will attempt to use hard links if possible and fall back to copying.
     /// Unwanted files or directories can be skipped
     /// by returning `false` from the filter function.
+    #[track_caller]
     pub fn cp_link_filtered(&self, src: &Path, dst: &Path, filter: &dyn Fn(&Path) -> bool) {
         // Immediately recurse with an empty relative path
         self.cp_link_filtered_recurse(src, dst, Path::new(""), filter)
     }
 
     // Inner function does the actual work
+    #[track_caller]
     fn cp_link_filtered_recurse(
         &self,
         src: &Path,
@@ -1854,7 +1902,6 @@ Executed at: {executed_at}"#,
                     self.create_dir(&dst);
                     self.cp_link_filtered_recurse(&path, &dst, &relative, filter);
                 } else {
-                    let _ = fs::remove_file(&dst);
                     self.copy_link(&path, &dst, FileType::Regular);
                 }
             }
@@ -1872,7 +1919,10 @@ Executed at: {executed_at}"#,
             return;
         }
         let dst = dstdir.join(src.file_name().unwrap());
-        self.verbose_than(1, || println!("Install {src:?} to {dst:?}"));
+
+        #[cfg(feature = "tracing")]
+        let _span = trace_io!("install", ?src, ?dst);
+
         t!(fs::create_dir_all(dstdir));
         if !src.exists() {
             panic!("ERROR: File \"{}\" not found!", src.display());
@@ -1882,10 +1932,10 @@ Executed at: {executed_at}"#,
         chmod(&dst, file_type.perms());
 
         // If this file can have debuginfo, look for split debuginfo and install it too.
-        if file_type.could_have_split_debuginfo() {
-            if let Some(dbg_file) = split_debuginfo(src) {
-                self.install(&dbg_file, dstdir, FileType::Regular);
-            }
+        if file_type.could_have_split_debuginfo()
+            && let Some(dbg_file) = split_debuginfo(src)
+        {
+            self.install(&dbg_file, dstdir, FileType::Regular);
         }
     }
 
@@ -1896,10 +1946,15 @@ Executed at: {executed_at}"#,
         t!(fs::read_to_string(path))
     }
 
+    #[track_caller]
     fn create_dir(&self, dir: &Path) {
         if self.config.dry_run() {
             return;
         }
+
+        #[cfg(feature = "tracing")]
+        let _span = trace_io!("dir-create", ?dir);
+
         t!(fs::create_dir_all(dir))
     }
 
@@ -1907,7 +1962,25 @@ Executed at: {executed_at}"#,
         if self.config.dry_run() {
             return;
         }
+
+        #[cfg(feature = "tracing")]
+        let _span = trace_io!("dir-remove", ?dir);
+
         t!(fs::remove_dir_all(dir))
+    }
+
+    /// Make sure that `dir` will be an empty existing directory after this function ends.
+    /// If it existed before, it will be first deleted.
+    fn clear_dir(&self, dir: &Path) {
+        if self.config.dry_run() {
+            return;
+        }
+
+        #[cfg(feature = "tracing")]
+        let _span = trace_io!("dir-clear", ?dir);
+
+        let _ = std::fs::remove_dir_all(dir);
+        self.create_dir(dir);
     }
 
     fn read_dir(&self, dir: &Path) -> impl Iterator<Item = fs::DirEntry> {
@@ -1961,7 +2034,7 @@ to download LLVM rather than building it.
         // In these cases we automatically enable Ninja if we find it in the
         // environment.
         if !self.config.ninja_in_file
-            && self.config.build.is_msvc()
+            && self.config.host_target.is_msvc()
             && cmd_finder.maybe_have("ninja").is_some()
         {
             return true;
@@ -1994,6 +2067,25 @@ to download LLVM rather than building it.
         stream.reset().unwrap();
         result
     }
+
+    pub fn exec_ctx(&self) -> &ExecutionContext {
+        &self.config.exec_ctx
+    }
+
+    pub fn report_summary(&self, path: &Path, start_time: Instant) {
+        self.config.exec_ctx.profiler().report_summary(path, start_time);
+    }
+
+    #[cfg(feature = "tracing")]
+    pub fn report_step_graph(self, directory: &Path) {
+        self.step_graph.into_inner().store_to_dot_files(directory);
+    }
+}
+
+impl AsRef<ExecutionContext> for Build {
+    fn as_ref(&self) -> &ExecutionContext {
+        &self.config.exec_ctx
+    }
 }
 
 #[cfg(unix)]
@@ -2013,14 +2105,9 @@ impl Compiler {
         self.forced_compiler = forced_compiler;
     }
 
-    pub fn with_stage(mut self, stage: u32) -> Compiler {
-        self.stage = stage;
-        self
-    }
-
     /// Returns `true` if this is a snapshot compiler for `build`'s configuration
     pub fn is_snapshot(&self, build: &Build) -> bool {
-        self.stage == 0 && self.host == build.build
+        self.stage == 0 && self.host == build.host_target
     }
 
     /// Indicates whether the compiler was forced to use a specific stage.
@@ -2030,9 +2117,11 @@ impl Compiler {
 }
 
 fn envify(s: &str) -> String {
+    // Converting foo-bar to FOO_BAR is a fairly idomatic mapping to an environment variable name.
+    // We also convert '.' to '_' to fix https://github.com/rust-lang/rust/issues/158090
     s.chars()
         .map(|c| match c {
-            '-' => '_',
+            '-' | '.' => '_',
             c => c,
         })
         .flat_map(|c| c.to_uppercase())
@@ -2056,4 +2145,11 @@ pub fn prepare_behaviour_dump_dir(build: &Build) {
 
         t!(INITIALIZED.set(true));
     }
+}
+
+#[macro_export]
+macro_rules! exit {
+    ($code:expr) => {
+        $crate::utils::helpers::detail_exit($code, cfg!(test));
+    };
 }

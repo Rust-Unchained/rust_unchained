@@ -1,21 +1,20 @@
 use std::sync::Arc;
 
-use rustc_ast::ptr::P;
 use rustc_ast::*;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir::{self as hir, LangItem, Target};
 use rustc_middle::span_bug;
-use rustc_span::source_map::{Spanned, respan};
-use rustc_span::{DesugaringKind, Ident, Span};
+use rustc_span::{DesugaringKind, Ident, Span, Spanned, respan};
 
-use super::errors::{
+use crate::diagnostics::{
     ArbitraryExpressionInPattern, ExtraDoubleDot, MisplacedDoubleDot, SubTupleBinding,
 };
-use super::{ImplTraitContext, LoweringContext, ParamMode, ResolverAstLoweringExt};
-use crate::{AllowReturnTypeNotation, ImplTraitPosition};
+use crate::{
+    AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, LoweringContext, ParamMode,
+};
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     pub(crate) fn lower_pat(&mut self, pattern: &Pat) -> &'hir hir::Pat<'hir> {
         self.arena.alloc(self.lower_pat_mut(pattern))
     }
@@ -94,7 +93,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
                         let fs = self.arena.alloc_from_iter(fields.iter().map(|f| {
                             let hir_id = self.lower_node_id(f.id);
-                            self.lower_attrs(hir_id, &f.attrs, f.span);
+                            self.lower_attrs(hir_id, &f.attrs, f.span, Target::PatField);
 
                             hir::PatField {
                                 hir_id,
@@ -107,10 +106,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         break hir::PatKind::Struct(
                             qpath,
                             fs,
-                            matches!(
-                                etc,
-                                ast::PatFieldsRest::Rest | ast::PatFieldsRest::Recovered(_)
-                            ),
+                            match etc {
+                                ast::PatFieldsRest::Rest(sp) => Some(self.lower_span(*sp)),
+                                ast::PatFieldsRest::Recovered(_) => Some(Span::default()),
+                                _ => None,
+                            },
                         );
                     }
                     PatKind::Tuple(pats) => {
@@ -123,8 +123,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     PatKind::Deref(inner) => {
                         break hir::PatKind::Deref(self.lower_pat(inner));
                     }
-                    PatKind::Ref(inner, mutbl) => {
-                        break hir::PatKind::Ref(self.lower_pat(inner), *mutbl);
+                    PatKind::Ref(inner, pinned, mutbl) => {
+                        break hir::PatKind::Ref(self.lower_pat(inner), *pinned, *mutbl);
                     }
                     PatKind::Range(e1, e2, Spanned { node: end, .. }) => {
                         break hir::PatKind::Range(
@@ -133,8 +133,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             self.lower_range_end(end, e2.is_some()),
                         );
                     }
-                    PatKind::Guard(inner, cond) => {
-                        break hir::PatKind::Guard(self.lower_pat(inner), self.lower_expr(cond));
+                    PatKind::Guard(inner, guard) => {
+                        break hir::PatKind::Guard(
+                            self.lower_pat(inner),
+                            self.lower_expr(&guard.cond),
+                        );
                     }
                     PatKind::Slice(pats) => break self.lower_pat_slice(pats),
                     PatKind::Rest => {
@@ -143,7 +146,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     }
                     // return inner to be processed in next loop
                     PatKind::Paren(inner) => pattern = inner,
-                    PatKind::MacCall(_) => panic!("{:?} shouldn't exist here", pattern.span),
+                    PatKind::MacCall(_) => {
+                        panic!("{pattern:#?} shouldn't exist here")
+                    }
                     PatKind::Err(guar) => break hir::PatKind::Err(*guar),
                 }
             };
@@ -154,7 +159,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
     fn lower_pat_tuple(
         &mut self,
-        pats: &[P<Pat>],
+        pats: &[Pat],
         ctx: &str,
     ) -> (&'hir [hir::Pat<'hir>], hir::DotDotPos) {
         let mut elems = Vec::with_capacity(pats.len());
@@ -209,7 +214,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     /// When encountering `($binding_mode $ident @)? ..` (`slice`),
     /// this is interpreted as a sub-slice pattern semantically.
     /// Patterns that follow, which are not like `slice` -- or an error occurs, are in `after`.
-    fn lower_pat_slice(&mut self, pats: &[P<Pat>]) -> hir::PatKind<'hir> {
+    fn lower_pat_slice(&mut self, pats: &[Pat]) -> hir::PatKind<'hir> {
         let mut before = Vec::new();
         let mut after = Vec::new();
         let mut slice = None;
@@ -283,7 +288,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         hir_id: hir::HirId,
         lower_sub: impl FnOnce(&mut Self) -> Option<&'hir hir::Pat<'hir>>,
     ) -> hir::PatKind<'hir> {
-        match self.resolver.get_partial_res(p.id).map(|d| d.expect_full_res()) {
+        match self.get_partial_res(p.id).map(|d| d.expect_full_res()) {
             // `None` can occur in body-less function signatures
             res @ (None | Some(Res::Local(_))) => {
                 let binding_id = match res {
@@ -390,19 +395,14 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         allow_paths: bool,
     ) -> &'hir hir::PatExpr<'hir> {
         let span = self.lower_span(expr.span);
-        let err = |guar| hir::PatExprKind::Lit {
-            lit: self.arena.alloc(respan(span, LitKind::Err(guar))),
-            negated: false,
-        };
+        let err =
+            |guar| hir::PatExprKind::Lit { lit: respan(span, LitKind::Err(guar)), negated: false };
         let kind = match &expr.kind {
             ExprKind::Lit(lit) => {
                 hir::PatExprKind::Lit { lit: self.lower_lit(lit, span), negated: false }
             }
-            ExprKind::ConstBlock(c) => hir::PatExprKind::ConstBlock(self.lower_const_block(c)),
-            ExprKind::IncludedBytes(bytes) => hir::PatExprKind::Lit {
-                lit: self
-                    .arena
-                    .alloc(respan(span, LitKind::ByteStr(Arc::clone(bytes), StrStyle::Cooked))),
+            ExprKind::IncludedBytes(byte_sym) => hir::PatExprKind::Lit {
+                lit: respan(span, LitKind::ByteStr(*byte_sym, StrStyle::Cooked)),
                 negated: false,
             },
             ExprKind::Err(guar) => err(*guar),
@@ -420,10 +420,16 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 hir::PatExprKind::Lit { lit: self.lower_lit(lit, span), negated: true }
             }
             _ => {
-                let pattern_from_macro = expr.is_approximately_pattern();
+                let is_const_block = matches!(expr.kind, ExprKind::ConstBlock(_));
+                let pattern_from_macro = expr.is_approximately_pattern()
+                    || matches!(
+                        expr.peel_parens().kind,
+                        ExprKind::Binary(Spanned { node: BinOpKind::BitOr, .. }, ..)
+                    );
                 let guar = self.dcx().emit_err(ArbitraryExpressionInPattern {
                     span,
                     pattern_from_macro_note: pattern_from_macro,
+                    const_block_in_pattern_help: is_const_block,
                 });
                 err(guar)
             }
@@ -444,16 +450,18 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let pat_hir_id = self.lower_node_id(pattern.id);
         let node = match &pattern.kind {
             TyPatKind::Range(e1, e2, Spanned { node: end, span }) => hir::TyPatKind::Range(
-                e1.as_deref().map(|e| self.lower_anon_const_to_const_arg(e)).unwrap_or_else(|| {
-                    self.lower_ty_pat_range_end(
-                        hir::LangItem::RangeMin,
-                        span.shrink_to_lo(),
-                        base_type,
-                    )
-                }),
+                e1.as_deref()
+                    .map(|e| self.lower_anon_const_to_const_arg_and_alloc(e))
+                    .unwrap_or_else(|| {
+                        self.lower_ty_pat_range_end(
+                            hir::LangItem::RangeMin,
+                            span.shrink_to_lo(),
+                            base_type,
+                        )
+                    }),
                 e2.as_deref()
                     .map(|e| match end {
-                        RangeEnd::Included(..) => self.lower_anon_const_to_const_arg(e),
+                        RangeEnd::Included(..) => self.lower_anon_const_to_const_arg_and_alloc(e),
                         RangeEnd::Excluded => self.lower_excluded_range_end(e),
                     })
                     .unwrap_or_else(|| {
@@ -464,6 +472,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         )
                     }),
             ),
+            TyPatKind::NotNull => hir::TyPatKind::NotNull,
             TyPatKind::Or(variants) => {
                 hir::TyPatKind::Or(self.arena.alloc_from_iter(
                     variants.iter().map(|pat| self.lower_ty_pat_mut(pat, base_type)),
@@ -510,6 +519,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         self.arena.alloc(hir::ConstArg {
             hir_id: self.next_id(),
             kind: hir::ConstArgKind::Anon(self.arena.alloc(anon_const)),
+            span,
         })
     }
 
@@ -522,14 +532,13 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         span: Span,
         base_type: Span,
     ) -> &'hir hir::ConstArg<'hir> {
-        let parent_def_id = self.current_hir_id_owner.def_id;
         let node_id = self.next_node_id();
 
         // Add a definition for the in-band const def.
         // We're generating a range end that didn't exist in the AST,
         // so the def collector didn't create the def ahead of time. That's why we have to do
         // it here.
-        let def_id = self.create_def(parent_def_id, node_id, None, DefKind::AnonConst, span);
+        let def_id = self.create_def(node_id, None, DefKind::AnonConst, span);
         let hir_id = self.lower_node_id(node_id);
 
         let unstable_span = self.mark_span_with_reason(
@@ -554,6 +563,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             })
         });
         let hir_id = self.next_id();
-        self.arena.alloc(hir::ConstArg { kind: hir::ConstArgKind::Anon(ct), hir_id })
+        self.arena.alloc(hir::ConstArg { kind: hir::ConstArgKind::Anon(ct), hir_id, span })
     }
 }

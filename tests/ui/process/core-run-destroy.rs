@@ -8,6 +8,10 @@
 //@ needs-subprocess
 //@ ignore-vxworks no 'cat' and 'sleep'
 //@ ignore-fuchsia no 'cat'
+//@ ignore-ios no 'cat' and 'sleep'
+//@ ignore-tvos no 'cat' and 'sleep'
+//@ ignore-watchos no 'cat' and 'sleep'
+//@ ignore-visionos no 'cat' and 'sleep'
 
 // N.B., these tests kill child processes. Valgrind sees these children as leaking
 // memory, which makes for some *confusing* logs. That's why these are here
@@ -37,7 +41,7 @@ pub fn sleeper() -> Child {
 pub fn sleeper() -> Child {
     // There's a `timeout` command on windows, but it doesn't like having
     // its output piped, so instead just ping ourselves a few times with
-    // gaps in between so we're sure this process is alive for awhile
+    // gaps in between so we're sure this process is alive for a while
     t!(Command::new("ping").arg("127.0.0.1").arg("-n").arg("1000").spawn())
 }
 

@@ -4,43 +4,48 @@
 
 use std::fmt;
 
-use base_db::CrateId;
-use chalk_solve::rust_ir::AdtKind;
+use base_db::Crate;
 use either::Either;
 use hir_def::{
-    lang_item::LangItem,
+    AdtId, AssocItemId, CallableDefId, DefWithBodyId, HasModule, ItemContainerId, Lookup,
+    attrs::AttrFlags,
+    lang_item::LangItems,
     resolver::{HasResolver, ValueNs},
-    AdtId, AssocItemId, DefWithBodyId, HasModule, ItemContainerId, Lookup,
 };
 use intern::sym;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use rustc_pattern_analysis::constructor::Constructor;
+use rustc_type_ir::inherent::IntoKind;
 use syntax::{
-    ast::{self, UnaryOp},
     AstNode,
+    ast::{self, UnaryOp},
 };
 use tracing::debug;
-use triomphe::Arc;
+
 use typed_arena::Arena;
 
 use crate::{
+    Adjust, InferenceResult,
     db::HirDatabase,
     diagnostics::match_check::{
         self,
         pat_analysis::{self, DeconstructedPat, MatchCheckCtx, WitnessPat},
     },
     display::{DisplayTarget, HirDisplay},
-    Adjust, InferenceResult, Interner, Ty, TyExt, TyKind,
+    next_solver::{
+        CallableIdWrapper, DbInterner, ParamEnv, Ty, TyKind, TypingMode,
+        infer::{DbInternerInferExt, InferCtxt},
+    },
 };
 
 pub(crate) use hir_def::{
-    expr_store::Body,
-    hir::{Expr, ExprId, MatchArm, Pat, PatId, Statement},
     LocalFieldId, VariantId,
+    expr_store::Body,
+    hir::{Expr, ExprId, MatchArm, Pat, PatId, RecordSpread, Statement},
 };
 
-pub enum BodyValidationDiagnostic {
+pub enum BodyValidationDiagnostic<'db> {
     RecordMissingFields {
         record: Either<ExprId, PatId>,
         variant: VariantId,
@@ -63,45 +68,68 @@ pub enum BodyValidationDiagnostic {
     RemoveUnnecessaryElse {
         if_expr: ExprId,
     },
+    UnusedMustUse {
+        expr: ExprId,
+        message: Option<&'db str>,
+    },
 }
 
-impl BodyValidationDiagnostic {
+impl<'db> BodyValidationDiagnostic<'db> {
     pub fn collect(
-        db: &dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         owner: DefWithBodyId,
         validate_lints: bool,
-    ) -> Vec<BodyValidationDiagnostic> {
+    ) -> Vec<BodyValidationDiagnostic<'db>> {
         let _p = tracing::info_span!("BodyValidationDiagnostic::collect").entered();
-        let infer = db.infer(owner);
-        let body = db.body(owner);
-        let mut validator =
-            ExprValidator { owner, body, infer, diagnostics: Vec::new(), validate_lints };
-        validator.validate_body(db);
+        let infer = InferenceResult::of(db, owner);
+        let body = Body::of(db, owner);
+        let env = db.trait_environment(owner.generic_def(db));
+        let interner = DbInterner::new_with(db, owner.krate(db));
+        let infcx =
+            interner.infer_ctxt().build(TypingMode::typeck_for_body(interner, owner.into()));
+        let mut validator = ExprValidator {
+            owner,
+            body,
+            infer,
+            diagnostics: Vec::new(),
+            validate_lints,
+            env,
+            infcx,
+        };
+        validator.validate_body();
         validator.diagnostics
     }
 }
 
-struct ExprValidator {
+struct ExprValidator<'db> {
     owner: DefWithBodyId,
-    body: Arc<Body>,
-    infer: Arc<InferenceResult>,
-    diagnostics: Vec<BodyValidationDiagnostic>,
+    body: &'db Body,
+    infer: &'db InferenceResult<'db>,
+    env: ParamEnv<'db>,
+    diagnostics: Vec<BodyValidationDiagnostic<'db>>,
     validate_lints: bool,
+    infcx: InferCtxt<'db>,
 }
 
-impl ExprValidator {
-    fn validate_body(&mut self, db: &dyn HirDatabase) {
+impl<'db> ExprValidator<'db> {
+    #[inline]
+    fn db(&self) -> &'db dyn HirDatabase {
+        self.infcx.interner.db
+    }
+
+    fn validate_body(&mut self) {
+        let db = self.db();
         let mut filter_map_next_checker = None;
         // we'll pass &mut self while iterating over body.exprs, so they need to be disjoint
-        let body = Arc::clone(&self.body);
+        let body = self.body;
 
         if matches!(self.owner, DefWithBodyId::FunctionId(_)) {
-            self.check_for_trailing_return(body.body_expr, &body);
+            self.check_for_trailing_return(body.root_expr(), body);
         }
 
-        for (id, expr) in body.exprs.iter() {
-            if let Some((variant, missed_fields, true)) =
-                record_literal_missing_fields(db, &self.infer, id, expr)
+        for (id, expr) in body.exprs() {
+            if let Some((variant, missed_fields)) =
+                record_literal_missing_fields(db, self.infer, id, expr)
             {
                 self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
                     record: Either::Left(id),
@@ -112,50 +140,37 @@ impl ExprValidator {
 
             match expr {
                 Expr::Match { expr, arms } => {
-                    self.validate_match(id, *expr, arms, db);
+                    self.validate_match(id, *expr, arms);
                 }
                 Expr::Call { .. } | Expr::MethodCall { .. } => {
-                    self.validate_call(db, id, expr, &mut filter_map_next_checker);
+                    self.validate_call(id, expr, &mut filter_map_next_checker);
                 }
                 Expr::Closure { body: body_expr, .. } => {
-                    self.check_for_trailing_return(*body_expr, &body);
+                    self.check_for_trailing_return(*body_expr, body);
                 }
                 Expr::If { .. } => {
-                    self.check_for_unnecessary_else(id, expr, db);
+                    self.check_for_unnecessary_else(id, expr);
                 }
-                Expr::Block { .. } | Expr::Async { .. } | Expr::Unsafe { .. } => {
-                    self.validate_block(db, expr);
+                Expr::Block { .. } | Expr::Unsafe { .. } => {
+                    self.validate_block(expr);
                 }
                 _ => {}
-            }
-        }
-
-        for (id, pat) in body.pats.iter() {
-            if let Some((variant, missed_fields, true)) =
-                record_pattern_missing_fields(db, &self.infer, id, pat)
-            {
-                self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
-                    record: Either::Right(id),
-                    variant,
-                    missed_fields,
-                });
             }
         }
     }
 
     fn validate_call(
         &mut self,
-        db: &dyn HirDatabase,
         call_id: ExprId,
         expr: &Expr,
-        filter_map_next_checker: &mut Option<FilterMapNextChecker>,
+        filter_map_next_checker: &mut Option<FilterMapNextChecker<'db>>,
     ) {
         if !self.validate_lints {
             return;
         }
         // Check that the number of arguments matches the number of parameters.
 
-        if self.infer.expr_type_mismatches().next().is_some() {
+        if self.infer.exprs_have_type_mismatches() {
             // FIXME: Due to shortcomings in the current type system implementation, only emit
             // this diagnostic if there are no type mismatches in the containing function.
         } else if let Expr::MethodCall { receiver, .. } = expr {
@@ -165,7 +180,7 @@ impl ExprValidator {
             };
 
             let checker = filter_map_next_checker.get_or_insert_with(|| {
-                FilterMapNextChecker::new(&self.owner.resolver(db.upcast()), db)
+                FilterMapNextChecker::new(self.infcx.interner.lang_items(), self.db())
             });
 
             if checker.check(call_id, receiver, &callee).is_some() {
@@ -174,24 +189,21 @@ impl ExprValidator {
                 });
             }
 
-            let receiver_ty = self.infer[*receiver].clone();
-            checker.prev_receiver_ty = Some(receiver_ty);
+            if let Some(receiver_ty) = self.infer.type_of_expr_with_adjust(*receiver) {
+                checker.prev_receiver_ty = Some(receiver_ty);
+            }
         }
     }
 
-    fn validate_match(
-        &mut self,
-        match_expr: ExprId,
-        scrutinee_expr: ExprId,
-        arms: &[MatchArm],
-        db: &dyn HirDatabase,
-    ) {
-        let scrut_ty = &self.infer[scrutinee_expr];
-        if scrut_ty.contains_unknown() {
+    fn validate_match(&mut self, match_expr: ExprId, scrutinee_expr: ExprId, arms: &[MatchArm]) {
+        let Some(scrut_ty) = self.infer.type_of_expr_with_adjust(scrutinee_expr) else {
+            return;
+        };
+        if scrut_ty.references_non_lt_error() {
             return;
         }
 
-        let cx = MatchCheckCtx::new(self.owner.module(db.upcast()), self.owner, db);
+        let cx = MatchCheckCtx::new(self.owner.module(self.db()), &self.infcx, self.env);
 
         let pattern_arena = Arena::new();
         let mut m_arms = Vec::with_capacity(arms.len());
@@ -199,10 +211,8 @@ impl ExprValidator {
         // Note: Skipping the entire diagnostic rather than just not including a faulty match arm is
         // preferred to avoid the chance of false positives.
         for arm in arms {
-            let Some(pat_ty) = self.infer.type_of_pat.get(arm.pat) else {
-                return;
-            };
-            if pat_ty.contains_unknown() {
+            let pat_ty = self.infer.type_of_pat_with_adjust(arm.pat);
+            if pat_ty.references_non_lt_error() {
                 return;
             }
 
@@ -219,14 +229,13 @@ impl ExprValidator {
             if (pat_ty == scrut_ty
                 || scrut_ty
                     .as_reference()
-                    .map(|(match_expr_ty, ..)| match_expr_ty == pat_ty)
-                    .unwrap_or(false))
-                && types_of_subpatterns_do_match(arm.pat, &self.body, &self.infer)
+                    .is_none_or(|(match_expr_ty, ..)| match_expr_ty == pat_ty))
+                && types_of_subpatterns_do_match(arm.pat, self.body, self.infer)
             {
                 // If we had a NotUsefulMatchArm diagnostic, we could
                 // check the usefulness of each pattern as we added it
                 // to the matrix here.
-                let pat = self.lower_pattern(&cx, arm.pat, db, &mut has_lowering_errors);
+                let pat = self.lower_pattern(&cx, arm.pat, &mut has_lowering_errors);
                 let m_arm = pat_analysis::MatchArm {
                     pat: pattern_arena.alloc(pat),
                     has_guard: arm.guard.is_some(),
@@ -242,15 +251,12 @@ impl ExprValidator {
             return;
         }
 
-        let known_valid_scrutinee = Some(self.is_known_valid_scrutinee(scrutinee_expr, db));
-        let report = match cx.compute_match_usefulness(
-            m_arms.as_slice(),
-            scrut_ty.clone(),
-            known_valid_scrutinee,
-        ) {
-            Ok(report) => report,
-            Err(()) => return,
-        };
+        let known_valid_scrutinee = Some(self.is_known_valid_scrutinee(scrutinee_expr));
+        let report =
+            match cx.compute_match_usefulness(m_arms.as_slice(), scrut_ty, known_valid_scrutinee) {
+                Ok(report) => report,
+                Err(()) => return,
+            };
 
         // FIXME Report unreachable arms
         // https://github.com/rust-lang/rust/blob/f31622a50/compiler/rustc_mir_build/src/thir/pattern/check_match.rs#L200
@@ -264,7 +270,7 @@ impl ExprValidator {
                     scrut_ty,
                     witnesses,
                     m_arms.is_empty(),
-                    self.owner.krate(db.upcast()),
+                    self.owner.krate(self.db()),
                 ),
             });
         }
@@ -275,7 +281,9 @@ impl ExprValidator {
     // While the above function in rustc uses thir exprs, r-a doesn't have them.
     // So, the logic here is getting same result as "hir lowering + match with lowered thir"
     // with "hir only"
-    fn is_known_valid_scrutinee(&self, scrutinee_expr: ExprId, db: &dyn HirDatabase) -> bool {
+    fn is_known_valid_scrutinee(&self, scrutinee_expr: ExprId) -> bool {
+        let db = self.db();
+
         if self
             .infer
             .expr_adjustments
@@ -288,92 +296,108 @@ impl ExprValidator {
         match &self.body[scrutinee_expr] {
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => false,
             Expr::Path(path) => {
-                let value_or_partial =
-                    self.owner.resolver(db.upcast()).resolve_path_in_value_ns_fully(
-                        db.upcast(),
-                        path,
-                        self.body.expr_path_hygiene(scrutinee_expr),
-                    );
+                let value_or_partial = self.owner.resolver(db).resolve_path_in_value_ns_fully(
+                    db,
+                    path,
+                    self.body.expr_path_hygiene(scrutinee_expr),
+                );
                 value_or_partial.is_none_or(|v| !matches!(v, ValueNs::StaticId(_)))
             }
-            Expr::Field { expr, .. } => match self.infer.type_of_expr[*expr].kind(Interner) {
-                TyKind::Adt(adt, ..)
-                    if db.adt_datum(self.owner.krate(db.upcast()), *adt).kind == AdtKind::Union =>
-                {
-                    false
-                }
-                _ => self.is_known_valid_scrutinee(*expr, db),
+            Expr::Field { expr, .. } => match self.infer.expr_ty(*expr).kind() {
+                TyKind::Adt(adt, ..) if matches!(adt.def_id(), AdtId::UnionId(_)) => false,
+                _ => self.is_known_valid_scrutinee(*expr),
             },
-            Expr::Index { base, .. } => self.is_known_valid_scrutinee(*base, db),
-            Expr::Cast { expr, .. } => self.is_known_valid_scrutinee(*expr, db),
+            Expr::Index { base, .. } => self.is_known_valid_scrutinee(*base),
+            Expr::Cast { expr, .. } => self.is_known_valid_scrutinee(*expr),
             Expr::Missing => false,
             _ => true,
         }
     }
 
-    fn validate_block(&mut self, db: &dyn HirDatabase, expr: &Expr) {
-        let (Expr::Block { statements, .. }
-        | Expr::Async { statements, .. }
-        | Expr::Unsafe { statements, .. }) = expr
-        else {
+    fn validate_block(&mut self, expr: &Expr) {
+        let (Expr::Block { statements, .. } | Expr::Unsafe { statements, .. }) = expr else {
             return;
         };
         let pattern_arena = Arena::new();
-        let cx = MatchCheckCtx::new(self.owner.module(db.upcast()), self.owner, db);
+        let cx = MatchCheckCtx::new(self.owner.module(self.db()), &self.infcx, self.env);
         for stmt in &**statements {
-            let &Statement::Let { pat, initializer, else_branch: None, .. } = stmt else {
-                continue;
-            };
-            let Some(initializer) = initializer else { continue };
-            let ty = &self.infer[initializer];
-            if ty.contains_unknown() {
-                continue;
-            }
-
-            let mut have_errors = false;
-            let deconstructed_pat = self.lower_pattern(&cx, pat, db, &mut have_errors);
-
-            // optimization, wildcard trivially hold
-            if have_errors || matches!(deconstructed_pat.ctor(), Constructor::Wildcard) {
-                continue;
-            }
-
-            let match_arm = rustc_pattern_analysis::MatchArm {
-                pat: pattern_arena.alloc(deconstructed_pat),
-                has_guard: false,
-                arm_data: (),
-            };
-            let report = match cx.compute_match_usefulness(&[match_arm], ty.clone(), None) {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!(?e, "match usefulness error");
-                    continue;
+            match *stmt {
+                Statement::Expr { expr: stmt_expr, has_semi: true } if self.validate_lints => {
+                    let mut diags = Vec::new();
+                    self.check_unused_must_use(stmt_expr, &mut diags);
+                    self.diagnostics.extend(diags);
                 }
-            };
-            let witnesses = report.non_exhaustiveness_witnesses;
-            if !witnesses.is_empty() {
-                self.diagnostics.push(BodyValidationDiagnostic::NonExhaustiveLet {
-                    pat,
-                    uncovered_patterns: missing_match_arms(
-                        &cx,
-                        ty,
-                        witnesses,
-                        false,
-                        self.owner.krate(db.upcast()),
-                    ),
-                });
+                Statement::Let { pat, initializer, else_branch: None, .. } => {
+                    if let Some(diag) =
+                        self.check_non_exhaustive_let(&cx, &pattern_arena, pat, initializer)
+                    {
+                        self.diagnostics.push(diag);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    fn lower_pattern<'p>(
+    fn check_non_exhaustive_let<'a>(
         &self,
-        cx: &MatchCheckCtx<'p>,
+        cx: &MatchCheckCtx<'a, 'db>,
+        pattern_arena: &'a Arena<DeconstructedPat<'a, 'db>>,
         pat: PatId,
-        db: &dyn HirDatabase,
+        initializer: Option<ExprId>,
+    ) -> Option<BodyValidationDiagnostic<'db>> {
+        if self.infer.pat_has_type_mismatch(pat) {
+            return None;
+        }
+        let initializer = initializer?;
+        let ty = self.infer.type_of_expr_with_adjust(initializer)?;
+        if ty.references_non_lt_error() {
+            return None;
+        }
+
+        let mut have_errors = false;
+        let deconstructed_pat = self.lower_pattern(cx, pat, &mut have_errors);
+
+        // optimization, wildcard trivially hold
+        if have_errors || matches!(deconstructed_pat.ctor(), Constructor::Wildcard) {
+            return None;
+        }
+
+        let match_arm = rustc_pattern_analysis::MatchArm {
+            pat: pattern_arena.alloc(deconstructed_pat),
+            has_guard: false,
+            arm_data: (),
+        };
+        let report = match cx.compute_match_usefulness(&[match_arm], ty, None) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(?e, "match usefulness error");
+                return None;
+            }
+        };
+        let witnesses = report.non_exhaustiveness_witnesses;
+        if witnesses.is_empty() {
+            return None;
+        }
+        Some(BodyValidationDiagnostic::NonExhaustiveLet {
+            pat,
+            uncovered_patterns: missing_match_arms(
+                cx,
+                ty,
+                witnesses,
+                false,
+                self.owner.krate(self.db()),
+            ),
+        })
+    }
+
+    fn lower_pattern<'a>(
+        &self,
+        cx: &MatchCheckCtx<'a, 'db>,
+        pat: PatId,
         have_errors: &mut bool,
-    ) -> DeconstructedPat<'p> {
-        let mut patcx = match_check::PatCtxt::new(db, &self.infer, &self.body);
+    ) -> DeconstructedPat<'a, 'db> {
+        let mut patcx = match_check::PatCtxt::new(self.db(), self.infer, self.body);
         let pattern = patcx.lower_pattern(pat);
         let pattern = cx.lower_pat(&pattern);
         if !patcx.errors.is_empty() {
@@ -382,11 +406,71 @@ impl ExprValidator {
         pattern
     }
 
+    fn check_unused_must_use(
+        &self,
+        mut expr: ExprId,
+        acc: &mut Vec<BodyValidationDiagnostic<'db>>,
+    ) {
+        // Walk through container expressions so that the value-producing leaf is
+        // checked even when wrapped in a block, `unsafe { .. }`, `if`/`match`, or
+        // a `const { .. }` block.  Single-tail chains are followed by reassigning
+        // `expr`; branching containers (`if`/`match`) recurse on each arm.
+        loop {
+            match &self.body[expr] {
+                Expr::Block { tail: Some(tail), .. }
+                | Expr::Unsafe { tail: Some(tail), .. }
+                | Expr::Const(tail) => expr = *tail,
+                Expr::If { then_branch, else_branch, .. } => {
+                    self.check_unused_must_use(*then_branch, acc);
+                    if let Some(else_branch) = else_branch {
+                        self.check_unused_must_use(*else_branch, acc);
+                    }
+                    return;
+                }
+                Expr::Match { arms, .. } => {
+                    for arm in arms.iter() {
+                        self.check_unused_must_use(arm.expr, acc);
+                    }
+                    return;
+                }
+                _ => break,
+            }
+        }
+
+        let fn_def = match &self.body[expr] {
+            Expr::Call { callee, .. } => {
+                let callee_ty = self.infer.expr_ty(*callee);
+                if let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(func)), _) =
+                    callee_ty.kind()
+                {
+                    Some(func.into())
+                } else {
+                    None
+                }
+            }
+            Expr::MethodCall { .. } => {
+                self.infer.method_resolution(expr).map(|(func, _)| func.into())
+            }
+            _ => None,
+        };
+        let ty_def = self.infer.type_of_expr_with_adjust(expr).and_then(|ty| match ty.kind() {
+            TyKind::Adt(adt, _) => Some(adt.def_id().into()),
+            _ => None,
+        });
+        let must_use_diag = |owner| {
+            AttrFlags::must_use_message(self.db(), owner?)
+                .map(|message| BodyValidationDiagnostic::UnusedMustUse { expr, message })
+        };
+        if let Some(diag) = must_use_diag(fn_def).or_else(|| must_use_diag(ty_def)) {
+            acc.push(diag);
+        }
+    }
+
     fn check_for_trailing_return(&mut self, body_expr: ExprId, body: &Body) {
         if !self.validate_lints {
             return;
         }
-        match &body.exprs[body_expr] {
+        match &body[body_expr] {
             Expr::Block { statements, tail, .. } => {
                 let last_stmt = tail.or_else(|| match statements.last()? {
                     Statement::Expr { expr, .. } => Some(*expr),
@@ -417,7 +501,7 @@ impl ExprValidator {
         }
     }
 
-    fn check_for_unnecessary_else(&mut self, id: ExprId, expr: &Expr, db: &dyn HirDatabase) {
+    fn check_for_unnecessary_else(&mut self, id: ExprId, expr: &Expr) {
         if !self.validate_lints {
             return;
         }
@@ -425,78 +509,73 @@ impl ExprValidator {
             if else_branch.is_none() {
                 return;
             }
-            if let Expr::Block { statements, tail, .. } = &self.body.exprs[*then_branch] {
+            if let Expr::Block { statements, tail, .. } = &self.body[*then_branch] {
                 let last_then_expr = tail.or_else(|| match statements.last()? {
                     Statement::Expr { expr, .. } => Some(*expr),
                     _ => None,
                 });
-                if let Some(last_then_expr) = last_then_expr {
-                    let last_then_expr_ty = &self.infer[last_then_expr];
-                    if last_then_expr_ty.is_never() {
-                        // Only look at sources if the then branch diverges and we have an else branch.
-                        let (_, source_map) = db.body_with_source_map(self.owner);
-                        let Ok(source_ptr) = source_map.expr_syntax(id) else {
-                            return;
-                        };
-                        let root = source_ptr.file_syntax(db.upcast());
-                        let either::Left(ast::Expr::IfExpr(if_expr)) =
-                            source_ptr.value.to_node(&root)
-                        else {
-                            return;
-                        };
-                        let mut top_if_expr = if_expr;
-                        loop {
-                            let parent = top_if_expr.syntax().parent();
-                            let has_parent_expr_stmt_or_stmt_list =
-                                parent.as_ref().is_some_and(|node| {
-                                    ast::ExprStmt::can_cast(node.kind())
-                                        | ast::StmtList::can_cast(node.kind())
-                                });
-                            if has_parent_expr_stmt_or_stmt_list {
-                                // Only emit diagnostic if parent or direct ancestor is either
-                                // an expr stmt or a stmt list.
-                                break;
-                            }
-                            let Some(parent_if_expr) = parent.and_then(ast::IfExpr::cast) else {
-                                // Bail if parent is neither an if expr, an expr stmt nor a stmt list.
-                                return;
-                            };
-                            // Check parent if expr.
-                            top_if_expr = parent_if_expr;
+                if let Some(last_then_expr) = last_then_expr
+                    && let Some(last_then_expr_ty) =
+                        self.infer.type_of_expr_with_adjust(last_then_expr)
+                    && last_then_expr_ty.is_never()
+                {
+                    // Only look at sources if the then branch diverges and we have an else branch.
+                    let source_map = &Body::with_source_map(self.db(), self.owner).1;
+                    let Ok(source_ptr) = source_map.expr_syntax(id) else {
+                        return;
+                    };
+                    let root = source_ptr.file_syntax(self.db());
+                    let either::Left(ast::Expr::IfExpr(if_expr)) = source_ptr.value.to_node(&root)
+                    else {
+                        return;
+                    };
+                    let mut top_if_expr = if_expr;
+                    loop {
+                        let parent = top_if_expr.syntax().parent();
+                        let has_parent_expr_stmt_or_stmt_list =
+                            parent.as_ref().is_some_and(|node| {
+                                ast::ExprStmt::can_cast(node.kind())
+                                    | ast::StmtList::can_cast(node.kind())
+                            });
+                        if has_parent_expr_stmt_or_stmt_list {
+                            // Only emit diagnostic if parent or direct ancestor is either
+                            // an expr stmt or a stmt list.
+                            break;
                         }
-
-                        self.diagnostics
-                            .push(BodyValidationDiagnostic::RemoveUnnecessaryElse { if_expr: id })
+                        let Some(parent_if_expr) = parent.and_then(ast::IfExpr::cast) else {
+                            // Bail if parent is neither an if expr, an expr stmt nor a stmt list.
+                            return;
+                        };
+                        // Check parent if expr.
+                        top_if_expr = parent_if_expr;
                     }
+
+                    self.diagnostics
+                        .push(BodyValidationDiagnostic::RemoveUnnecessaryElse { if_expr: id })
                 }
             }
         }
     }
 }
 
-struct FilterMapNextChecker {
+struct FilterMapNextChecker<'db> {
     filter_map_function_id: Option<hir_def::FunctionId>,
     next_function_id: Option<hir_def::FunctionId>,
     prev_filter_map_expr_id: Option<ExprId>,
-    prev_receiver_ty: Option<chalk_ir::Ty<Interner>>,
+    prev_receiver_ty: Option<Ty<'db>>,
 }
 
-impl FilterMapNextChecker {
-    fn new(resolver: &hir_def::resolver::Resolver, db: &dyn HirDatabase) -> Self {
+impl<'db> FilterMapNextChecker<'db> {
+    fn new(lang_items: &'db LangItems, db: &'db dyn HirDatabase) -> Self {
         // Find and store the FunctionIds for Iterator::filter_map and Iterator::next
-        let (next_function_id, filter_map_function_id) = match db
-            .lang_item(resolver.krate(), LangItem::IteratorNext)
-            .and_then(|it| it.as_function())
-        {
+        let (next_function_id, filter_map_function_id) = match lang_items.IteratorNext {
             Some(next_function_id) => (
                 Some(next_function_id),
-                match next_function_id.lookup(db.upcast()).container {
+                match next_function_id.lookup(db).container {
                     ItemContainerId::TraitId(iterator_trait_id) => {
-                        let iterator_trait_items = &db.trait_data(iterator_trait_id).items;
+                        let iterator_trait_items = &iterator_trait_id.trait_items(db).items;
                         iterator_trait_items.iter().find_map(|(name, it)| match it {
-                            &AssocItemId::FunctionId(id) if *name == sym::filter_map.clone() => {
-                                Some(id)
-                            }
+                            &AssocItemId::FunctionId(id) if *name == sym::filter_map => Some(id),
                             _ => None,
                         })
                     }
@@ -525,15 +604,15 @@ impl FilterMapNextChecker {
             return None;
         }
 
-        if *function_id == self.next_function_id? {
-            if let Some(prev_filter_map_expr_id) = self.prev_filter_map_expr_id {
-                let is_dyn_trait = self
-                    .prev_receiver_ty
-                    .as_ref()
-                    .is_some_and(|it| it.strip_references().dyn_trait().is_some());
-                if *receiver_expr_id == prev_filter_map_expr_id && !is_dyn_trait {
-                    return Some(());
-                }
+        if *function_id == self.next_function_id?
+            && let Some(prev_filter_map_expr_id) = self.prev_filter_map_expr_id
+        {
+            let is_dyn_trait = self
+                .prev_receiver_ty
+                .as_ref()
+                .is_some_and(|it| it.strip_references().dyn_trait().is_some());
+            if *receiver_expr_id == prev_filter_map_expr_id && !is_dyn_trait {
+                return Some(());
             }
         }
 
@@ -542,14 +621,14 @@ impl FilterMapNextChecker {
     }
 }
 
-pub fn record_literal_missing_fields(
-    db: &dyn HirDatabase,
-    infer: &InferenceResult,
+pub fn record_literal_missing_fields<'db>(
+    db: &'db dyn HirDatabase,
+    infer: &InferenceResult<'db>,
     id: ExprId,
     expr: &Expr,
-) -> Option<(VariantId, Vec<LocalFieldId>, /*exhaustive*/ bool)> {
-    let (fields, exhaustive) = match expr {
-        Expr::RecordLit { fields, spread, .. } => (fields, spread.is_none()),
+) -> Option<(VariantId, Vec<LocalFieldId>)> {
+    let (fields, spread) = match expr {
+        Expr::RecordLit { fields, spread, .. } => (fields, spread),
         _ => return None,
     };
 
@@ -558,28 +637,41 @@ pub fn record_literal_missing_fields(
         return None;
     }
 
-    let variant_data = variant_def.variant_data(db.upcast());
+    let variant_data = variant_def.fields(db);
 
     let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    // don't show missing fields if:
+    // - has ..expr
+    // - or has default value + ..
+    // - or already in code
     let missed_fields: Vec<LocalFieldId> = variant_data
         .fields()
         .iter()
-        .filter_map(|(f, d)| if specified_fields.contains(&d.name) { None } else { Some(f) })
+        .filter_map(|(f, d)| {
+            if specified_fields.contains(&d.name)
+                || matches!(spread, RecordSpread::Expr(_))
+                || (d.default_value.is_some() && matches!(spread, RecordSpread::FieldDefaults))
+            {
+                None
+            } else {
+                Some(f)
+            }
+        })
         .collect();
     if missed_fields.is_empty() {
         return None;
     }
-    Some((variant_def, missed_fields, exhaustive))
+    Some((variant_def, missed_fields))
 }
 
-pub fn record_pattern_missing_fields(
-    db: &dyn HirDatabase,
-    infer: &InferenceResult,
+pub fn record_pattern_missing_fields<'db>(
+    db: &'db dyn HirDatabase,
+    infer: &InferenceResult<'db>,
     id: PatId,
     pat: &Pat,
-) -> Option<(VariantId, Vec<LocalFieldId>, /*exhaustive*/ bool)> {
-    let (fields, exhaustive) = match pat {
-        Pat::Record { path: _, args, ellipsis } => (args, !ellipsis),
+) -> Option<(VariantId, Vec<LocalFieldId>)> {
+    let (fields, ellipsis) = match pat {
+        Pat::Record { path: _, args, ellipsis } => (args, *ellipsis),
         _ => return None,
     };
 
@@ -588,29 +680,36 @@ pub fn record_pattern_missing_fields(
         return None;
     }
 
-    let variant_data = variant_def.variant_data(db.upcast());
+    let variant_data = variant_def.fields(db);
 
     let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
+    // don't show missing fields if:
+    // - in code
+    // - or has ..
     let missed_fields: Vec<LocalFieldId> = variant_data
         .fields()
         .iter()
-        .filter_map(|(f, d)| if specified_fields.contains(&d.name) { None } else { Some(f) })
+        .filter_map(
+            |(f, d)| {
+                if specified_fields.contains(&d.name) || ellipsis { None } else { Some(f) }
+            },
+        )
         .collect();
     if missed_fields.is_empty() {
         return None;
     }
-    Some((variant_def, missed_fields, exhaustive))
+    Some((variant_def, missed_fields))
 }
 
-fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResult) -> bool {
-    fn walk(pat: PatId, body: &Body, infer: &InferenceResult, has_type_mismatches: &mut bool) {
-        match infer.type_mismatch_for_pat(pat) {
-            Some(_) => *has_type_mismatches = true,
-            None if *has_type_mismatches => (),
-            None => {
+fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResult<'_>) -> bool {
+    fn walk(pat: PatId, body: &Body, infer: &InferenceResult<'_>, has_type_mismatches: &mut bool) {
+        match infer.pat_has_type_mismatch(pat) {
+            true => *has_type_mismatches = true,
+            false if *has_type_mismatches => (),
+            false => {
                 let pat = &body[pat];
                 if let Pat::ConstBlock(expr) | Pat::Lit(expr) = *pat {
-                    *has_type_mismatches |= infer.type_mismatch_for_expr(expr).is_some();
+                    *has_type_mismatches |= infer.expr_has_type_mismatch(expr);
                     if *has_type_mismatches {
                         return;
                     }
@@ -625,15 +724,19 @@ fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResul
     !has_type_mismatches
 }
 
-fn missing_match_arms<'p>(
-    cx: &MatchCheckCtx<'p>,
-    scrut_ty: &Ty,
-    witnesses: Vec<WitnessPat<'p>>,
+fn missing_match_arms<'a, 'db>(
+    cx: &MatchCheckCtx<'a, 'db>,
+    scrut_ty: Ty<'a>,
+    witnesses: Vec<WitnessPat<'a, 'db>>,
     arms_is_empty: bool,
-    krate: CrateId,
+    krate: Crate,
 ) -> String {
-    struct DisplayWitness<'a, 'p>(&'a WitnessPat<'p>, &'a MatchCheckCtx<'p>, DisplayTarget);
-    impl fmt::Display for DisplayWitness<'_, '_> {
+    struct DisplayWitness<'a, 'b, 'db>(
+        &'a WitnessPat<'b, 'db>,
+        &'a MatchCheckCtx<'b, 'db>,
+        DisplayTarget,
+    );
+    impl fmt::Display for DisplayWitness<'_, '_, '_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let DisplayWitness(witness, cx, display_target) = *self;
             let pat = cx.hoist_witness_pat(witness);
@@ -642,7 +745,7 @@ fn missing_match_arms<'p>(
     }
 
     let non_empty_enum = match scrut_ty.as_adt() {
-        Some((AdtId::EnumId(e), _)) => !cx.db.enum_data(e).variants.is_empty(),
+        Some((AdtId::EnumId(e), _)) => !e.enum_variants(cx.db).variants.is_empty(),
         _ => false,
     };
     let display_target = DisplayTarget::from_crate(cx.db, krate);

@@ -2,20 +2,23 @@
 //! into a place.
 //! All high-level functions to write to memory work on places as destinations.
 
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use either::{Either, Left, Right};
 use rustc_abi::{BackendRepr, HasDataLayout, Size};
-use rustc_middle::ty::Ty;
-use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::{self, Ty};
 use rustc_middle::{bug, mir, span_bug};
+use tracing::field::Empty;
 use tracing::{instrument, trace};
 
 use super::{
-    AllocInit, AllocRef, AllocRefMut, CheckAlignMsg, CtfeProvenance, ImmTy, Immediate, InterpCx,
-    InterpResult, Machine, MemoryKind, Misalignment, OffsetMode, OpTy, Operand, Pointer,
-    Projectable, Provenance, Scalar, alloc_range, interp_ok, mir_assign_valid_types,
+    AllocInit, AllocRef, AllocRefMut, CheckAlignMsg, CheckInAllocMsg, CtfeProvenance, ImmTy,
+    Immediate, InterpCx, InterpResult, Machine, MemoryKind, Misalignment, OffsetMode, OpTy,
+    Operand, Pointer, Projectable, Provenance, Scalar, alloc_range, err_ub, err_ub_format,
+    interp_ok, mir_assign_valid_types, throw_ub_format,
 };
+use crate::enter_trace_span;
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 /// Information required for the sound usage of a `MemPlace`.
@@ -118,7 +121,7 @@ impl<'tcx, Prov: Provenance> MPlaceTy<'tcx, Prov> {
     pub fn fake_alloc_zst(layout: TyAndLayout<'tcx>) -> Self {
         assert!(layout.is_zst());
         let align = layout.align.abi;
-        let ptr = Pointer::from_addr_invalid(align.bytes()); // no provenance, absolute address
+        let ptr = Pointer::without_provenance(align.bytes()); // no provenance, absolute address
         MPlaceTy { mplace: MemPlace { ptr, meta: MemPlaceMeta::None, misaligned: None }, layout }
     }
 
@@ -232,6 +235,12 @@ impl<'tcx, Prov: Provenance> PlaceTy<'tcx, Prov> {
     }
 
     /// A place is either an mplace or some local.
+    ///
+    /// Note that the return value can be different even for logically identical places!
+    /// Specifically, if a local is stored in-memory, this may return `Local` or `MPlaceTy`
+    /// depending on how the place was constructed. In other words, seeing `Local` here does *not*
+    /// imply that this place does not point to memory. Every caller must therefore always handle
+    /// both cases.
     #[inline(always)]
     pub fn as_mplace_or_local(
         &self,
@@ -409,57 +418,122 @@ where
         self.ptr_with_meta_to_mplace(ptr, MemPlaceMeta::None, layout, /*unaligned*/ true)
     }
 
-    /// Take a value, which represents a (thin or wide) reference, and make it a place.
-    /// Alignment is just based on the type. This is the inverse of `mplace_to_ref()`.
+    /// Take a value, which represents a (thin or wide) pointer, and make it a place.
+    /// Alignment is just based on the type. This is the inverse of `mplace_to_imm_ptr()`.
     ///
     /// Only call this if you are sure the place is "valid" (aligned and inbounds), or do not
     /// want to ever use the place for memory access!
     /// Generally prefer `deref_pointer`.
-    pub fn ref_to_mplace(
+    pub fn imm_ptr_to_mplace(
         &self,
         val: &ImmTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
         let pointee_type =
-            val.layout.ty.builtin_deref(true).expect("`ref_to_mplace` called on non-ptr type");
+            val.layout.ty.builtin_deref(true).expect("`imm_ptr_to_mplace` called on non-ptr type");
         let layout = self.layout_of(pointee_type)?;
         let (ptr, meta) = val.to_scalar_and_meta();
 
-        // `ref_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
+        // `imm_ptr_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
         // we hence can't call `size_and_align_of` since that asserts more validity than we want.
         let ptr = ptr.to_pointer(self)?;
         interp_ok(self.ptr_with_meta_to_mplace(ptr, meta, layout, /*unaligned*/ false))
     }
 
     /// Turn a mplace into a (thin or wide) mutable raw pointer, pointing to the same space.
+    ///
     /// `align` information is lost!
-    /// This is the inverse of `ref_to_mplace`.
-    pub fn mplace_to_ref(
+    /// This is the inverse of `imm_ptr_to_mplace`.
+    ///
+    /// If `ptr_ty` is provided, the resulting pointer will be of that type. Otherwise, it defaults to `*mut _`.
+    /// `ptr_ty` must be a type with builtin deref which derefs to the type of `mplace` (`mplace.layout.ty`).
+    pub fn mplace_to_imm_ptr(
         &self,
         mplace: &MPlaceTy<'tcx, M::Provenance>,
+        ptr_ty: Option<Ty<'tcx>>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
         let imm = mplace.mplace.to_ref(self);
-        let layout = self.layout_of(Ty::new_mut_ptr(self.tcx.tcx, mplace.layout.ty))?;
+
+        let ptr_ty = ptr_ty
+            .inspect(|t| assert_eq!(t.builtin_deref(true), Some(mplace.layout.ty)))
+            .unwrap_or_else(|| Ty::new_mut_ptr(self.tcx.tcx, mplace.layout.ty));
+
+        let layout = self.layout_of(ptr_ty)?;
         interp_ok(ImmTy::from_immediate(imm, layout))
     }
 
     /// Take an operand, representing a pointer, and dereference it to a place.
     /// Corresponds to the `*` operator in Rust.
+    /// Unlike `imm_ptr_to_mplace`, this checks that the pointer is valid for its type.
     #[instrument(skip(self), level = "trace")]
     pub fn deref_pointer(
         &self,
         src: &impl Projectable<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
-        if src.layout().ty.is_box() {
-            // Derefer should have removed all Box derefs.
-            // Some `Box` are not immediates (if they have a custom allocator)
-            // so the code below would fail.
+        let ptr_ty = src.layout().ty;
+        if !(ptr_ty.is_ref() || ptr_ty.is_raw_ptr() || ptr_ty.is_box_global(*self.tcx)) {
             bug!("dereferencing {}", src.layout().ty);
         }
 
         let val = self.read_immediate(src)?;
+        // Construct a place for that pointer.
         trace!("deref to {} on {:?}", val.layout.ty, *val);
+        let mplace = self.imm_ptr_to_mplace(&val)?;
 
-        let mplace = self.ref_to_mplace(&val)?;
+        if M::enforce_validity(self, val.layout) {
+            // This is conceptually a typed load from `src` to get the pointer. Most of the time when
+            // we do typed loads for primitive operations, all relevant invariants are checked
+            // implicitly, e.g. when we call `to_bool()` on a Boolean.
+            // But here, we do need to specifically check for metadata validity, null, alignment, and
+            // dereferenceability, or they will not be checked anywhere at all.
+            // This duplicates some of the logic in the validity check, but so far we found no
+            // good way to share that logic.
+            if ptr_ty.is_ref() || ptr_ty.is_box() {
+                let kind = if ptr_ty.is_ref() { "reference" } else { "box" };
+
+                // Null check.
+                let scalar_ptr = Scalar::from_maybe_pointer(mplace.ptr(), self);
+                if self.scalar_may_be_null(scalar_ptr)? {
+                    let maybe =
+                        !M::Provenance::OFFSET_IS_ADDR && matches!(scalar_ptr, Scalar::Ptr(..));
+                    throw_ub_format!(
+                        "dereferencing a {maybe}null {kind}",
+                        maybe = if maybe { "maybe-" } else { "" }
+                    );
+                }
+
+                // Dereferencability and alignment check. This also implicitly checks metadata validity.
+                let (size, align) = self
+                    .size_and_align_of_val(&mplace)?
+                    .unwrap_or_else(|| (mplace.layout.size, mplace.layout.align.abi));
+                self.check_ptr_access(mplace.ptr(), size, CheckInAllocMsg::Dereferenceable(kind))?;
+                self.check_ptr_align(mplace.ptr(), align).map_err_kind(|err| {
+                let err_ub!(AlignmentCheckFailed(Misalignment { required, has }, _msg)) = err else { bug!() };
+                err_ub_format!(
+                    "encountered an unaligned {kind} (required {required_bytes} byte alignment but found {found_bytes})",
+                    required_bytes = required.bytes(),
+                    found_bytes = has.bytes()
+                )
+            })?;
+            } else {
+                assert!(ptr_ty.is_raw_ptr());
+                // For raw pointers, the validity invariant is pretty weak, but we do require the vtable
+                // to make sense, so we do have to check that if there is one.
+                if mplace.layout.is_unsized() {
+                    let tail = self.tcx.struct_tail_for_codegen(mplace.layout.ty, self.typing_env);
+                    match tail.kind() {
+                        ty::Dynamic(data, _) => {
+                            let vtable = mplace.meta().unwrap_meta().to_pointer(self)?;
+                            self.get_ptr_vtable_ty(vtable, Some(data))?;
+                        }
+                        ty::Slice(..) | ty::Str | ty::Foreign(..) => {
+                            // Nothing to check (`read_immediate` already ensured initialization).
+                        }
+                        _ => bug!("Unexpected unsized type tail: {:?}", tail),
+                    }
+                }
+            }
+        }
+
         interp_ok(mplace)
     }
 
@@ -470,7 +544,7 @@ where
     ) -> InterpResult<'tcx, Option<AllocRef<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let (size, _align) = self
-            .size_and_align_of_mplace(mplace)?
+            .size_and_align_of_val(mplace)?
             .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
         // We check alignment separately, and *after* checking everything else.
         // If an access is both OOB and misaligned, we want to see the bounds error.
@@ -486,7 +560,7 @@ where
     ) -> InterpResult<'tcx, Option<AllocRefMut<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
         let (size, _align) = self
-            .size_and_align_of_mplace(mplace)?
+            .size_and_align_of_val(mplace)?
             .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
         // We check alignment separately, and raise that error *after* checking everything else.
         // If an access is both OOB and misaligned, we want to see the bounds error.
@@ -519,12 +593,27 @@ where
 
     /// Computes a place. You should only use this if you intend to write into this
     /// place; for reading, a more efficient alternative is `eval_place_to_op`.
+    ///
+    /// If `skip_validity_for_simple_deref` is true, then we do not check validity of the inner
+    /// pointer for places of the form `*ptr`. The caller must justify why that is okay.
     #[instrument(skip(self), level = "trace")]
     pub fn eval_place(
         &self,
         mir_place: mir::Place<'tcx>,
+        skip_validity_for_simple_deref: bool,
     ) -> InterpResult<'tcx, PlaceTy<'tcx, M::Provenance>> {
+        let _trace =
+            enter_trace_span!(M, step::eval_place, ?mir_place, tracing_separate_thread = Empty);
+
         let mut place = self.local_to_place(mir_place.local)?;
+        if skip_validity_for_simple_deref
+            && mir_place.projection.as_slice() == &[mir::ProjectionElem::Deref]
+        {
+            // We want to skip the checks in `deref_pointer`.
+            let val = self.read_immediate(&place)?;
+            let place = self.imm_ptr_to_mplace(&val)?;
+            return interp_ok(place.into());
+        }
         // Using `try_fold` turned out to be bad for performance, hence the loop.
         for elem in mir_place.projection.iter() {
             place = self.project(&place, elem)?
@@ -572,7 +661,7 @@ where
             Right((local, offset, locals_addr, layout)) => {
                 if offset.is_some() {
                     // This has been projected to a part of this local, or had the type changed.
-                    // FIMXE: there are cases where we could still avoid allocating an mplace.
+                    // FIXME: there are cases where we could still avoid allocating an mplace.
                     Left(place.force_mplace(self)?)
                 } else {
                     debug_assert_eq!(locals_addr, self.frame().locals_addr());
@@ -605,7 +694,7 @@ where
         if M::enforce_validity(self, dest.layout()) {
             // Data got changed, better make sure it matches the type!
             // Also needed to reset padding.
-            self.validate_operand(
+            self.validate_place(
                 &dest.to_place(),
                 M::enforce_validity_recursively(self, dest.layout()),
                 /*reset_provenance_and_padding*/ true,
@@ -692,7 +781,7 @@ where
         // to handle padding properly, which is only correct if we never look at this data with the
         // wrong type.
 
-        let tcx = *self.tcx;
+        let will_later_validate = M::enforce_validity(self, layout);
         let Some(mut alloc) = self.get_place_alloc_mut(&MPlaceTy { mplace: dest, layout })? else {
             // zero-sized access
             return interp_ok(());
@@ -700,30 +789,38 @@ where
 
         match value {
             Immediate::Scalar(scalar) => {
-                alloc.write_scalar(alloc_range(Size::ZERO, scalar.size()), scalar)
+                alloc.write_scalar(alloc_range(Size::ZERO, scalar.size()), scalar)?;
             }
             Immediate::ScalarPair(a_val, b_val) => {
-                let BackendRepr::ScalarPair(a, b) = layout.backend_repr else {
+                let BackendRepr::ScalarPair { a: _, b: _, b_offset } = layout.backend_repr else {
                     span_bug!(
                         self.cur_span(),
                         "write_immediate_to_mplace: invalid ScalarPair layout: {:#?}",
                         layout
                     )
                 };
-                let b_offset = a.size(&tcx).align_to(b.align(&tcx).abi);
+                let a_size = a_val.size();
+                let b_size = b_val.size();
                 assert!(b_offset.bytes() > 0); // in `operand_field` we use the offset to tell apart the fields
 
                 // It is tempting to verify `b_offset` against `layout.fields.offset(1)`,
                 // but that does not work: We could be a newtype around a pair, then the
                 // fields do not match the `ScalarPair` components.
 
-                alloc.write_scalar(alloc_range(Size::ZERO, a_val.size()), a_val)?;
-                alloc.write_scalar(alloc_range(b_offset, b_val.size()), b_val)?;
-                // We don't have to reset padding here, `write_immediate` will anyway do a validation run.
-                interp_ok(())
+                // In preparation, if we do *not* later reset the padding, we clear the entire
+                // destination now to ensure that no stray pointer fragments are being
+                // preserved (see <https://github.com/rust-lang/rust/issues/148470>).
+                // We can skip this if there is no padding (e.g. for wide pointers).
+                if !will_later_validate && a_size + b_size != layout.size {
+                    alloc.write_uninit_full();
+                }
+
+                alloc.write_scalar(alloc_range(Size::ZERO, a_size), a_val)?;
+                alloc.write_scalar(alloc_range(b_offset, b_size), b_val)?;
             }
             Immediate::Uninit => alloc.write_uninit_full(),
         }
+        interp_ok(())
     }
 
     pub fn write_uninit(
@@ -743,7 +840,7 @@ where
                     // Zero-sized access
                     return interp_ok(());
                 };
-                alloc.write_uninit_full()?;
+                alloc.write_uninit_full();
             }
         }
         interp_ok(())
@@ -754,6 +851,13 @@ where
         &mut self,
         dest: &impl Writeable<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
+        // If this is an efficiently represented local variable without provenance, skip the
+        // `as_mplace_or_mutable_local` that would otherwise force this local into memory.
+        if let Right(imm) = dest.to_op(self)?.as_mplace_or_imm() {
+            if !imm.has_provenance() {
+                return interp_ok(());
+            }
+        }
         match self.as_mplace_or_mutable_local(&dest.to_place())? {
             Right((local_val, _local_layout, local)) => {
                 local_val.clear_provenance()?;
@@ -767,7 +871,7 @@ where
                     // Zero-sized access
                     return interp_ok(());
                 };
-                alloc.clear_provenance()?;
+                alloc.clear_provenance();
             }
         }
         interp_ok(())
@@ -795,8 +899,13 @@ where
         self.copy_op_inner(src, dest, /* allow_transmute */ false)
     }
 
-    /// Copies the data from an operand to a place.
-    /// `allow_transmute` indicates whether the layouts may disagree.
+    /// Perform a typed copy of the data from an operand to a place.
+    ///
+    /// `allow_transmute` indicates whether the layouts may disagree. In that case there are
+    /// technically *two* typed copies: `src` is a not-yet-loaded value, so we're doing a typed copy
+    /// at `src` type from there to some intermediate storage. And then we're doing a second typed
+    /// copy at `dest` type from that intermediate storage to `dest`. As an optimization, we only
+    /// make a single direct copy here, but we still have to ensure the data is valid at both types.
     #[inline(always)]
     #[instrument(skip(self), level = "trace")]
     fn copy_op_inner(
@@ -805,27 +914,25 @@ where
         dest: &impl Writeable<'tcx, M::Provenance>,
         allow_transmute: bool,
     ) -> InterpResult<'tcx> {
-        // These are technically *two* typed copies: `src` is a not-yet-loaded value,
-        // so we're doing a typed copy at `src` type from there to some intermediate storage.
-        // And then we're doing a second typed copy from that intermediate storage to `dest`.
-        // But as an optimization, we only make a single direct copy here.
-
         // Do the actual copy.
         self.copy_op_no_validate(src, dest, allow_transmute)?;
 
         if M::enforce_validity(self, dest.layout()) {
             let dest = dest.to_place();
-            // Given that there were two typed copies, we have to ensure this is valid at both types,
-            // and we have to ensure this loses provenance and padding according to both types.
-            // But if the types are identical, we only do one pass.
+            // Given that there were two typed copies, we have to ensure this is valid at both
+            // types, and we have to ensure this loses provenance and padding according to both
+            // types. We also transmute both ways: when transmuting `*ptr` from `&T` to `*const T`,
+            // it seems nice to ensure that the resulting pointer value indeed is derived from a
+            // shared reference.
+            // But if the types are identical, that is strictly redundant so we only do one pass.
             if src.layout().ty != dest.layout().ty {
-                self.validate_operand(
+                self.validate_place(
                     &dest.transmute(src.layout(), self)?,
                     M::enforce_validity_recursively(self, src.layout()),
                     /*reset_provenance_and_padding*/ true,
                 )?;
             }
-            self.validate_operand(
+            self.validate_place(
                 &dest,
                 M::enforce_validity_recursively(self, dest.layout()),
                 /*reset_provenance_and_padding*/ true,
@@ -835,12 +942,12 @@ where
         interp_ok(())
     }
 
-    /// Copies the data from an operand to a place.
+    /// Perform an untyped copy of the data from an operand to a place.
+    /// You are responsible for validating that things get copied at the right type.
+    ///
     /// `allow_transmute` indicates whether the layouts may disagree.
-    /// Also, if you use this you are responsible for validating that things get copied at the
-    /// right type.
     #[instrument(skip(self), level = "trace")]
-    fn copy_op_no_validate(
+    pub(super) fn copy_op_no_validate(
         &mut self,
         src: &impl Projectable<'tcx, M::Provenance>,
         dest: &impl Writeable<'tcx, M::Provenance>,
@@ -858,10 +965,40 @@ where
                 dest.layout().ty,
             );
         }
+        // If the source has padding, we want to always do a mem-to-mem copy to ensure consistent
+        // padding in the target independent of layout choices.
+        let src_has_padding = match src.layout().backend_repr {
+            BackendRepr::Scalar(_) => false,
+            BackendRepr::ScalarPair { a: left, b: right, b_offset: _ }
+                if matches!(src.layout().ty.kind(), ty::Ref(..) | ty::RawPtr(..)) =>
+            {
+                // Wide pointers never have padding, so we can avoid calling `size()`.
+                debug_assert_eq!(left.size(self) + right.size(self), src.layout().size);
+                false
+            }
+            BackendRepr::ScalarPair { a: left, b: right, b_offset: _ } => {
+                let left_size = left.size(self);
+                let right_size = right.size(self);
+                // We have padding if the sizes don't add up to the total.
+                // (Why don't we need to check the offset?  The scalars don't overlap so no padding
+                // implies `b_offset == left_size`, which would be superfluous to check explicitly.)
+                left_size + right_size != src.layout().size
+            }
+            // Everything else can only exist in memory anyway, so it doesn't matter.
+            BackendRepr::SimdVector { .. }
+            | BackendRepr::SimdScalableVector { .. }
+            | BackendRepr::Memory { .. } => true,
+        };
 
-        // Let us see if the layout is simple so we take a shortcut,
-        // avoid force_allocation.
-        let src = match self.read_immediate_raw(src)? {
+        let src_val = if src_has_padding {
+            // Do our best to get an mplace. If there's no mplace, then this is stored as an
+            // "optimized" local, so its padding is definitely uninitialized and we are fine.
+            src.to_op(self)?.as_mplace_or_imm()
+        } else {
+            // Do our best to get an immediate, to avoid having to force_allocate the destination.
+            self.read_immediate_raw(src)?
+        };
+        let src = match src_val {
             Right(src_val) => {
                 assert!(!src.layout().is_unsized());
                 assert!(!dest.layout().is_unsized());
@@ -888,11 +1025,11 @@ where
         trace!("copy_op: {:?} <- {:?}: {}", *dest, src, dest.layout().ty);
 
         let dest = dest.force_mplace(self)?;
-        let Some((dest_size, _)) = self.size_and_align_of_mplace(&dest)? else {
+        let Some((dest_size, _)) = self.size_and_align_of_val(&dest)? else {
             span_bug!(self.cur_span(), "copy_op needs (dynamically) sized values")
         };
         if cfg!(debug_assertions) {
-            let src_size = self.size_and_align_of_mplace(&src)?.unwrap().0;
+            let src_size = self.size_and_align_of_val(&src)?.unwrap().0;
             assert_eq!(src_size, dest_size, "Cannot copy differently-sized data");
         } else {
             // As a cheap approximation, we compare the fixed parts of the size.
@@ -980,7 +1117,7 @@ where
         kind: MemoryKind<M::MemoryKind>,
         meta: MemPlaceMeta<M::Provenance>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
-        let Some((size, align)) = self.size_and_align_of(&meta, &layout)? else {
+        let Some((size, align)) = self.size_and_align_from_meta(&meta, &layout)? else {
             span_bug!(self.cur_span(), "cannot allocate space for `extern` type, size is not known")
         };
         let ptr = self.allocate_ptr(size, align, kind, AllocInit::Uninit)?;
@@ -1056,9 +1193,9 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
+    static_assert_size!(MPlaceTy<'_>, 64);
     static_assert_size!(MemPlace, 48);
     static_assert_size!(MemPlaceMeta, 24);
-    static_assert_size!(MPlaceTy<'_>, 64);
     static_assert_size!(Place, 48);
     static_assert_size!(PlaceTy<'_>, 64);
     // tidy-alphabetical-end

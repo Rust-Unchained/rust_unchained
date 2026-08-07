@@ -1,9 +1,6 @@
 //! Print diagnostics to explain why values are borrowed.
 
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use rustc_errors::{Applicability, Diag, EmissionGuarantee};
 use rustc_hir as hir;
@@ -15,7 +12,7 @@ use rustc_middle::mir::{
     Operand, Place, Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{self, RegionVid, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{DesugaringKind, Span, kw, sym};
 use rustc_trait_selection::error_reporting::traits::FindExprBySpan;
 use rustc_trait_selection::error_reporting::traits::call_kind::CallKind;
@@ -25,7 +22,7 @@ use super::{RegionName, UseSpans, find_use};
 use crate::borrow_set::BorrowData;
 use crate::constraints::OutlivesConstraint;
 use crate::nll::ConstraintDescription;
-use crate::region_infer::{BlameConstraint, Cause};
+use crate::region_infer::{BestBlame, Cause};
 use crate::{MirBorrowckCtxt, WriteKind};
 
 #[derive(Debug)]
@@ -38,12 +35,9 @@ pub(crate) enum BorrowExplanation<'tcx> {
         should_note_order: bool,
     },
     MustBeValidFor {
-        category: ConstraintCategory<'tcx>,
-        from_closure: bool,
-        span: Span,
+        best_blame: BestBlame<'tcx>,
         region_name: RegionName,
         opt_place_desc: Option<String>,
-        path: Vec<OutlivesConstraint<'tcx>>,
     },
     Unexplained,
 }
@@ -71,7 +65,6 @@ impl<'tcx> BorrowExplanation<'tcx> {
     ) {
         let tcx = cx.infcx.tcx;
         let body = cx.body;
-        let local_names = &cx.local_names;
 
         if let Some(span) = borrow_span {
             let def_id = body.source.def_id();
@@ -220,7 +213,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     _ => ("destructor", format!("type `{}`", local_decl.ty)),
                 };
 
-                match local_names[dropped_local] {
+                match cx.local_name(dropped_local) {
                     Some(local_name) if !local_decl.from_compiler_desugaring() => {
                         let message = format!(
                             "{borrow_desc}borrow might be used here, when `{local_name}` is dropped \
@@ -342,6 +335,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                                 }
                             }
                         } else if let LocalInfo::BlockTailTemp(info) = local_decl.local_info() {
+                            let sp = info.span.find_ancestor_not_from_macro().unwrap_or(info.span);
                             if info.tail_result_is_ignored {
                                 // #85581: If the first mutable borrow's scope contains
                                 // the second borrow, this suggestion isn't helpful.
@@ -349,7 +343,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                                     old.to(info.span.shrink_to_hi()).contains(new)
                                 }) {
                                     err.span_suggestion_verbose(
-                                        info.span.shrink_to_hi(),
+                                        sp.shrink_to_hi(),
                                         "consider adding semicolon after the expression so its \
                                         temporaries are dropped sooner, before the local variables \
                                         declared by the block are dropped",
@@ -368,8 +362,8 @@ impl<'tcx> BorrowExplanation<'tcx> {
                                      local variable `x` and then make `x` be the expression at the \
                                      end of the block",
                                     vec![
-                                        (info.span.shrink_to_lo(), "let x = ".to_string()),
-                                        (info.span.shrink_to_hi(), "; x".to_string()),
+                                        (sp.shrink_to_lo(), "let x = ".to_string()),
+                                        (sp.shrink_to_hi(), "; x".to_string()),
                                     ],
                                     Applicability::MaybeIncorrect,
                                 );
@@ -379,13 +373,13 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 }
             }
             BorrowExplanation::MustBeValidFor {
-                category,
-                span,
+                ref best_blame,
                 ref region_name,
                 ref opt_place_desc,
-                from_closure: _,
-                ref path,
             } => {
+                let OutlivesConstraint { category, span, .. } = *best_blame.constraint();
+                let path = best_blame.path();
+
                 region_name.highlight_region_name(err);
 
                 if let Some(desc) = opt_place_desc {
@@ -406,16 +400,37 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     );
                 };
 
-                cx.add_placeholder_from_predicate_note(err, &path);
-                cx.add_sized_or_copy_bound_info(err, category, &path);
+                cx.add_placeholder_from_predicate_note(err, path);
+                cx.add_sized_or_copy_bound_info(err, category, path);
 
                 if let ConstraintCategory::Cast {
+                    is_raw_ptr_dyn_type_cast: _,
                     is_implicit_coercion: true,
                     unsize_to: Some(unsize_ty),
                 } = category
                 {
                     self.add_object_lifetime_default_note(tcx, err, unsize_ty);
                 }
+
+                let mut preds = path
+                    .iter()
+                    .filter_map(|constraint| match constraint.category {
+                        ConstraintCategory::Predicate(pred) if !pred.is_dummy() => Some(pred),
+                        _ => None,
+                    })
+                    .collect::<Vec<Span>>();
+                preds.sort();
+                preds.dedup();
+                if !preds.is_empty() {
+                    let s = if preds.len() == 1 { "" } else { "s" };
+                    err.span_note(
+                        preds,
+                        format!(
+                            "requirement{s} that the value outlives `{region_name}` introduced here"
+                        ),
+                    );
+                }
+
                 self.add_lifetime_bound_suggestion_to_diagnostic(err, &category, span, region_name);
             }
             _ => {}
@@ -438,7 +453,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
 
             let elaborated_args =
                 std::iter::zip(*args, &generics.own_params).map(|(arg, param)| {
-                    if let Some(ty::Dynamic(obj, _, ty::Dyn)) = arg.as_type().map(Ty::kind) {
+                    if let Some(ty::Dynamic(obj, _)) = arg.as_type().map(Ty::kind) {
                         let default = tcx.object_lifetime_default(param.def_id);
 
                         let re_static = tcx.lifetimes.re_static;
@@ -464,7 +479,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
 
                         has_dyn = true;
 
-                        Ty::new_dynamic(tcx, obj, implied_region, ty::Dyn).into()
+                        Ty::new_dynamic(tcx, obj, implied_region).into()
                     } else {
                         arg
                     }
@@ -556,24 +571,6 @@ fn suggest_rewrite_if_let<G: EmissionGuarantee>(
 }
 
 impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
-    fn free_region_constraint_info(
-        &self,
-        borrow_region: RegionVid,
-        outlived_region: RegionVid,
-    ) -> (ConstraintCategory<'tcx>, bool, Span, Option<RegionName>, Vec<OutlivesConstraint<'tcx>>)
-    {
-        let (blame_constraint, path) = self.regioncx.best_blame_constraint(
-            borrow_region,
-            NllRegionVariableOrigin::FreeRegion,
-            |r| self.regioncx.provides_universal_region(r, borrow_region, outlived_region),
-        );
-        let BlameConstraint { category, from_closure, cause, .. } = blame_constraint;
-
-        let outlived_fr_name = self.give_region_a_name(outlived_region);
-
-        (category, from_closure, cause.span, outlived_fr_name, path)
-    }
-
     /// Returns structured explanation for *why* the borrow contains the
     /// point from `location`. This is key for the "3-point errors"
     /// [described in the NLL RFC][d].
@@ -632,8 +629,8 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // We want to focus on relevant live locals in diagnostics, so when polonius is enabled, we
         // ensure that we don't emit live boring locals as explanations.
         let is_local_boring = |local| {
-            if let Some(polonius_diagnostics) = self.polonius_diagnostics {
-                polonius_diagnostics.boring_nll_locals.contains(&local)
+            if let Some(polonius_context) = self.polonius_context {
+                polonius_context.boring_nll_locals.contains(&local)
             } else {
                 assert!(!tcx.sess.opts.unstable_opts.polonius.is_next_enabled());
 
@@ -667,12 +664,12 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 }
             }
 
-            Some(Cause::DropVar(local, location)) => {
+            Some(Cause::DropVar(local, location)) if !is_local_boring(local) => {
                 let mut should_note_order = false;
-                if self.local_names[local].is_some()
+                if self.local_name(local).is_some()
                     && let Some((WriteKind::StorageDeadOrDrop, place)) = kind_place
                     && let Some(borrowed_local) = place.as_local()
-                    && self.local_names[borrowed_local].is_some()
+                    && self.local_name(borrowed_local).is_some()
                     && local != borrowed_local
                 {
                     should_note_order = true;
@@ -685,21 +682,22 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 }
             }
 
-            Some(Cause::LiveVar(..)) | None => {
+            Some(Cause::LiveVar(..) | Cause::DropVar(..)) | None => {
                 // Here, under NLL: no cause was found. Under polonius: no cause was found, or a
                 // boring local was found, which we ignore like NLLs do to match its diagnostics.
-                if let Some(region) = self.to_error_region_vid(borrow_region_vid) {
-                    let (category, from_closure, span, region_name, path) =
-                        self.free_region_constraint_info(borrow_region_vid, region);
-                    if let Some(region_name) = region_name {
+                if let Some(region) = self.regioncx.to_error_region_vid(borrow_region_vid) {
+                    let best_blame = self.regioncx.best_blame_constraint(
+                        borrow_region_vid,
+                        NllRegionVariableOrigin::FreeRegion,
+                        region,
+                    );
+
+                    if let Some(region_name) = self.give_region_a_name(region) {
                         let opt_place_desc = self.describe_place(borrow.borrowed_place.as_ref());
                         BorrowExplanation::MustBeValidFor {
-                            category,
-                            from_closure,
-                            span,
+                            best_blame,
                             region_name,
                             opt_place_desc,
-                            path,
                         }
                     } else {
                         debug!("Could not generate a region name");
@@ -743,11 +741,12 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 {
                     // Just point to the function, to reduce the chance of overlapping spans.
                     let function_span = match func {
+                        Operand::RuntimeChecks(_) => span,
                         Operand::Constant(c) => c.span,
                         Operand::Copy(place) | Operand::Move(place) => {
                             if let Some(l) = place.as_local() {
                                 let local_decl = &self.body.local_decls[l];
-                                if self.local_names[l].is_none() {
+                                if self.local_name(l).is_none() {
                                     local_decl.source_info.span
                                 } else {
                                     span
@@ -768,7 +767,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 let block = &self.body.basic_blocks[location.block];
 
                 let kind = if let Some(&Statement {
-                    kind: StatementKind::FakeRead(box (FakeReadCause::ForLet(_), place)),
+                    kind: StatementKind::FakeRead((FakeReadCause::ForLet(_), place)),
                     ..
                 }) = block.statements.get(location.statement_index)
                 {
@@ -788,11 +787,12 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     {
                         // Just point to the function, to reduce the chance of overlapping spans.
                         let function_span = match func {
+                            Operand::RuntimeChecks(_) => span,
                             Operand::Constant(c) => c.span,
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(l) = place.as_local() {
                                     let local_decl = &self.body.local_decls[l];
-                                    if self.local_names[l].is_none() {
+                                    if self.local_name(l).is_none() {
                                         local_decl.source_info.span
                                     } else {
                                         span
@@ -829,16 +829,10 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // will only ever have one item at any given time, but by using a vector, we can pop from
         // it which simplifies the termination logic.
         let mut queue = vec![location];
-        let mut target =
-            if let Some(Statement { kind: StatementKind::Assign(box (place, _)), .. }) = stmt {
-                if let Some(local) = place.as_local() {
-                    local
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            };
+        let Some(Statement { kind: StatementKind::Assign((place, _)), .. }) = stmt else {
+            return false;
+        };
+        let Some(mut target) = place.as_local() else { return false };
 
         debug!("was_captured_by_trait: target={:?} queue={:?}", target, queue);
         while let Some(current_location) = queue.pop() {
@@ -851,7 +845,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 debug!("was_captured_by_trait_object: stmt={:?}", stmt);
 
                 // The only kind of statement that we care about is assignments...
-                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
                     let Some(into) = place.local_or_deref_local() else {
                         // Continue at the next location.
                         queue.push(current_location.successor_within_block());
@@ -861,7 +855,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     match rvalue {
                         // If we see a use, we should check whether it is our data, and if so
                         // update the place that we're looking for to that new place.
-                        Rvalue::Use(operand) => match operand {
+                        Rvalue::Use(operand, _) => match operand {
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(from) = place.as_local() {
                                     if from == target {
@@ -917,30 +911,29 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
 
                 if let TerminatorKind::Call { destination, target: Some(block), args, .. } =
                     &terminator.kind
+                    && let Some(dest) = destination.as_local()
                 {
-                    if let Some(dest) = destination.as_local() {
-                        debug!(
-                            "was_captured_by_trait_object: target={:?} dest={:?} args={:?}",
-                            target, dest, args
-                        );
-                        // Check if one of the arguments to this function is the target place.
-                        let found_target = args.iter().any(|arg| {
-                            if let Operand::Move(place) = arg.node {
-                                if let Some(potential) = place.as_local() {
-                                    potential == target
-                                } else {
-                                    false
-                                }
+                    debug!(
+                        "was_captured_by_trait_object: target={:?} dest={:?} args={:?}",
+                        target, dest, args
+                    );
+                    // Check if one of the arguments to this function is the target place.
+                    let found_target = args.iter().any(|arg| {
+                        if let Operand::Move(place) = arg.node {
+                            if let Some(potential) = place.as_local() {
+                                potential == target
                             } else {
                                 false
                             }
-                        });
-
-                        // If it is, follow this to the next block and update the target.
-                        if found_target {
-                            target = dest;
-                            queue.push(block.start_location());
+                        } else {
+                            false
                         }
+                    });
+
+                    // If it is, follow this to the next block and update the target.
+                    if found_target {
+                        target = dest;
+                        queue.push(block.start_location());
                     }
                 }
             }

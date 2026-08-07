@@ -14,13 +14,17 @@ export function assert(condition: boolean, explanation: string): asserts conditi
 }
 
 export type Env = {
-    [name: string]: string;
+    [name: string]: string | undefined;
 };
 
 class Log {
-    private readonly output = vscode.window.createOutputChannel("Rust Analyzer Client", {
+    private readonly output = vscode.window.createOutputChannel("rust-analyzer Extension", {
         log: true,
     });
+
+    show(): void {
+        this.output.show(true);
+    }
 
     trace(...messages: [unknown, ...unknown[]]): void {
         this.output.trace(this.stringify(messages));
@@ -40,7 +44,7 @@ class Log {
 
     error(...messages: [unknown, ...unknown[]]): void {
         this.output.error(this.stringify(messages));
-        this.output.show(true);
+        this.show();
     }
 
     private stringify(messages: unknown[]): string {
@@ -298,4 +302,58 @@ export async function spawnAsync(
             error: e.error,
         };
     }
+}
+
+export const isWindows = process.platform === "win32";
+
+export function isWindowsDriveLetter(code: number): boolean {
+    // Copied from https://github.com/microsoft/vscode/blob/02c2dba5f2669b924fd290dff7d2ff3460791996/src/vs/base/common/extpath.ts#L265-L267
+    return (
+        (code >= /* CharCode.A */ 65 && code <= /* CharCode.Z */ 90) ||
+        (code >= /* CharCode.a */ 97 && code <= /* CharCode.z */ 122)
+    );
+}
+export function hasDriveLetter(path: string, isWindowsOS: boolean = isWindows): boolean {
+    // Copied from https://github.com/microsoft/vscode/blob/02c2dba5f2669b924fd290dff7d2ff3460791996/src/vs/base/common/extpath.ts#L324-L330
+    if (isWindowsOS) {
+        return (
+            isWindowsDriveLetter(path.charCodeAt(0)) &&
+            path.charCodeAt(1) === /* CharCode.Colon */ 58
+        );
+    }
+
+    return false;
+}
+export function normalizeDriveLetter(path: string, isWindowsOS: boolean = isWindows): string {
+    // Copied from https://github.com/microsoft/vscode/blob/02c2dba5f2669b924fd290dff7d2ff3460791996/src/vs/base/common/labels.ts#L140-L146
+    if (hasDriveLetter(path, isWindowsOS)) {
+        return path.charAt(0).toUpperCase() + path.slice(1);
+    }
+
+    return path;
+}
+
+export const RUST_TOOLCHAIN_FILES = ["rust-toolchain.toml", "rust-toolchain"] as const;
+
+export async function findRustToolchainFiles(): Promise<vscode.Uri[]> {
+    const found: vscode.Uri[] = [];
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+        return found;
+    }
+
+    for (const folder of workspaceFolders) {
+        for (const filename of RUST_TOOLCHAIN_FILES) {
+            const toolchainUri = vscode.Uri.joinPath(folder.uri, filename);
+            try {
+                await vscode.workspace.fs.stat(toolchainUri);
+                found.push(toolchainUri);
+                // Only add the first toolchain file found per workspace folder
+                break;
+            } catch {
+                // File doesn't exist, continue
+            }
+        }
+    }
+    return found;
 }

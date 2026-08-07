@@ -1,4 +1,5 @@
-//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0
+// This tests carefully crafted schedules to ensure they are not considered races.
+//@compile-flags: -Zmiri-deterministic-concurrency
 
 use std::sync::atomic::*;
 use std::thread::{self, spawn};
@@ -8,6 +9,10 @@ struct EvilSend<T>(pub T);
 
 unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
+
+unsafe fn split_atomic(a: &AtomicU16) -> &[AtomicU8; 2] {
+    unsafe { std::mem::transmute(a) }
+}
 
 fn test_fence_sync() {
     static SYNC: AtomicUsize = AtomicUsize::new(0);
@@ -56,7 +61,7 @@ fn test_multiple_reads() {
     assert_eq!(var, 10);
 }
 
-pub fn test_rmw_no_block() {
+fn test_rmw_no_block() {
     static SYNC: AtomicUsize = AtomicUsize::new(0);
 
     let mut a = 0u32;
@@ -88,7 +93,7 @@ pub fn test_rmw_no_block() {
     }
 }
 
-pub fn test_simple_release() {
+fn test_simple_release() {
     static SYNC: AtomicUsize = AtomicUsize::new(0);
 
     let mut a = 0u32;
@@ -178,13 +183,9 @@ fn test_read_read_race2() {
 }
 
 fn mixed_size_read_read() {
-    fn convert(a: &AtomicU16) -> &[AtomicU8; 2] {
-        unsafe { std::mem::transmute(a) }
-    }
-
     let a = AtomicU16::new(0);
     let a16 = &a;
-    let a8 = convert(a16);
+    let a8 = unsafe { split_atomic(a16) };
 
     // Just two different-sized atomic reads without any writes are fine.
     thread::scope(|s| {
@@ -213,7 +214,7 @@ fn failing_rmw_is_read() {
     });
 }
 
-pub fn main() {
+fn main() {
     test_fence_sync();
     test_multiple_reads();
     test_rmw_no_block();

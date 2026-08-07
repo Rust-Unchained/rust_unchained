@@ -65,13 +65,13 @@ trait A {
 }
 trait B: A {}
 
-fn test(
+fn test<'a>(
     _: &(dyn A<Assoc = ()> + Send),
-  //^ &'_ (dyn A<Assoc = ()> + Send)
-    _: &(dyn Send + A<Assoc = ()>),
-  //^ &'_ (dyn A<Assoc = ()> + Send)
+  //^ &(dyn A<Assoc = ()> + Send + 'static)
+    _: &'a (dyn Send + A<Assoc = ()>),
+  //^ &(dyn A<Assoc = ()> + Send + 'static)
     _: &dyn B<Assoc = ()>,
-  //^ &'_ (dyn B<Assoc = ()>)
+  //^ &(dyn B<Assoc = ()> + 'static)
 ) {}
         "#,
     );
@@ -85,7 +85,7 @@ fn render_dyn_for_ty() {
 trait Foo<'a> {}
 
 fn foo(foo: &dyn for<'a> Foo<'a>) {}
-    // ^^^ &'_ dyn Foo<'_>
+    // ^^^ &(dyn Foo<'_> + 'static)
 "#,
     );
 }
@@ -111,11 +111,11 @@ fn test(
     b;
   //^ impl Foo
     c;
-  //^ &'_ impl Foo + ?Sized
+  //^ &(impl Foo + ?Sized)
     d;
   //^ S<impl Foo>
     ref_any;
-  //^^^^^^^ &'_ impl ?Sized
+  //^^^^^^^ &impl ?Sized
     empty;
 } //^^^^^ impl Sized
 "#,
@@ -192,7 +192,7 @@ fn test(
     b;
   //^ fn(impl Foo) -> impl Foo
     c;
-} //^ fn(&'_ impl Foo + ?Sized) -> &'_ impl Foo + ?Sized
+} //^ fn(&(impl Foo + ?Sized)) -> &(impl Foo + ?Sized)
 "#,
     );
 }
@@ -242,6 +242,25 @@ fn test() {
       //^ fn(i8) -> S<i8>
     let f = E::A;
       //^ fn(usize) -> E
+}
+"#,
+    );
+}
+
+#[test]
+fn type_placeholder_type() {
+    check_types_source_code(
+        r#"
+struct S<T>(T);
+fn test() {
+    let f: S<_> = S(3);
+           //^ i32
+    let f: [_; _] = [4_u32, 5, 6];
+          //^ u32
+    let f: (_, _, _) = (1_u32, 1_i32, false);
+          //^ u32
+             //^ i32
+                //^ bool
 }
 "#,
     );

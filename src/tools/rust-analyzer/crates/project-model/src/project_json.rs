@@ -1,6 +1,6 @@
 //! `rust-project.json` file format.
 //!
-//! This format is spiritually a serialization of [`base_db::CrateGraph`]. The
+//! This format is spiritually a serialization of `base_db::CrateGraph`. The
 //! idea here is that people who do not use Cargo, can instead teach their build
 //! system to generate `rust-project.json` which can be ingested by
 //! rust-analyzer.
@@ -53,7 +53,7 @@ use base_db::{CrateDisplayName, CrateName};
 use cfg::CfgAtom;
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use span::Edition;
 
 use crate::{ManifestPath, TargetKind};
@@ -78,6 +78,13 @@ pub struct ProjectJson {
     runnables: Vec<Runnable>,
 }
 
+impl std::ops::Index<CrateArrayIdx> for ProjectJson {
+    type Output = Crate;
+    fn index(&self, index: CrateArrayIdx) -> &Self::Output {
+        &self.crates[index.0]
+    }
+}
+
 impl ProjectJson {
     /// Create a new ProjectJson instance.
     ///
@@ -85,8 +92,7 @@ impl ProjectJson {
     ///
     /// * `manifest` - The path to the `rust-project.json`.
     /// * `base` - The path to the workspace root (i.e. the folder containing `rust-project.json`)
-    /// * `data` - The parsed contents of `rust-project.json`, or project json that's passed via
-    ///   configuration.
+    /// * `data` - The parsed contents of `rust-project.json`, or project json that's passed via configuration.
     pub fn new(
         manifest: Option<ManifestPath>,
         base: &AbsPath,
@@ -164,6 +170,7 @@ impl ProjectJson {
                         cfg,
                         target: crate_data.target,
                         env: crate_data.env,
+                        crate_attrs: crate_data.crate_attrs,
                         proc_macro_dylib_path: crate_data
                             .proc_macro_dylib_path
                             .map(absolutize_on_base),
@@ -195,12 +202,11 @@ impl ProjectJson {
         &self.project_root
     }
 
-    pub fn crate_by_root(&self, root: &AbsPath) -> Option<Crate> {
+    pub fn crate_by_root(&self, root: &AbsPath) -> Option<&Crate> {
         self.crates
             .iter()
             .filter(|krate| krate.is_workspace_member)
             .find(|krate| krate.root_module == root)
-            .cloned()
     }
 
     /// Returns the path to the project's manifest, if it exists.
@@ -214,8 +220,17 @@ impl ProjectJson {
         self.crates
             .iter()
             .filter(|krate| krate.is_workspace_member)
-            .filter_map(|krate| krate.build.clone())
+            .filter_map(|krate| krate.build.as_ref())
             .find(|build| build.build_file.as_std_path() == path)
+            .cloned()
+    }
+
+    pub fn crate_by_label(&self, label: &str) -> Option<&Crate> {
+        // this is fast enough for now, but it's unfortunate that this is O(crates).
+        self.crates
+            .iter()
+            .filter(|krate| krate.is_workspace_member)
+            .find(|krate| krate.build.as_ref().is_some_and(|build| build.label == label))
     }
 
     /// Returns the path to the project's manifest or root folder, if no manifest exists.
@@ -231,6 +246,10 @@ impl ProjectJson {
     pub fn runnables(&self) -> &[Runnable] {
         &self.runnables
     }
+
+    pub fn runnable_template(&self, kind: RunnableKind) -> Option<&Runnable> {
+        self.runnables().iter().find(|r| r.kind == kind)
+    }
 }
 
 /// A crate points to the root module of a crate and lists the dependencies of the crate. This is
@@ -245,8 +264,10 @@ pub struct Crate {
     pub(crate) cfg: Vec<CfgAtom>,
     pub(crate) target: Option<String>,
     pub(crate) env: FxHashMap<String, String>,
+    // Extra crate-level attributes, without the surrounding `#![]`.
+    pub(crate) crate_attrs: Vec<String>,
     pub(crate) proc_macro_dylib_path: Option<AbsPathBuf>,
-    pub(crate) is_workspace_member: bool,
+    pub is_workspace_member: bool,
     pub(crate) include: Vec<AbsPathBuf>,
     pub(crate) exclude: Vec<AbsPathBuf>,
     pub(crate) is_proc_macro: bool,
@@ -254,6 +275,12 @@ pub struct Crate {
     pub(crate) proc_macro_cwd: Option<AbsPathBuf>,
     pub(crate) repository: Option<String>,
     pub build: Option<Build>,
+}
+
+impl Crate {
+    pub fn iter_deps(&self) -> impl ExactSizeIterator<Item = CrateArrayIdx> {
+        self.deps.iter().map(|dep| dep.krate)
+    }
 }
 
 /// Additional, build-specific data about a crate.
@@ -326,13 +353,39 @@ pub struct Runnable {
 /// The kind of runnable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnableKind {
+    /// `cargo check`, basically, with human-readable output.
     Check,
 
     /// Can run a binary.
+    /// May include {label} which will get the label from the `build` section of a crate.
     Run,
 
     /// Run a single test.
+    /// May include {label} which will get the label from the `build` section of a crate.
+    /// May include {test_id} which will get the test clicked on by the user.
     TestOne,
+
+    /// Run tests matching a pattern (in RA, usually a path::to::module::of::tests)
+    /// May include {label} which will get the label from the `build` section of a crate.
+    /// May include {test_pattern} which will get the test module clicked on by the user.
+    TestMod,
+
+    /// Run a single doctest
+    /// May include {label} which will get the label from the `build` section of a crate.
+    /// May include {test_id} which will get the doctest clicked on by the user.
+    DocTestOne,
+
+    /// Run a single benchmark
+    /// May include {label} which will get the label from the `build` section of a crate.
+    /// May include {bench_id} which will get the benchmark clicked on by the user.
+    BenchOne,
+
+    /// Template for checking a target, emitting rustc JSON diagnostics.
+    /// May include {label} which will get the label from the `build` section of a crate.
+    Flycheck,
+
+    /// For forwards-compatibility, i.e. old rust-analyzer binary with newer workspace discovery tools
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -345,6 +398,8 @@ pub struct ProjectJsonData {
     crates: Vec<CrateData>,
     #[serde(default)]
     runnables: Vec<RunnableData>,
+    //
+    // New fields should be Option or #[serde(default)]. This applies to most of this datastructure.
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Default)]
@@ -356,7 +411,6 @@ struct CrateData {
     display_name: Option<String>,
     root_module: Utf8PathBuf,
     edition: EditionData,
-    #[serde(default)]
     version: Option<semver::Version>,
     deps: Vec<Dep>,
     #[serde(default)]
@@ -366,16 +420,15 @@ struct CrateData {
     target: Option<String>,
     #[serde(default)]
     env: FxHashMap<String, String>,
+    #[serde(default)]
+    crate_attrs: Vec<String>,
     proc_macro_dylib_path: Option<Utf8PathBuf>,
     is_workspace_member: Option<bool>,
     source: Option<CrateSource>,
     #[serde(default)]
     is_proc_macro: bool,
-    #[serde(default)]
     repository: Option<String>,
-    #[serde(default)]
     build: Option<BuildData>,
-    #[serde(default)]
     proc_macro_cwd: Option<Utf8PathBuf>,
 }
 
@@ -420,31 +473,40 @@ enum EditionData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct BuildData {
+struct BuildData {
     label: String,
     build_file: Utf8PathBuf,
     target_kind: TargetKindData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunnableData {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: Utf8PathBuf,
-    pub kind: RunnableKindData,
+struct RunnableData {
+    program: String,
+    args: Vec<String>,
+    cwd: Utf8PathBuf,
+    kind: RunnableKindData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum RunnableKindData {
+enum RunnableKindData {
+    Flycheck,
     Check,
     Run,
     TestOne,
+    TestMod,
+    DocTestOne,
+    BenchOne,
+
+    /// For forwards-compatibility, i.e. old rust-analyzer binary with newer workspace discovery tools
+    #[allow(unused)]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum TargetKindData {
+enum TargetKindData {
     Bin,
     /// Any kind of Cargo lib crate-type (dylib, rlib, proc-macro, ...).
     Lib,
@@ -452,7 +514,7 @@ pub enum TargetKindData {
 }
 /// Identifies a crate by position in the crates array.
 ///
-/// This will differ from `CrateId` when multiple `ProjectJson`
+/// This will differ from `Crate` when multiple `ProjectJson`
 /// workspaces are loaded.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[serde(transparent)]
@@ -507,6 +569,11 @@ impl From<RunnableKindData> for RunnableKind {
             RunnableKindData::Check => RunnableKind::Check,
             RunnableKindData::Run => RunnableKind::Run,
             RunnableKindData::TestOne => RunnableKind::TestOne,
+            RunnableKindData::TestMod => RunnableKind::TestMod,
+            RunnableKindData::DocTestOne => RunnableKind::DocTestOne,
+            RunnableKindData::BenchOne => RunnableKind::BenchOne,
+            RunnableKindData::Flycheck => RunnableKind::Flycheck,
+            RunnableKindData::Unknown => RunnableKind::Unknown,
         }
     }
 }

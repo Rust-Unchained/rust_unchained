@@ -1,5 +1,4 @@
-//@no-rustfix
-#![allow(dead_code)]
+//@no-rustfix: has placeholders
 #![warn(clippy::comparison_chain)]
 
 fn a() {}
@@ -12,11 +11,10 @@ fn f(x: u8, y: u8, z: u8) {
         a()
     }
 
-    if x > y {
-        //~^ comparison_chain
-
+    // Ignored: Not all cases are covered
+    if x < y {
         a()
-    } else if x < y {
+    } else if x > y {
         b()
     }
 
@@ -123,9 +121,8 @@ fn g(x: f64, y: f64, z: f64) {
 }
 
 fn h<T: Ord>(x: T, y: T, z: T) {
+    // Ignored: Not all cases are covered
     if x > y {
-        //~^ comparison_chain
-
         a()
     } else if x < y {
         b()

@@ -3,9 +3,12 @@ use core::sync::atomic::{Atomic, AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use super::*;
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
+use crate::net::{
+    IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs,
+};
 use crate::os::xous::services;
 use crate::sync::Arc;
+use crate::sys::net::connection::each_addr;
 use crate::time::Duration;
 
 macro_rules! unimpl {
@@ -79,8 +82,8 @@ impl TcpStream {
         }
     }
 
-    pub fn connect(socketaddr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
-        Self::connect_timeout(socketaddr?, Duration::ZERO)
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+        each_addr(addr, |addr| Self::connect_timeout(addr, Duration::ZERO))
     }
 
     pub fn connect_timeout(addr: &SocketAddr, duration: Duration) -> io::Result<TcpStream> {
@@ -210,11 +213,14 @@ impl TcpStream {
         } else {
             let result = receive_request.raw;
             if result[0] != 0 {
-                if result[1] == 8 {
+                // The error code lives at byte 4 of the kernel's response buffer
+                // (matches the byte the send path reads in `write` below). Byte 1
+                // is part of the marker header, not the code.
+                if result[4] == 8 {
                     // timed out
                     return Err(io::const_error!(io::ErrorKind::TimedOut, "timeout"));
                 }
-                if result[1] == 9 {
+                if result[4] == 9 {
                     // would block
                     return Err(io::const_error!(io::ErrorKind::WouldBlock, "would block"));
                 }
@@ -235,7 +241,7 @@ impl TcpStream {
         crate::io::default_read_vectored(|b| self.read(b), bufs)
     }
 
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         crate::io::default_read_buf(|buf| self.read(buf), cursor)
     }
 
@@ -347,6 +353,14 @@ impl TcpStream {
     }
 
     pub fn linger(&self) -> io::Result<Option<Duration>> {
+        unimpl!();
+    }
+
+    pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
+        unimpl!();
+    }
+
+    pub fn keepalive(&self) -> io::Result<bool> {
         unimpl!();
     }
 

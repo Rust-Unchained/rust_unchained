@@ -3,7 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::has_iter_method;
 use clippy_utils::visitors::is_local_used;
-use clippy_utils::{SpanlessEq, contains_name, higher, is_integer_const, sugg};
+use clippy_utils::{SpanlessEq, contains_name, higher, is_integer_literal, peel_hir_expr_while, sugg};
 use rustc_ast::ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_errors::Applicability;
@@ -29,8 +29,9 @@ pub(super) fn check<'tcx>(
     if let Some(higher::Range {
         start: Some(start),
         ref end,
-        limits,
-    }) = higher::Range::hir(arg)
+        ty: range_ty,
+        span,
+    }) = higher::Range::hir(cx, arg)
         // the var must be a single name
         && let PatKind::Binding(_, canonical_id, ident, _) = pat.kind
     {
@@ -39,7 +40,9 @@ pub(super) fn check<'tcx>(
             var: canonical_id,
             indexed_mut: FxHashSet::default(),
             indexed_indirectly: FxHashMap::default(),
+            unnamed_indexed_indirectly: false,
             indexed_directly: FxIndexMap::default(),
+            unnamed_indexed_directly: false,
             referenced: FxHashSet::default(),
             nonindex: false,
             prefer_mutable: false,
@@ -47,7 +50,11 @@ pub(super) fn check<'tcx>(
         walk_expr(&mut visitor, body);
 
         // linting condition: we only indexed one variable, and indexed it directly
-        if visitor.indexed_indirectly.is_empty() && visitor.indexed_directly.len() == 1 {
+        if visitor.indexed_indirectly.is_empty()
+            && !visitor.unnamed_indexed_indirectly
+            && !visitor.unnamed_indexed_directly
+            && visitor.indexed_directly.len() == 1
+        {
             let (indexed, (indexed_extent, indexed_ty)) = visitor
                 .indexed_directly
                 .into_iter()
@@ -76,7 +83,7 @@ pub(super) fn check<'tcx>(
                 return;
             }
 
-            let starts_at_zero = is_integer_const(cx, start, 0);
+            let starts_at_zero = is_integer_literal(start, 0);
 
             let skip = if starts_at_zero {
                 String::new()
@@ -94,8 +101,9 @@ pub(super) fn check<'tcx>(
                 if let ExprKind::Binary(ref op, left, right) = end.kind
                     && op.node == BinOpKind::Add
                 {
-                    let start_equal_left = SpanlessEq::new(cx).eq_expr(start, left);
-                    let start_equal_right = SpanlessEq::new(cx).eq_expr(start, right);
+                    let ctxt = start.span.ctxt();
+                    let start_equal_left = SpanlessEq::new(cx).eq_expr(ctxt, start, left);
+                    let start_equal_right = SpanlessEq::new(cx).eq_expr(ctxt, start, right);
 
                     if start_equal_left {
                         take_expr = right;
@@ -106,12 +114,12 @@ pub(super) fn check<'tcx>(
                     end_is_start_plus_val = start_equal_left | start_equal_right;
                 }
 
-                if is_len_call(end, indexed) || is_end_eq_array_len(cx, end, limits, indexed_ty) {
+                if is_len_call(end, indexed) || is_end_eq_array_len(cx, end, range_ty, indexed_ty) {
                     String::new()
                 } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, take_expr, cx) {
                     return;
                 } else {
-                    match limits {
+                    match range_ty.limits() {
                         ast::RangeLimits::Closed => {
                             let take_expr = sugg::Sugg::hir(cx, take_expr, "<count>");
                             format!(".take({})", take_expr + sugg::ONE)
@@ -143,17 +151,14 @@ pub(super) fn check<'tcx>(
                 span_lint_and_then(
                     cx,
                     NEEDLESS_RANGE_LOOP,
-                    arg.span,
+                    span,
                     format!("the loop variable `{}` is used to index `{indexed}`", ident.name),
                     |diag| {
                         diag.multipart_suggestion(
                             "consider using an iterator and enumerate()",
                             vec![
                                 (pat.span, format!("({}, <item>)", ident.name)),
-                                (
-                                    arg.span,
-                                    format!("{indexed}.{method}().enumerate(){method_1}{method_2}"),
-                                ),
+                                (span, format!("{indexed}.{method}().enumerate(){method_1}{method_2}")),
                             ],
                             Applicability::HasPlaceholders,
                         );
@@ -169,12 +174,12 @@ pub(super) fn check<'tcx>(
                 span_lint_and_then(
                     cx,
                     NEEDLESS_RANGE_LOOP,
-                    arg.span,
+                    span,
                     format!("the loop variable `{}` is only used to index `{indexed}`", ident.name),
                     |diag| {
                         diag.multipart_suggestion(
                             "consider using an iterator",
-                            vec![(pat.span, "<item>".to_string()), (arg.span, repl)],
+                            vec![(pat.span, "<item>".to_string()), (span, repl)],
                             Applicability::HasPlaceholders,
                         );
                     },
@@ -200,7 +205,7 @@ fn is_len_call(expr: &Expr<'_>, var: Symbol) -> bool {
 fn is_end_eq_array_len<'tcx>(
     cx: &LateContext<'tcx>,
     end: &Expr<'_>,
-    limits: ast::RangeLimits,
+    range_ty: higher::RangeTy,
     indexed_ty: Ty<'tcx>,
 ) -> bool {
     if let ExprKind::Lit(lit) = end.kind
@@ -208,7 +213,7 @@ fn is_end_eq_array_len<'tcx>(
         && let ty::Array(_, arr_len_const) = indexed_ty.kind()
         && let Some(arr_len) = arr_len_const.try_to_target_usize(cx.tcx)
     {
-        return match limits {
+        return match range_ty.limits() {
             ast::RangeLimits::Closed => end_int.get() + 1 >= arr_len.into(),
             ast::RangeLimits::HalfOpen => end_int.get() >= arr_len.into(),
         };
@@ -217,6 +222,7 @@ fn is_end_eq_array_len<'tcx>(
     false
 }
 
+#[expect(clippy::struct_excessive_bools)]
 struct VarVisitor<'a, 'tcx> {
     /// context reference
     cx: &'a LateContext<'tcx>,
@@ -226,9 +232,13 @@ struct VarVisitor<'a, 'tcx> {
     indexed_mut: FxHashSet<Symbol>,
     /// indirectly indexed variables (`v[(i + 4) % N]`), the extend is `None` for global
     indexed_indirectly: FxHashMap<Symbol, Option<region::Scope>>,
+    /// indirectly indexed literals, like `[1, 2, 3][(i + 4) % N]`
+    unnamed_indexed_indirectly: bool,
     /// subset of `indexed` of vars that are indexed directly: `v[i]`
     /// this will not contain cases like `v[calc_index(i)]` or `v[(i + 4) % N]`
     indexed_directly: FxIndexMap<Symbol, (Option<region::Scope>, Ty<'tcx>)>,
+    /// directly indexed literals, like `[1, 2, 3][i]`
+    unnamed_indexed_directly: bool,
     /// Any names that are used outside an index operation.
     /// Used to detect things like `&mut vec` used together with `vec[i]`
     referenced: FxHashSet<Symbol>,
@@ -242,16 +252,42 @@ struct VarVisitor<'a, 'tcx> {
 
 impl<'tcx> VarVisitor<'_, 'tcx> {
     fn check(&mut self, idx: &'tcx Expr<'_>, seqexpr: &'tcx Expr<'_>, expr: &'tcx Expr<'_>) -> bool {
+        let mut used_cnt = 0;
+        // It is `true` if all indices are direct
+        let mut index_used_directly = true;
+
+        // Handle initial index
+        if is_local_used(self.cx, idx, self.var) {
+            used_cnt += 1;
+            index_used_directly &= matches!(idx.kind, ExprKind::Path(_));
+        }
+        // Handle nested indices
+        let seqexpr = peel_hir_expr_while(seqexpr, |e| {
+            if let ExprKind::Index(e, idx, _) = e.kind {
+                if is_local_used(self.cx, idx, self.var) {
+                    used_cnt += 1;
+                    index_used_directly &= matches!(idx.kind, ExprKind::Path(_));
+                }
+                Some(e)
+            } else {
+                None
+            }
+        });
+
+        match used_cnt {
+            0 => return true,
+            n if n > 1 => self.nonindex = true, // Optimize code like `a[i][i]`
+            _ => {},
+        }
+
         if let ExprKind::Path(ref seqpath) = seqexpr.kind
             // the indexed container is referenced by a name
             && let QPath::Resolved(None, seqvar) = *seqpath
             && seqvar.segments.len() == 1
-            && is_local_used(self.cx, idx, self.var)
         {
             if self.prefer_mutable {
                 self.indexed_mut.insert(seqvar.segments[0].ident.name);
             }
-            let index_used_directly = matches!(idx.kind, ExprKind::Path(_));
             let res = self.cx.qpath_res(seqpath, seqexpr.hir_id);
             match res {
                 Res::Local(hir_id) => {
@@ -273,7 +309,7 @@ impl<'tcx> VarVisitor<'_, 'tcx> {
                     }
                     return false; // no need to walk further *on the variable*
                 },
-                Res::Def(DefKind::Static { .. } | DefKind::Const, ..) => {
+                Res::Def(DefKind::Static { .. } | DefKind::Const { .. }, ..) => {
                     if index_used_directly {
                         self.indexed_directly.insert(
                             seqvar.segments[0].ident.name,
@@ -286,6 +322,13 @@ impl<'tcx> VarVisitor<'_, 'tcx> {
                 },
                 _ => (),
             }
+        } else if let ExprKind::Repeat(..) | ExprKind::Array(..) = seqexpr.kind {
+            if index_used_directly {
+                self.unnamed_indexed_directly = true;
+            } else {
+                self.unnamed_indexed_indirectly = true;
+            }
+            return false;
         }
         true
     }
@@ -294,12 +337,11 @@ impl<'tcx> VarVisitor<'_, 'tcx> {
 impl<'tcx> Visitor<'tcx> for VarVisitor<'_, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
         if let ExprKind::MethodCall(meth, args_0, [args_1, ..], _) = &expr.kind
-            // a range index op
             && let Some(trait_id) = self
                 .cx
                 .typeck_results()
                 .type_dependent_def_id(expr.hir_id)
-                .and_then(|def_id| self.cx.tcx.trait_of_item(def_id))
+                .and_then(|def_id| self.cx.tcx.trait_of_assoc(def_id))
             && ((meth.ident.name == sym::index && self.cx.tcx.lang_items().index_trait() == Some(trait_id))
                 || (meth.ident.name == sym::index_mut && self.cx.tcx.lang_items().index_mut_trait() == Some(trait_id)))
             && !self.check(args_1, args_0, expr)
@@ -356,7 +398,13 @@ impl<'tcx> Visitor<'tcx> for VarVisitor<'_, 'tcx> {
             ExprKind::MethodCall(_, receiver, args, _) => {
                 let def_id = self.cx.typeck_results().type_dependent_def_id(expr.hir_id).unwrap();
                 for (ty, expr) in iter::zip(
-                    self.cx.tcx.fn_sig(def_id).instantiate_identity().inputs().skip_binder(),
+                    self.cx
+                        .tcx
+                        .fn_sig(def_id)
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .inputs()
+                        .skip_binder(),
                     iter::once(receiver).chain(args.iter()),
                 ) {
                     self.prefer_mutable = false;

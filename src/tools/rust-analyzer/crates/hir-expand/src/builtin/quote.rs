@@ -1,15 +1,15 @@
 //! A simplified version of quote-crate like quasi quote macro
 #![allow(clippy::crate_in_macro_def)]
 
-use intern::{sym, Symbol};
+use intern::{Symbol, sym};
 use span::Span;
 use syntax::ToSmolStr;
 use tt::IdentIsRaw;
 
 use crate::{name::Name, tt::TopSubtreeBuilder};
 
-pub(crate) fn dollar_crate(span: Span) -> tt::Ident<Span> {
-    tt::Ident { sym: sym::dollar_crate.clone(), span, is_raw: tt::IdentIsRaw::No }
+pub(crate) fn dollar_crate(span: Span) -> tt::Ident {
+    tt::Ident { sym: sym::dollar_crate, span, is_raw: tt::IdentIsRaw::No }
 }
 
 // A helper macro quote macro
@@ -61,7 +61,7 @@ macro_rules! quote_impl__ {
         $crate::builtin::quote::__quote!($span $builder $($tail)*);
     };
 
-    ($span:ident $builder:ident ## $first:ident $($tail:tt)* ) => {{
+    ($span:ident $builder:ident # # $first:ident $($tail:tt)* ) => {{
         ::std::iter::IntoIterator::into_iter($first).for_each(|it| $crate::builtin::quote::ToTokenTree::to_tokens(it, $span, $builder));
         $crate::builtin::quote::__quote!($span $builder $($tail)*);
     }};
@@ -129,7 +129,7 @@ macro_rules! quote {
         }
     }
 }
-pub(super) use quote;
+pub use quote;
 
 pub trait ToTokenTree {
     fn to_tokens(self, span: Span, builder: &mut TopSubtreeBuilder);
@@ -163,7 +163,7 @@ impl ToTokenTree for crate::tt::SubtreeView<'_> {
 
 impl ToTokenTree for crate::tt::TopSubtree {
     fn to_tokens(self, _: Span, builder: &mut TopSubtreeBuilder) {
-        builder.extend_tt_dangerous(self.0);
+        builder.extend_with_tt(self.as_token_trees());
     }
 }
 
@@ -172,10 +172,9 @@ impl ToTokenTree for crate::tt::TtElement<'_> {
         match self {
             crate::tt::TtElement::Leaf(leaf) => builder.push(leaf.clone()),
             crate::tt::TtElement::Subtree(subtree, subtree_iter) => {
-                builder.extend_tt_dangerous(
-                    std::iter::once(crate::tt::TokenTree::Subtree(subtree.clone()))
-                        .chain(subtree_iter.remaining().flat_tokens().iter().cloned()),
-                );
+                builder.open(subtree.delimiter.kind, subtree.delimiter.open);
+                builder.extend_with_tt(subtree_iter.remaining());
+                builder.close(subtree.delimiter.close);
             }
         }
     }
@@ -200,16 +199,16 @@ impl<T: ToTokenTree + Clone> ToTokenTree for &T {
 }
 
 impl_to_to_tokentrees! {
-    span: u32 => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
-    span: usize => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
-    span: i32 => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
-    span: bool => self { crate::tt::Ident{sym: if self { sym::true_.clone() } else { sym::false_.clone() }, span, is_raw: tt::IdentIsRaw::No } };
+    span: u32 => self { crate::tt::Literal{text_and_suffix: sym::Integer::get(self as _), span, kind: tt::LitKind::Integer, suffix_len: 0 } };
+    span: usize => self { crate::tt::Literal{text_and_suffix: sym::Integer::get(self as _), span, kind: tt::LitKind::Integer, suffix_len: 0 } };
+    span: i32 => self { crate::tt::Literal{text_and_suffix: sym::Integer::get(self as _), span, kind: tt::LitKind::Integer, suffix_len: 0 } };
+    span: bool => self { crate::tt::Ident{sym: if self { sym::true_ } else { sym::false_ }, span, is_raw: tt::IdentIsRaw::No } };
     _span: crate::tt::Leaf => self { self };
     _span: crate::tt::Literal => self { self };
     _span: crate::tt::Ident => self { self };
     _span: crate::tt::Punct => self { self };
-    span: &str => self { crate::tt::Literal{symbol: Symbol::intern(&self.escape_default().to_smolstr()), span, kind: tt::LitKind::Str, suffix: None }};
-    span: String => self { crate::tt::Literal{symbol: Symbol::intern(&self.escape_default().to_smolstr()), span, kind: tt::LitKind::Str, suffix: None }};
+    span: &str => self { crate::tt::Literal{text_and_suffix: Symbol::intern(&self.escape_default().to_smolstr()), span, kind: tt::LitKind::Str, suffix_len: 0 }};
+    span: String => self { crate::tt::Literal{text_and_suffix: Symbol::intern(&self.escape_default().to_smolstr()), span, kind: tt::LitKind::Str, suffix_len: 0 }};
     span: Name => self {
         let (is_raw, s) = IdentIsRaw::split_from_symbol(self.as_str());
         crate::tt::Ident{sym: Symbol::intern(s), span, is_raw }
@@ -226,10 +225,8 @@ mod tests {
     use ::tt::IdentIsRaw;
     use expect_test::expect;
     use intern::Symbol;
-    use span::{Edition, SpanAnchor, SyntaxContextId, ROOT_ERASED_FILE_AST_ID};
+    use span::{Edition, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
     use syntax::{TextRange, TextSize};
-
-    use super::quote;
 
     const DUMMY: tt::Span = tt::Span {
         range: TextRange::empty(TextSize::new(0)),
@@ -240,7 +237,7 @@ mod tests {
             ),
             ast_id: ROOT_ERASED_FILE_AST_ID,
         },
-        ctx: SyntaxContextId::root(Edition::CURRENT),
+        ctx: SyntaxContext::root(Edition::CURRENT),
     };
 
     #[test]
@@ -277,8 +274,8 @@ mod tests {
         assert_eq!(quoted.to_string(), "hello");
         let t = format!("{quoted:#?}");
         expect![[r#"
-            SUBTREE $$ 937550:0@0..0#2 937550:0@0..0#2
-              IDENT   hello 937550:0@0..0#2"#]]
+            SUBTREE $$ 937550:Root[0000, 0]@0..0#ROOT2024 937550:Root[0000, 0]@0..0#ROOT2024
+              IDENT   hello 937550:Root[0000, 0]@0..0#ROOT2024"#]]
         .assert_eq(&t);
     }
 
@@ -324,6 +321,9 @@ mod tests {
             }
         };
 
-        assert_eq!(quoted.to_string(), "impl Clone for Foo {fn clone (& self) -> Self {Self {name : self . name . clone () , id : self . id . clone () ,}}}");
+        assert_eq!(
+            quoted.to_string(),
+            "impl Clone for Foo {fn clone (& self) -> Self {Self {name : self . name . clone () , id : self . id . clone () ,}}}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::ty::implements_trait;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{Item, ItemKind, Path, TraitRef};
+use rustc_hir::{Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::Ty;
 use rustc_session::declare_lint_pass;
@@ -69,17 +69,19 @@ declare_clippy_lint! {
     "ensures that the semantics of `Borrow` for `Hash` are satisfied when `Borrow<str>` and `Borrow<[u8]>` are implemented"
 }
 
-declare_lint_pass!(ImplHashWithBorrowStrBytes => [IMPL_HASH_BORROW_WITH_STR_AND_BYTES]);
+declare_lint_pass!(ImplHashWithBorrowStrBytes => [
+    IMPL_HASH_BORROW_WITH_STR_AND_BYTES,
+]);
 
 impl LateLintPass<'_> for ImplHashWithBorrowStrBytes {
     /// We are emitting this lint at the Hash impl of a type that implements all
     /// three of `Hash`, `Borrow<str>` and `Borrow<[u8]>`.
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
         if let ItemKind::Impl(imp) = item.kind
-            && let Some(TraitRef {path: Path {span, res, ..}, ..}) = imp.of_trait
-            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+            && let Some(of_trait) = imp.of_trait
+            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip()
             && let Some(hash_id) = cx.tcx.get_diagnostic_item(sym::Hash)
-            && Res::Def(DefKind::Trait, hash_id) == *res
+            && Res::Def(DefKind::Trait, hash_id) == of_trait.trait_ref.path.res
             && let Some(borrow_id) = cx.tcx.get_diagnostic_item(sym::Borrow)
             // since we are in the `Hash` impl, we don't need to check for that.
             // we need only to check for `Borrow<str>` and `Borrow<[u8]>`
@@ -89,7 +91,7 @@ impl LateLintPass<'_> for ImplHashWithBorrowStrBytes {
             span_lint_and_then(
                 cx,
                 IMPL_HASH_BORROW_WITH_STR_AND_BYTES,
-                *span,
+                of_trait.trait_ref.path.span,
                 "the semantics of `Borrow<T>` around `Hash` can't be satisfied when both `Borrow<str>` and `Borrow<[u8]>` are implemented",
                 |diag| {
                     diag.note("the `Borrow` semantics require that `Hash` must behave the same for all implementations of Borrow<T>");

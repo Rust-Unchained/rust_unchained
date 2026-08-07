@@ -10,20 +10,20 @@ use rustc_abi::{
 };
 
 use crate::callconv::{ArgAbi, ArgExtension, CastTarget, FnAbi, PassMode, Uniform};
-use crate::spec::HasTargetSpec;
+use crate::spec::{HasTargetSpec, LlvmAbi};
 
 #[derive(Copy, Clone)]
 enum RegPassKind {
-    Float(Reg),
-    Integer(Reg),
+    Float { offset_from_start: Size, ty: Reg },
+    Integer { offset_from_start: Size, ty: Reg },
     Unknown,
 }
 
 #[derive(Copy, Clone)]
 enum FloatConv {
-    FloatPair(Reg, Reg),
+    FloatPair { first_ty: Reg, second_ty_offset_from_start: Size, second_ty: Reg },
     Float(Reg),
-    MixedPair(Reg, Reg),
+    MixedPair { first_ty: Reg, second_ty_offset_from_start: Size, second_ty: Reg },
 }
 
 #[derive(Copy, Clone)]
@@ -43,6 +43,7 @@ fn should_use_fp_conv_helper<'a, Ty, C>(
     flen: u64,
     field1_kind: &mut RegPassKind,
     field2_kind: &mut RegPassKind,
+    offset_from_start: Size,
 ) -> Result<(), CannotUseFpConv>
 where
     Ty: TyAbiInterface<'a, C> + Copy,
@@ -55,16 +56,16 @@ where
                 }
                 match (*field1_kind, *field2_kind) {
                     (RegPassKind::Unknown, _) => {
-                        *field1_kind = RegPassKind::Integer(Reg {
-                            kind: RegKind::Integer,
-                            size: arg_layout.size,
-                        });
+                        *field1_kind = RegPassKind::Integer {
+                            offset_from_start,
+                            ty: Reg { kind: RegKind::Integer, size: arg_layout.size },
+                        };
                     }
-                    (RegPassKind::Float(_), RegPassKind::Unknown) => {
-                        *field2_kind = RegPassKind::Integer(Reg {
-                            kind: RegKind::Integer,
-                            size: arg_layout.size,
-                        });
+                    (RegPassKind::Float { .. }, RegPassKind::Unknown) => {
+                        *field2_kind = RegPassKind::Integer {
+                            offset_from_start,
+                            ty: Reg { kind: RegKind::Integer, size: arg_layout.size },
+                        };
                     }
                     _ => return Err(CannotUseFpConv),
                 }
@@ -75,19 +76,25 @@ where
                 }
                 match (*field1_kind, *field2_kind) {
                     (RegPassKind::Unknown, _) => {
-                        *field1_kind =
-                            RegPassKind::Float(Reg { kind: RegKind::Float, size: arg_layout.size });
+                        *field1_kind = RegPassKind::Float {
+                            offset_from_start,
+                            ty: Reg { kind: RegKind::Float, size: arg_layout.size },
+                        };
                     }
                     (_, RegPassKind::Unknown) => {
-                        *field2_kind =
-                            RegPassKind::Float(Reg { kind: RegKind::Float, size: arg_layout.size });
+                        *field2_kind = RegPassKind::Float {
+                            offset_from_start,
+                            ty: Reg { kind: RegKind::Float, size: arg_layout.size },
+                        };
                     }
                     _ => return Err(CannotUseFpConv),
                 }
             }
         },
-        BackendRepr::SimdVector { .. } => return Err(CannotUseFpConv),
-        BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => match arg_layout.fields {
+        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => {
+            return Err(CannotUseFpConv);
+        }
+        BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } => match arg_layout.fields {
             FieldsShape::Primitive => {
                 unreachable!("aggregates can't have `FieldsShape::Primitive`")
             }
@@ -102,13 +109,14 @@ where
                             flen,
                             field1_kind,
                             field2_kind,
+                            offset_from_start,
                         );
                     }
                     return Err(CannotUseFpConv);
                 }
             }
             FieldsShape::Array { count, .. } => {
-                for _ in 0..count {
+                for i in 0..count {
                     let elem_layout = arg_layout.field(cx, 0);
                     should_use_fp_conv_helper(
                         cx,
@@ -117,6 +125,7 @@ where
                         flen,
                         field1_kind,
                         field2_kind,
+                        offset_from_start + elem_layout.size * i,
                     )?;
                 }
             }
@@ -127,7 +136,15 @@ where
                 }
                 for i in arg_layout.fields.index_by_increasing_offset() {
                     let field = arg_layout.field(cx, i);
-                    should_use_fp_conv_helper(cx, &field, xlen, flen, field1_kind, field2_kind)?;
+                    should_use_fp_conv_helper(
+                        cx,
+                        &field,
+                        xlen,
+                        flen,
+                        field1_kind,
+                        field2_kind,
+                        offset_from_start + arg_layout.fields.offset(i),
+                    )?;
                 }
             }
         },
@@ -146,14 +163,52 @@ where
 {
     let mut field1_kind = RegPassKind::Unknown;
     let mut field2_kind = RegPassKind::Unknown;
-    if should_use_fp_conv_helper(cx, arg, xlen, flen, &mut field1_kind, &mut field2_kind).is_err() {
+    if should_use_fp_conv_helper(
+        cx,
+        arg,
+        xlen,
+        flen,
+        &mut field1_kind,
+        &mut field2_kind,
+        Size::ZERO,
+    )
+    .is_err()
+    {
         return None;
     }
     match (field1_kind, field2_kind) {
-        (RegPassKind::Integer(l), RegPassKind::Float(r)) => Some(FloatConv::MixedPair(l, r)),
-        (RegPassKind::Float(l), RegPassKind::Integer(r)) => Some(FloatConv::MixedPair(l, r)),
-        (RegPassKind::Float(l), RegPassKind::Float(r)) => Some(FloatConv::FloatPair(l, r)),
-        (RegPassKind::Float(f), RegPassKind::Unknown) => Some(FloatConv::Float(f)),
+        (
+            RegPassKind::Integer { offset_from_start, .. }
+            | RegPassKind::Float { offset_from_start, .. },
+            _,
+        ) if offset_from_start != Size::ZERO => {
+            panic!("type {:?} has a first field with non-zero offset {offset_from_start:?}", arg.ty)
+        }
+        (
+            RegPassKind::Integer { ty: first_ty, .. },
+            RegPassKind::Float { offset_from_start, ty: second_ty },
+        ) => Some(FloatConv::MixedPair {
+            first_ty,
+            second_ty_offset_from_start: offset_from_start,
+            second_ty,
+        }),
+        (
+            RegPassKind::Float { ty: first_ty, .. },
+            RegPassKind::Integer { offset_from_start, ty: second_ty },
+        ) => Some(FloatConv::MixedPair {
+            first_ty,
+            second_ty_offset_from_start: offset_from_start,
+            second_ty,
+        }),
+        (
+            RegPassKind::Float { ty: first_ty, .. },
+            RegPassKind::Float { offset_from_start, ty: second_ty },
+        ) => Some(FloatConv::FloatPair {
+            first_ty,
+            second_ty_offset_from_start: offset_from_start,
+            second_ty,
+        }),
+        (RegPassKind::Float { ty, .. }, RegPassKind::Unknown) => Some(FloatConv::Float(ty)),
         _ => None,
     }
 }
@@ -171,11 +226,19 @@ where
             FloatConv::Float(f) => {
                 arg.cast_to(f);
             }
-            FloatConv::FloatPair(l, r) => {
-                arg.cast_to(CastTarget::pair(l, r));
+            FloatConv::FloatPair { first_ty, second_ty_offset_from_start, second_ty } => {
+                arg.cast_to(CastTarget::offset_pair(
+                    first_ty,
+                    second_ty_offset_from_start,
+                    second_ty,
+                ));
             }
-            FloatConv::MixedPair(l, r) => {
-                arg.cast_to(CastTarget::pair(l, r));
+            FloatConv::MixedPair { first_ty, second_ty_offset_from_start, second_ty } => {
+                arg.cast_to(CastTarget::offset_pair(
+                    first_ty,
+                    second_ty_offset_from_start,
+                    second_ty,
+                ));
             }
         }
         return false;
@@ -229,7 +292,13 @@ fn classify_arg<'a, Ty, C>(
     Ty: TyAbiInterface<'a, C> + Copy,
 {
     if !arg.layout.is_sized() {
+        // FIXME: Update avail_gprs?
         // Not touching this...
+        return;
+    }
+    if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+        arg.make_indirect();
+        *avail_gprs = (*avail_gprs).saturating_sub(1);
         return;
     }
     if !is_vararg {
@@ -239,15 +308,27 @@ fn classify_arg<'a, Ty, C>(
                 arg.cast_to(f);
                 return;
             }
-            Some(FloatConv::FloatPair(l, r)) if *avail_fprs >= 2 => {
+            Some(FloatConv::FloatPair { first_ty, second_ty_offset_from_start, second_ty })
+                if *avail_fprs >= 2 =>
+            {
                 *avail_fprs -= 2;
-                arg.cast_to(CastTarget::pair(l, r));
+                arg.cast_to(CastTarget::offset_pair(
+                    first_ty,
+                    second_ty_offset_from_start,
+                    second_ty,
+                ));
                 return;
             }
-            Some(FloatConv::MixedPair(l, r)) if *avail_fprs >= 1 && *avail_gprs >= 1 => {
+            Some(FloatConv::MixedPair { first_ty, second_ty_offset_from_start, second_ty })
+                if *avail_fprs >= 1 && *avail_gprs >= 1 =>
+            {
                 *avail_gprs -= 1;
                 *avail_fprs -= 1;
-                arg.cast_to(CastTarget::pair(l, r));
+                arg.cast_to(CastTarget::offset_pair(
+                    first_ty,
+                    second_ty_offset_from_start,
+                    second_ty,
+                ));
                 return;
             }
             _ => (),
@@ -255,7 +336,7 @@ fn classify_arg<'a, Ty, C>(
     }
 
     let total = arg.layout.size;
-    let align = arg.layout.align.abi.bits();
+    let align = arg.layout.align.bits();
 
     // "Scalars wider than 2✕XLEN are passed by reference and are replaced in
     // the argument list with the address."
@@ -320,16 +401,14 @@ fn classify_arg<'a, Ty, C>(
 }
 
 fn extend_integer_width<Ty>(arg: &mut ArgAbi<'_, Ty>, xlen: u64) {
-    if let BackendRepr::Scalar(scalar) = arg.layout.backend_repr {
-        if let Primitive::Int(i, _) = scalar.primitive() {
-            // 32-bit integers are always sign-extended
-            if i.size().bits() == 32 && xlen > 32 {
-                if let PassMode::Direct(ref mut attrs) = arg.mode {
-                    attrs.ext(ArgExtension::Sext);
-                    return;
-                }
-            }
-        }
+    if let BackendRepr::Scalar(scalar) = arg.layout.backend_repr
+        && let Primitive::Int(i, _) = scalar.primitive()
+        && i.size().bits() == 32
+        && xlen > 32
+        && let PassMode::Direct(ref mut attrs) = arg.mode
+    {
+        attrs.ext(ArgExtension::Sext);
+        return;
     }
 
     arg.extend_integer_width_to(xlen);
@@ -340,12 +419,12 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout + HasTargetSpec,
 {
-    let flen = match &cx.target_spec().llvm_abiname[..] {
-        "ilp32f" | "lp64f" => 32,
-        "ilp32d" | "lp64d" => 64,
+    let flen = match &cx.target_spec().llvm_abiname {
+        LlvmAbi::Ilp32f | LlvmAbi::Lp64f => 32,
+        LlvmAbi::Ilp32d | LlvmAbi::Lp64d => 64,
         _ => 0,
     };
-    let xlen = cx.data_layout().pointer_size.bits();
+    let xlen = cx.data_layout().pointer_size().bits();
 
     let mut avail_gprs = 8;
     let mut avail_fprs = 8;
@@ -375,7 +454,7 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout + HasTargetSpec,
 {
-    let xlen = cx.data_layout().pointer_size.bits();
+    let xlen = cx.data_layout().pointer_size().bits();
 
     for arg in fn_abi.args.iter_mut() {
         if arg.is_ignore() {

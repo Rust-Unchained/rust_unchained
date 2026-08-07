@@ -3,6 +3,7 @@
 
 //@ revisions: rpass1 rpass2
 //@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 
@@ -26,7 +27,7 @@ mod mod3 {
     #[cfg(rpass2)]
     use Trait2;
 
-    #[rustc_clean(except="typeck", cfg="rpass2")]
+    #[rustc_clean(except="hir_owner,typeck_root", cfg="rpass2")]
     fn bar() {
         ().method();
     }

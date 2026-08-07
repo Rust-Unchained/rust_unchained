@@ -1,20 +1,18 @@
+use crate::internal_paths;
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
 use clippy_utils::macros::root_macro_call_first_node;
-use clippy_utils::{is_lint_allowed, match_def_path, paths};
+use clippy_utils::{is_lint_allowed, sym};
 use rustc_ast::ast::LitKind;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::hir_id::CRATE_HIR_ID;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ExprKind, HirId, Item, MutTy, Mutability, Path, TyKind};
+use rustc_hir::{CRATE_HIR_ID, ExprKind, HirId, Item, MutTy, Mutability, Path, TyKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_lint_defs::declare_tool_lint;
 use rustc_middle::hir::nested_filter;
-use rustc_session::impl_lint_pass;
-use rustc_span::source_map::Spanned;
+use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::symbol::Symbol;
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Spanned};
 
 declare_tool_lint! {
     /// ### What it does
@@ -105,7 +103,7 @@ impl_lint_pass!(LintWithoutLintPass => [
 
 impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
-        if let hir::ItemKind::Static(ident, ty, Mutability::Not, body_id) = item.kind {
+        if let hir::ItemKind::Static(Mutability::Not, ident, ty, body_id) = item.kind {
             if is_lint_ref_type(cx, ty) {
                 check_invalid_clippy_version_attribute(cx, item);
 
@@ -160,9 +158,8 @@ impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
                 let body = cx.tcx.hir_body_owned_by(
                     impl_item_refs
                         .iter()
-                        .find(|iiref| iiref.ident.as_str() == "lint_vec")
+                        .find(|&&iiref| cx.tcx.item_name(iiref.owner_id) == sym::lint_vec)
                         .expect("LintPass needs to implement lint_vec")
-                        .id
                         .owner_id
                         .def_id,
                 );
@@ -209,10 +206,10 @@ pub(super) fn is_lint_ref_type(cx: &LateContext<'_>, ty: &hir::Ty<'_>) -> bool {
         && let TyKind::Path(ref path) = inner.kind
         && let Res::Def(DefKind::Struct, def_id) = cx.qpath_res(path, inner.hir_id)
     {
-        return match_def_path(cx, def_id, &paths::LINT);
+        internal_paths::LINT.matches(cx, def_id)
+    } else {
+        false
     }
-
-    false
 }
 
 fn check_invalid_clippy_version_attribute(cx: &LateContext<'_>, item: &'_ Item<'_>) {
@@ -251,8 +248,8 @@ pub(super) fn extract_clippy_version_value(cx: &LateContext<'_>, item: &'_ Item<
         if let hir::Attribute::Unparsed(attr_kind) = &attr
             // Identify attribute
             && let [tool_name, attr_name] = &attr_kind.path.segments[..]
-            && tool_name.name == sym::clippy
-            && attr_name.name == sym::version
+            && tool_name == &sym::clippy
+            && attr_name == &sym::version
             && let Some(version) = attr.value_str()
         {
             Some(version)

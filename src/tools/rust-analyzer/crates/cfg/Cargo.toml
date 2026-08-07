@@ -10,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [lib]
+doctest = false
 
 [dependencies]
 rustc-hash.workspace = true
@@ -17,20 +18,26 @@ tracing.workspace = true
 
 # locals deps
 tt = { workspace = true, optional = true }
+syntax = { workspace = true, optional = true }
 intern.workspace = true
 
 [dev-dependencies]
-expect-test = "1.4.1"
-oorandom = "11.1.3"
-# We depend on both individually instead of using `features = ["derive"]` to microoptimize the
-# build graph: if the feature was enabled, syn would be built early on in the graph if `smolstr`
-# supports `arbitrary`. This way, we avoid feature unification.
-arbitrary = "1.3.2"
-derive_arbitrary = "1.3.2"
+expect-test = "1.5.1"
+oorandom = "11.1.5"
+arbitrary = { version = "1.4.1", features = ["derive"] }
 
 # local deps
 syntax-bridge.workspace = true
 syntax.workspace = true
+
+# tt is needed for testing
+cfg = { path = ".", default-features = false, features = ["tt"] }
+
+[features]
+default = []
+syntax = ["dep:syntax"]
+tt = ["dep:tt"]
+in-rust-tree = []
 
 [lints]
 workspace = true

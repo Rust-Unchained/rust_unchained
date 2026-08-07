@@ -3,6 +3,7 @@
 use crate::alloc::{Layout, alloc, dealloc};
 use crate::borrow::Cow;
 use crate::ffi::{OsStr, OsString, c_void};
+use crate::fs::TryLockError;
 use crate::io::{self, BorrowedCursor, Error, IoSlice, IoSliceMut, SeekFrom};
 use crate::mem::{self, MaybeUninit, offset_of};
 use crate::os::windows::io::{AsHandle, BorrowedHandle};
@@ -14,10 +15,11 @@ use crate::sys::pal::api::{self, WinError, set_file_information_by_handle};
 use crate::sys::pal::{IoResult, fill_utf16_buf, to_u16s, truncate_utf16_at_nul};
 use crate::sys::path::{WCStr, maybe_verbatim};
 use crate::sys::time::SystemTime;
-use crate::sys::{Align8, c, cvt};
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{Align8, AsInner, FromInner, IntoInner, c, cvt};
 use crate::{fmt, ptr, slice};
 
+mod dir;
+pub use dir::Dir;
 mod remove_dir_all;
 use remove_dir_all::remove_dir_all_iterative;
 
@@ -79,7 +81,9 @@ pub struct OpenOptions {
     attributes: u32,
     share_mode: u32,
     security_qos_flags: u32,
-    security_attributes: *mut c::SECURITY_ATTRIBUTES,
+    inherit_handle: bool,
+    freeze_last_access_time: bool,
+    freeze_last_write_time: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -131,6 +135,7 @@ impl Iterator for ReadDir {
             let mut wfd = mem::zeroed();
             loop {
                 if c::FindNextFileW(handle.0, &mut wfd) == 0 {
+                    self.handle = None;
                     match api::get_last_error() {
                         WinError::NO_MORE_FILES => return None,
                         WinError { code } => {
@@ -201,7 +206,9 @@ impl OpenOptions {
             share_mode: c::FILE_SHARE_READ | c::FILE_SHARE_WRITE | c::FILE_SHARE_DELETE,
             attributes: 0,
             security_qos_flags: 0,
-            security_attributes: ptr::null_mut(),
+            inherit_handle: false,
+            freeze_last_access_time: false,
+            freeze_last_write_time: false,
         }
     }
 
@@ -241,8 +248,14 @@ impl OpenOptions {
         // receive is `SECURITY_ANONYMOUS = 0x0`, which we can't check for later on.
         self.security_qos_flags = flags | c::SECURITY_SQOS_PRESENT;
     }
-    pub fn security_attributes(&mut self, attrs: *mut c::SECURITY_ATTRIBUTES) {
-        self.security_attributes = attrs;
+    pub fn inherit_handle(&mut self, inherit: bool) {
+        self.inherit_handle = inherit;
+    }
+    pub fn freeze_last_access_time(&mut self, freeze: bool) {
+        self.freeze_last_access_time = freeze;
+    }
+    pub fn freeze_last_write_time(&mut self, freeze: bool) {
+        self.freeze_last_write_time = freeze;
     }
 
     fn get_access_mode(&self) -> io::Result<u32> {
@@ -256,35 +269,61 @@ impl OpenOptions {
                 Ok(c::GENERIC_READ | (c::FILE_GENERIC_WRITE & !c::FILE_WRITE_DATA))
             }
             (false, false, false, None) => {
-                Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32))
+                // If no access mode is set, check if any creation flags are set
+                // to provide a more descriptive error message
+                if self.create || self.create_new || self.truncate {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "creating or truncating a file requires write or append access",
+                    ))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "must specify at least one of read, write, or append access",
+                    ))
+                }
             }
         }
     }
 
-    fn get_creation_mode(&self) -> io::Result<u32> {
+    fn get_cmode_disposition(&self) -> io::Result<(u32, u32)> {
         match (self.write, self.append) {
             (true, false) => {}
             (false, false) => {
                 if self.truncate || self.create || self.create_new {
-                    return Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "creating or truncating a file requires write or append access",
+                    ));
                 }
             }
             (_, true) => {
                 if self.truncate && !self.create_new {
-                    return Err(Error::from_raw_os_error(c::ERROR_INVALID_PARAMETER as i32));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "creating or truncating a file requires write or append access",
+                    ));
                 }
             }
         }
 
         Ok(match (self.create, self.truncate, self.create_new) {
-            (false, false, false) => c::OPEN_EXISTING,
-            (true, false, false) => c::OPEN_ALWAYS,
-            (false, true, false) => c::TRUNCATE_EXISTING,
+            (false, false, false) => (c::OPEN_EXISTING, c::FILE_OPEN),
+            (true, false, false) => (c::OPEN_ALWAYS, c::FILE_OPEN_IF),
+            (false, true, false) => (c::TRUNCATE_EXISTING, c::FILE_OVERWRITE),
             // `CREATE_ALWAYS` has weird semantics so we emulate it using
             // `OPEN_ALWAYS` and a manual truncation step. See #115745.
-            (true, true, false) => c::OPEN_ALWAYS,
-            (_, _, true) => c::CREATE_NEW,
+            (true, true, false) => (c::OPEN_ALWAYS, c::FILE_OVERWRITE_IF),
+            (_, _, true) => (c::CREATE_NEW, c::FILE_CREATE),
         })
+    }
+
+    fn get_creation_mode(&self) -> io::Result<u32> {
+        self.get_cmode_disposition().map(|(mode, _)| mode)
+    }
+
+    fn get_disposition(&self) -> io::Result<u32> {
+        self.get_cmode_disposition().map(|(_, mode)| mode)
     }
 
     fn get_flags_and_attributes(&self) -> u32 {
@@ -305,12 +344,17 @@ impl File {
 
     fn open_native(path: &WCStr, opts: &OpenOptions) -> io::Result<File> {
         let creation = opts.get_creation_mode()?;
+        let sa = c::SECURITY_ATTRIBUTES {
+            nLength: size_of::<c::SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: opts.inherit_handle as c::BOOL,
+        };
         let handle = unsafe {
             c::CreateFileW(
                 path.as_ptr(),
                 opts.get_access_mode()?,
                 opts.share_mode,
-                opts.security_attributes,
+                if opts.inherit_handle { &sa } else { ptr::null() },
                 creation,
                 opts.get_flags_and_attributes(),
                 ptr::null_mut(),
@@ -318,6 +362,18 @@ impl File {
         };
         let handle = unsafe { HandleOrInvalid::from_raw_handle(handle) };
         if let Ok(handle) = OwnedHandle::try_from(handle) {
+            if opts.freeze_last_access_time || opts.freeze_last_write_time {
+                let file_time =
+                    c::FILETIME { dwLowDateTime: 0xFFFFFFFF, dwHighDateTime: 0xFFFFFFFF };
+                cvt(unsafe {
+                    c::SetFileTime(
+                        handle.as_raw_handle(),
+                        core::ptr::null(),
+                        if opts.freeze_last_access_time { &file_time } else { core::ptr::null() },
+                        if opts.freeze_last_write_time { &file_time } else { core::ptr::null() },
+                    )
+                })?;
+            }
             // Manual truncation. See #115745.
             if opts.truncate
                 && creation == c::OPEN_ALWAYS
@@ -399,7 +455,7 @@ impl File {
         self.acquire_lock(0)
     }
 
-    pub fn try_lock(&self) -> io::Result<bool> {
+    pub fn try_lock(&self) -> Result<(), TryLockError> {
         let result = cvt(unsafe {
             let mut overlapped = mem::zeroed();
             c::LockFileEx(
@@ -413,18 +469,15 @@ impl File {
         });
 
         match result {
-            Ok(_) => Ok(true),
-            Err(err)
-                if err.raw_os_error() == Some(c::ERROR_IO_PENDING as i32)
-                    || err.raw_os_error() == Some(c::ERROR_LOCK_VIOLATION as i32) =>
-            {
-                Ok(false)
+            Ok(_) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(c::ERROR_LOCK_VIOLATION as i32) => {
+                Err(TryLockError::WouldBlock)
             }
-            Err(err) => Err(err),
+            Err(err) => Err(TryLockError::Error(err)),
         }
     }
 
-    pub fn try_lock_shared(&self) -> io::Result<bool> {
+    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
         let result = cvt(unsafe {
             let mut overlapped = mem::zeroed();
             c::LockFileEx(
@@ -438,14 +491,11 @@ impl File {
         });
 
         match result {
-            Ok(_) => Ok(true),
-            Err(err)
-                if err.raw_os_error() == Some(c::ERROR_IO_PENDING as i32)
-                    || err.raw_os_error() == Some(c::ERROR_LOCK_VIOLATION as i32) =>
-            {
-                Ok(false)
+            Ok(_) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(c::ERROR_LOCK_VIOLATION as i32) => {
+                Err(TryLockError::WouldBlock)
             }
-            Err(err) => Err(err),
+            Err(err) => Err(TryLockError::Error(err)),
         }
     }
 
@@ -547,7 +597,7 @@ impl File {
                 (&raw mut info) as *mut c_void,
                 size as u32,
             ))?;
-            attr.file_size = info.AllocationSize as u64;
+            attr.file_size = info.EndOfFile as u64;
             attr.number_of_links = Some(info.NumberOfLinks);
             if attr.attributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 let mut attr_tag: c::FILE_ATTRIBUTE_TAG_INFO = mem::zeroed();
@@ -582,8 +632,12 @@ impl File {
         self.handle.read_at(buf, offset)
     }
 
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.handle.read_buf(cursor)
+    }
+
+    pub fn read_buf_at(&self, cursor: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        self.handle.read_buf_at(cursor, offset)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -619,6 +673,14 @@ impl File {
         let mut newpos = 0;
         cvt(unsafe { c::SetFilePointerEx(self.handle.as_raw_handle(), pos, &mut newpos, whence) })?;
         Ok(newpos as u64)
+    }
+
+    pub fn size(&self) -> Option<io::Result<u64>> {
+        let mut result = 0;
+        Some(
+            cvt(unsafe { c::GetFileSizeEx(self.handle.as_raw_handle(), &mut result) })
+                .map(|_| result as u64),
+        )
     }
 
     pub fn tell(&self) -> io::Result<u64> {
@@ -989,14 +1051,23 @@ impl FromRawHandle for File {
     }
 }
 
+fn debug_path_handle<'a, 'b>(
+    handle: BorrowedHandle<'a>,
+    f: &'a mut fmt::Formatter<'b>,
+    name: &str,
+) -> fmt::DebugStruct<'a, 'b> {
+    // FIXME(#24570): add more info here (e.g., mode)
+    let mut b = f.debug_struct(name);
+    b.field("handle", &handle.as_raw_handle());
+    if let Ok(path) = get_path(handle) {
+        b.field("path", &path);
+    }
+    b
+}
+
 impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // FIXME(#24570): add more info here (e.g., mode)
-        let mut b = f.debug_struct("File");
-        b.field("handle", &self.handle.as_raw_handle());
-        if let Ok(path) = get_path(self) {
-            b.field("path", &path);
-        }
+        let mut b = debug_path_handle(self.handle.as_handle(), f, "File");
         b.finish()
     }
 }
@@ -1095,6 +1166,16 @@ impl FilePermissions {
         } else {
             self.attrs &= !c::FILE_ATTRIBUTE_READONLY;
         }
+    }
+
+    pub fn file_attributes(&self) -> u32 {
+        self.attrs as u32
+    }
+}
+
+impl FromInner<u32> for FilePermissions {
+    fn from_inner(attrs: u32) -> FilePermissions {
+        FilePermissions { attrs }
     }
 }
 
@@ -1262,8 +1343,8 @@ pub fn rename(old: &WCStr, new: &WCStr) -> io::Result<()> {
                 Layout::from_size_align(struct_size as usize, align_of::<c::FILE_RENAME_INFO>())
                     .unwrap();
 
-            // SAFETY: We allocate enough memory for a full FILE_RENAME_INFO struct and a filename.
             let file_rename_info;
+            // SAFETY: We allocate enough memory for a full FILE_RENAME_INFO struct and a filename.
             unsafe {
                 file_rename_info = alloc(layout).cast::<c::FILE_RENAME_INFO>();
                 if file_rename_info.is_null() {
@@ -1483,10 +1564,36 @@ pub fn set_perm(p: &WCStr, perm: FilePermissions) -> io::Result<()> {
     }
 }
 
-fn get_path(f: &File) -> io::Result<PathBuf> {
+pub fn set_perm_nofollow(p: &WCStr, perm: FilePermissions) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.access_mode(c::FILE_WRITE_ATTRIBUTES);
+    // `FILE_FLAG_OPEN_REPARSE_POINT` for no_follow behavior
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | c::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = File::open_native(p, &opts)?;
+    file.set_permissions(perm)
+}
+
+pub fn set_times(p: &WCStr, times: FileTimes) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.access_mode(c::FILE_WRITE_ATTRIBUTES);
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS);
+    let file = File::open_native(p, &opts)?;
+    file.set_times(times)
+}
+
+pub fn set_times_nofollow(p: &WCStr, times: FileTimes) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.access_mode(c::FILE_WRITE_ATTRIBUTES);
+    // `FILE_FLAG_OPEN_REPARSE_POINT` for no_follow behavior
+    opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS | c::FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = File::open_native(p, &opts)?;
+    file.set_times(times)
+}
+
+fn get_path(f: impl AsRawHandle) -> io::Result<PathBuf> {
     fill_utf16_buf(
         |buf, sz| unsafe {
-            c::GetFinalPathNameByHandleW(f.handle.as_raw_handle(), buf, sz, c::VOLUME_NAME_DOS)
+            c::GetFinalPathNameByHandleW(f.as_raw_handle(), buf, sz, c::VOLUME_NAME_DOS)
         },
         |buf| PathBuf::from(OsString::from_wide(buf)),
     )
@@ -1499,7 +1606,7 @@ pub fn canonicalize(p: &WCStr) -> io::Result<PathBuf> {
     // This flag is so we can open directories too
     opts.custom_flags(c::FILE_FLAG_BACKUP_SEMANTICS);
     let f = File::open_native(p, &opts)?;
-    get_path(&f)
+    get_path(f.handle)
 }
 
 pub fn copy(from: &WCStr, to: &WCStr) -> io::Result<u64> {
@@ -1578,33 +1685,46 @@ pub fn junction_point(original: &Path, link: &Path) -> io::Result<()> {
         SubstituteNameLength: u16,
         PrintNameOffset: u16,
         PrintNameLength: u16,
-        PathBuffer: [MaybeUninit<u16>; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize],
+        // `MAXIMUM_REPARSE_DATA_BUFFER_SIZE` is a size in bytes, but this is a
+        // buffer of `u16`s, so it holds half as many elements.
+        PathBuffer: [MaybeUninit<u16>; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize / 2],
     }
-    let data_len = 12 + (abs_path.len() * 2);
-    if data_len > u16::MAX as usize {
-        return Err(io::const_error!(io::ErrorKind::InvalidInput, "`original` path is too long"));
-    }
-    let data_len = data_len as u16;
     let mut header = MountPointBuffer {
         ReparseTag: c::IO_REPARSE_TAG_MOUNT_POINT,
-        ReparseDataLength: data_len,
+        ReparseDataLength: 0, // filled in below
         Reserved: 0,
         SubstituteNameOffset: 0,
         SubstituteNameLength: (abs_path.len() * 2) as u16,
+        // The print name follows the substitute name and its null terminator.
         PrintNameOffset: ((abs_path.len() + 1) * 2) as u16,
         PrintNameLength: 0,
-        PathBuffer: [MaybeUninit::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize],
+        PathBuffer: [MaybeUninit::uninit(); c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize / 2],
     };
+    // A mount point reparse point requires both the substitute name and the
+    // (empty) print name to be null terminated, even though their lengths are
+    // explicit. Bounds-check and copy in a single step so an over-long path
+    // fails cleanly instead of overflowing the buffer.
+    let Some(path_buffer) = header.PathBuffer.get_mut(..abs_path.len() + 2) else {
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "`original` path is too long"));
+    };
+    let (substitute_name, terminators) = path_buffer.split_at_mut(abs_path.len());
+    substitute_name.write_copy_of_slice(&abs_path);
+    terminators.write_copy_of_slice(&[0, 0]);
+    // Total size of the structure: the fixed header fields, the path, and the
+    // two null terminators.
+    let total_len = offset_of!(MountPointBuffer, PathBuffer) + (abs_path.len() + 2) * 2;
+    // `ReparseDataLength` counts only the bytes after the 8-byte common header
+    // (`ReparseTag`, `ReparseDataLength`, `Reserved`), i.e.
+    // `SubstituteNameLength + PrintNameLength + 12`.
+    header.ReparseDataLength =
+        (total_len - offset_of!(MountPointBuffer, SubstituteNameOffset)) as u16;
     unsafe {
-        let ptr = header.PathBuffer.as_mut_ptr();
-        ptr.copy_from(abs_path.as_ptr().cast::<MaybeUninit<u16>>(), abs_path.len());
-
         let mut ret = 0;
         cvt(c::DeviceIoControl(
             d.as_raw_handle(),
             c::FSCTL_SET_REPARSE_POINT,
             (&raw const header).cast::<c_void>(),
-            data_len as u32 + 8,
+            total_len as u32,
             ptr::null_mut(),
             0,
             &mut ret,

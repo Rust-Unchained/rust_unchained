@@ -1,22 +1,23 @@
-//@ known-bug: #110395
+//@ check-pass
 //@ compile-flags: -Znext-solver
 #![allow(incomplete_features)]
 #![feature(staged_api)]
 #![feature(const_trait_impl)]
 #![feature(const_t_try)]
 #![feature(const_try)]
+#![feature(const_try_residual)]
 #![feature(try_trait_v2)]
-
+#![feature(try_trait_v2_residual)]
 #![stable(feature = "foo", since = "1.0")]
 
-use std::ops::{ControlFlow, FromResidual, Try};
+use std::ops::{ControlFlow, FromResidual, Residual, Try};
 
 #[stable(feature = "foo", since = "1.0")]
 pub struct T;
 
 #[stable(feature = "foo", since = "1.0")]
 #[rustc_const_unstable(feature = "const_t_try", issue = "none")]
-impl const Try for T {
+const impl Try for T {
     type Output = T;
     type Residual = T;
 
@@ -31,7 +32,13 @@ impl const Try for T {
 
 #[stable(feature = "foo", since = "1.0")]
 #[rustc_const_unstable(feature = "const_t_try", issue = "none")]
-impl const FromResidual for T {
+const impl Residual<T> for T {
+    type TryType = T;
+}
+
+#[stable(feature = "foo", since = "1.0")]
+#[rustc_const_unstable(feature = "const_t_try", issue = "none")]
+const impl FromResidual for T {
     fn from_residual(t: T) -> T {
         t
     }
@@ -39,8 +46,7 @@ impl const FromResidual for T {
 
 #[stable(feature = "foo", since = "1.0")]
 #[rustc_const_unstable(feature = "const_tr", issue = "none")]
-#[const_trait]
-pub trait Tr {
+pub const trait Tr {
     #[stable(feature = "foo", since = "1.0")]
     fn bar() -> T {
         T?

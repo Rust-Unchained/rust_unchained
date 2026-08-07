@@ -1,5 +1,5 @@
 #![warn(clippy::for_kv_map)]
-#![allow(clippy::used_underscore_binding)]
+#![expect(clippy::used_underscore_binding)]
 
 use std::collections::*;
 use std::rc::Rc;
@@ -67,5 +67,44 @@ fn main() {
     let m: HashMap<u64, String> = Default::default();
     for (_, v) in m {
         let _v = v;
+    }
+}
+
+fn wrongly_unmangled_macros() {
+    use std::collections::HashMap;
+
+    macro_rules! test_map {
+        ($val:expr) => {
+            &*$val
+        };
+    }
+
+    let m: HashMap<u64, u64> = HashMap::new();
+    let wrapped = Rc::new(m);
+    for (_, v) in test_map!(wrapped) {
+        //~^ for_kv_map
+        let _v = v;
+    }
+}
+
+fn issue16822(mut x: HashMap<usize, usize>) {
+    for (_, v) in x.iter() {
+        //~^ for_kv_map
+        println!("{}", v);
+    }
+
+    for (_, v) in x.iter_mut() {
+        //~^ for_kv_map
+        *v += 1;
+    }
+
+    for (k, _) in x.iter() {
+        //~^ for_kv_map
+        println!("{}", k);
+    }
+
+    for (k, _) in x.iter_mut() {
+        //~^ for_kv_map
+        println!("{}", k);
     }
 }

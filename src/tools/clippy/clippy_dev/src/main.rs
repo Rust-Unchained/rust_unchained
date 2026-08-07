@@ -3,11 +3,17 @@
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
 use clap::{Args, Parser, Subcommand};
-use clippy_dev::{dogfood, fmt, lint, new_lint, release, serve, setup, sync, update_lints, utils};
-use std::convert::Infallible;
+use clippy_dev::{
+    ClippyInfo, UpdateMode, dogfood, edit_lints, fmt, lint, new_lint, new_parse_cx, release, serve, setup, sync,
+};
+use std::env;
 
 fn main() {
     let dev = Dev::parse();
+    let clippy = ClippyInfo::search_for_manifest();
+    if let Err(e) = env::set_current_dir(&clippy.path) {
+        panic!("error setting current directory to `{}`: {e}", clippy.path.display());
+    }
 
     match dev.command {
         DevCommand::Bless => {
@@ -19,15 +25,9 @@ fn main() {
             allow_staged,
             allow_no_vcs,
         } => dogfood::dogfood(fix, allow_dirty, allow_staged, allow_no_vcs),
-        DevCommand::Fmt { check, verbose } => fmt::run(check, verbose),
-        DevCommand::UpdateLints { print_only, check } => {
-            if print_only {
-                update_lints::print_lints();
-            } else if check {
-                update_lints::update(utils::UpdateMode::Check);
-            } else {
-                update_lints::update(utils::UpdateMode::Change);
-            }
+        DevCommand::Fmt { check } => fmt::run(UpdateMode::from_check(check)),
+        DevCommand::UpdateLints { check } => {
+            new_parse_cx(|cx| cx.parse_lint_decls().gen_decls(UpdateMode::from_check(check)));
         },
         DevCommand::NewLint {
             pass,
@@ -35,8 +35,8 @@ fn main() {
             category,
             r#type,
             msrv,
-        } => match new_lint::create(pass, &name, &category, r#type.as_deref(), msrv) {
-            Ok(()) => update_lints::update(utils::UpdateMode::Change),
+        } => match new_lint::create(clippy.version, pass, &name, &category, r#type.as_deref(), msrv) {
+            Ok(()) => new_parse_cx(|cx| cx.parse_lint_decls().gen_decls(UpdateMode::Change)),
             Err(e) => eprintln!("Unable to create lint: {e}"),
         },
         DevCommand::Setup(SetupCommand { subcommand }) => match subcommand {
@@ -75,18 +75,35 @@ fn main() {
         },
         DevCommand::Serve { port, lint } => serve::run(port, lint),
         DevCommand::Lint { path, edition, args } => lint::run(&path, &edition, args.iter()),
-        DevCommand::RenameLint {
-            old_name,
-            new_name,
-            uplift,
-        } => update_lints::rename(&old_name, new_name.as_ref().unwrap_or(&old_name), uplift),
-        DevCommand::Deprecate { name, reason } => update_lints::deprecate(&name, &reason),
+        DevCommand::RenameLint { old_name, new_name } => new_parse_cx(|cx| {
+            edit_lints::rename(cx, clippy.version, &old_name, &new_name);
+        }),
+        DevCommand::Uplift { old_name, new_name } => new_parse_cx(|cx| {
+            edit_lints::uplift(cx, clippy.version, &old_name, new_name.as_deref().unwrap_or(&old_name));
+        }),
+        DevCommand::Deprecate { name, reason } => {
+            new_parse_cx(|cx| edit_lints::deprecate(cx, clippy.version, &name, &reason));
+        },
         DevCommand::Sync(SyncCommand { subcommand }) => match subcommand {
             SyncSubcommand::UpdateNightly => sync::update_nightly(),
         },
         DevCommand::Release(ReleaseCommand { subcommand }) => match subcommand {
-            ReleaseSubcommand::BumpVersion => release::bump_version(),
+            ReleaseSubcommand::BumpVersion => release::bump_version(clippy.version),
         },
+    }
+}
+
+fn lint_name(name: &str) -> Result<String, String> {
+    let name = name.replace('-', "_");
+    if let Some((pre, _)) = name.split_once("::") {
+        Err(format!("lint name should not contain the `{pre}` prefix"))
+    } else if name
+        .bytes()
+        .any(|x| !matches!(x, b'_' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'))
+    {
+        Err("lint name contains invalid characters".to_owned())
+    } else {
+        Ok(name)
     }
 }
 
@@ -121,9 +138,6 @@ enum DevCommand {
         #[arg(long)]
         /// Use the rustfmt --check option
         check: bool,
-        #[arg(short, long)]
-        /// Echo commands run
-        verbose: bool,
     },
     #[command(name = "update_lints")]
     /// Updates lint registration and information from the source code
@@ -135,11 +149,6 @@ enum DevCommand {
     /// * lint modules in `clippy_lints/*` are visible in `src/lib.rs` via `pub mod` {n}
     /// * all lints are registered in the lint store
     UpdateLints {
-        #[arg(long)]
-        /// Print a table of lints to STDOUT
-        ///
-        /// This does not include deprecated and internal lints. (Does not modify any files)
-        print_only: bool,
         #[arg(long)]
         /// Checks that `cargo dev update_lints` has been run. Used on CI.
         check: bool,
@@ -153,7 +162,7 @@ enum DevCommand {
         #[arg(
             short,
             long,
-            value_parser = |name: &str| Ok::<_, Infallible>(name.replace('-', "_")),
+            value_parser = lint_name,
         )]
         /// Name of the new lint in snake case, ex: `fn_too_long`
         name: String,
@@ -195,7 +204,7 @@ enum DevCommand {
         /// Which lint's page to load initially (optional)
         lint: Option<String>,
     },
-    #[allow(clippy::doc_markdown)]
+    #[expect(clippy::doc_markdown)]
     /// Manually run clippy on a file or package
     ///
     /// ## Examples
@@ -226,17 +235,16 @@ enum DevCommand {
     /// Rename a lint
     RenameLint {
         /// The name of the lint to rename
+        #[arg(value_parser = lint_name)]
         old_name: String,
-        #[arg(required_unless_present = "uplift")]
+        #[arg(value_parser = lint_name)]
         /// The new name of the lint
-        new_name: Option<String>,
-        #[arg(long)]
-        /// This lint will be uplifted into rustc
-        uplift: bool,
+        new_name: String,
     },
     /// Deprecate the given lint
     Deprecate {
         /// The name of the lint to deprecate
+        #[arg(value_parser = lint_name)]
         name: String,
         #[arg(long, short)]
         /// The reason for deprecation
@@ -246,6 +254,15 @@ enum DevCommand {
     Sync(SyncCommand),
     /// Manage Clippy releases
     Release(ReleaseCommand),
+    /// Marks a lint as uplifted into rustc and removes its code
+    Uplift {
+        /// The name of the lint to uplift
+        #[arg(value_parser = lint_name)]
+        old_name: String,
+        /// The name of the lint in rustc
+        #[arg(value_parser = lint_name)]
+        new_name: Option<String>,
+    },
 }
 
 #[derive(Args)]

@@ -1,20 +1,21 @@
 //! Builtin attributes.
+use base_db::SourceDatabase;
 use intern::sym;
-use span::{MacroCallId, Span};
+use span::Span;
 
-use crate::{db::ExpandDatabase, name, tt, ExpandResult, MacroCallKind};
+use crate::{ExpandResult, MacroCallId, MacroCallKind, name, tt};
 
 use super::quote;
 
 macro_rules! register_builtin {
-    ($(($name:ident, $variant:ident) => $expand:ident),* ) => {
+    ($(($name:ident, $variant:ident) => $expand:ident),* $(,)? ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum BuiltinAttrExpander {
             $($variant),*
         }
 
         impl BuiltinAttrExpander {
-            pub fn expander(&self) -> fn (&dyn ExpandDatabase, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> fn (&dyn SourceDatabase, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( BuiltinAttrExpander::$variant => $expand, )*
                 }
@@ -34,7 +35,7 @@ macro_rules! register_builtin {
 impl BuiltinAttrExpander {
     pub fn expand(
         &self,
-        db: &dyn ExpandDatabase,
+        db: &dyn SourceDatabase,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
@@ -65,7 +66,8 @@ register_builtin! {
     (derive_const, DeriveConst) => derive_expand,
     (global_allocator, GlobalAllocator) => dummy_attr_expand,
     (test, Test) => dummy_gate_test_expand,
-    (test_case, TestCase) => dummy_gate_test_expand
+    (test_case, TestCase) => dummy_gate_test_expand,
+    (define_opaque, DefineOpaque) => dummy_attr_expand,
 }
 
 pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
@@ -73,7 +75,7 @@ pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
 }
 
 fn dummy_attr_expand(
-    _db: &dyn ExpandDatabase,
+    _db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     _span: Span,
@@ -82,7 +84,7 @@ fn dummy_attr_expand(
 }
 
 fn dummy_gate_test_expand(
-    _db: &dyn ExpandDatabase,
+    _db: &dyn SourceDatabase,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
@@ -114,14 +116,14 @@ fn dummy_gate_test_expand(
 /// wasting a lot of memory, and it would also require some way to use a path in a way that makes it
 /// always resolve as a derive without nameres recollecting them.
 /// So this hacky approach is a lot more friendly for us, though it does require a bit of support in
-/// [`hir::Semantics`] to make this work.
+/// hir::Semantics to make this work.
 fn derive_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let loc = db.lookup_intern_macro_call(id);
+    let loc = id.loc(db);
     let derives = match &loc.kind {
         MacroCallKind::Attr { attr_args: Some(attr_args), .. } if loc.def.is_attribute_derive() => {
             attr_args
@@ -130,7 +132,7 @@ fn derive_expand(
             return ExpandResult::ok(tt::TopSubtree::empty(tt::DelimSpan {
                 open: span,
                 close: span,
-            }))
+            }));
         }
     };
     pseudo_derive_attr_expansion(tt, derives, span)

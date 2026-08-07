@@ -4,7 +4,7 @@
 //! this feature, turn back. This is *exceptionally* unstable. There is no attempt at all to make
 //! anything work besides those things which the rustc test suite happened to need. If you make a
 //! typo you'll probably ICE. Really, this is not the solution to your problems. Consider instead
-//! supporting the [stable MIR project group](https://github.com/rust-lang/project-stable-mir).
+//! supporting the [rustc public project group](https://github.com/rust-lang/rustc_public).
 //!
 //! The documentation for this module describes how to use this feature. If you are interested in
 //! hacking on the implementation, most of that documentation lives at
@@ -62,7 +62,9 @@
 //!
 //! # Examples
 //!
-//! ```rust
+#![cfg_attr(panic = "unwind", doc = "```rust")]
+// This test can't support panic=abort because it generates an UnwindContinue MIR terminator.
+#![cfg_attr(panic = "abort", doc = "```ignore")]
 //! #![feature(core_intrinsics, custom_mir)]
 //! #![allow(internal_features)]
 //! #![allow(unused_assignments)]
@@ -227,13 +229,14 @@
 //!
 //! #### Statements
 //!  - Assign statements work via normal Rust assignment.
-//!  - [`Retag`], [`StorageLive`], [`StorageDead`], [`Deinit`] statements have an associated function.
+//!  - [`StorageLive`], [`StorageDead`] statements have an associated function.
 //!
 //! #### Rvalues
 //!
 //!  - Operands implicitly convert to `Use` rvalues.
 //!  - `&`, `&mut`, `addr_of!`, and `addr_of_mut!` all work to create their associated rvalue.
-//!  - [`Discriminant`], [`Len`], and [`CopyForDeref`] have associated functions.
+//!  - [`CastTransmute`], [`CastPtrToPtr`], [`CastUnsize`], and [`Discriminant`]
+//!    have associated functions.
 //!  - Unary and binary operations use their normal Rust syntax - `a * b`, `!c`, etc.
 //!  - The binary operation `Offset` can be created via [`Offset`].
 //!  - Checked binary operations are represented by wrapping the associated binop in [`Checked`].
@@ -288,7 +291,7 @@
     reason = "MIR is an implementation detail and extremely unstable",
     issue = "none"
 )]
-#![allow(unused_variables, non_snake_case, missing_debug_implementations)]
+#![allow(unused_variables, non_snake_case, missing_debug_implementations, missing_docs)]
 
 /// Type representing basic blocks.
 ///
@@ -399,15 +402,11 @@ define!("mir_unwind_resume",
 define!("mir_storage_live", fn StorageLive<T>(local: T));
 define!("mir_storage_dead", fn StorageDead<T>(local: T));
 define!("mir_assume", fn Assume(operand: bool));
-define!("mir_deinit", fn Deinit<T>(place: T));
 define!("mir_checked", fn Checked<T>(binop: T) -> (T, bool));
-define!("mir_len", fn Len<T>(place: T) -> usize);
 define!(
     "mir_ptr_metadata",
     fn PtrMetadata<P: ?Sized>(place: *const P) -> <P as ::core::ptr::Pointee>::Metadata
 );
-define!("mir_copy_for_deref", fn CopyForDeref<T>(place: T) -> T);
-define!("mir_retag", fn Retag<T>(place: T));
 define!("mir_move", fn Move<T>(place: T) -> T);
 define!("mir_static", fn Static<T>(s: T) -> &'static T);
 define!("mir_static_mut", fn StaticMut<T>(s: T) -> *mut T);
@@ -490,6 +489,13 @@ define!(
     ///
     /// This allows bypassing normal validation to generate strange casts.
     fn CastPtrToPtr<T, U>(operand: T) -> U
+);
+define!(
+    "mir_cast_unsize",
+    /// Emits a `CastKind::PointerCoercion(Unsize)` cast.
+    ///
+    /// This allows bypassing normal validation to generate strange casts.
+    fn CastUnsize<T, U>(operand: T) -> U
 );
 define!(
     "mir_make_place",

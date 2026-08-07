@@ -1,3 +1,4 @@
+//@ edition:2015
 mod foo {
   struct Self;
   //~^ ERROR expected identifier, found keyword `Self`
@@ -18,12 +19,9 @@ pub fn main() {
         //~| ERROR cannot find unit struct, unit variant or constant `Self`
         ref mut Self => (),
         //~^ ERROR expected identifier, found keyword `Self`
-        Self!() => (),
-        //~^ ERROR cannot find macro `Self` in this scope
         Foo { Self } => (),
         //~^ ERROR expected identifier, found keyword `Self`
         //~| ERROR mismatched types
-        //~| ERROR `Foo` does not have a field named `Self`
     }
 }
 

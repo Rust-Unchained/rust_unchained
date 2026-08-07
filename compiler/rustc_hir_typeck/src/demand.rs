@@ -1,13 +1,13 @@
 use rustc_errors::{Applicability, Diag, MultiSpan, listify};
-use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::Visitor;
+use rustc_hir::{self as hir, find_attr};
 use rustc_infer::infer::DefineOpaqueTypes;
-use rustc_middle::bug;
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, AssocItem, BottomUpFolder, Ty, TypeFoldable, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Ident, Span, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::ObligationCause;
@@ -40,10 +40,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             || self.suggest_semicolon_in_repeat_expr(err, expr, expr_ty)
             || self.suggest_deref_ref_or_into(err, expr, expected, expr_ty, expected_ty_expr)
             || self.suggest_option_to_bool(err, expr, expr_ty, expected)
+            || self.suggest_collect(err, expr, expected, expr_ty)
             || self.suggest_compatible_variants(err, expr, expected, expr_ty)
             || self.suggest_non_zero_new_unwrap(err, expr, expected, expr_ty)
             || self.suggest_calling_boxed_future_when_appropriate(err, expr, expected, expr_ty)
-            || self.suggest_no_capture_closure(err, expected, expr_ty)
+            || self.suggest_closure_to_fn_ptr_coercion(err, expr, expected, expr_ty)
             || self.suggest_boxing_when_appropriate(
                 err,
                 expr.peel_blocks().span,
@@ -84,7 +85,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         self.annotate_expected_due_to_let_ty(err, expr, error);
         self.annotate_loop_expected_due_to_inference(err, expr, error);
-        if self.annotate_mut_binding_to_immutable_binding(err, expr, error) {
+        if self.annotate_mut_binding_to_immutable_binding(err, expr, expr_ty, expected, error) {
             return;
         }
 
@@ -331,7 +332,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let mut expr_finder = FindExprs { hir_id: local_hir_id, uses: init.into_iter().collect() };
-        let body = self.tcx.hir_body_owned_by(self.body_id);
+        let body = self.tcx.hir_body_owned_by(self.body_def_id);
         expr_finder.visit_expr(body.value);
 
         // Replaces all of the variables in the given type with a fresh inference variable.
@@ -342,7 +343,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     match infer {
                         ty::TyVar(_) => self.next_ty_var(DUMMY_SP),
                         ty::IntVar(_) => self.next_int_var(),
-                        ty::FloatVar(_) => self.next_float_var(),
+                        ty::FloatVar(_) => self.next_float_var(DUMMY_SP, None),
                         ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => {
                             bug!("unexpected fresh ty outside of the trait solver")
                         }
@@ -401,9 +402,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Unify the method signature with our incompatible arg, to
                     // do inference in the *opposite* direction and to find out
                     // what our ideal rcvr ty would look like.
+                    let Some(input_arg) = method.sig.inputs().get(idx + 1) else {
+                        if method.sig.splatted().is_some() {
+                            // FIXME(splat): when the arg is splatted, adjust its index, to handle the type mismatch properly
+                            return None;
+                        } else {
+                            span_bug!(
+                                self.tcx.def_span(method.def_id),
+                                "arg index {} out of bounds for method with {} inputs",
+                                idx + 1,
+                                method.sig.inputs().len(),
+                            );
+                        }
+                    };
                     let _ = self
                         .at(&ObligationCause::dummy(), self.param_env)
-                        .eq(DefineOpaqueTypes::Yes, method.sig.inputs()[idx + 1], arg_ty)
+                        .eq(DefineOpaqueTypes::Yes, *input_arg, arg_ty)
                         .ok()?;
                     self.select_obligations_where_possible(|errs| {
                         // Yeet the errors, we're already reporting errors.
@@ -411,11 +425,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     });
                     Some(self.resolve_vars_if_possible(possible_rcvr_ty))
                 });
-                if let Some(rcvr_ty) = possible_rcvr_ty {
-                    rcvr_ty
-                } else {
-                    return false;
-                }
+                let Some(rcvr_ty) = possible_rcvr_ty else { return false };
+                rcvr_ty
             }
         };
 
@@ -604,6 +615,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         parent_id = self.tcx.parent_hir_id(*hir_id);
                         parent
                     }
+                    hir::Node::Stmt(hir::Stmt { hir_id, kind: hir::StmtKind::Let(_), .. }) => {
+                        parent_id = self.tcx.parent_hir_id(*hir_id);
+                        parent
+                    }
+                    hir::Node::LetStmt(hir::LetStmt { hir_id, .. }) => {
+                        parent_id = self.tcx.parent_hir_id(*hir_id);
+                        parent
+                    }
                     hir::Node::Block(_) => {
                         parent_id = self.tcx.parent_hir_id(parent_id);
                         parent
@@ -694,7 +713,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) {
         match (self.tcx.parent_hir_node(expr.hir_id), error) {
             (hir::Node::LetStmt(hir::LetStmt { ty: Some(ty), init: Some(init), .. }), _)
-                if init.hir_id == expr.hir_id =>
+                if init.hir_id == expr.hir_id && !ty.span.source_equal(init.span) =>
             {
                 // Point at `let` assignment type.
                 err.span_label(ty.span, "expected due to this");
@@ -714,7 +733,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         hir::Path {
                             res:
                                 hir::def::Res::Def(
-                                    hir::def::DefKind::Static { .. } | hir::def::DefKind::Const,
+                                    hir::def::DefKind::Static { .. }
+                                    | hir::def::DefKind::Const { .. },
                                     def_id,
                                 ),
                             ..
@@ -722,8 +742,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     )) => {
                         if let Some(hir::Node::Item(hir::Item {
                             kind:
-                                hir::ItemKind::Static(ident, ty, ..)
-                                | hir::ItemKind::Const(ident, ty, ..),
+                                hir::ItemKind::Static(_, ident, ty, _)
+                                | hir::ItemKind::Const(ident, _, ty, _),
                             ..
                         })) = self.tcx.hir_get_if_local(*def_id)
                         {
@@ -788,7 +808,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Binary(_, lhs, rhs), .. }),
                 Some(TypeError::Sorts(ExpectedFound { expected, .. })),
             ) if rhs.hir_id == expr.hir_id
-                && self.typeck_results.borrow().expr_ty_adjusted_opt(lhs) == Some(expected) =>
+                && self.typeck_results.borrow().expr_ty_adjusted_opt(lhs) == Some(expected)
+                // let expressions being marked as `bool` is confusing (see issue #147665)
+                && !matches!(lhs.kind, hir::ExprKind::Let(..)) =>
             {
                 err.span_label(lhs.span, format!("expected because this is `{expected}`"));
             }
@@ -799,17 +821,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Detect the following case
     ///
     /// ```text
-    /// fn change_object(mut a: &Ty) {
+    /// fn change_object(mut b: &Ty) {
     ///     let a = Ty::new();
     ///     b = a;
     /// }
     /// ```
     ///
-    /// where the user likely meant to modify the value behind there reference, use `a` as an out
+    /// where the user likely meant to modify the value behind there reference, use `b` as an out
     /// parameter, instead of mutating the local binding. When encountering this we suggest:
     ///
     /// ```text
-    /// fn change_object(a: &'_ mut Ty) {
+    /// fn change_object(b: &'_ mut Ty) {
     ///     let a = Ty::new();
     ///     *b = a;
     /// }
@@ -818,13 +840,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         err: &mut Diag<'_>,
         expr: &hir::Expr<'_>,
+        expr_ty: Ty<'tcx>,
+        expected: Ty<'tcx>,
         error: Option<TypeError<'tcx>>,
     ) -> bool {
-        if let Some(TypeError::Sorts(ExpectedFound { expected, found })) = error
+        if let Some(TypeError::Sorts(ExpectedFound { .. })) = error
             && let ty::Ref(_, inner, hir::Mutability::Not) = expected.kind()
 
             // The difference between the expected and found values is one level of borrowing.
-            && self.can_eq(self.param_env, *inner, found)
+            && self.can_eq(self.param_env, *inner, expr_ty)
 
             // We have an `ident = expr;` assignment.
             && let hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Assign(lhs, rhs, _), .. }) =
@@ -874,7 +898,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ]);
             // We suggest changing the argument from `mut ident: &Ty` to `ident: &'_ mut Ty` and the
             // assignment from `ident = val;` to `*ident = val;`.
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 "you might have meant to mutate the pointed at value being passed in, instead of \
                 changing the reference in the local binding",
                 sugg,
@@ -994,7 +1018,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         );
         let container_id = pick.item.container_id(self.tcx);
         let container = with_no_trimmed_paths!(self.tcx.def_path_str(container_id));
-        for def_id in pick.import_ids {
+        for &def_id in pick.import_ids {
             let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
             path_span
                 .push_span_label(self.tcx.hir_span(hir_id), format!("`{container}` imported here"));
@@ -1068,19 +1092,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             hir_id,
             |m| {
                 self.has_only_self_parameter(m)
-                    && self
-                        .tcx
-                        // This special internal attribute is used to permit
-                        // "identity-like" conversion methods to be suggested here.
-                        //
-                        // FIXME (#46459 and #46460): ideally
-                        // `std::convert::Into::into` and `std::borrow:ToOwned` would
-                        // also be `#[rustc_conversion_suggestion]`, if not for
-                        // method-probing false-positives and -negatives (respectively).
-                        //
-                        // FIXME? Other potential candidate methods: `as_ref` and
-                        // `as_mut`?
-                        .has_attr(m.def_id, sym::rustc_conversion_suggestion)
+                // This special internal attribute is used to permit
+                // "identity-like" conversion methods to be suggested here.
+                //
+                // FIXME (#46459 and #46460): ideally
+                // `std::convert::Into::into` and `std::borrow:ToOwned` would
+                // also be `#[rustc_conversion_suggestion]`, if not for
+                // method-probing false-positives and -negatives (respectively).
+                //
+                // FIXME? Other potential candidate methods: `as_ref` and
+                // `as_mut`?
+                && find_attr!(self.tcx, m.def_id, RustcConversionSuggestion)
             },
         );
 
@@ -1104,27 +1126,26 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    // Returns whether the given expression is a destruct assignment desugaring.
-    // For example, `(a, b) = (1, &2);`
-    // Here we try to find the pattern binding of the expression,
-    // `default_binding_modes` is false only for destruct assignment desugaring.
+    /// Returns whether the given expression is a destruct assignment desugaring.
+    /// For example, `(a, b) = (1, &2);`
+    /// Here we try to find the pattern binding of the expression,
+    /// `default_binding_modes` is false only for destruct assignment desugaring.
     pub(crate) fn is_destruct_assignment_desugaring(&self, expr: &hir::Expr<'_>) -> bool {
         if let hir::ExprKind::Path(hir::QPath::Resolved(
             _,
             hir::Path { res: hir::def::Res::Local(bind_hir_id), .. },
         )) = expr.kind
-        {
-            let bind = self.tcx.hir_node(*bind_hir_id);
-            let parent = self.tcx.parent_hir_node(*bind_hir_id);
-            if let hir::Node::Pat(hir::Pat {
+            && let bind = self.tcx.hir_node(*bind_hir_id)
+            && let parent = self.tcx.parent_hir_node(*bind_hir_id)
+            && let hir::Node::Pat(hir::Pat {
                 kind: hir::PatKind::Binding(_, _hir_id, _, _), ..
             }) = bind
-                && let hir::Node::Pat(hir::Pat { default_binding_modes: false, .. }) = parent
-            {
-                return true;
-            }
+            && let hir::Node::Pat(hir::Pat { default_binding_modes: false, .. }) = parent
+        {
+            true
+        } else {
+            false
         }
-        false
     }
 
     fn explain_self_literal(
@@ -1189,6 +1210,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let hir::Node::Expr(parent_expr) = self.tcx.parent_hir_node(expr.hir_id) else {
             return;
         };
+        if parent_expr.span.desugaring_kind().is_some() {
+            return;
+        }
         enum CallableKind {
             Function,
             Method,

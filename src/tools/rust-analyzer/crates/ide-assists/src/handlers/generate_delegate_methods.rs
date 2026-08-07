@@ -1,15 +1,16 @@
-use hir::{HasCrate, HasVisibility};
-use ide_db::{path_transform::PathTransform, FxHashSet};
+use hir::HasVisibility;
+use ide_db::{FxHashSet, path_transform::PathTransform};
 use syntax::{
     ast::{
-        self, edit_in_place::Indent, make, AstNode, HasGenericParams, HasName, HasVisibility as _,
+        self, AstNode, HasGenericParams, HasName, HasVisibility as _,
+        edit::{AstNodeEdit, IndentLevel},
     },
-    ted,
+    syntax_editor::Position,
 };
 
 use crate::{
-    utils::{convert_param_list_to_arg_list, find_struct_impl},
     AssistContext, AssistId, AssistKind, Assists, GroupLabel,
+    utils::{convert_param_list_to_arg_list, find_struct_impl},
 };
 
 // Assist: generate_delegate_methods
@@ -47,7 +48,10 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn generate_delegate_methods(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     if !ctx.config.code_action_grouping {
         return None;
     }
@@ -55,7 +59,7 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
     let strukt = ctx.find_node_at_offset::<ast::Struct>()?;
     let strukt_name = strukt.name()?;
     let current_module = ctx.sema.scope(strukt.syntax())?.module();
-    let current_edition = current_module.krate().edition(ctx.db());
+    let current_edition = current_module.krate(ctx.db()).edition(ctx.db());
 
     let (field_name, field_ty, target) = match ctx.find_node_at_offset::<ast::RecordField>() {
         Some(field) => {
@@ -77,8 +81,7 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
     let mut seen_names = FxHashSet::default();
 
     for ty in sema_field_ty.autoderef(ctx.db()) {
-        let krate = ty.krate(ctx.db());
-        ty.iterate_assoc_items(ctx.db(), krate, |item| {
+        ty.iterate_assoc_items(ctx.db(), |item| {
             if let hir::AssocItem::Function(f) = item {
                 let name = f.name(ctx.db());
                 if f.self_param(ctx.db()).is_some()
@@ -92,7 +95,7 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
         });
     }
     methods.sort_by(|(a, _), (b, _)| a.cmp(b));
-    for (name, method) in methods {
+    for (index, (name, method)) in methods.into_iter().enumerate() {
         let adt = ast::Adt::Struct(strukt.clone());
         let name = name.display(ctx.db(), current_edition).to_string();
         // if `find_struct_impl` returns None, that means that a function named `name` already exists.
@@ -100,24 +103,31 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
             continue;
         };
 
-        let field = make::ext::field_from_idents(["self", &field_name])?;
-
         acc.add_group(
             &GroupLabel("Generate delegate methods…".to_owned()),
-            AssistId("generate_delegate_methods", AssistKind::Generate),
+            AssistId("generate_delegate_methods", AssistKind::Generate, Some(index)),
             format!("Generate delegate for `{field_name}.{name}()`",),
             target,
             |edit| {
+                let editor = edit.make_editor(strukt.syntax());
+                let make = editor.make();
+                let field = make
+                    .field_from_idents(["self", &field_name])
+                    .expect("always be a valid expression");
                 // Create the function
                 let method_source = match ctx.sema.source(method) {
                     Some(source) => {
-                        let v = source.value.clone_for_update();
+                        let v = source.value;
                         let source_scope = ctx.sema.scope(v.syntax());
                         let target_scope = ctx.sema.scope(strukt.syntax());
                         if let (Some(s), Some(t)) = (source_scope, target_scope) {
-                            PathTransform::generic_transformation(&t, &s).apply(v.syntax());
+                            ast::Fn::cast(
+                                PathTransform::generic_transformation(&t, &s).apply(v.syntax()),
+                            )
+                            .unwrap_or(v)
+                        } else {
+                            v
                         }
-                        v
                     }
                     None => return,
                 };
@@ -128,87 +138,99 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
                 let is_unsafe = method_source.unsafe_token().is_some();
                 let is_gen = method_source.gen_token().is_some();
 
-                let fn_name = make::name(&name);
+                let fn_name = make.name(&name);
 
                 let type_params = method_source.generic_param_list();
                 let where_clause = method_source.where_clause();
                 let params =
-                    method_source.param_list().unwrap_or_else(|| make::param_list(None, []));
+                    method_source.param_list().unwrap_or_else(|| make.param_list(None, []));
 
                 // compute the `body`
                 let arg_list = method_source
                     .param_list()
-                    .map(convert_param_list_to_arg_list)
-                    .unwrap_or_else(|| make::arg_list([]));
+                    .map(|v| convert_param_list_to_arg_list(v, make))
+                    .unwrap_or_else(|| make.arg_list([]));
 
-                let tail_expr = make::expr_method_call(field, make::name_ref(&name), arg_list);
+                let tail_expr = make.expr_method_call(field, make.name_ref(&name), arg_list).into();
                 let tail_expr_finished =
-                    if is_async { make::expr_await(tail_expr) } else { tail_expr };
-                let body = make::block_expr([], Some(tail_expr_finished));
+                    if is_async { make.expr_await(tail_expr).into() } else { tail_expr };
+                let body = make.block_expr([], Some(tail_expr_finished));
 
                 let ret_type = method_source.ret_type();
 
-                let f = make::fn_(
-                    vis,
-                    fn_name,
-                    type_params,
-                    where_clause,
-                    params,
-                    body,
-                    ret_type,
-                    is_async,
-                    is_const,
-                    is_unsafe,
-                    is_gen,
-                )
-                .clone_for_update();
+                let f = make
+                    .fn_(
+                        None,
+                        vis,
+                        fn_name,
+                        type_params,
+                        where_clause,
+                        params,
+                        body,
+                        ret_type,
+                        is_async,
+                        is_const,
+                        is_unsafe,
+                        is_gen,
+                    )
+                    .indent(IndentLevel(1));
+                let item = ast::AssocItem::Fn(f.clone());
 
-                // Get the impl to update, or create one if we need to.
-                let impl_def = match impl_def {
-                    Some(impl_def) => edit.make_mut(impl_def),
+                let fn_: Option<ast::AssocItem> = match impl_def {
+                    Some(impl_def) => match impl_def.assoc_item_list() {
+                        Some(assoc_item_list) => {
+                            let item = item.indent(IndentLevel::from_node(impl_def.syntax()));
+                            assoc_item_list.add_items(&editor, vec![item.clone()]);
+                            Some(item)
+                        }
+                        None => {
+                            let assoc_item_list = make.assoc_item_list(vec![item]);
+                            editor.insert(
+                                Position::last_child_of(impl_def.syntax()),
+                                assoc_item_list.syntax(),
+                            );
+                            assoc_item_list.assoc_items().next()
+                        }
+                    },
                     None => {
                         let name = &strukt_name.to_string();
                         let ty_params = strukt.generic_param_list();
-                        let ty_args = ty_params.as_ref().map(|it| it.to_generic_args());
+                        let ty_args = ty_params.as_ref().map(|it| it.to_generic_args(make));
                         let where_clause = strukt.where_clause();
+                        let assoc_item_list = make.assoc_item_list(vec![item]);
 
-                        let impl_def = make::impl_(
+                        let impl_def = make.impl_(
+                            None,
                             ty_params,
                             ty_args,
-                            make::ty_path(make::ext::ident_path(name)),
+                            syntax::ast::Type::PathType(make.ty_path(make.ident_path(name))),
                             where_clause,
-                            None,
-                        )
-                        .clone_for_update();
+                            Some(assoc_item_list),
+                        );
 
                         // Fixup impl_def indentation
                         let indent = strukt.indent_level();
-                        impl_def.reindent_to(indent);
+                        let impl_def = impl_def.indent(indent);
 
                         // Insert the impl block.
-                        let strukt = edit.make_mut(strukt.clone());
-                        ted::insert_all(
-                            ted::Position::after(strukt.syntax()),
+                        editor.insert_all(
+                            Position::after(strukt.syntax()),
                             vec![
-                                make::tokens::whitespace(&format!("\n\n{indent}")).into(),
+                                make.whitespace(&format!("\n\n{indent}")).into(),
                                 impl_def.syntax().clone().into(),
                             ],
                         );
-
-                        impl_def
+                        impl_def.assoc_item_list().and_then(|list| list.assoc_items().next())
                     }
                 };
 
-                // Fixup function indentation.
-                // FIXME: Should really be handled by `AssocItemList::add_item`
-                f.reindent_to(impl_def.indent_level() + 1);
-
-                let assoc_items = impl_def.get_or_create_assoc_item_list();
-                assoc_items.add_item(f.clone().into());
-
-                if let Some(cap) = ctx.config.snippet_cap {
-                    edit.add_tabstop_before(cap, f)
+                if let Some(cap) = ctx.config.snippet_cap
+                    && let Some(fn_) = fn_
+                {
+                    let tabstop = edit.make_tabstop_before(cap);
+                    editor.add_annotation(fn_.syntax(), tabstop);
                 }
+                edit.add_file_edits(ctx.vfs_file_id(), editor);
             },
         )?;
     }

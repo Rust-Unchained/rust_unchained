@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ghcr.io/rust-lang/ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   lsb-release \
   xdg-utils \
   wget \
+  unzip \
   # libgccjit dependencies
   flex \
   libmpfr-dev \
@@ -72,18 +73,25 @@ ENV GCC_EXEC_PREFIX="/usr/lib/gcc/"
 
 COPY host-x86_64/x86_64-gnu-tools/checktools.sh /tmp/
 
+# The version used by current `browser-ui-test` version. To be removed once `yarn` can download
+# it without failing...
+RUN curl https://ci-mirrors.rust-lang.org/rustc/chrome-linux64.zip > chrome-linux64.zip
+RUN unzip -d /usr/bin/ chrome-linux64.zip && rm chrome-linux64.zip
+
+# We already downloaded chromium so no need to download it again.
+ENV PUPPETEER_SKIP_DOWNLOAD 1
+# We provide the path to the extracted chrome binary.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chrome-linux64/chrome
+
 COPY scripts/nodejs.sh /scripts/
 RUN sh /scripts/nodejs.sh /node
 ENV PATH="/node/bin:${PATH}"
 
-COPY host-x86_64/x86_64-gnu-tools/browser-ui-test.version /tmp/
-
-ENV RUST_CONFIGURE_ARGS \
-  --build=x86_64-unknown-linux-gnu \
+ENV RUST_CONFIGURE_ARGS="--build=x86_64-unknown-linux-gnu \
   --save-toolstates=/tmp/toolstate/toolstates.json \
-  --enable-new-symbol-mangling
+  --enable-new-symbol-mangling"
 
-ENV HOST_TARGET x86_64-unknown-linux-gnu
+ENV HOST_TARGET="x86_64-unknown-linux-gnu"
 
 # FIXME(#133381): currently rustc alt builds do *not* have rustc debug
 # assertions enabled! Therefore, we cannot force download CI rustc.
@@ -91,15 +99,5 @@ ENV HOST_TARGET x86_64-unknown-linux-gnu
 
 COPY scripts/shared.sh /scripts/
 
-# For now, we need to use `--unsafe-perm=true` to go around an issue when npm tries
-# to create a new folder. For reference:
-# https://github.com/puppeteer/puppeteer/issues/375
-#
-# We also specify the version in case we need to update it to go around cache limitations.
-#
-# The `browser-ui-test.version` file is also used by bootstrap to emit warnings in case
-# the local version of the package is different than the one used by the CI.
-ENV SCRIPT /tmp/checktools.sh ../x.py && \
-  npm install browser-ui-test@$(head -n 1 /tmp/browser-ui-test.version) --unsafe-perm=true && \
-  python3 ../x.py check compiletest --set build.compiletest-use-stage0-libtest=true && \
-  python3 ../x.py test tests/rustdoc-gui --stage 2 --test-args "'--jobs 1'"
+ENV SCRIPT="/tmp/checktools.sh ../x.py && \
+  python3 ../x.py test tests/rustdoc-gui --stage 2 --test-args '--jobs 1'"

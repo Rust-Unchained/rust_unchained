@@ -1,6 +1,6 @@
-use syntax::{ast, AstNode, T};
+use syntax::{AstNode, T, ast};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: split_import
 //
@@ -13,7 +13,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 // use std::{collections::HashMap};
 // ```
-pub(crate) fn split_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn split_import(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let colon_colon = ctx.find_token_syntax_at_offset(T![::])?;
     let path = ast::Path::cast(colon_colon.parent()?)?.qualifier()?;
 
@@ -29,10 +29,10 @@ pub(crate) fn split_import(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
     }
 
     let target = colon_colon.text_range();
-    acc.add(AssistId("split_import", AssistKind::RefactorRewrite), "Split import", target, |edit| {
-        let use_tree = edit.make_mut(use_tree.clone());
-        let path = edit.make_mut(path);
-        use_tree.split_prefix(&path);
+    acc.add(AssistId::refactor_rewrite("split_import"), "Split import", target, |edit| {
+        let editor = edit.make_editor(use_tree.syntax());
+        use_tree.split_prefix_with_editor(&editor, &path);
+        edit.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
 

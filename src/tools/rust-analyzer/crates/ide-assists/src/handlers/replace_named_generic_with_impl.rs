@@ -1,19 +1,17 @@
 use hir::{FileRange, Semantics};
 use ide_db::text_edit::TextRange;
 use ide_db::{
+    EditionedFileId, RootDatabase,
     defs::Definition,
     search::{SearchScope, UsageSearchResult},
-    EditionedFileId, RootDatabase,
 };
 use syntax::{
-    ast::{
-        self, make::impl_trait_type, HasGenericParams, HasName, HasTypeBounds, Name, NameLike,
-        PathType,
-    },
-    match_ast, ted, AstNode,
+    AstNode,
+    ast::{self, HasGenericParams, HasName, HasTypeBounds, Name, NameLike, PathType},
+    match_ast,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: replace_named_generic_with_impl
 //
@@ -28,7 +26,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn replace_named_generic_with_impl(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     // finds `<P: AsRef<Path>>`
     let type_param = ctx.find_node_at_offset::<ast::TypeParam>()?;
@@ -36,7 +34,7 @@ pub(crate) fn replace_named_generic_with_impl(
     let type_param_name = type_param.name()?;
 
     // The list of type bounds / traits: `AsRef<Path>`
-    let type_bound_list = type_param.type_bound_list()?;
+    let type_bound_list = type_param.type_bound_list();
 
     let fn_ = type_param.syntax().ancestors().find_map(ast::Fn::cast)?;
     let param_list_text_range = fn_.param_list()?.syntax().text_range();
@@ -69,30 +67,35 @@ pub(crate) fn replace_named_generic_with_impl(
     let target = type_param.syntax().text_range();
 
     acc.add(
-        AssistId("replace_named_generic_with_impl", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("replace_named_generic_with_impl"),
         "Replace named generic with impl trait",
         target,
         |edit| {
-            let type_param = edit.make_mut(type_param);
-            let fn_ = edit.make_mut(fn_);
-
-            let path_types_to_replace = path_types_to_replace
-                .into_iter()
-                .map(|param| edit.make_mut(param))
-                .collect::<Vec<_>>();
+            let editor = edit.make_editor(type_param.syntax());
+            let make = editor.make();
 
             // remove trait from generic param list
             if let Some(generic_params) = fn_.generic_param_list() {
-                generic_params.remove_generic_param(ast::GenericParam::TypeParam(type_param));
-                if generic_params.generic_params().count() == 0 {
-                    ted::remove(generic_params.syntax());
+                let params: Vec<ast::GenericParam> = generic_params
+                    .clone()
+                    .generic_params()
+                    .filter(|it| it.syntax() != type_param.syntax())
+                    .collect();
+                if params.is_empty() {
+                    editor.delete(generic_params.syntax());
+                } else {
+                    let new_generic_param_list = make.generic_param_list(params);
+                    editor.replace(generic_params.syntax(), new_generic_param_list.syntax());
                 }
             }
 
-            let new_bounds = impl_trait_type(type_bound_list);
+            let type_bound_list = type_bound_list
+                .unwrap_or_else(|| make.type_bound_list([make.type_bound_text("Sized")]).unwrap());
+            let new_bounds = make.impl_trait_type(type_bound_list);
             for path_type in path_types_to_replace.iter().rev() {
-                ted::replace(path_type.syntax(), new_bounds.clone_for_update().syntax());
+                editor.replace(path_type.syntax(), new_bounds.syntax());
             }
+            edit.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -152,10 +155,10 @@ fn find_path_type(
 }
 
 /// Returns all usage references for the given type parameter definition.
-fn find_usages(
-    sema: &Semantics<'_, RootDatabase>,
+fn find_usages<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     fn_: &ast::Fn,
-    type_param_def: Definition,
+    type_param_def: Definition<'db>,
     file_id: EditionedFileId,
 ) -> UsageSearchResult {
     let file_range = FileRange { file_id, range: fn_.syntax().text_range() };
@@ -308,6 +311,15 @@ mod tests {
             replace_named_generic_with_impl,
             r#"fn new<A: Send, B$0: ToString, C: Debug>(a: A, b: B, c: C) -> Self {}"#,
             r#"fn new<A: Send, C: Debug>(a: A, b: impl ToString, c: C) -> Self {}"#,
+        );
+    }
+
+    #[test]
+    fn replace_generic_without_bounds() {
+        check_assist(
+            replace_named_generic_with_impl,
+            r#"fn foo<T$0>(input: T) {}"#,
+            r#"fn foo(input: impl Sized) {}"#,
         );
     }
 

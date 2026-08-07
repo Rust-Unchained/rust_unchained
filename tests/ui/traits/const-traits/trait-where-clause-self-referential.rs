@@ -2,9 +2,8 @@
 //@ compile-flags: -Znext-solver
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Foo {
-    fn bar() where Self: ~const Foo;
+const trait Foo {
+    fn bar() where Self: [const] Foo;
 }
 
 struct S;
@@ -17,7 +16,7 @@ fn baz<T: Foo>() {
     T::bar();
 }
 
-const fn qux<T: ~const Foo>() {
+const fn qux<T: [const] Foo>() {
     T::bar();
 }
 

@@ -1,4 +1,4 @@
-use rustc_abi::{FIRST_VARIANT, FieldIdx};
+use rustc_abi::FieldIdx;
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_hir::LangItem;
 use rustc_index::IndexVec;
@@ -10,13 +10,14 @@ use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{excluded_locals, iter_fields};
 use tracing::{debug, instrument};
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct ScalarReplacementOfAggregates;
 
 impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        PassPolicy::optimization(sess.mir_opt_level() >= 2)
     }
 
     #[instrument(level = "debug", skip(self, tcx, body))]
@@ -24,7 +25,7 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
         debug!(def_id = ?body.source.def_id());
 
         // Avoid query cycles (coroutines require optimized MIR for layout).
-        if tcx.type_of(body.source.def_id()).instantiate_identity().is_coroutine() {
+        if tcx.type_of(body.source.def_id()).instantiate_identity().skip_norm_wip().is_coroutine() {
             return;
         }
 
@@ -32,7 +33,7 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
         let typing_env = body.typing_env(tcx);
         loop {
             debug!(?excluded);
-            let escaping = escaping_locals(tcx, typing_env, &excluded, body);
+            let escaping = escaping_locals(tcx, &excluded, body);
             debug!(?escaping);
             let replacements = compute_flattening(tcx, typing_env, body, escaping);
             debug!(?replacements);
@@ -49,10 +50,6 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
             }
         }
     }
-
-    fn is_required(&self) -> bool {
-        false
-    }
 }
 
 /// Identify all locals that are not eligible for SROA.
@@ -64,7 +61,6 @@ impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
 ///   client code.
 fn escaping_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
-    typing_env: ty::TypingEnv<'tcx>,
     excluded: &DenseBitSet<Local>,
     body: &Body<'tcx>,
 ) -> DenseBitSet<Local> {
@@ -72,38 +68,23 @@ fn escaping_locals<'tcx>(
         if ty.is_union() || ty.is_enum() {
             return true;
         }
-        if let ty::Adt(def, _args) = ty.kind() {
-            if def.repr().simd() {
-                // Exclude #[repr(simd)] types so that they are not de-optimized into an array
-                return true;
-            }
-            if tcx.is_lang_item(def.did(), LangItem::DynMetadata) {
-                // codegen wants to see the `DynMetadata<T>`,
-                // not the inner reference-to-opaque-type.
-                return true;
-            }
-            // We already excluded unions and enums, so this ADT must have one variant
-            let variant = def.variant(FIRST_VARIANT);
-            if variant.fields.len() > 1 {
-                // If this has more than one field, it cannot be a wrapper that only provides a
-                // niche, so we do not want to automatically exclude it.
-                return false;
-            }
-            let Ok(layout) = tcx.layout_of(typing_env.as_query_input(ty)) else {
-                // We can't get the layout
-                return true;
-            };
-            if layout.layout.largest_niche().is_some() {
-                // This type has a niche
-                return true;
-            }
+        if let ty::Adt(def, _args) = ty.kind()
+            && (def.repr().simd() || tcx.is_lang_item(def.did(), LangItem::DynMetadata))
+        {
+            // Exclude #[repr(simd)] types so that they are not de-optimized into an array
+            // (MCP#838 banned projections into SIMD types, but if the value is unused
+            // this pass sees "all the uses are of the fields" and expands it.)
+
+            // codegen wants to see the `DynMetadata<T>`,
+            // not the inner reference-to-opaque-type.
+            return true;
         }
         // Default for non-ADTs
         false
     };
 
     let mut set = DenseBitSet::new_empty(body.local_decls.len());
-    set.insert_range(RETURN_PLACE..=Local::from_usize(body.arg_count));
+    set.insert_range(RETURN_PLACE..Local::arg(body.arg_count));
     for (local, decl) in body.local_decls().iter_enumerated() {
         if excluded.contains(local) || is_excluded_ty(decl.ty) {
             set.insert(local);
@@ -152,9 +133,7 @@ fn escaping_locals<'tcx>(
         fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
             match statement.kind {
                 // Storage statements are expanded in run_pass.
-                StatementKind::StorageLive(..)
-                | StatementKind::StorageDead(..)
-                | StatementKind::Deinit(..) => return,
+                StatementKind::StorageLive(..) | StatementKind::StorageDead(..) => return,
                 _ => self.super_statement(statement, location),
             }
         }
@@ -334,7 +313,7 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                     for (_, _, fl) in final_locals {
                         self.patch.add_statement(location, StatementKind::StorageLive(fl));
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                 }
                 return;
             }
@@ -343,19 +322,9 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                     for (_, _, fl) in final_locals {
                         self.patch.add_statement(location, StatementKind::StorageDead(fl));
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                 }
                 return;
-            }
-            StatementKind::Deinit(box place) => {
-                if let Some(final_locals) = self.replacements.place_fragments(place) {
-                    for (_, _, fl) in final_locals {
-                        self.patch
-                            .add_statement(location, StatementKind::Deinit(Box::new(fl.into())));
-                    }
-                    statement.make_nop();
-                    return;
-                }
             }
 
             // We have `a = Struct { 0: x, 1: y, .. }`.
@@ -365,7 +334,7 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
             // a_1 = y
             // ...
             // ```
-            StatementKind::Assign(box (place, Rvalue::Aggregate(_, ref mut operands))) => {
+            StatementKind::Assign((place, Rvalue::Aggregate(_, ref mut operands))) => {
                 if let Some(local) = place.as_local()
                     && let Some(final_locals) = &self.replacements.fragments[local]
                 {
@@ -376,14 +345,14 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                             // Replace mentions of SROA'd locals that appear in the operand.
                             self.visit_operand(&mut operand, location);
 
-                            let rvalue = Rvalue::Use(operand);
+                            let rvalue = Rvalue::Use(operand, WithRetag::Yes);
                             self.patch.add_statement(
                                 location,
                                 StatementKind::Assign(Box::new((new_local.into(), rvalue))),
                             );
                         }
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                     return;
                 }
             }
@@ -396,13 +365,13 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
             // ...
             // ```
             // ConstProp will pick up the pieces and replace them by actual constants.
-            StatementKind::Assign(box (place, Rvalue::Use(Operand::Constant(_)))) => {
+            StatementKind::Assign((place, Rvalue::Use(Operand::Constant(_), retag))) => {
                 if let Some(final_locals) = self.replacements.place_fragments(place) {
                     // Put the deaggregated statements *after* the original one.
                     let location = location.successor_within_block();
                     for (field, ty, new_local) in final_locals {
                         let rplace = self.tcx.mk_place_field(place, field, ty);
-                        let rvalue = Rvalue::Use(Operand::Move(rplace));
+                        let rvalue = Rvalue::Use(Operand::Move(rplace), retag);
                         self.patch.add_statement(
                             location,
                             StatementKind::Assign(Box::new((new_local.into(), rvalue))),
@@ -420,11 +389,14 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
             // a_1 = move? place.1
             // ...
             // ```
-            StatementKind::Assign(box (lhs, Rvalue::Use(ref op))) => {
-                let (rplace, copy) = match *op {
-                    Operand::Copy(rplace) => (rplace, true),
-                    Operand::Move(rplace) => (rplace, false),
-                    Operand::Constant(_) => bug!(),
+            StatementKind::Assign((
+                lhs,
+                Rvalue::Use(ref op @ (Operand::Copy(rplace) | Operand::Move(rplace)), retag),
+            )) => {
+                let copy = match *op {
+                    Operand::Copy(_) => true,
+                    Operand::Move(_) => false,
+                    Operand::Constant(_) | Operand::RuntimeChecks(_) => bug!(),
                 };
                 if let Some(final_locals) = self.replacements.place_fragments(lhs) {
                     for (field, ty, new_local) in final_locals {
@@ -436,16 +408,16 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                             .unwrap_or(rplace);
                         debug!(?rplace);
                         let rvalue = if copy {
-                            Rvalue::Use(Operand::Copy(rplace))
+                            Rvalue::Use(Operand::Copy(rplace), retag)
                         } else {
-                            Rvalue::Use(Operand::Move(rplace))
+                            Rvalue::Use(Operand::Move(rplace), retag)
                         };
                         self.patch.add_statement(
                             location,
                             StatementKind::Assign(Box::new((new_local.into(), rvalue))),
                         );
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                     return;
                 }
             }

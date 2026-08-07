@@ -7,7 +7,7 @@
 //! there is no value in lifting these out into the outline module test since they will either not
 //! show up for normal completions, or they won't show completions other than lifetimes depending
 //! on the fixture input.
-use hir::{sym, Name, ScopeDef};
+use hir::{Name, ScopeDef, sym};
 
 use crate::{
     completions::Completions,
@@ -17,7 +17,7 @@ use crate::{
 /// Completes lifetimes.
 pub(crate) fn complete_lifetime(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     lifetime_ctx: &LifetimeContext,
 ) {
     let &LifetimeContext { kind: LifetimeKind::Lifetime { in_lifetime_param_bound, def }, .. } =
@@ -31,20 +31,20 @@ pub(crate) fn complete_lifetime(
             acc.add_lifetime(ctx, name);
         }
     });
-    acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_static.clone()));
+    acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_static));
     if !in_lifetime_param_bound
         && def.is_some_and(|def| {
             !matches!(def, hir::GenericDef::Function(_) | hir::GenericDef::Impl(_))
         })
     {
-        acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_underscore.clone()));
+        acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_underscore));
     }
 }
 
 /// Completes labels.
 pub(crate) fn complete_label(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     lifetime_ctx: &LifetimeContext,
 ) {
     if !matches!(lifetime_ctx, LifetimeContext { kind: LifetimeKind::LabelRef, .. }) {
@@ -116,13 +116,13 @@ fn foo<'lifetime>(foo: &'a$0) {}
         check(
             r#"
 struct Foo;
-impl<'impl> Foo {
+impl<'r#impl> Foo {
     fn foo<'func>(&'a$0 self) {}
 }
 "#,
             expect![[r#"
                 lt 'func
-                lt 'impl
+                lt 'r#impl
                 lt 'static
             "#]],
         );

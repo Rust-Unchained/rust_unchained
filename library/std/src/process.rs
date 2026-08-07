@@ -156,6 +156,7 @@
         target_env = "sgx",
         target_os = "xous",
         target_os = "trusty",
+        target_os = "hermit",
     ))
 ))]
 mod tests;
@@ -166,12 +167,8 @@ use crate::io::prelude::*;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::num::NonZero;
 use crate::path::Path;
-use crate::sys::pipe::{AnonPipe, read2};
-use crate::sys::process as imp;
-#[stable(feature = "command_access", since = "1.57.0")]
-pub use crate::sys_common::process::CommandEnvs;
-use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
-use crate::{fmt, fs, str};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner, process as imp};
+use crate::{fmt, format_args_nl, fs, str};
 
 /// Representation of a running or exited child process.
 ///
@@ -259,10 +256,6 @@ pub struct Child {
     pub stderr: Option<ChildStderr>,
 }
 
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for Child {}
-
 impl AsInner<imp::Process> for Child {
     #[inline]
     fn as_inner(&self) -> &imp::Process {
@@ -270,8 +263,8 @@ impl AsInner<imp::Process> for Child {
     }
 }
 
-impl FromInner<(imp::Process, imp::StdioPipes)> for Child {
-    fn from_inner((handle, io): (imp::Process, imp::StdioPipes)) -> Child {
+impl FromInner<(imp::Process, StdioPipes)> for Child {
+    fn from_inner((handle, io): (imp::Process, StdioPipes)) -> Child {
         Child {
             handle,
             stdin: io.stdin.map(ChildStdin::from_inner),
@@ -298,6 +291,15 @@ impl fmt::Debug for Child {
     }
 }
 
+/// The pipes connected to a spawned process.
+///
+/// Used to pass pipe handles between this module and [`imp`].
+pub(crate) struct StdioPipes {
+    pub stdin: Option<imp::ChildPipe>,
+    pub stdout: Option<imp::ChildPipe>,
+    pub stderr: Option<imp::ChildPipe>,
+}
+
 /// A handle to a child process's standard input (stdin).
 ///
 /// This struct is used in the [`stdin`] field on [`Child`].
@@ -310,7 +312,7 @@ impl fmt::Debug for Child {
 /// [dropped]: Drop
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStdin {
-    inner: AnonPipe,
+    inner: imp::ChildPipe,
 }
 
 // In addition to the `impl`s here, `ChildStdin` also has `impl`s for
@@ -359,21 +361,21 @@ impl Write for &ChildStdin {
     }
 }
 
-impl AsInner<AnonPipe> for ChildStdin {
+impl AsInner<imp::ChildPipe> for ChildStdin {
     #[inline]
-    fn as_inner(&self) -> &AnonPipe {
+    fn as_inner(&self) -> &imp::ChildPipe {
         &self.inner
     }
 }
 
-impl IntoInner<AnonPipe> for ChildStdin {
-    fn into_inner(self) -> AnonPipe {
+impl IntoInner<imp::ChildPipe> for ChildStdin {
+    fn into_inner(self) -> imp::ChildPipe {
         self.inner
     }
 }
 
-impl FromInner<AnonPipe> for ChildStdin {
-    fn from_inner(pipe: AnonPipe) -> ChildStdin {
+impl FromInner<imp::ChildPipe> for ChildStdin {
+    fn from_inner(pipe: imp::ChildPipe) -> ChildStdin {
         ChildStdin { inner: pipe }
     }
 }
@@ -396,7 +398,7 @@ impl fmt::Debug for ChildStdin {
 /// [dropped]: Drop
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStdout {
-    inner: AnonPipe,
+    inner: imp::ChildPipe,
 }
 
 // In addition to the `impl`s here, `ChildStdout` also has `impl`s for
@@ -411,7 +413,7 @@ impl Read for ChildStdout {
         self.inner.read(buf)
     }
 
-    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.inner.read_buf(buf)
     }
 
@@ -429,21 +431,21 @@ impl Read for ChildStdout {
     }
 }
 
-impl AsInner<AnonPipe> for ChildStdout {
+impl AsInner<imp::ChildPipe> for ChildStdout {
     #[inline]
-    fn as_inner(&self) -> &AnonPipe {
+    fn as_inner(&self) -> &imp::ChildPipe {
         &self.inner
     }
 }
 
-impl IntoInner<AnonPipe> for ChildStdout {
-    fn into_inner(self) -> AnonPipe {
+impl IntoInner<imp::ChildPipe> for ChildStdout {
+    fn into_inner(self) -> imp::ChildPipe {
         self.inner
     }
 }
 
-impl FromInner<AnonPipe> for ChildStdout {
-    fn from_inner(pipe: AnonPipe) -> ChildStdout {
+impl FromInner<imp::ChildPipe> for ChildStdout {
+    fn from_inner(pipe: imp::ChildPipe) -> ChildStdout {
         ChildStdout { inner: pipe }
     }
 }
@@ -466,7 +468,7 @@ impl fmt::Debug for ChildStdout {
 /// [dropped]: Drop
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStderr {
-    inner: AnonPipe,
+    inner: imp::ChildPipe,
 }
 
 // In addition to the `impl`s here, `ChildStderr` also has `impl`s for
@@ -481,7 +483,7 @@ impl Read for ChildStderr {
         self.inner.read(buf)
     }
 
-    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.inner.read_buf(buf)
     }
 
@@ -499,21 +501,21 @@ impl Read for ChildStderr {
     }
 }
 
-impl AsInner<AnonPipe> for ChildStderr {
+impl AsInner<imp::ChildPipe> for ChildStderr {
     #[inline]
-    fn as_inner(&self) -> &AnonPipe {
+    fn as_inner(&self) -> &imp::ChildPipe {
         &self.inner
     }
 }
 
-impl IntoInner<AnonPipe> for ChildStderr {
-    fn into_inner(self) -> AnonPipe {
+impl IntoInner<imp::ChildPipe> for ChildStderr {
+    fn into_inner(self) -> imp::ChildPipe {
         self.inner
     }
 }
 
-impl FromInner<AnonPipe> for ChildStderr {
-    fn from_inner(pipe: AnonPipe) -> ChildStderr {
+impl FromInner<imp::ChildPipe> for ChildStderr {
+    fn from_inner(pipe: imp::ChildPipe) -> ChildStderr {
         ChildStderr { inner: pipe }
     }
 }
@@ -534,6 +536,7 @@ impl fmt::Debug for ChildStderr {
 /// to be changed (for example, by adding arguments) prior to spawning:
 ///
 /// ```
+/// # if cfg!(not(all(target_vendor = "apple", not(target_os = "macos")))) {
 /// use std::process::Command;
 ///
 /// let output = if cfg!(target_os = "windows") {
@@ -550,6 +553,7 @@ impl fmt::Debug for ChildStderr {
 /// };
 ///
 /// let hello = output.stdout;
+/// # }
 /// ```
 ///
 /// `Command` can be reused to spawn multiple processes. The builder methods
@@ -589,10 +593,6 @@ pub struct Command {
     inner: imp::Command,
 }
 
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for Command {}
-
 impl Command {
     /// Constructs a new `Command` for launching the program at
     /// path `program`, with the following default configuration:
@@ -609,21 +609,50 @@ impl Command {
     /// Builder methods are provided to change these defaults and
     /// otherwise configure the process.
     ///
-    /// If `program` is not an absolute path, the `PATH` will be searched in
-    /// an OS-defined way.
-    ///
-    /// The search path to be used may be controlled by setting the
-    /// `PATH` environment variable on the Command,
-    /// but this has some implementation limitations on Windows
-    /// (see issue #37519).
+    /// If `program` is not an absolute path, the `PATH` environment variable
+    /// will be searched in an OS-defined way.
     ///
     /// # Platform-specific behavior
     ///
-    /// Note on Windows: For executable files with the .exe extension,
-    /// it can be omitted when specifying the program for this Command.
-    /// However, if the file has a different extension,
-    /// a filename including the extension needs to be provided,
-    /// otherwise the file won't be found.
+    /// The details below describe the current behavior, but these details
+    /// may change in future versions of Rust.
+    ///
+    /// On Unix, the `PATH` searched comes from the child's environment:
+    ///
+    /// - If the environment is unmodified, the child inherits the parent's
+    ///   `PATH` and that is what is searched.
+    /// - If `PATH` is explicitly set via [`env`], that new value is searched.
+    /// - If [`env_clear`] or [`env_remove`] removes `PATH` without a
+    ///   replacement, `execvp` falls back to an OS-defined default (typically
+    ///   `/bin:/usr/bin`), **not** the parent's `PATH`. This may fail to find
+    ///   programs that rely on the parent's `PATH`.
+    ///
+    /// To avoid surprises, use an absolute path or explicitly set `PATH` on
+    /// the `Command` when modifying the child's environment.
+    ///
+    /// On Windows, Rust resolves the executable path before spawning, rather
+    /// than passing the name to `CreateProcessW` for resolution. When
+    /// `program` is not an absolute path, the following locations are searched
+    /// in order:
+    ///
+    /// 1. The child's `PATH`, if explicitly set via [`env`].
+    /// 2. The directory of the current executable.
+    /// 3. The system directory (`GetSystemDirectoryW`).
+    /// 4. The Windows directory (`GetWindowsDirectoryW`).
+    /// 5. The parent process's `PATH`.
+    ///
+    /// Note: when `PATH` is cleared via [`env_clear`] or [`env_remove`] on
+    /// Windows, step 1 is skipped but the parent process's `PATH` is still
+    /// searched at step 5, unlike on Unix.
+    ///
+    /// For executable files, the `.exe` extension may be omitted. Files with
+    /// other extensions must include the extension, otherwise they will not be
+    /// found. Note that this behavior has some known limitations
+    /// (see issue #37519).
+    ///
+    /// [`env`]: Self::env
+    /// [`env_remove`]: Self::env_remove
+    /// [`env_clear`]: Self::env_clear
     ///
     /// # Examples
     ///
@@ -1033,6 +1062,26 @@ impl Command {
     ///
     /// By default, stdin, stdout and stderr are inherited from the parent.
     ///
+    /// # Errors
+    ///
+    /// This method returns an [`io::Error`] if the child process could not be
+    /// spawned. Common reasons include:
+    ///
+    /// * the program could not be found (for example, it does not exist, or,
+    ///   when given a bare name, it is not present in the `PATH`);
+    /// * the current process does not have permission to execute the program
+    ///   (for example, the file is not marked executable, or execution is
+    ///   denied by a security policy such as `seccomp`);
+    /// * the operating system could not create the new process because of
+    ///   resource exhaustion (for example, a limit on the number of processes
+    ///   was reached).
+    ///
+    /// An error is only returned for failures that occur while the child is
+    /// being spawned. Once the child has started successfully, anything that
+    /// happens to it afterwards — including being terminated by a signal — is
+    /// reported through its [`ExitStatus`] rather than as an error from the
+    /// spawning method.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1055,6 +1104,20 @@ impl Command {
     /// attempt by the child process to read from the stdin stream will result
     /// in the stream immediately closing.
     ///
+    /// # Errors
+    ///
+    /// Like [`spawn`], this method returns an [`io::Error`] if the child
+    /// process could not be spawned; see [`spawn`] for the common reasons. It
+    /// may also return an error if reading the child's output or waiting on the
+    /// child fails.
+    ///
+    /// Note that this method does **not** return an error if the child runs and
+    /// then exits unsuccessfully, or is terminated by a signal. In those cases
+    /// it still returns [`Ok`], and the outcome is reflected in the
+    /// [`ExitStatus`] stored in the returned [`Output`].
+    ///
+    /// [`spawn`]: Command::spawn
+    ///
     /// # Examples
     ///
     /// ```should_panic
@@ -1073,7 +1136,7 @@ impl Command {
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn output(&mut self) -> io::Result<Output> {
-        let (status, stdout, stderr) = self.inner.output()?;
+        let (status, stdout, stderr) = imp::output(&mut self.inner)?;
         Ok(Output { status: ExitStatus(status), stdout, stderr })
     }
 
@@ -1081,6 +1144,19 @@ impl Command {
     /// collecting its status.
     ///
     /// By default, stdin, stdout and stderr are inherited from the parent.
+    ///
+    /// # Errors
+    ///
+    /// Like [`spawn`], this method returns an [`io::Error`] if the child
+    /// process could not be spawned; see [`spawn`] for the common reasons. It
+    /// may also return an error if waiting on the child fails.
+    ///
+    /// Note that this method does **not** return an error if the child runs and
+    /// then exits unsuccessfully, or is terminated by a signal. In those cases
+    /// it still returns [`Ok`], and the outcome is reflected in the returned
+    /// [`ExitStatus`].
+    ///
+    /// [`spawn`]: Command::spawn
     ///
     /// # Examples
     ///
@@ -1148,7 +1224,8 @@ impl Command {
     /// [`Command::env_remove`] can be retrieved with this method.
     ///
     /// Note that this output does not include environment variables inherited from the parent
-    /// process.
+    /// process. To see the full list of environment variables, including those inherited from the
+    /// parent process, use [`Command::get_resolved_envs`].
     ///
     /// Each element is a tuple key/value pair `(&OsStr, Option<&OsStr>)`. A [`None`] value
     /// indicates its key was explicitly removed via [`Command::env_remove`]. The associated key for
@@ -1174,7 +1251,43 @@ impl Command {
     /// ```
     #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_envs(&self) -> CommandEnvs<'_> {
-        self.inner.get_envs()
+        CommandEnvs { iter: self.inner.get_envs() }
+    }
+
+    /// Returns an iterator of the environment variables that will be set when the process is spawned.
+    ///
+    /// This returns the environment as it would be if the command were executed at the time of calling
+    /// this method. The returned environment includes:
+    /// - All inherited environment variables from the parent process (unless [`Command::env_clear`] was called)
+    /// - All environment variables explicitly set via [`Command::env`] or [`Command::envs`]
+    /// - Excluding any environment variables removed via [`Command::env_remove`]
+    ///
+    /// Note that the returned environment is a snapshot at the time this method is called and will not
+    /// reflect any subsequent changes to the `Command` or the parent process's environment. Additionally,
+    /// it will not reflect changes made in a `pre_exec` hook (on Unix platforms).
+    ///
+    /// Each element is a tuple `(OsString, OsString)` representing an environment variable key and value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(command_resolved_envs)]
+    /// use std::process::Command;
+    /// use std::ffi::{OsString, OsStr};
+    /// use std::env;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut cmd = Command::new("ls");
+    /// cmd.env("TZ", "UTC");
+    /// unsafe { env::set_var("EDITOR", "vim"); }
+    ///
+    /// let resolved: HashMap<OsString, OsString> = cmd.get_resolved_envs().collect();
+    /// assert_eq!(resolved.get(OsStr::new("TZ")), Some(&OsString::from("UTC")));
+    /// assert_eq!(resolved.get(OsStr::new("EDITOR")), Some(&OsString::from("vim")));
+    /// ```
+    #[unstable(feature = "command_resolved_envs", issue = "149070")]
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        self.inner.get_resolved_envs()
     }
 
     /// Returns the working directory for the child process.
@@ -1196,6 +1309,30 @@ impl Command {
     #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_current_dir(&self) -> Option<&Path> {
         self.inner.get_current_dir()
+    }
+
+    /// Returns whether the environment will be cleared for the child process.
+    ///
+    /// This returns `true` if [`Command::env_clear`] was called, and `false` otherwise.
+    /// When `true`, the child process will not inherit any environment variables from
+    /// its parent process.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(command_resolved_envs)]
+    /// use std::process::Command;
+    ///
+    /// let mut cmd = Command::new("ls");
+    /// assert_eq!(cmd.get_env_clear(), false);
+    ///
+    /// cmd.env_clear();
+    /// assert_eq!(cmd.get_env_clear(), true);
+    /// ```
+    #[must_use]
+    #[unstable(feature = "command_resolved_envs", issue = "149070")]
+    pub fn get_env_clear(&self) -> bool {
+        self.inner.get_env_clear()
     }
 }
 
@@ -1264,6 +1401,57 @@ impl<'a> ExactSizeIterator for CommandArgs<'a> {
     }
 }
 
+const fn assert_send<T: core::marker::Send>() {}
+const fn assert_sync<T: core::marker::Sync>() {}
+
+const _: () = assert_send::<CommandArgs<'static>>();
+const _: () = assert_sync::<CommandArgs<'static>>();
+
+/// An iterator over the command environment variables.
+///
+/// This struct is created by
+/// [`Command::get_envs`][crate::process::Command::get_envs]. See its
+/// documentation for more.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+#[stable(feature = "command_access", since = "1.57.0")]
+pub struct CommandEnvs<'a> {
+    iter: imp::CommandEnvs<'a>,
+}
+
+#[stable(feature = "command_access", since = "1.57.0")]
+impl<'a> Iterator for CommandEnvs<'a> {
+    type Item = (&'a OsStr, Option<&'a OsStr>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+#[stable(feature = "command_access", since = "1.57.0")]
+impl<'a> ExactSizeIterator for CommandEnvs<'a> {
+    fn len(&self) -> usize {
+        self.iter.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.iter.is_empty()
+    }
+}
+
+#[stable(feature = "command_access", since = "1.57.0")]
+impl<'a> fmt::Debug for CommandEnvs<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.iter.fmt(f)
+    }
+}
+
+#[unstable(feature = "command_resolved_envs", issue = "149070")]
+pub use imp::CommandResolvedEnvs;
+
 /// The output of a finished process.
 ///
 /// This is returned in a Result by either the [`output`] method of a
@@ -1307,8 +1495,9 @@ impl Output {
     /// # Examples
     ///
     /// ```
+    /// # #![allow(unused_features)]
     /// #![feature(exit_status_error)]
-    /// # #[cfg(unix)] {
+    /// # #[cfg(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos")))))] {
     /// use std::process::Command;
     /// assert!(Command::new("false").output().unwrap().exit_ok().is_err());
     /// # }
@@ -1655,7 +1844,7 @@ impl From<io::Stdout> for Stdio {
     /// # Ok(())
     /// # }
     /// #
-    /// # if cfg!(unix) {
+    /// # if cfg!(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos"))))) {
     /// #     test().unwrap();
     /// # }
     /// ```
@@ -1684,7 +1873,7 @@ impl From<io::Stderr> for Stdio {
     /// # Ok(())
     /// # }
     /// #
-    /// # if cfg!(unix) {
+    /// # if cfg!(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos"))))) {
     /// #     test().unwrap();
     /// # }
     /// ```
@@ -1749,10 +1938,6 @@ impl Default for ExitStatus {
     }
 }
 
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for ExitStatus {}
-
 impl ExitStatus {
     /// Was termination successful?  Returns a `Result`.
     ///
@@ -1760,7 +1945,7 @@ impl ExitStatus {
     ///
     /// ```
     /// #![feature(exit_status_error)]
-    /// # if cfg!(unix) {
+    /// # if cfg!(all(unix, not(all(target_vendor = "apple", not(target_os = "macos"))))) {
     /// use std::process::Command;
     ///
     /// let status = Command::new("ls")
@@ -1855,10 +2040,6 @@ impl fmt::Display for ExitStatus {
     }
 }
 
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for ExitStatusError {}
-
 /// Describes the result of a process after it has failed
 ///
 /// Produced by the [`.exit_ok`](ExitStatus::exit_ok) method on [`ExitStatus`].
@@ -1867,7 +2048,7 @@ impl crate::sealed::Sealed for ExitStatusError {}
 ///
 /// ```
 /// #![feature(exit_status_error)]
-/// # if cfg!(unix) {
+/// # if cfg!(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos"))))) {
 /// use std::process::{Command, ExitStatusError};
 ///
 /// fn run(cmd: &str) -> Result<(), ExitStatusError> {
@@ -1886,6 +2067,7 @@ impl crate::sealed::Sealed for ExitStatusError {}
 pub struct ExitStatusError(imp::ExitStatusError);
 
 #[unstable(feature = "exit_status_error", issue = "84908")]
+#[doc(test(attr(allow(unused_features))))]
 impl ExitStatusError {
     /// Reports the exit code, if applicable, from an `ExitStatusError`.
     ///
@@ -1910,7 +2092,7 @@ impl ExitStatusError {
     ///
     /// ```
     /// #![feature(exit_status_error)]
-    /// # #[cfg(unix)] {
+    /// # #[cfg(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos")))))] {
     /// use std::process::Command;
     ///
     /// let bad = Command::new("false").status().unwrap().exit_ok().unwrap_err();
@@ -1935,7 +2117,7 @@ impl ExitStatusError {
     /// ```
     /// #![feature(exit_status_error)]
     ///
-    /// # if cfg!(unix) {
+    /// # if cfg!(all(unix, not(target_os = "android"), not(all(target_vendor = "apple", not(target_os = "macos"))))) {
     /// use std::num::NonZero;
     /// use std::process::Command;
     ///
@@ -2025,10 +2207,6 @@ impl crate::error::Error for ExitStatusError {}
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[stable(feature = "process_exitcode", since = "1.61.0")]
 pub struct ExitCode(imp::ExitCode);
-
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for ExitCode {}
 
 #[stable(feature = "process_exitcode", since = "1.61.0")]
 impl ExitCode {
@@ -2305,7 +2483,7 @@ impl Child {
                 res.unwrap();
             }
             (Some(out), Some(err)) => {
-                let res = read2(out.inner, &mut stdout, err.inner, &mut stderr);
+                let res = imp::read_output(out.inner, &mut stdout, err.inner, &mut stderr);
                 res.unwrap();
             }
         }
@@ -2391,7 +2569,7 @@ impl Child {
 #[cfg_attr(not(test), rustc_diagnostic_item = "process_exit")]
 pub fn exit(code: i32) -> ! {
     crate::rt::cleanup();
-    crate::sys::os::exit(code)
+    crate::sys::exit::exit(code)
 }
 
 /// Terminates the process in an abnormal fashion.
@@ -2455,9 +2633,14 @@ pub fn exit(code: i32) -> ! {
 #[stable(feature = "process_abort", since = "1.17.0")]
 #[cold]
 #[cfg_attr(not(test), rustc_diagnostic_item = "process_abort")]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub fn abort() -> ! {
     crate::sys::abort_internal();
 }
+
+#[doc(inline)]
+#[unstable(feature = "abort_immediate", issue = "154601")]
+pub use core::process::abort_immediate;
 
 /// Returns the OS-assigned process identifier associated with this process.
 ///
@@ -2471,7 +2654,7 @@ pub fn abort() -> ! {
 #[must_use]
 #[stable(feature = "getpid", since = "1.26.0")]
 pub fn id() -> u32 {
-    crate::sys::os::getpid()
+    imp::getpid()
 }
 
 /// A trait for implementing arbitrary return types in the `main` function.
@@ -2492,7 +2675,7 @@ pub fn id() -> u32 {
 #[rustc_on_unimplemented(on(
     cause = "MainFunctionType",
     message = "`main` has invalid return type `{Self}`",
-    label = "`main` can only return types that implement `{Termination}`"
+    label = "`main` can only return types that implement `{This}`"
 ))]
 pub trait Termination {
     /// Is called to get the representation of the value as status code.

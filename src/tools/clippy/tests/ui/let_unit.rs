@@ -1,5 +1,5 @@
 #![warn(clippy::let_unit_value)]
-#![allow(unused, clippy::no_effect, clippy::needless_late_init, path_statements)]
+#![expect(clippy::match_single_binding, clippy::needless_late_init, clippy::no_effect)]
 
 macro_rules! let_and_return {
     ($n:expr) => {{
@@ -15,12 +15,12 @@ fn main() {
     if true {
         // do not lint this, since () is explicit
         let _a = ();
-        let () = dummy();
+        let () = returns_unit();
         let () = ();
-        () = dummy();
+        () = returns_unit();
         () = ();
         let _a: () = ();
-        let _a: () = dummy();
+        let _a: () = returns_unit();
     }
 
     consume_units_with_for_loop(); // should be fine as well
@@ -30,7 +30,7 @@ fn main() {
     let_and_return!(()) // should be fine
 }
 
-fn dummy() {}
+fn returns_unit() {}
 
 // Related to issue #1964
 fn consume_units_with_for_loop() {
@@ -61,7 +61,7 @@ fn multiline_sugg() {
         //~^ let_unit_value
         .into_iter()
         .map(|i| i * 2)
-        .filter(|i| i % 2 == 0)
+        .filter(|i| i.is_multiple_of(2))
         .map(|_| ())
         .next()
         .unwrap();
@@ -181,8 +181,6 @@ async fn issue10433() {
 pub async fn issue11502(a: ()) {}
 
 pub fn issue12594() {
-    fn returns_unit() {}
-
     fn returns_result<T>(res: T) -> Result<T, ()> {
         Ok(res)
     }
@@ -197,4 +195,40 @@ pub fn issue12594() {
         let res = 1;
         returns_result(res).unwrap();
     }
+}
+
+fn takes_unit(x: ()) {}
+
+fn issue15061() {
+    let res = returns_unit();
+    //~^ let_unit_value
+    takes_unit(res);
+    println!("{res:?}");
+}
+
+fn issue15771() {
+    match "Example String" {
+        _ => _ = returns_unit(),
+        //~^ let_unit_value
+    }
+
+    _ = if true {}
+    //~^ let_unit_value
+}
+
+fn issue_15784() {
+    let res = eprintln!("I return unit");
+    //~^ let_unit_value
+    takes_unit(res);
+    println!("{res:?}");
+}
+
+fn issue15789() {
+    struct Foo {
+        value: (),
+    }
+    let value = println!();
+    //~^ let_unit_value
+
+    Foo { value };
 }

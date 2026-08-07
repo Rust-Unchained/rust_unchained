@@ -1,72 +1,118 @@
 //! Module defining all known symbols required by the rest of rust-analyzer.
 #![allow(non_upper_case_globals)]
 
-use std::hash::{BuildHasherDefault, Hash as _, Hasher as _};
+use std::{
+    hash::{BuildHasher, BuildHasherDefault},
+    ptr::NonNull,
+};
 
+use arrayvec::ArrayString;
 use dashmap::{DashMap, SharedValue};
 use rustc_hash::FxHasher;
 
-use crate::{
-    symbol::{SymbolProxy, TaggedArcPtr},
-    Symbol,
-};
+use crate::{Symbol, symbol::TaggedArcPtr};
+
+macro_rules! last {
+    ( $($elems:literal,)+ ) => {
+        *[ $($elems,)* ].last().unwrap()
+    };
+}
+
+impl Integer {
+    #[inline]
+    pub fn as_uint(sym: &Symbol) -> Option<usize> {
+        if !sym.repr.is_arc() {
+            let elem_ref = sym.repr.pointer();
+            // SAFETY: The types have the same layout.
+            let elem_ref = unsafe { std::mem::transmute::<NonNull<*const str>, &&str>(elem_ref) };
+            Self::LIST.element_offset(elem_ref)
+        } else {
+            Self::as_uint_cold(sym)
+        }
+    }
+
+    #[cold]
+    fn as_uint_cold(sym: &Symbol) -> Option<usize> {
+        sym.as_str().parse().ok()
+    }
+}
 
 macro_rules! define_symbols {
-    (@WITH_NAME: $($alias:ident = $value:literal,)* @PLAIN: $($name:ident,)*) => {
-        // We define symbols as both `const`s and `static`s because some const code requires const symbols,
-        // but code from before the transition relies on the lifetime of the predefined symbols and making them
-        // `const`s make it error (because now they're temporaries). In the future we probably should only
-        // use consts.
-
-        /// Predefined symbols as `const`s (instead of the default `static`s).
-        pub mod consts {
-            use super::{Symbol, TaggedArcPtr};
-
-            // The strings should be in `static`s so that symbol equality holds.
-            $(
-                pub const $name: Symbol = {
-                    static SYMBOL_STR: &str = stringify!($name);
-                    Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
-                };
-            )*
-            $(
-                pub const $alias: Symbol = {
-                    static SYMBOL_STR: &str = $value;
-                    Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
-                };
-            )*
-        }
-
+    (
+        @LISTS: $($list_type_name:ident = $list_prefix:literal + [ $($list_idx:literal,)+ ],)*
+        @WITH_NAME: $($alias:ident = $value:literal,)*
+        @PLAIN: $($name:ident,)*
+    ) => {
         $(
-            pub static $name: Symbol = consts::$name;
+            pub enum $list_type_name {}
+            impl $list_type_name {
+                // Ensure we covered all numbers.
+                const LIST: &[&str; last!($($list_idx,)+) + 1] = {
+                    static LIST: [&str; last!($($list_idx,)+) + 1] = [ $( concat!($list_prefix, $list_idx), )* ];
+                    &LIST
+                };
+
+                #[cold]
+                #[inline(never)]
+                fn create(idx: usize) -> Symbol {
+                    use std::fmt::Write;
+                    const MAX_LEN: usize = $list_prefix.len() + u64::MAX.ilog10() as usize + 1;
+                    let mut s = ArrayString::<MAX_LEN>::new();
+                    s.push_str($list_prefix);
+                    _ = write!(s, "{idx}");
+                    Symbol::intern(&s)
+                }
+
+                #[inline]
+                pub fn get(idx: usize) -> Symbol {
+                    match Self::LIST.get(idx) {
+                        Option::Some(s) => Symbol { repr: TaggedArcPtr::non_arc(s) },
+                        Option::None => Self::create(idx),
+                    }
+                }
+            }
         )*
+
+        // The strings should be in `static`s so that symbol equality holds.
         $(
-            pub static $alias: Symbol = consts::$alias;
-        )*
-
-
-        pub(super) fn prefill() -> DashMap<SymbolProxy, (), BuildHasherDefault<FxHasher>> {
-            let mut dashmap_ = <DashMap<SymbolProxy, (), BuildHasherDefault<FxHasher>>>::with_hasher(BuildHasherDefault::default());
-
-            let hash_thing_ = |hasher_: &BuildHasherDefault<FxHasher>, it_: &SymbolProxy| {
-                let mut hasher_ = std::hash::BuildHasher::build_hasher(hasher_);
-                it_.hash(&mut hasher_);
-                hasher_.finish()
+            pub const $name: Symbol = {
+                static SYMBOL_STR: &str = stringify!($name);
+                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
             };
+        )*
+        $(
+            pub const $alias: Symbol = {
+                static SYMBOL_STR: &str = $value;
+                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
+            };
+        )*
+
+
+        pub(super) fn prefill() -> DashMap<Symbol, (), BuildHasherDefault<FxHasher>> {
+            let mut dashmap_ = <DashMap<Symbol, (), BuildHasherDefault<FxHasher>>>::with_hasher(BuildHasherDefault::default());
+
+            let hasher_ = dashmap_.hasher().clone();
+            let hash_one = |it_: &str| hasher_.hash_one(it_);
             {
                 $(
-
-                    let proxy_ = SymbolProxy($name.repr);
-                    let hash_ = hash_thing_(dashmap_.hasher(), &proxy_);
-                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().raw_entry_mut().from_hash(hash_, |k| k == &proxy_).insert(proxy_, SharedValue::new(()));
+                    for s in $list_type_name::LIST {
+                        let hash_ = hash_one(s);
+                        let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
+                        let symbol = Symbol { repr: TaggedArcPtr::non_arc(s) };
+                        dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, (symbol, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
+                    }
                 )*
                 $(
-
-                    let proxy_ = SymbolProxy($alias.repr);
-                    let hash_ = hash_thing_(dashmap_.hasher(), &proxy_);
+                    let s = stringify!($name);
+                    let hash_ = hash_one(s);
                     let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().raw_entry_mut().from_hash(hash_, |k| k == &proxy_).insert(proxy_, SharedValue::new(()));
+                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($name, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
+                )*
+                $(
+                    let s = $value;
+                    let hash_ = hash_one(s);
+                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
+                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($alias, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
                 )*
             }
             dashmap_
@@ -74,25 +120,37 @@ macro_rules! define_symbols {
     };
 }
 define_symbols! {
+    @LISTS:
+    Integer = "" + [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+        76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
+        101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+        126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+        151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175,
+        176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
+        201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225,
+        226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250,
+        251, 252, 253, 254, 255,
+    ],
+    RaGeneratedName = "<ra@gennew>" + [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+        76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
+        101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+        126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+        151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175,
+        176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
+        201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225,
+        226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250,
+        251, 252, 253, 254, 255,
+    ],
+
     @WITH_NAME:
 
     dotdotdot = "...",
-    INTEGER_0 = "0",
-    INTEGER_1 = "1",
-    INTEGER_2 = "2",
-    INTEGER_3 = "3",
-    INTEGER_4 = "4",
-    INTEGER_5 = "5",
-    INTEGER_6 = "6",
-    INTEGER_7 = "7",
-    INTEGER_8 = "8",
-    INTEGER_9 = "9",
-    INTEGER_10 = "10",
-    INTEGER_11 = "11",
-    INTEGER_12 = "12",
-    INTEGER_13 = "13",
-    INTEGER_14 = "14",
-    INTEGER_15 = "15",
     __empty = "",
     unsafe_ = "unsafe",
     in_ = "in",
@@ -110,6 +168,7 @@ define_symbols! {
     false_ = "false",
     let_ = "let",
     const_ = "const",
+    kw_impl = "impl",
     proc_dash_macro = "proc-macro",
     aapcs_dash_unwind = "aapcs-unwind",
     avr_dash_interrupt = "avr-interrupt",
@@ -133,6 +192,8 @@ define_symbols! {
     vectorcall_dash_unwind = "vectorcall-unwind",
     win64_dash_unwind = "win64-unwind",
     x86_dash_interrupt = "x86-interrupt",
+    rust_dash_preserve_dash_none = "preserve-none",
+    _0_u8 = "0_u8",
 
     @PLAIN:
     __ra_fixup,
@@ -145,12 +206,15 @@ define_symbols! {
     all,
     alloc_layout,
     alloc,
-    allow_internal_unsafe,
     allow,
     any,
     as_str,
     asm,
     assert,
+    async_iter,
+    async_iterator,
+    AsyncIterator,
+    attr,
     attributes,
     begin_panic,
     bench,
@@ -161,6 +225,7 @@ define_symbols! {
     bitxor_assign,
     bitxor,
     bool,
+    bootstrap,
     box_free,
     Box,
     boxed,
@@ -180,15 +245,16 @@ define_symbols! {
     cfg_attr,
     cfg_eval,
     cfg,
+    cfg_select,
     char,
     clone,
+    trivial_clone,
     Clone,
     coerce_unsized,
     column,
     completion,
     compile_error,
     concat_bytes,
-    concat_idents,
     concat,
     const_format_args,
     const_panic_fmt,
@@ -197,11 +263,14 @@ define_symbols! {
     Continue,
     convert,
     copy,
+    use_cloned,
     Copy,
     core_panic,
     core,
     coroutine_state,
     coroutine,
+    coroutine_return,
+    coroutine_yield,
     count,
     crate_type,
     CStr,
@@ -211,18 +280,22 @@ define_symbols! {
     Default,
     deprecated,
     deref_mut,
+    deref_pure,
     deref_target,
     deref,
     derive_const,
     derive,
     discriminant_kind,
     discriminant_type,
-    dispatch_from_dyn,destruct,
+    dispatch_from_dyn,
+    destruct,
+    bikeshed_guaranteed_no_drop,
     div_assign,
     div,
     doc,
     drop_in_place,
     drop,
+    pin_drop,
     dyn_metadata,
     efiapi,
     eh_catch_typeinfo,
@@ -247,8 +320,13 @@ define_symbols! {
     fn_once_output,
     fn_once,
     async_fn_once,
+    async_fn_once_output,
     async_fn_mut,
     async_fn,
+    async_fn_kind_helper,
+    async_fn_kind_upvars,
+    call_ref_future,
+    call_once_future,
     fn_ptr_addr,
     fn_ptr_trait,
     format_alignment,
@@ -300,6 +378,7 @@ define_symbols! {
     Into,
     into_future,
     into_iter,
+    into_try_type,
     IntoFuture,
     IntoIter,
     IntoIterator,
@@ -311,8 +390,10 @@ define_symbols! {
     iter,
     Iterator,
     iterator,
+    fused_iterator,
     keyword,
     lang,
+    lang_items,
     le,
     Left,
     len,
@@ -335,6 +416,7 @@ define_symbols! {
     module_path,
     mul_assign,
     mul,
+    must_use,
     naked_asm,
     ne,
     neg,
@@ -394,6 +476,7 @@ define_symbols! {
     PartialOrd,
     CoercePointee,
     path,
+    pattern_type,
     Pending,
     phantom_data,
     pieces,
@@ -439,6 +522,7 @@ define_symbols! {
     rustc_allow_incoherent_impl,
     rustc_builtin_macro,
     rustc_coherence_is_core,
+    rustc_coinductive,
     rustc_const_panic_str,
     rustc_deallocator,
     rustc_deprecated_safe_2024,
@@ -455,13 +539,15 @@ define_symbols! {
     rustc_safe_intrinsic,
     rustc_skip_array_during_method_dispatch,
     rustc_skip_during_method_dispatch,
-    semitransparent,
+    rustc_force_inline,
     shl_assign,
     shl,
     shr_assign,
     shr,
     simd,
     sized,
+    meta_sized,
+    pointee_sized,
     skip,
     slice_len_fn,
     Some,
@@ -511,6 +597,8 @@ define_symbols! {
     unreachable_2021,
     unreachable,
     unsafe_cell,
+    covariant_unsafe_cell,
+    unsafe_pinned,
     unsize,
     unstable,
     usize,
@@ -519,6 +607,74 @@ define_symbols! {
     vectorcall,
     wasm,
     win64,
+    args,
     array,
     boxed_slice,
+    completions,
+    ignore_flyimport,
+    ignore_flyimport_methods,
+    ignore_methods,
+    position,
+    flags,
+    precision,
+    width,
+    never_type_fallback,
+    specialization,
+    min_specialization,
+    arbitrary_self_types,
+    arbitrary_self_types_pointers,
+    supertrait_item_shadowing,
+    new_range,
+    range,
+    RangeCopy,
+    RangeFromCopy,
+    RangeInclusiveCopy,
+    RangeToInclusiveCopy,
+    hash,
+    partial_cmp,
+    cmp,
+    CoerceUnsized,
+    DispatchFromDyn,
+    define_opaque,
+    marker,
+    abi_unadjusted,
+    allocator_internals,
+    allow_internal_unsafe,
+    allow_internal_unstable,
+    cfg_emscripten_wasm_eh,
+    cfg_target_has_reliable_f16_f128,
+    compiler_builtins,
+    custom_mir,
+    eii_internals,
+    field_representing_type_raw,
+    intrinsics,
+    core_intrinsics,
+    link_cfg,
+    more_maybe_bounds,
+    negative_bounds,
+    pattern_complexity_limit,
+    profiler_runtime,
+    rustc_attrs,
+    staged_api,
+    test_unstable_lint,
+    builtin_syntax,
+    link_llvm_intrinsics,
+    needs_panic_runtime,
+    panic_runtime,
+    pattern_types,
+    rustdoc_internals,
+    contracts_internals,
+    freeze_impls,
+    unsized_fn_params,
+    field,
+    field_base,
+    field_type,
+    ref_pat_eat_one_layer_2024,
+    ref_pat_eat_one_layer_2024_structural,
+    deref_patterns,
+    mut_ref,
+    type_changing_struct_update,
+    RangeMin,
+    RangeMax,
+    RangeSub,
 }

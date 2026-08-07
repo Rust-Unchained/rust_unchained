@@ -9,16 +9,16 @@ use super::{check_infer, check_types};
 fn cfg_impl_def() {
     check_types(
         r#"
-//- /main.rs crate:main deps:foo cfg:test
+//- /main.rs crate:main deps:foo cfg:some_cfg
 use foo::S as T;
 struct S;
 
-#[cfg(test)]
+#[cfg(some_cfg)]
 impl S {
     fn foo1(&self) -> i32 { 0 }
 }
 
-#[cfg(not(test))]
+#[cfg(not(some_cfg))]
 impl S {
     fn foo2(&self) -> i32 { 0 }
 }
@@ -31,12 +31,12 @@ fn test() {
 //- /foo.rs crate:foo
 pub struct S;
 
-#[cfg(not(test))]
+#[cfg(not(some_cfg))]
 impl S {
     pub fn foo3(&self) -> i32 { 0 }
 }
 
-#[cfg(test)]
+#[cfg(some_cfg)]
 impl S {
     pub fn foo4(&self) -> i32 { 0 }
 }
@@ -194,20 +194,20 @@ fn expr_macro_def_expanded_in_various_places() {
             !0..6 '1isize': isize
             !0..6 '1isize': isize
             !0..6 '1isize': isize
-            39..442 '{     ...!(); }': ()
+            39..442 '{     ...!(); }': !
             73..94 'spam!(...am!())': {unknown}
-            100..119 'for _ ...!() {}': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
-            100..119 'for _ ...!() {}': IntoIterator::IntoIter<isize>
             100..119 'for _ ...!() {}': !
-            100..119 'for _ ...!() {}': IntoIterator::IntoIter<isize>
-            100..119 'for _ ...!() {}': &'? mut IntoIterator::IntoIter<isize>
-            100..119 'for _ ...!() {}': fn next<IntoIterator::IntoIter<isize>>(&'? mut IntoIterator::IntoIter<isize>) -> Option<<IntoIterator::IntoIter<isize> as Iterator>::Item>
-            100..119 'for _ ...!() {}': Option<IntoIterator::Item<isize>>
+            100..119 'for _ ...!() {}': {unknown}
+            100..119 'for _ ...!() {}': &'? mut {unknown}
+            100..119 'for _ ...!() {}': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            100..119 'for _ ...!() {}': Option<<{unknown} as Iterator>::Item>
             100..119 'for _ ...!() {}': ()
             100..119 'for _ ...!() {}': ()
             100..119 'for _ ...!() {}': ()
             100..119 'for _ ...!() {}': ()
-            104..105 '_': IntoIterator::Item<isize>
+            104..105 '_': {unknown}
+            109..116 'spam!()': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
+            109..116 'spam!()': <isize as IntoIterator>::IntoIter
             117..119 '{}': ()
             124..134 '|| spam!()': impl Fn() -> isize
             140..156 'while ...!() {}': !
@@ -288,20 +288,20 @@ fn expr_macro_rules_expanded_in_various_places() {
             !0..6 '1isize': isize
             !0..6 '1isize': isize
             !0..6 '1isize': isize
-            53..456 '{     ...!(); }': ()
+            53..456 '{     ...!(); }': !
             87..108 'spam!(...am!())': {unknown}
-            114..133 'for _ ...!() {}': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
-            114..133 'for _ ...!() {}': IntoIterator::IntoIter<isize>
             114..133 'for _ ...!() {}': !
-            114..133 'for _ ...!() {}': IntoIterator::IntoIter<isize>
-            114..133 'for _ ...!() {}': &'? mut IntoIterator::IntoIter<isize>
-            114..133 'for _ ...!() {}': fn next<IntoIterator::IntoIter<isize>>(&'? mut IntoIterator::IntoIter<isize>) -> Option<<IntoIterator::IntoIter<isize> as Iterator>::Item>
-            114..133 'for _ ...!() {}': Option<IntoIterator::Item<isize>>
+            114..133 'for _ ...!() {}': {unknown}
+            114..133 'for _ ...!() {}': &'? mut {unknown}
+            114..133 'for _ ...!() {}': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            114..133 'for _ ...!() {}': Option<<{unknown} as Iterator>::Item>
             114..133 'for _ ...!() {}': ()
             114..133 'for _ ...!() {}': ()
             114..133 'for _ ...!() {}': ()
             114..133 'for _ ...!() {}': ()
-            118..119 '_': IntoIterator::Item<isize>
+            118..119 '_': {unknown}
+            123..130 'spam!()': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
+            123..130 'spam!()': <isize as IntoIterator>::IntoIter
             131..133 '{}': ()
             138..148 '|| spam!()': impl Fn() -> isize
             154..170 'while ...!() {}': !
@@ -707,7 +707,7 @@ fn infer_builtin_macros_file() {
         expect![[r#"
             !0..6 '"file"': &'static str
             63..87 '{     ...!(); }': ()
-            73..74 'x': &'static str
+            73..74 'x': &'? str
         "#]],
     );
 }
@@ -745,7 +745,7 @@ fn infer_builtin_macros_concat() {
         expect![[r#"
             !0..13 '"helloworld!"': &'static str
             65..121 '{     ...")); }': ()
-            75..76 'x': &'static str
+            75..76 'x': &'? str
         "#]],
     );
 }
@@ -822,7 +822,7 @@ macro_rules! include_str {() => {}}
 fn main() {
     let a = include_str!("foo.rs");
     a;
-} //^ &'static str
+} //^ &'? str
 
 //- /foo.rs
 hello
@@ -849,7 +849,7 @@ macro_rules! m {
 fn main() {
     let a = include_str!(m!(".rs"));
     a;
-} //^ &'static str
+} //^ &'? str
 
 //- /foo.rs
 hello
@@ -964,7 +964,7 @@ fn infer_builtin_macros_concat_with_lazy() {
         expect![[r#"
             !0..13 '"helloworld!"': &'static str
             103..160 '{     ...")); }': ()
-            113..114 'x': &'static str
+            113..114 'x': &'? str
         "#]],
     );
 }
@@ -979,7 +979,7 @@ fn infer_builtin_macros_env() {
 
         fn main() {
             let x = env!("foo");
-              //^ &'static str
+              //^ &'? str
         }
         "#,
     );
@@ -993,7 +993,7 @@ fn infer_builtin_macros_option_env() {
 //- /main.rs env:foo=bar
 fn main() {
     let x = option_env!("foo");
-      //^ Option<&'static str>
+      //^ Option<&'? str>
 }
         "#,
     );
@@ -1493,7 +1493,7 @@ fn main() {
             !0..136 'builti...tack))': ()
             !0..449 'builti...urn),)': !
             10..1236 '{     ...   } }': ()
-            16..1234 'unsafe...     }': ()
+            16..1234 'unsafe...     }': !
             37..40 'foo': i32
             43..44 '1': i32
             58..63 'mut o': i32
@@ -1505,6 +1505,10 @@ fn main() {
             !119..120 'o': i32
             293..294 'o': i32
             308..317 'thread_id': usize
+            !314..320 'OffPtr': usize
+            !333..338 'OffFn': usize
+            !354..355 '0': i32
+            !371..382 'MEM_RELEASE': usize
         "#]],
     )
 }

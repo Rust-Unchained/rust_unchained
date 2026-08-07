@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::{
     flags::{self, CodegenType},
@@ -21,11 +21,11 @@ impl flags::Codegen {
     pub(crate) fn run(self, _sh: &Shell) -> anyhow::Result<()> {
         match self.codegen_type.unwrap_or_default() {
             flags::CodegenType::All => {
-                diagnostics_docs::generate(self.check);
+                grammar::generate(self.check);
                 assists_doc_tests::generate(self.check);
                 parser_inline_tests::generate(self.check);
-                feature_docs::generate(self.check)
-                // diagnostics_docs::generate(self.check) doesn't generate any tests
+                feature_docs::generate(self.check);
+                diagnostics_docs::generate(self.check);
                 // lints::generate(self.check) Updating clones the rust repo, so don't run it unless
                 // explicitly asked for
             }
@@ -130,16 +130,17 @@ impl fmt::Display for Location {
 fn reformat(text: String) -> String {
     let sh = Shell::new().unwrap();
     let rustfmt_toml = project_root().join("rustfmt.toml");
-    let version = cmd!(sh, "rustup run stable rustfmt --version").read().unwrap_or_default();
+    let toolchain = &std::env::var("RUSTFMT_TOOLCHAIN").unwrap_or("stable".to_owned());
+    let version = cmd!(sh, "rustup run {toolchain} rustfmt --version").read().unwrap_or_default();
 
     // First try explicitly requesting the stable channel via rustup in case nightly is being used by default,
     // then plain rustfmt in case rustup isn't being used to manage the compiler (e.g. when using Nix).
-    let mut stdout = if !version.contains("stable") {
+    let mut stdout = if !version.contains(toolchain) {
         let version = cmd!(sh, "rustfmt --version").read().unwrap_or_default();
-        if !version.contains("stable") {
+        if !version.contains(toolchain) {
             panic!(
-                "Failed to run rustfmt from toolchain 'stable'. \
-                 Please run `rustup component add rustfmt --toolchain stable` to install it.",
+                "Failed to run rustfmt from toolchain '{toolchain}'. \
+                 Please run `rustup component add rustfmt --toolchain {toolchain}` to install it.",
             );
         } else {
             cmd!(sh, "rustfmt --config-path {rustfmt_toml} --config fn_single_line=true")
@@ -150,7 +151,7 @@ fn reformat(text: String) -> String {
     } else {
         cmd!(
             sh,
-            "rustup run stable rustfmt --config-path {rustfmt_toml} --config fn_single_line=true"
+            "rustup run {toolchain} rustfmt --config-path {rustfmt_toml} --config fn_single_line=true"
         )
         .stdin(text)
         .read()
@@ -173,11 +174,11 @@ fn add_preamble(cg: CodegenType, mut text: String) -> String {
 #[allow(clippy::print_stderr)]
 fn ensure_file_contents(cg: CodegenType, file: &Path, contents: &str, check: bool) -> bool {
     let contents = normalize_newlines(contents);
-    if let Ok(old_contents) = fs::read_to_string(file) {
-        if normalize_newlines(&old_contents) == contents {
-            // File is already up to date.
-            return false;
-        }
+    if let Ok(old_contents) = fs::read_to_string(file)
+        && normalize_newlines(&old_contents) == contents
+    {
+        // File is already up to date.
+        return false;
     }
 
     let display_path = file.strip_prefix(project_root()).unwrap_or(file);

@@ -1,10 +1,13 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_lint_allowed;
 use clippy_utils::macros::span_is_local;
+use clippy_utils::msrvs::Msrv;
+use clippy_utils::source::snippet_opt;
 use rustc_hir::def_id::DefIdSet;
 use rustc_hir::{Impl, Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -54,28 +57,41 @@ declare_clippy_lint! {
     restriction,
     "trait implementation uses default provided method"
 }
-declare_lint_pass!(MissingTraitMethods => [MISSING_TRAIT_METHODS]);
+
+impl_lint_pass!(MissingTraitMethods => [MISSING_TRAIT_METHODS]);
+
+pub struct MissingTraitMethods {
+    msrv: Msrv,
+}
+
+impl MissingTraitMethods {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for MissingTraitMethods {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if !is_lint_allowed(cx, MISSING_TRAIT_METHODS, item.hir_id())
             && span_is_local(item.span)
             && let ItemKind::Impl(Impl {
-                items,
-                of_trait: Some(trait_ref),
+                of_trait: Some(of_trait),
                 ..
             }) = item.kind
-            && let Some(trait_id) = trait_ref.trait_def_id()
+            && let Some(trait_id) = of_trait.trait_ref.trait_def_id()
         {
-            let trait_item_ids: DefIdSet = items
-                .iter()
-                .filter_map(|impl_item| impl_item.trait_item_def_id)
+            let trait_item_ids: DefIdSet = cx
+                .tcx
+                .associated_items(item.owner_id)
+                .in_definition_order()
+                .filter_map(|assoc_item| assoc_item.expect_trait_impl().ok())
                 .collect();
 
             for assoc in cx
                 .tcx
                 .provided_trait_methods(trait_id)
                 .filter(|assoc| !trait_item_ids.contains(&assoc.def_id))
+                .filter(|assoc| self.msrv.is_stable(cx, assoc.def_id))
             {
                 span_lint_and_then(
                     cx,
@@ -83,7 +99,14 @@ impl<'tcx> LateLintPass<'tcx> for MissingTraitMethods {
                     cx.tcx.def_span(item.owner_id),
                     format!("missing trait method provided by default: `{}`", assoc.name()),
                     |diag| {
-                        diag.span_help(cx.tcx.def_span(assoc.def_id), "implement the method");
+                        if assoc.def_id.is_local() {
+                            diag.span_help(cx.tcx.def_span(assoc.def_id), "implement the method");
+                        } else if let Some(snippet) = snippet_opt(cx, of_trait.trait_ref.path.span) {
+                            diag.help(format!(
+                                "implement the missing `{}` method of the `{snippet}` trait",
+                                assoc.name(),
+                            ));
+                        }
                     },
                 );
             }

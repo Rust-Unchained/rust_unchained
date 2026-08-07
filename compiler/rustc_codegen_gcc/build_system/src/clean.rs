@@ -17,12 +17,12 @@ enum CleanArg {
 impl CleanArg {
     fn new() -> Result<Self, String> {
         // We skip the binary and the "clean" option.
-        for arg in std::env::args().skip(2) {
+        if let Some(arg) = std::env::args().nth(2) {
             return match arg.as_str() {
                 "all" => Ok(Self::All),
                 "ui-tests" => Ok(Self::UiTests),
                 "--help" => Ok(Self::Help),
-                a => Err(format!("Unknown argument `{}`", a)),
+                a => Err(format!("Unknown argument `{a}`")),
             };
         }
         Ok(Self::default())
@@ -69,8 +69,13 @@ fn clean_all() -> Result<(), String> {
 }
 
 fn clean_ui_tests() -> Result<(), String> {
-    let path = Path::new(crate::BUILD_DIR).join("rust/build/x86_64-unknown-linux-gnu/test/ui/");
-    run_command(&[&"find", &path, &"-name", &"stamp", &"-delete"], None)?;
+    let directories = ["run-make", "run-make-cargo", "ui"];
+    for directory in directories {
+        let path = Path::new(crate::BUILD_DIR)
+            .join("rust/build/x86_64-unknown-linux-gnu/test/")
+            .join(directory);
+        run_command(&[&"find", &path, &"-name", &"stamp", &"-delete"], None)?;
+    }
     Ok(())
 }
 

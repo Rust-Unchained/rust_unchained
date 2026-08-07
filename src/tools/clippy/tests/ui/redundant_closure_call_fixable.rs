@@ -1,7 +1,6 @@
 #![warn(clippy::redundant_closure_call)]
-#![allow(clippy::redundant_async_block)]
-#![allow(clippy::type_complexity)]
-#![allow(unused)]
+#![expect(incomplete_features)]
+#![feature(ergonomic_clones)]
 
 async fn something() -> u32 {
     21
@@ -67,6 +66,7 @@ fn issue9956() {
     // nested async closures
     let a = (|| || || || async || 1)()()()()();
     //~^ redundant_closure_call
+    #[expect(clippy::redundant_async_block)]
     let h = async { a.await };
 
     // macro expansion tests
@@ -83,6 +83,7 @@ fn issue9956() {
     assert_eq!(a, 123);
 
     // chaining calls, but not closures
+    #[expect(clippy::type_complexity)]
     fn x() -> fn() -> fn() -> fn() -> i32 {
         || || || 42
     }
@@ -110,6 +111,37 @@ mod issue11707 {
 
     fn demo() {
         spawn_on((|| async move {})());
+        //~^ redundant_closure_call
+    }
+
+    fn demo_with_captures() {
+        let name = String::from("world");
+        spawn_on((|| async move { drop(format!("hello, {name}")) })());
+        //~^ redundant_closure_call
+    }
+
+    fn demo_async_move_closure() {
+        let name = String::from("world");
+        spawn_on((async move || drop(format!("hello, {name}")))());
+        //~^ redundant_closure_call
+    }
+}
+
+mod issue16232 {
+    use core::future::Future;
+
+    fn spawn_on(fut: impl Future<Output = ()>) {}
+
+    fn closure_async_use_block() {
+        let name = String::from("world");
+        #[rustfmt::skip]
+        spawn_on((|| async use { drop(format!("hello, {name:?}")) })());
+        //~^ redundant_closure_call
+    }
+
+    fn async_use_closure() {
+        let name = String::from("world");
+        spawn_on((async use || drop(format!("hello, {name}")))());
         //~^ redundant_closure_call
     }
 }
@@ -143,4 +175,16 @@ fn issue_12358() {
     // The lint would suggest to alter the line below to `make_closure!(x)`, which is semantically
     // different.
     make_closure!(x)();
+}
+
+#[rustfmt::skip]
+fn issue_9583() {
+    (|| { Some(true) })() == Some(true);
+     //~^ redundant_closure_call
+    (|| Some(true))() == Some(true);
+    //~^ redundant_closure_call
+    (|| { Some(if 1 > 2 {1} else {2}) })() == Some(2);
+    //~^ redundant_closure_call
+    (|| { Some( 1 > 2 ) })() == Some(true);
+    //~^ redundant_closure_call
 }

@@ -91,6 +91,7 @@ pub enum TokenType {
     KwElse,
     KwEnum,
     KwExtern,
+    KwFinal,
     KwFn,
     KwFor,
     KwGen,
@@ -129,6 +130,7 @@ pub enum TokenType {
     // Keyword-like symbols.
     // tidy-alphabetical-start
     SymAttSyntax,
+    SymBikeshed,
     SymClobberAbi,
     SymInlateout,
     SymInout,
@@ -139,8 +141,10 @@ pub enum TokenType {
     SymNomem,
     SymNoreturn,
     SymNostack,
+    SymNull,
     SymOptions,
     SymOut,
+    SymPin,
     SymPreservesFlags,
     SymPure,
     SymReadonly,
@@ -230,6 +234,7 @@ impl TokenType {
             KwExtern,
             KwFn,
             KwFor,
+            KwFinal,
             KwGen,
             KwIf,
             KwImpl,
@@ -273,6 +278,7 @@ impl TokenType {
             SymNomem,
             SymNoreturn,
             SymNostack,
+            SymNull,
             SymOptions,
             SymOut,
             SymPreservesFlags,
@@ -305,6 +311,7 @@ impl TokenType {
             TokenType::KwExtern => Some(kw::Extern),
             TokenType::KwFn => Some(kw::Fn),
             TokenType::KwFor => Some(kw::For),
+            TokenType::KwFinal => Some(kw::Final),
             TokenType::KwGen => Some(kw::Gen),
             TokenType::KwIf => Some(kw::If),
             TokenType::KwImpl => Some(kw::Impl),
@@ -348,6 +355,7 @@ impl TokenType {
             TokenType::SymNomem => Some(sym::nomem),
             TokenType::SymNoreturn => Some(sym::noreturn),
             TokenType::SymNostack => Some(sym::nostack),
+            TokenType::SymNull => Some(sym::null),
             TokenType::SymOptions => Some(sym::options),
             TokenType::SymOut => Some(sym::out),
             TokenType::SymPreservesFlags => Some(sym::preserves_flags),
@@ -416,8 +424,8 @@ impl TokenType {
 /// is always by used those methods. The second field is only used when the
 /// first field doesn't match.
 #[derive(Clone, Copy, Debug)]
-pub struct ExpTokenPair<'a> {
-    pub tok: &'a TokenKind,
+pub struct ExpTokenPair {
+    pub tok: TokenKind,
     pub token_type: TokenType,
 }
 
@@ -444,7 +452,7 @@ macro_rules! exp {
     // `ExpTokenPair` helper rules.
     (@tok, $tok:ident) => {
         $crate::parser::token_type::ExpTokenPair {
-            tok: &rustc_ast::token::$tok,
+            tok: rustc_ast::token::$tok,
             token_type: $crate::parser::token_type::TokenType::$tok
         }
     };
@@ -519,6 +527,7 @@ macro_rules! exp {
     (Extern)         => { exp!(@kw, Extern,     KwExtern) };
     (Fn)             => { exp!(@kw, Fn,         KwFn) };
     (For)            => { exp!(@kw, For,        KwFor) };
+    (Final)          => { exp!(@kw, Final,      KwFinal) };
     (Gen)            => { exp!(@kw, Gen,        KwGen) };
     (If)             => { exp!(@kw, If,         KwIf) };
     (Impl)           => { exp!(@kw, Impl,       KwImpl) };
@@ -552,6 +561,7 @@ macro_rules! exp {
     (Yield)          => { exp!(@kw, Yield,      KwYield) };
 
     (AttSyntax)      => { exp!(@sym, att_syntax,      SymAttSyntax) };
+    (Bikeshed)       => { exp!(@sym, bikeshed,        SymBikeshed) };
     (ClobberAbi)     => { exp!(@sym, clobber_abi,     SymClobberAbi) };
     (Inlateout)      => { exp!(@sym, inlateout,       SymInlateout) };
     (Inout)          => { exp!(@sym, inout,           SymInout) };
@@ -562,8 +572,10 @@ macro_rules! exp {
     (Nomem)          => { exp!(@sym, nomem,           SymNomem) };
     (Noreturn)       => { exp!(@sym, noreturn,        SymNoreturn) };
     (Nostack)        => { exp!(@sym, nostack,         SymNostack) };
+    (Null)           => { exp!(@sym, null,            SymNull) };
     (Options)        => { exp!(@sym, options,         SymOptions) };
     (Out)            => { exp!(@sym, out,             SymOut) };
+    (Pin)            => { exp!(@sym, pin,             SymPin) };
     (PreservesFlags) => { exp!(@sym, preserves_flags, SymPreservesFlags) };
     (Pure)           => { exp!(@sym, pure,            SymPure) };
     (Readonly)       => { exp!(@sym, readonly,        SymReadonly) };
@@ -577,7 +589,7 @@ macro_rules! exp {
 pub(super) struct TokenTypeSet(u128);
 
 impl TokenTypeSet {
-    pub(super) fn new() -> TokenTypeSet {
+    pub(super) const fn new() -> TokenTypeSet {
         TokenTypeSet(0)
     }
 

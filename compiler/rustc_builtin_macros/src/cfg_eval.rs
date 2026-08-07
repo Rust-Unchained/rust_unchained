@@ -2,15 +2,14 @@ use core::ops::ControlFlow;
 
 use rustc_ast as ast;
 use rustc_ast::mut_visit::MutVisitor;
-use rustc_ast::ptr::P;
 use rustc_ast::visit::{AssocCtxt, Visitor};
-use rustc_ast::{Attribute, HasAttrs, HasTokens, NodeId, mut_visit, visit};
+use rustc_ast::{Attribute, HasTokens, NodeId, mut_visit, visit};
 use rustc_errors::PResult;
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_expand::config::StripUnconfigured;
 use rustc_expand::configure;
 use rustc_feature::Features;
-use rustc_parse::parser::{ForceCollect, Parser};
+use rustc_parse::parser::{AllowConstBlockItems, ForceCollect, Parser};
 use rustc_session::Session;
 use rustc_span::{Span, sym};
 use smallvec::SmallVec;
@@ -48,10 +47,7 @@ fn has_cfg_or_cfg_attr(annotatable: &Annotatable) -> bool {
     impl<'ast> visit::Visitor<'ast> for CfgFinder {
         type Result = ControlFlow<()>;
         fn visit_attribute(&mut self, attr: &'ast Attribute) -> ControlFlow<()> {
-            if attr
-                .ident()
-                .is_some_and(|ident| ident.name == sym::cfg || ident.name == sym::cfg_attr)
-            {
+            if attr.name().is_some_and(|name| name == sym::cfg || name == sym::cfg_attr) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -71,7 +67,7 @@ fn has_cfg_or_cfg_attr(annotatable: &Annotatable) -> bool {
 }
 
 impl CfgEval<'_> {
-    fn configure<T: HasAttrs + HasTokens>(&mut self, node: T) -> Option<T> {
+    fn configure<T: HasTokens>(&mut self, node: T) -> Option<T> {
         self.0.configure(node)
     }
 
@@ -111,40 +107,42 @@ impl CfgEval<'_> {
         // our attribute target will correctly configure the tokens as well.
         let mut parser = Parser::new(&self.0.sess.psess, orig_tokens, None);
         parser.capture_cfg = true;
-        let res: PResult<'_, Annotatable> = try {
-            match annotatable {
-                Annotatable::Item(_) => {
-                    let item = parser.parse_item(ForceCollect::Yes)?.unwrap();
-                    Annotatable::Item(self.flat_map_item(item).pop().unwrap())
-                }
+        let res: PResult<'_, Option<Annotatable>> = try {
+            match &annotatable {
+                Annotatable::Item(_) => parser
+                    .parse_item(ForceCollect::Yes, AllowConstBlockItems::Yes)?
+                    .and_then(|item| self.flat_map_item(item).pop().map(Annotatable::Item)),
                 Annotatable::AssocItem(_, ctxt) => {
-                    let item = parser.parse_trait_item(ForceCollect::Yes)?.unwrap().unwrap();
-                    Annotatable::AssocItem(
-                        self.flat_map_assoc_item(item, ctxt).pop().unwrap(),
-                        ctxt,
-                    )
+                    parser.parse_trait_item(ForceCollect::Yes)?.flatten().and_then(|item| {
+                        self.flat_map_assoc_item(item, *ctxt)
+                            .pop()
+                            .map(|item| Annotatable::AssocItem(item, *ctxt))
+                    })
                 }
                 Annotatable::ForeignItem(_) => {
-                    let item = parser.parse_foreign_item(ForceCollect::Yes)?.unwrap().unwrap();
-                    Annotatable::ForeignItem(self.flat_map_foreign_item(item).pop().unwrap())
+                    parser.parse_foreign_item(ForceCollect::Yes)?.flatten().and_then(|item| {
+                        self.flat_map_foreign_item(item).pop().map(Annotatable::ForeignItem)
+                    })
                 }
                 Annotatable::Stmt(_) => {
-                    let stmt = parser
-                        .parse_stmt_without_recovery(false, ForceCollect::Yes, false)?
-                        .unwrap();
-                    Annotatable::Stmt(P(self.flat_map_stmt(stmt).pop().unwrap()))
+                    let stmt =
+                        parser.parse_stmt_without_recovery(false, ForceCollect::Yes, false)?;
+                    self.flat_map_stmt(stmt).pop().map(|stmt| Annotatable::Stmt(Box::new(stmt)))
                 }
                 Annotatable::Expr(_) => {
                     let mut expr = parser.parse_expr_force_collect()?;
                     self.visit_expr(&mut expr);
-                    Annotatable::Expr(expr)
+                    Some(Annotatable::Expr(expr))
                 }
                 _ => unreachable!(),
             }
         };
 
         match res {
-            Ok(ann) => ann,
+            Ok(Some(ann)) => ann,
+            // Parser recovery may emit errors without reconstructing an annotatable.
+            // Keep the original node so cfg-eval stays best-effort instead of ICEing.
+            Ok(None) => annotatable,
             Err(err) => {
                 err.emit();
                 annotatable
@@ -155,18 +153,18 @@ impl CfgEval<'_> {
 
 impl MutVisitor for CfgEval<'_> {
     #[instrument(level = "trace", skip(self))]
-    fn visit_expr(&mut self, expr: &mut P<ast::Expr>) {
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
         self.0.configure_expr(expr, false);
         mut_visit::walk_expr(self, expr);
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn visit_method_receiver_expr(&mut self, expr: &mut P<ast::Expr>) {
+    fn visit_method_receiver_expr(&mut self, expr: &mut ast::Expr) {
         self.0.configure_expr(expr, true);
         mut_visit::walk_expr(self, expr);
     }
 
-    fn filter_map_expr(&mut self, expr: P<ast::Expr>) -> Option<P<ast::Expr>> {
+    fn filter_map_expr(&mut self, expr: Box<ast::Expr>) -> Option<Box<ast::Expr>> {
         let mut expr = configure!(self, expr);
         mut_visit::walk_expr(self, &mut expr);
         Some(expr)
@@ -185,24 +183,24 @@ impl MutVisitor for CfgEval<'_> {
         mut_visit::walk_flat_map_stmt(self, stmt)
     }
 
-    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
+    fn flat_map_item(&mut self, item: Box<ast::Item>) -> SmallVec<[Box<ast::Item>; 1]> {
         let item = configure!(self, item);
         mut_visit::walk_flat_map_item(self, item)
     }
 
     fn flat_map_assoc_item(
         &mut self,
-        item: P<ast::AssocItem>,
+        item: Box<ast::AssocItem>,
         ctxt: AssocCtxt,
-    ) -> SmallVec<[P<ast::AssocItem>; 1]> {
+    ) -> SmallVec<[Box<ast::AssocItem>; 1]> {
         let item = configure!(self, item);
         mut_visit::walk_flat_map_assoc_item(self, item, ctxt)
     }
 
     fn flat_map_foreign_item(
         &mut self,
-        foreign_item: P<ast::ForeignItem>,
-    ) -> SmallVec<[P<ast::ForeignItem>; 1]> {
+        foreign_item: Box<ast::ForeignItem>,
+    ) -> SmallVec<[Box<ast::ForeignItem>; 1]> {
         let foreign_item = configure!(self, foreign_item);
         mut_visit::walk_flat_map_foreign_item(self, foreign_item)
     }

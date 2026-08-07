@@ -1,6 +1,6 @@
 use rustc_abi::Endian;
 
-use crate::spec::{Target, TargetMetadata, TargetOptions, base};
+use crate::spec::{Arch, LlvmAbi, Target, TargetMetadata, TargetOptions, base, cvs};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -13,11 +13,13 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 32,
         data_layout: "E-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64".into(),
-        arch: "mips".into(),
+        arch: Arch::Mips,
         options: TargetOptions {
             endian: Endian::Big,
             cpu: "mips32r2".into(),
             features: "+mips32r2,+fpxx,+nooddspreg".into(),
+            llvm_abiname: LlvmAbi::O32,
+            llvm_args: cvs!["-mno-check-zero-division"],
             max_atomic_width: Some(32),
             mcount: "_mcount".into(),
 

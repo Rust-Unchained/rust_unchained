@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 use std::mem::{self, discriminant};
 
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
@@ -9,6 +9,7 @@ use rustc_middle::bug;
 use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
 use rustc_middle::ty::{
     self, GenericArg, GenericArgKind, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt,
+    Unnormalized,
 };
 use tracing::debug;
 
@@ -32,8 +33,13 @@ pub(super) fn mangle<'tcx>(
             | DefPathData::ValueNs(_)
             | DefPathData::Closure
             | DefPathData::SyntheticCoroutineBody => {
-                instance_ty = tcx.type_of(ty_def_id).instantiate_identity();
+                instance_ty = tcx.type_of(ty_def_id).instantiate_identity().skip_norm_wip();
                 debug!(?instance_ty);
+                break;
+            }
+            DefPathData::GlobalAsm => {
+                // `global_asm!` doesn't have a type.
+                instance_ty = tcx.types.unit;
                 break;
             }
             _ => {
@@ -54,52 +60,64 @@ pub(super) fn mangle<'tcx>(
 
     // Erase regions because they may not be deterministic when hashed
     // and should not matter anyhow.
-    let instance_ty = tcx.erase_regions(instance_ty);
+    let instance_ty = tcx.erase_and_anonymize_regions(instance_ty);
 
     let hash = get_symbol_hash(tcx, instance, instance_ty, instantiating_crate);
 
-    let mut printer = SymbolPrinter { tcx, path: SymbolPath::new(), keep_within_component: false };
-    printer
-        .print_def_path(
-            def_id,
-            if let ty::InstanceKind::DropGlue(_, _)
-            | ty::InstanceKind::AsyncDropGlueCtorShim(_, _) = instance.def
-            {
-                // Add the name of the dropped type to the symbol name
-                &*instance.args
-            } else {
-                &[]
-            },
-        )
-        .unwrap();
+    let mut p = LegacySymbolMangler { tcx, path: SymbolPath::new(), keep_within_component: false };
+    p.print_def_path(
+        def_id,
+        if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, _))
+        | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(_, _))
+        | ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(_, _, _)) = instance.def
+        {
+            // Add the name of the dropped type to the symbol name
+            &*instance.args
+        } else if let ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(_, ty)) = instance.def {
+            let ty::Coroutine(_, cor_args) = ty.kind() else {
+                bug!();
+            };
+            let drop_ty = cor_args.first().unwrap().expect_ty();
+            tcx.mk_args(&[GenericArg::from(drop_ty)])
+        } else {
+            &[]
+        },
+    )
+    .unwrap();
 
     match instance.def {
-        ty::InstanceKind::ThreadLocalShim(..) => {
-            printer.write_str("{{tls-shim}}").unwrap();
+        ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..)) => {
+            p.write_str("{{tls-shim}}").unwrap();
         }
-        ty::InstanceKind::VTableShim(..) => {
-            printer.write_str("{{vtable-shim}}").unwrap();
+        ty::InstanceKind::Shim(ty::ShimKind::VTable(..)) => {
+            p.write_str("{{vtable-shim}}").unwrap();
         }
-        ty::InstanceKind::ReifyShim(_, reason) => {
-            printer.write_str("{{reify-shim").unwrap();
+        ty::InstanceKind::Shim(ty::ShimKind::Reify(_, reason)) => {
+            p.write_str("{{reify-shim").unwrap();
             match reason {
-                Some(ReifyReason::FnPtr) => printer.write_str("-fnptr").unwrap(),
-                Some(ReifyReason::Vtable) => printer.write_str("-vtable").unwrap(),
+                Some(ReifyReason::FnPtr) => p.write_str("-fnptr").unwrap(),
+                Some(ReifyReason::Vtable) => p.write_str("-vtable").unwrap(),
                 None => (),
             }
-            printer.write_str("}}").unwrap();
+            p.write_str("}}").unwrap();
         }
         // FIXME(async_closures): This shouldn't be needed when we fix
         // `Instance::ty`/`Instance::def_id`.
-        ty::InstanceKind::ConstructCoroutineInClosureShim { receiver_by_ref, .. } => {
-            printer
-                .write_str(if receiver_by_ref { "{{by-move-shim}}" } else { "{{by-ref-shim}}" })
+        ty::InstanceKind::Shim(ty::ShimKind::ConstructCoroutineInClosure {
+            receiver_by_ref,
+            ..
+        }) => {
+            p.write_str(if receiver_by_ref { "{{by-move-shim}}" } else { "{{by-ref-shim}}" })
                 .unwrap();
         }
         _ => {}
     }
 
-    printer.path.finish(hash)
+    if let ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(..)) = instance.def {
+        let _ = p.write_str("{{drop-shim}}");
+    }
+
+    p.path.finish(hash)
 }
 
 fn get_symbol_hash<'tcx>(
@@ -126,35 +144,33 @@ fn get_symbol_hash<'tcx>(
         // the main symbol name is not necessarily unique; hash in the
         // compiler's internal def-path, guaranteeing each symbol has a
         // truly unique path
-        tcx.def_path_hash(def_id).hash_stable(&mut hcx, &mut hasher);
+        tcx.def_path_hash(def_id).stable_hash(&mut hcx, &mut hasher);
 
         // Include the main item-type. Note that, in this case, the
         // assertions about `has_param` may not hold, but this item-type
         // ought to be the same for every reference anyway.
         assert!(!item_type.has_erasable_regions());
         hcx.while_hashing_spans(false, |hcx| {
-            item_type.hash_stable(hcx, &mut hasher);
+            item_type.stable_hash(hcx, &mut hasher);
 
             // If this is a function, we hash the signature as well.
             // This is not *strictly* needed, but it may help in some
             // situations, see the `run-make/a-b-a-linker-guard` test.
             if let ty::FnDef(..) = item_type.kind() {
-                item_type.fn_sig(tcx).hash_stable(hcx, &mut hasher);
+                item_type.fn_sig(tcx).stable_hash(hcx, &mut hasher);
             }
 
             // also include any type parameters (for generic items)
-            args.hash_stable(hcx, &mut hasher);
+            args.stable_hash(hcx, &mut hasher);
 
             if let Some(instantiating_crate) = instantiating_crate {
-                tcx.def_path_hash(instantiating_crate.as_def_id())
-                    .stable_crate_id()
-                    .hash_stable(hcx, &mut hasher);
+                tcx.stable_crate_id(instantiating_crate).stable_hash(hcx, &mut hasher);
             }
 
             // We want to avoid accidental collision between different types of instances.
             // Especially, `VTableShim`s and `ReifyShim`s may overlap with their original
             // instances without this.
-            discriminant(&instance.def).hash_stable(hcx, &mut hasher);
+            discriminant(&instance.def).stable_hash(hcx, &mut hasher);
         });
 
         // 64 bits should be enough to avoid collisions.
@@ -204,13 +220,13 @@ impl SymbolPath {
     }
 }
 
-struct SymbolPrinter<'tcx> {
+struct LegacySymbolMangler<'tcx> {
     tcx: TyCtxt<'tcx>,
     path: SymbolPath,
 
     // When `true`, `finalize_pending_component` isn't used.
-    // This is needed when recursing into `path_qualified`,
-    // or `path_generic_args`, as any nested paths are
+    // This is needed when recursing into `print_path_with_qualified`,
+    // or `print_path_with_generic_args`, as any nested paths are
     // logically within one component.
     keep_within_component: bool,
 }
@@ -219,23 +235,32 @@ struct SymbolPrinter<'tcx> {
 // `PrettyPrinter` aka pretty printing of e.g. types in paths,
 // symbol names should have their own printing machinery.
 
-impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
+impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
     fn print_region(&mut self, _region: ty::Region<'_>) -> Result<(), PrintError> {
+        // This might be reachable (via `pretty_print_dyn_existential`) even though
+        // `<Self As PrettyPrinter>::should_print_optional_region` returns false and
+        // `print_path_with_generic_args` filters out lifetimes. See #144994.
         Ok(())
     }
 
     fn print_type(&mut self, ty: Ty<'tcx>) -> Result<(), PrintError> {
         match *ty.kind() {
             // Print all nominal types as paths (unlike `pretty_print_type`).
-            ty::FnDef(def_id, args)
-            | ty::Alias(ty::Projection | ty::Opaque, ty::AliasTy { def_id, args, .. })
+            ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Projection { def_id } | ty::Opaque { def_id }, args, ..
+                },
+            )
             | ty::Closure(def_id, args)
             | ty::CoroutineClosure(def_id, args)
             | ty::Coroutine(def_id, args) => self.print_def_path(def_id, args),
+
+            ty::FnDef(def_id, args) => self.print_def_path(def_id, args.no_bound_vars().unwrap()),
 
             // The `pretty_print_type` formatting of array size depends on
             // -Zverbose-internals flag, so we cannot reuse it here.
@@ -254,7 +279,9 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
                 Ok(())
             }
 
-            ty::Alias(ty::Inherent, _) => panic!("unexpected inherent projection"),
+            ty::Alias(_, ty::AliasTy { kind: ty::Inherent { .. }, .. }) => {
+                panic!("unexpected inherent projection")
+            }
 
             _ => self.pretty_print_type(ty),
         }
@@ -281,7 +308,7 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
             ty::ConstKind::Value(cv) if cv.ty.is_integral() => {
                 // The `pretty_print_const` formatting depends on -Zverbose-internals
                 // flag, so we cannot reuse it here.
-                let scalar = cv.valtree.unwrap_leaf();
+                let scalar = cv.to_leaf();
                 let signed = matches!(cv.ty.kind(), ty::Int(_));
                 write!(
                     self,
@@ -294,16 +321,17 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
         Ok(())
     }
 
-    fn path_crate(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
+    fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
         self.write_str(self.tcx.crate_name(cnum).as_str())?;
         Ok(())
     }
-    fn path_qualified(
+
+    fn print_path_with_qualified(
         &mut self,
         self_ty: Ty<'tcx>,
         trait_ref: Option<ty::TraitRef<'tcx>>,
     ) -> Result<(), PrintError> {
-        // Similar to `pretty_path_qualified`, but for the other
+        // Similar to `pretty_print_path_with_qualified`, but for the other
         // types that are printed as paths (see `print_type` above).
         match self_ty.kind() {
             ty::FnDef(..)
@@ -316,18 +344,17 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
                 self.print_type(self_ty)
             }
 
-            _ => self.pretty_path_qualified(self_ty, trait_ref),
+            _ => self.pretty_print_path_with_qualified(self_ty, trait_ref),
         }
     }
 
-    fn path_append_impl(
+    fn print_path_with_impl(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
-        _disambiguated_data: &DisambiguatedDefPathData,
         self_ty: Ty<'tcx>,
         trait_ref: Option<ty::TraitRef<'tcx>>,
     ) -> Result<(), PrintError> {
-        self.pretty_path_append_impl(
+        self.pretty_print_path_with_impl(
             |cx| {
                 print_prefix(cx)?;
 
@@ -344,7 +371,8 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
             trait_ref,
         )
     }
-    fn path_append(
+
+    fn print_path_with_simple(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
         disambiguated_data: &DisambiguatedDefPathData,
@@ -367,7 +395,8 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
 
         Ok(())
     }
-    fn path_generic_args(
+
+    fn print_path_with_generic_args(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
         args: &[GenericArg<'tcx>],
@@ -375,8 +404,7 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
         print_prefix(self)?;
 
         let args =
-            args.iter().cloned().filter(|arg| !matches!(arg.unpack(), GenericArgKind::Lifetime(_)));
-
+            args.iter().cloned().filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
         if args.clone().next().is_some() {
             self.generic_delimiters(|cx| cx.comma_sep(args))
         } else {
@@ -390,7 +418,7 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
         args: &'tcx [GenericArg<'tcx>],
     ) -> Result<(), PrintError> {
         let self_ty = self.tcx.type_of(impl_def_id);
-        let impl_trait_ref = self.tcx.impl_trait_ref(impl_def_id);
+        let impl_trait_ref = self.tcx.impl_opt_trait_ref(impl_def_id);
         let generics = self.tcx.generics_of(impl_def_id);
         // We have two cases to worry about here:
         // 1. We're printing a nested item inside of an impl item, like an inner
@@ -409,13 +437,17 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
             || &args[..generics.count()]
                 == self
                     .tcx
-                    .erase_regions(ty::GenericArgs::identity_for_item(self.tcx, impl_def_id))
+                    .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
+                        self.tcx,
+                        impl_def_id,
+                    ))
                     .as_slice()
         {
             (
                 ty::TypingEnv::post_analysis(self.tcx, impl_def_id),
-                self_ty.instantiate_identity(),
-                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate_identity()),
+                self_ty.instantiate_identity().skip_norm_wip(),
+                impl_trait_ref
+                    .map(|impl_trait_ref| impl_trait_ref.instantiate_identity().skip_norm_wip()),
             )
         } else {
             assert!(
@@ -425,19 +457,24 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
             );
             (
                 ty::TypingEnv::fully_monomorphized(),
-                self_ty.instantiate(self.tcx, args),
-                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate(self.tcx, args)),
+                self_ty.instantiate(self.tcx, args).skip_norm_wip(),
+                impl_trait_ref.map(|impl_trait_ref| {
+                    impl_trait_ref.instantiate(self.tcx, args).skip_norm_wip()
+                }),
             )
         };
 
         match &mut impl_trait_ref {
             Some(impl_trait_ref) => {
                 assert_eq!(impl_trait_ref.self_ty(), self_ty);
-                *impl_trait_ref = self.tcx.normalize_erasing_regions(typing_env, *impl_trait_ref);
+                *impl_trait_ref = self
+                    .tcx
+                    .normalize_erasing_regions(typing_env, Unnormalized::new_wip(*impl_trait_ref));
                 self_ty = impl_trait_ref.self_ty();
             }
             None => {
-                self_ty = self.tcx.normalize_erasing_regions(typing_env, self_ty);
+                self_ty =
+                    self.tcx.normalize_erasing_regions(typing_env, Unnormalized::new_wip(self_ty));
             }
         }
 
@@ -445,13 +482,15 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
     }
 }
 
-impl<'tcx> PrettyPrinter<'tcx> for SymbolPrinter<'tcx> {
-    fn should_print_region(&self, _region: ty::Region<'_>) -> bool {
+impl<'tcx> PrettyPrinter<'tcx> for LegacySymbolMangler<'tcx> {
+    fn should_print_optional_region(&self, _region: ty::Region<'_>) -> bool {
         false
     }
+
+    // Identical to `PrettyPrinter::comma_sep` except there is no space after each comma.
     fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
     where
-        T: Print<'tcx, Self>,
+        T: Print<Self>,
     {
         if let Some(first) = elems.next() {
             first.print(self)?;
@@ -479,7 +518,7 @@ impl<'tcx> PrettyPrinter<'tcx> for SymbolPrinter<'tcx> {
     }
 }
 
-impl fmt::Write for SymbolPrinter<'_> {
+impl fmt::Write for LegacySymbolMangler<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         // Name sanitation. LLVM will happily accept identifiers with weird names, but
         // gas doesn't!

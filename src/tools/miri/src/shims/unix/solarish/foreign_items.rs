@@ -1,6 +1,8 @@
+use rustc_abi::CanonAbi;
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::callconv::{Conv, FnAbi};
+use rustc_target::callconv::FnAbi;
+use rustc_target::spec::Os;
 
 use crate::shims::unix::foreign_items::EvalContextExt as _;
 use crate::shims::unix::linux_like::epoll::EvalContextExt as _;
@@ -25,33 +27,35 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match link_name.as_str() {
             // epoll, eventfd (NOT available on Solaris!)
             "epoll_create1" => {
-                this.assert_target_os("illumos", "epoll_create1");
-                let [flag] = this.check_shim(abi, Conv::C, link_name, args)?;
+                this.assert_target_os(Os::Illumos, "epoll_create1");
+                let [flag] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.epoll_create1(flag)?;
                 this.write_scalar(result, dest)?;
             }
             "epoll_ctl" => {
-                this.assert_target_os("illumos", "epoll_ctl");
-                let [epfd, op, fd, event] = this.check_shim(abi, Conv::C, link_name, args)?;
+                this.assert_target_os(Os::Illumos, "epoll_ctl");
+                let [epfd, op, fd, event] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.epoll_ctl(epfd, op, fd, event)?;
                 this.write_scalar(result, dest)?;
             }
             "epoll_wait" => {
-                this.assert_target_os("illumos", "epoll_wait");
+                this.assert_target_os(Os::Illumos, "epoll_wait");
                 let [epfd, events, maxevents, timeout] =
-                    this.check_shim(abi, Conv::C, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.epoll_wait(epfd, events, maxevents, timeout, dest)?;
             }
             "eventfd" => {
-                this.assert_target_os("illumos", "eventfd");
-                let [val, flag] = this.check_shim(abi, Conv::C, link_name, args)?;
+                this.assert_target_os(Os::Illumos, "eventfd");
+                let [val, flag] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.eventfd(val, flag)?;
                 this.write_scalar(result, dest)?;
             }
 
             // Threading
             "pthread_setname_np" => {
-                let [thread, name] = this.check_shim(abi, Conv::C, link_name, args)?;
+                let [thread, name] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 // THREAD_NAME_MAX allows a thread name of 31+1 length
                 // https://github.com/illumos/illumos-gate/blob/7671517e13b8123748eda4ef1ee165c6d9dba7fe/usr/src/uts/common/sys/thread.h#L613
                 let max_len = 32;
@@ -69,7 +73,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(res, dest)?;
             }
             "pthread_getname_np" => {
-                let [thread, name, len] = this.check_shim(abi, Conv::C, link_name, args)?;
+                let [thread, name, len] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 // See https://illumos.org/man/3C/pthread_getname_np for the error codes.
                 let res = match this.pthread_getname_np(
                     this.read_scalar(thread)?,
@@ -85,44 +90,89 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             // File related shims
-            "stat" | "stat64" => {
-                let [path, buf] = this.check_shim(abi, Conv::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_stat(path, buf)?;
+            "stat" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "lstat" | "lstat64" => {
-                let [path, buf] = this.check_shim(abi, Conv::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_lstat(path, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "fstat" | "fstat64" => {
-                let [fd, buf] = this.check_shim(abi, Conv::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_fstat(fd, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "readdir" => {
-                let [dirp] = this.check_shim(abi, Conv::C, link_name, args)?;
-                let result = this.linux_solarish_readdir64("dirent", dirp)?;
+            "lstat" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
 
             // Sockets and pipes
             "__xnet_socketpair" => {
                 let [domain, type_, protocol, sv] =
-                    this.check_shim(abi, Conv::C, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.socketpair(domain, type_, protocol, sv)?;
+                this.write_scalar(result, dest)?;
+            }
+
+            // Network sockets
+            "__xnet_socket" | "__xnet7_socket" => {
+                let [domain, type_, protocol] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, i32, i32) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.socket(domain, type_, protocol)?;
+                this.write_scalar(result, dest)?;
+            }
+            "__xnet_bind" => {
+                let [socket, address, address_len] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, *const _, libc::socklen_t) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.bind(socket, address, address_len)?;
+                this.write_scalar(result, dest)?;
+            }
+            "__xnet_connect" => {
+                let [socket, address, address_len] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, *const _, libc::socklen_t) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.connect(socket, address, address_len, dest)?;
+            }
+            "__xnet_getaddrinfo" => {
+                let [node, service, hints, res] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(*const _, *const _, *const _, *mut _) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.getaddrinfo(node, service, hints, res)?;
+                this.write_scalar(result, dest)?;
+            }
+            "__xnet_getsockopt" => {
+                let [socket, level, option_name, option_value, option_len] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, i32, i32, *mut _, *mut _) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result =
+                    this.getsockopt(socket, level, option_name, option_value, option_len)?;
                 this.write_scalar(result, dest)?;
             }
 
             // Miscellaneous
             "___errno" => {
-                let [] = this.check_shim(abi, Conv::C, link_name, args)?;
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let errno_place = this.last_error_place()?;
                 this.write_scalar(errno_place.to_ref(this).to_scalar(), dest)?;
             }
 
             "stack_getbounds" => {
-                let [stack] = this.check_shim(abi, Conv::C, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [stack] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let stack = this.deref_pointer_as(stack, this.libc_ty_layout("stack_t"))?;
 
                 this.write_int_fields_named(
@@ -140,7 +190,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             "pset_info" => {
-                let [pset, tpe, cpus, list] = this.check_shim(abi, Conv::C, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [pset, tpe, cpus, list] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 // We do not need to handle the current process cpu mask, available_parallelism
                 // implementation pass null anyway. We only care for the number of
                 // cpus.
@@ -169,7 +221,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             "__sysconf_xpg7" => {
-                let [val] = this.check_shim(abi, Conv::C, link_name, args)?;
+                let [val] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.sysconf(val)?;
                 this.write_scalar(result, dest)?;
             }

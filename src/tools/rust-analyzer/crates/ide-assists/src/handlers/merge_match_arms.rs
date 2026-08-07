@@ -2,12 +2,12 @@ use hir::Type;
 use ide_db::FxHashMap;
 use std::iter::successors;
 use syntax::{
+    Direction,
     algo::neighbor,
     ast::{self, AstNode, HasName},
-    Direction,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists, TextRange};
+use crate::{AssistContext, AssistId, Assists, TextRange};
 
 // Assist: merge_match_arms
 //
@@ -33,7 +33,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, TextRange};
 //     }
 // }
 // ```
-pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let current_arm = ctx.find_node_at_trimmed_offset::<ast::MatchArm>()?;
     // Don't try to handle arms with guards for now - can add support for this later
     if current_arm.guard().is_some() {
@@ -73,7 +73,7 @@ pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
     }
 
     acc.add(
-        AssistId("merge_match_arms", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("merge_match_arms"),
         "Merge match arms",
         current_text_range,
         |edit| {
@@ -105,9 +105,9 @@ fn contains_placeholder(a: &ast::MatchArm) -> bool {
 }
 
 fn are_same_types(
-    current_arm_types: &FxHashMap<String, Option<Type>>,
+    current_arm_types: &FxHashMap<String, Option<Type<'_>>>,
     arm: &ast::MatchArm,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> bool {
     let arm_types = get_arm_types(ctx, arm);
     for (other_arm_type_name, other_arm_type) in arm_types {
@@ -121,15 +121,15 @@ fn are_same_types(
     true
 }
 
-fn get_arm_types(
-    context: &AssistContext<'_>,
+fn get_arm_types<'db>(
+    context: &AssistContext<'_, 'db>,
     arm: &ast::MatchArm,
-) -> FxHashMap<String, Option<Type>> {
-    let mut mapping: FxHashMap<String, Option<Type>> = FxHashMap::default();
+) -> FxHashMap<String, Option<Type<'db>>> {
+    let mut mapping: FxHashMap<String, Option<Type<'db>>> = FxHashMap::default();
 
-    fn recurse(
-        map: &mut FxHashMap<String, Option<Type>>,
-        ctx: &AssistContext<'_>,
+    fn recurse<'db>(
+        map: &mut FxHashMap<String, Option<Type<'db>>>,
+        ctx: &AssistContext<'_, 'db>,
         pat: &Option<ast::Pat>,
     ) {
         if let Some(local_pat) = pat {
@@ -160,9 +160,12 @@ fn get_arm_types(
                     }
                 }
                 ast::Pat::IdentPat(ident_pat) => {
-                    if let Some(name) = ident_pat.name() {
+                    if let Some(name) = ident_pat.name()
+                        && ctx.sema.to_def(ident_pat).is_some()
+                    {
                         let pat_type = ctx.sema.type_of_binding_in_pat(ident_pat);
-                        map.insert(name.text().to_string(), pat_type);
+
+                        map.insert(name.text().to_owned(), pat_type);
                     }
                 }
                 _ => (),
@@ -206,6 +209,40 @@ fn main() {
     let y = match x {
         X::A | X::B => { 1i32 },
         X::C => { 2i32 }
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn merge_match_arms_ambiguous_ident_patterns() {
+        check_assist(
+            merge_match_arms,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+use X::*;
+
+fn main() {
+    let x = A;
+    let y = match x {
+        A => { 1i32$0 }
+        B => { 1i32 }
+        C => { 2i32 }
+    }
+}
+"#,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+use X::*;
+
+fn main() {
+    let x = A;
+    let y = match x {
+        A | B => { 1i32 },
+        C => { 2i32 }
     }
 }
 "#,

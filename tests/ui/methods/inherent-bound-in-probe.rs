@@ -1,3 +1,4 @@
+//@ compile-flags: -Zwrite-long-types-to-disk=yes
 // Fixes #110131
 //
 // The issue is that we were constructing an `ImplDerived` cause code for the
@@ -40,7 +41,7 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         Helper::new(&self.0)
-        //~^ ERROR overflow evaluating the requirement `&_: IntoIterator`
+        //~^ ERROR: overflow evaluating the requirement `&HashMap<_, _, _, _>: IntoIterator`
     }
 }
 

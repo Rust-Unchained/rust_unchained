@@ -67,5 +67,41 @@ error: there is no need to manually implement bit rotation
 LL |     let y_u64_as = (x_u32 as u64 >> 8) | ((x_u32 as u64) << 56);
    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `(x_u32 as u64).rotate_right(8)`
 
-error: aborting due to 11 previous errors
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:33:13
+   |
+LL |     let _ = (x_i64 >> N) | (x_i64 << (64 - N));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `x_i64.rotate_right(N)`
+
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:52:13
+   |
+LL |     let _ = (x << s) | (x >> (32 - s));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `x.rotate_left(s)`
+
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:54:13
+   |
+LL |     let _ = (x << s) | (x >> (31 ^ s));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `x.rotate_left(s)`
+
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:57:13
+   |
+LL |     let _ = (x >> 9) | (x << (32 - 9));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `x.rotate_right(9)`
+
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:76:13
+   |
+LL |     let _ = (test_expr!(x) << 3) | (test_expr!(x) >> 29);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `test_expr!(x).rotate_left(3)`
+
+error: there is no need to manually implement bit rotation
+  --> tests/ui/manual_rotate.rs:81:13
+   |
+LL |     let _ = (x.inner << test_expr!(y)) | (x.inner >> (32 - test_expr!(y)));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: this expression can be rewritten as: `x.inner.rotate_left(test_expr!(y))`
+
+error: aborting due to 17 previous errors
 

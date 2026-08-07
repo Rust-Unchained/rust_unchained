@@ -1,9 +1,9 @@
 //@aux-build:proc_macro_attr.rs
+#![warn(clippy::duplicated_attributes, clippy::duplicated_attributes)] //~ duplicated_attributes
 #![feature(rustc_attrs)]
-#![warn(clippy::duplicated_attributes)]
 #![cfg(any(unix, windows))]
 #![allow(dead_code)]
-#![allow(dead_code)] //~ ERROR: duplicated attribute
+#![allow(dead_code)] //~ duplicated_attributes
 #![cfg(any(unix, windows))] // Should not warn!
 
 #[macro_use]
@@ -11,7 +11,7 @@ extern crate proc_macro_attr;
 
 #[cfg(any(unix, windows, target_os = "linux"))]
 #[allow(dead_code)]
-#[allow(dead_code)] //~ ERROR: duplicated attribute
+#[allow(dead_code)] //~ duplicated_attributes
 #[cfg(any(unix, windows, target_os = "linux"))] // Should not warn!
 fn foo() {}
 
@@ -21,7 +21,7 @@ fn foo() {}
 fn bar() {}
 
 // No warning:
-#[rustc_on_unimplemented(on(_Self = "&str", label = "`a"), on(_Self = "alloc::string::String", label = "a"))]
+#[rustc_on_unimplemented(on(Self = "&str", label = "`a"), on(Self = "alloc::string::String", label = "a"))]
 trait Abc {}
 
 #[proc_macro_attr::duplicated_attr()] // Should not warn!

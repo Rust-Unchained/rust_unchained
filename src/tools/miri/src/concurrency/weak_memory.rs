@@ -19,6 +19,9 @@
 //!   that C++20 intended to copy (<https://plv.mpi-sws.org/scfix/paper.pdf>); a change was
 //!   introduced when translating the math to English. According to Viktor Vafeiadis, this
 //!   difference is harmless. So we stick to what the standard says, and allow fewer behaviors.)
+//! - If an SC store happens after a load (of any ordering), then the existing store (of any ordering)
+//!   seen by the load is marked as an SC store. (The paper's model only marks stores that happen-before
+//!   an SC store as SC.)
 //! - SC fences are treated like AcqRel RMWs to a global clock, to ensure they induce enough
 //!   synchronization with the surrounding accesses. This rules out legal behavior, but it is really
 //!   hard to be more precise here.
@@ -62,8 +65,11 @@
 //! You can refer to test cases in weak_memory/extra_cpp.rs and weak_memory/extra_cpp_unsafe.rs for examples of these operations.
 
 // Our and the author's own implementation (tsan11) of the paper have some deviations from the provided operational semantics in §5.3:
-// 1. In the operational semantics, store elements keep a copy of the atomic object's vector clock (AtomicCellClocks::sync_vector in miri),
-// but this is not used anywhere so it's omitted here.
+// 1. In the operational semantics, loads acquire the vector clock of the atomic location
+// irrespective of which store buffer element is loaded. That's incorrect; the synchronization clock
+// needs to be tracked per-store-buffer-element. (The paper has a field "clocks" for that purpose,
+// but it is not actuallt used.) tsan11 does this correctly
+// (https://github.com/ChrisLidbury/tsan11/blob/ecbd6b81e9b9454e01cba78eb9d88684168132c7/lib/tsan/rtl/tsan_relaxed.cc#L305).
 //
 // 2. In the operational semantics, each store element keeps the timestamp of a thread when it loads from the store.
 // If the same thread loads from the same store element multiple times, then the timestamps at all loads are saved in a list of load elements.
@@ -74,10 +80,11 @@
 //
 // 3. §4.5 of the paper wants an SC store to mark all existing stores in the buffer that happens before it
 // as SC. This is not done in the operational semantics but implemented correctly in tsan11
-// (https://github.com/ChrisLidbury/tsan11/blob/ecbd6b81e9b9454e01cba78eb9d88684168132c7/lib/tsan/rtl/tsan_relaxed.cc#L160-L167)
-// and here.
+// (https://github.com/ChrisLidbury/tsan11/blob/ecbd6b81e9b9454e01cba78eb9d88684168132c7/lib/tsan/rtl/tsan_relaxed.cc#L160-L167).
+// On top of this we've added a C++20 change: if the current SC store happens after a load, then the store seen by that load
+// is marked SC.
 //
-// 4. W_SC ; R_SC case requires the SC load to ignore all but last store maked SC (stores not marked SC are not
+// 4. W_SC ; R_SC case requires the SC load to ignore all but last store marked SC (stores not marked SC are not
 // affected). But this rule is applied to all loads in ReadsFromSet from the paper (last two lines of code), not just SC load.
 // This is implemented correctly in tsan11
 // (https://github.com/ChrisLidbury/tsan11/blob/ecbd6b81e9b9454e01cba78eb9d88684168132c7/lib/tsan/rtl/tsan_relaxed.cc#L295)
@@ -88,9 +95,11 @@ use std::collections::VecDeque;
 
 use rustc_data_structures::fx::FxHashMap;
 
+use super::AllocDataRaceHandler;
 use super::data_race::{GlobalState as DataRaceState, ThreadClockSet};
-use super::range_object_map::{AccessType, RangeObjectMap};
 use super::vector_clock::{VClock, VTimestamp, VectorIdx};
+use crate::concurrency::GlobalDataRaceHandler;
+use crate::data_structures::range_object_map::{AccessType, RangeObjectMap};
 use crate::*;
 
 pub type AllocState = StoreBufferAlloc;
@@ -136,15 +145,17 @@ enum LoadRecency {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoreElement {
-    /// The identifier of the vector index, corresponding to a thread
-    /// that performed the store.
-    store_index: VectorIdx,
-
-    /// Whether this store is SC.
-    is_seqcst: bool,
-
+    /// The thread that performed the store.
+    store_thread: VectorIdx,
     /// The timestamp of the storing thread when it performed the store
-    timestamp: VTimestamp,
+    store_timestamp: VTimestamp,
+
+    /// The vector clock that can be acquired by loading this store.
+    sync_clock: VClock,
+
+    /// Whether this store is SC. If a store happens-before or precedes in `mo` another SC store,
+    /// then it is also marked as SC.
+    is_seqcst: bool,
 
     /// The value of this store. `None` means uninitialized.
     // FIXME: Currently, we cannot represent partial initialization.
@@ -157,9 +168,12 @@ struct StoreElement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LoadInfo {
-    /// Timestamp of first loads from this store element by each thread
+    /// Timestamp of first loads from this store element by each thread.
     timestamps: FxHashMap<VectorIdx, VTimestamp>,
-    /// Whether this store element has been read by an SC load
+    /// Whether this store element has been read by an SC load.
+    /// This is crucial to ensure we respect coherence-ordered-before. Concretely we use
+    /// this to ensure that if a store element is seen by an SC load, then all later SC loads
+    /// cannot see `mo`-earlier store elements.
     sc_loaded: bool,
 }
 
@@ -168,11 +182,11 @@ impl StoreBufferAlloc {
         Self { store_buffers: RefCell::new(RangeObjectMap::new()) }
     }
 
-    /// When a non-atomic access happens on a location that has been atomically accessed
-    /// before without data race, we can determine that the non-atomic access fully happens
+    /// When a non-atomic write happens on a location that has been atomically accessed
+    /// before without data race, we can determine that the non-atomic write fully happens
     /// after all the prior atomic writes so the location no longer needs to exhibit
-    /// any weak memory behaviours until further atomic accesses.
-    pub fn memory_accessed(&self, range: AllocRange, global: &DataRaceState) {
+    /// any weak memory behaviours until further atomic writes.
+    pub fn non_atomic_write(&self, range: AllocRange, global: &DataRaceState) {
         if !global.ongoing_action_data_race_free() {
             let mut buffers = self.store_buffers.borrow_mut();
             let access_type = buffers.access_type(range);
@@ -199,11 +213,10 @@ impl StoreBufferAlloc {
         range: AllocRange,
     ) -> InterpResult<'tcx, Option<Ref<'_, StoreBuffer>>> {
         let access_type = self.store_buffers.borrow().access_type(range);
-        let pos = match access_type {
-            AccessType::PerfectlyOverlapping(pos) => pos,
+        let AccessType::PerfectlyOverlapping(pos) = access_type else {
             // If there is nothing here yet, that means there wasn't an atomic write yet so
             // we can't return anything outdated.
-            _ => return interp_ok(None),
+            return interp_ok(None);
         };
         let store_buffer = Ref::map(self.store_buffers.borrow(), |buffer| &buffer[pos]);
         interp_ok(Some(store_buffer))
@@ -221,11 +234,22 @@ impl StoreBufferAlloc {
         let pos = match access_type {
             AccessType::PerfectlyOverlapping(pos) => pos,
             AccessType::Empty(pos) => {
+                // We can use `init` for a new store buffer (with a default `sync_clock` that
+                // acquires nothing) because there was no data race and no previous atomic write
+                // either.
                 buffers.insert_at_pos(pos, range, StoreBuffer::new(init));
                 pos
             }
             AccessType::ImperfectlyOverlapping(pos_range) => {
-                // Once we reach here we would've already checked that this access is not racy.
+                // We can use `init` for a new store buffer (with a default `sync_clock` that
+                // acquires nothing) because there was no data race and all previous atomic writes
+                // are fully synchronized (as otherwise the imperfect overlap would be UB).
+                // It is tempting to try to sanity-check this against the data race clock view of
+                // whether there was any overlap, but that is very tricky: because we are skipping
+                // clock tracking until the first thread is spawned, we don't actually have a good
+                // view of whether a given atomic access "creates a new atomic object" or not.
+                // A sanity check would require is to always track clocks for atomic accesses, which
+                // does show up in benchmarks so we don't do it.
                 buffers.remove_pos_range(pos_range.clone());
                 buffers.insert_at_pos(pos_range.start, range, StoreBuffer::new(init));
                 pos_range.start
@@ -241,8 +265,10 @@ impl<'tcx> StoreBuffer {
         let store_elem = StoreElement {
             // The thread index and timestamp of the initialisation write
             // are never meaningfully used, so it's fine to leave them as 0
-            store_index: VectorIdx::from(0),
-            timestamp: VTimestamp::ZERO,
+            store_thread: VectorIdx::from(0),
+            store_timestamp: VTimestamp::ZERO,
+            // The initialization write is non-atomic so nothing can be acquired.
+            sync_clock: VClock::default(),
             val: init,
             is_seqcst: false,
             load_info: RefCell::new(LoadInfo::default()),
@@ -271,7 +297,7 @@ impl<'tcx> StoreBuffer {
         thread_mgr: &ThreadManager<'_>,
         is_seqcst: bool,
         rng: &mut (impl rand::Rng + ?Sized),
-        validate: impl FnOnce() -> InterpResult<'tcx>,
+        validate: impl FnOnce(Option<&VClock>) -> InterpResult<'tcx>,
     ) -> InterpResult<'tcx, (Option<Scalar>, LoadRecency)> {
         // Having a live borrow to store_buffer while calling validate_atomic_load is fine
         // because the race detector doesn't touch store_buffer
@@ -288,7 +314,7 @@ impl<'tcx> StoreBuffer {
         // after we've picked a store element from the store buffer, as presented
         // in ATOMIC LOAD rule of the paper. This is because fetch_store
         // requires access to ThreadClockSet.clock, which is updated by the race detector
-        validate()?;
+        validate(Some(&store_elem.sync_clock))?;
 
         let (index, clocks) = global.active_thread_state(thread_mgr);
         let loaded = store_elem.load_impl(index, &clocks, is_seqcst);
@@ -301,10 +327,11 @@ impl<'tcx> StoreBuffer {
         global: &DataRaceState,
         thread_mgr: &ThreadManager<'_>,
         is_seqcst: bool,
+        sync_clock: VClock,
     ) -> InterpResult<'tcx> {
         let (index, clocks) = global.active_thread_state(thread_mgr);
 
-        self.store_impl(val, index, &clocks.clock, is_seqcst);
+        self.store_impl(val, index, &clocks.clock, is_seqcst, sync_clock);
         interp_ok(())
     }
 
@@ -331,7 +358,9 @@ impl<'tcx> StoreBuffer {
                     return false;
                 }
 
-                keep_searching = if store_elem.timestamp <= clocks.clock[store_elem.store_index] {
+                keep_searching = if store_elem.store_timestamp
+                    <= clocks.clock[store_elem.store_thread]
+                {
                     // CoWR: if a store happens-before the current load,
                     // then we can't read-from anything earlier in modification order.
                     // C++20 §6.9.2.2 [intro.races] paragraph 18
@@ -343,7 +372,7 @@ impl<'tcx> StoreBuffer {
                     // then we cannot read-from anything earlier in modification order.
                     // C++20 §6.9.2.2 [intro.races] paragraph 16
                     false
-                } else if store_elem.timestamp <= clocks.write_seqcst[store_elem.store_index]
+                } else if store_elem.store_timestamp <= clocks.write_seqcst[store_elem.store_thread]
                     && store_elem.is_seqcst
                 {
                     // The current non-SC load, which may be sequenced-after an SC fence,
@@ -351,9 +380,9 @@ impl<'tcx> StoreBuffer {
                     // C++17 §32.4 [atomics.order] paragraph 4
                     false
                 } else if is_seqcst
-                    && store_elem.timestamp <= clocks.read_seqcst[store_elem.store_index]
+                    && store_elem.store_timestamp <= clocks.read_seqcst[store_elem.store_thread]
                 {
-                    // The current SC load cannot read-before the last store sequenced-before
+                    // The current SC load cannot read-from any but the last store sequenced-before
                     // the last SC fence.
                     // C++17 §32.4 [atomics.order] paragraph 5
                     false
@@ -371,7 +400,7 @@ impl<'tcx> StoreBuffer {
             })
             .filter(|&store_elem| {
                 if is_seqcst && store_elem.is_seqcst {
-                    // An SC load needs to ignore all but last store maked SC (stores not marked SC are not
+                    // An SC load needs to ignore all but last store marked SC (stores not marked SC are not
                     // affected)
                     let include = !found_sc;
                     found_sc = true;
@@ -389,17 +418,19 @@ impl<'tcx> StoreBuffer {
         }
     }
 
-    /// ATOMIC STORE IMPL in the paper (except we don't need the location's vector clock)
+    /// ATOMIC STORE IMPL in the paper
     fn store_impl(
         &mut self,
         val: Scalar,
         index: VectorIdx,
         thread_clock: &VClock,
         is_seqcst: bool,
+        sync_clock: VClock,
     ) {
         let store_elem = StoreElement {
-            store_index: index,
-            timestamp: thread_clock[index],
+            store_thread: index,
+            store_timestamp: thread_clock[index],
+            sync_clock,
             // In the language provided in the paper, an atomic store takes the value from a
             // non-atomic memory location.
             // But we already have the immediate value here so we don't need to do the memory
@@ -413,11 +444,23 @@ impl<'tcx> StoreBuffer {
         }
         self.buffer.push_back(store_elem);
         if is_seqcst {
-            // Every store that happens before this needs to be marked as SC
-            // so that in a later SC load, only the last SC store (i.e. this one) or stores that
-            // aren't ordered by hb with the last SC is picked.
+            // Every store that happens-before or is coherence-ordered before the ongoing SC store
+            // needs to be marked as SC, so that in a later SC load, only the latest SC-marked store
+            // or unmarked stores can be picked.
             self.buffer.iter_mut().rev().for_each(|elem| {
-                if elem.timestamp <= thread_clock[elem.store_index] {
+                if elem.store_timestamp <= thread_clock[elem.store_thread] {
+                    // This store happens-before the ongoing SC store.
+                    elem.is_seqcst = true;
+                } else if elem
+                    .load_info
+                    .borrow()
+                    .timestamps
+                    .iter()
+                    .any(|(&idx, &load_ts)| load_ts <= thread_clock[idx])
+                {
+                    // This store has a load which happens before the ongoing store.
+                    // This store must precede the onging store in modification order,
+                    // and is therefore coherence-ordered before the ongoing SC store.
                     elem.is_seqcst = true;
                 }
             })
@@ -449,6 +492,8 @@ impl StoreElement {
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    /// Update the store buffer after an RMW.
+    /// Does nothing if we are currently not detecting races (e.g. single-threaded mode).
     fn buffered_atomic_rmw(
         &mut self,
         new_val: Scalar,
@@ -459,34 +504,58 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let (alloc_id, base_offset, ..) = this.ptr_get_alloc_id(place.ptr(), 0)?;
         if let (
-            crate::AllocExtra { weak_memory: Some(alloc_buffers), .. },
-            crate::MiriMachine { data_race: Some(global), threads, .. },
+            crate::AllocExtra {
+                data_race: AllocDataRaceHandler::Vclocks(data_race_clocks, Some(alloc_buffers)),
+                ..
+            },
+            crate::MiriMachine {
+                data_race: GlobalDataRaceHandler::Vclocks(global), threads, ..
+            },
         ) = this.get_alloc_extra_mut(alloc_id)?
+            && global.race_detecting()
         {
             if atomic == AtomicRwOrd::SeqCst {
                 global.sc_read(threads);
                 global.sc_write(threads);
             }
             let range = alloc_range(base_offset, place.layout.size);
+            let sync_clock = data_race_clocks.sync_clock(range);
             let buffer = alloc_buffers.get_or_create_store_buffer_mut(range, Some(init))?;
+            // The RMW always reads from the most recent store.
             buffer.read_from_last_store(global, threads, atomic == AtomicRwOrd::SeqCst);
-            buffer.buffered_write(new_val, global, threads, atomic == AtomicRwOrd::SeqCst)?;
+            buffer.buffered_write(
+                new_val,
+                global,
+                threads,
+                atomic == AtomicRwOrd::SeqCst,
+                sync_clock,
+            )?;
         }
         interp_ok(())
     }
 
+    /// Perform a store buffer load. Returning `None` indicates a read of uninitialized memory.
+    /// Does nothing if we are currently not detecting races (e.g. single-threaded mode).
+    ///
+    /// `latest_in_mo` must be the most recent value according to the mo relation.
+    /// The argument to `validate` is the synchronization clock of the memory that is being read,
+    /// if we are reading from a store buffer element.
     fn buffered_atomic_read(
         &self,
         place: &MPlaceTy<'tcx>,
         atomic: AtomicReadOrd,
         latest_in_mo: Scalar,
-        validate: impl FnOnce() -> InterpResult<'tcx>,
+        validate: impl FnOnce(Option<&VClock>) -> InterpResult<'tcx>,
     ) -> InterpResult<'tcx, Option<Scalar>> {
         let this = self.eval_context_ref();
         'fallback: {
-            if let Some(global) = &this.machine.data_race {
+            if let Some(global) = this.machine.data_race.as_vclocks_ref()
+                && global.race_detecting()
+            {
                 let (alloc_id, base_offset, ..) = this.ptr_get_alloc_id(place.ptr(), 0)?;
-                if let Some(alloc_buffers) = this.get_alloc_extra(alloc_id)?.weak_memory.as_ref() {
+                if let Some(alloc_buffers) =
+                    this.get_alloc_extra(alloc_id)?.data_race.as_weak_memory_ref()
+                {
                     if atomic == AtomicReadOrd::SeqCst {
                         global.sc_read(&this.machine.threads);
                     }
@@ -516,14 +585,19 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
         // Race detector or weak memory disabled, simply read the latest value
-        validate()?;
+        validate(None)?;
         interp_ok(Some(latest_in_mo))
     }
 
     /// Add the given write to the store buffer. (Does not change machine memory.)
+    /// Must only be called after we determined that there is no data race or mixed-size race.
+    /// Does nothing if we are currently not detecting races (e.g. single-threaded mode).
     ///
     /// `init` says with which value to initialize the store buffer in case there wasn't a store
-    /// buffer for this memory range before.
+    /// buffer for this memory range before. `None` means the memory does not contain a valid
+    /// scalar.
+    ///
+    /// Must be called *after* `validate_atomic_store` to ensure that `sync_clock` is up-to-date.
     fn buffered_atomic_write(
         &mut self,
         val: Scalar,
@@ -534,17 +608,32 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let (alloc_id, base_offset, ..) = this.ptr_get_alloc_id(dest.ptr(), 0)?;
         if let (
-            crate::AllocExtra { weak_memory: Some(alloc_buffers), .. },
-            crate::MiriMachine { data_race: Some(global), threads, .. },
+            crate::AllocExtra {
+                data_race: AllocDataRaceHandler::Vclocks(data_race_clocks, Some(alloc_buffers)),
+                ..
+            },
+            crate::MiriMachine {
+                data_race: GlobalDataRaceHandler::Vclocks(global), threads, ..
+            },
         ) = this.get_alloc_extra_mut(alloc_id)?
+            && global.race_detecting()
         {
             if atomic == AtomicWriteOrd::SeqCst {
                 global.sc_write(threads);
             }
 
-            let buffer = alloc_buffers
-                .get_or_create_store_buffer_mut(alloc_range(base_offset, dest.layout.size), init)?;
-            buffer.buffered_write(val, global, threads, atomic == AtomicWriteOrd::SeqCst)?;
+            let range = alloc_range(base_offset, dest.layout.size);
+            // It's a bit annoying that we have to go back to the data race part to get the clock...
+            // but it does make things a lot simpler.
+            let sync_clock = data_race_clocks.sync_clock(range);
+            let buffer = alloc_buffers.get_or_create_store_buffer_mut(range, init)?;
+            buffer.buffered_write(
+                val,
+                global,
+                threads,
+                atomic == AtomicWriteOrd::SeqCst,
+                sync_clock,
+            )?;
         }
 
         // Caller should've written to dest with the vanilla scalar write, we do nothing here
@@ -561,13 +650,15 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
 
-        if let Some(global) = &this.machine.data_race {
+        if let Some(global) = this.machine.data_race.as_vclocks_ref() {
             if atomic == AtomicReadOrd::SeqCst {
                 global.sc_read(&this.machine.threads);
             }
             let size = place.layout.size;
             let (alloc_id, base_offset, ..) = this.ptr_get_alloc_id(place.ptr(), 0)?;
-            if let Some(alloc_buffers) = this.get_alloc_extra(alloc_id)?.weak_memory.as_ref() {
+            if let Some(alloc_buffers) =
+                this.get_alloc_extra(alloc_id)?.data_race.as_weak_memory_ref()
+            {
                 let Some(buffer) =
                     alloc_buffers.get_store_buffer(alloc_range(base_offset, size))?
                 else {

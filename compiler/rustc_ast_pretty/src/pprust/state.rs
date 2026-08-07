@@ -10,20 +10,20 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rustc_ast::attr::AttrIdGenerator;
-use rustc_ast::ptr::P;
-use rustc_ast::token::{self, CommentKind, Delimiter, IdentIsRaw, Token, TokenKind};
 use rustc_ast::tokenstream::{Spacing, TokenStream, TokenTree};
 use rustc_ast::util::classify;
 use rustc_ast::util::comments::{Comment, CommentStyle};
 use rustc_ast::{
-    self as ast, AttrArgs, BindingMode, BlockCheckMode, ByRef, DelimArgs, GenericArg, GenericBound,
-    InlineAsmOperand, InlineAsmOptions, InlineAsmRegOrRegClass, InlineAsmTemplatePiece, PatKind,
-    RangeEnd, RangeSyntax, Safety, SelfKind, Term, attr,
+    self as ast, AttrArgs, AttrKind, BindingMode, BlockCheckMode, ByRef, DelimArgs, GenericArg,
+    GenericBound, InlineAsmOperand, InlineAsmOptions, InlineAsmRegOrRegClass,
+    InlineAsmTemplatePiece, PatKind, RangeEnd, RangeSyntax, SelfKind, Term, attr, token as tk,
 };
 use rustc_span::edition::Edition;
-use rustc_span::source_map::{SourceMap, Spanned};
+use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::IdentPrinter;
-use rustc_span::{BytePos, CharPos, DUMMY_SP, FileName, Ident, Pos, Span, Symbol, kw, sym};
+use rustc_span::{
+    BytePos, CharPos, DUMMY_SP, FileName, Ident, Pos, Span, Spanned, Symbol, kw, sym,
+};
 
 use crate::pp::Breaks::{Consistent, Inconsistent};
 use crate::pp::{self, BoxMarker, Breaks};
@@ -120,7 +120,7 @@ fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comment> 
         pos += shebang_len;
     }
 
-    for token in rustc_lexer::tokenize(&text[pos..]) {
+    for token in rustc_lexer::tokenize(&text[pos..], rustc_lexer::FrontmatterAllowed::Yes) {
         let token_text = &text[pos..pos + token.len as usize];
         match token.kind {
             rustc_lexer::TokenKind::Whitespace => {
@@ -170,6 +170,14 @@ fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comment> 
                         pos: start_bpos + BytePos(pos as u32),
                     })
                 }
+            }
+            rustc_lexer::TokenKind::Frontmatter { .. } => {
+                code_to_the_left = false;
+                comments.push(Comment {
+                    style: CommentStyle::Isolated,
+                    lines: vec![token_text.to_string()],
+                    pos: start_bpos + BytePos(pos as u32),
+                });
             }
             _ => {
                 code_to_the_left = true;
@@ -221,6 +229,7 @@ pub struct State<'a> {
     pub s: pp::Printer,
     comments: Option<Comments<'a>>,
     ann: &'a (dyn PpAnn + 'a),
+    is_sdylib_interface: bool,
 }
 
 const INDENT_UNIT: isize = 4;
@@ -237,8 +246,40 @@ pub fn print_crate<'a>(
     edition: Edition,
     g: &AttrIdGenerator,
 ) -> String {
+    let mut s = State {
+        s: pp::Printer::new(),
+        comments: Some(Comments::new(sm, filename, input)),
+        ann,
+        is_sdylib_interface: false,
+    };
+
+    print_crate_inner(&mut s, krate, is_expanded, edition, g);
+    s.s.eof()
+}
+
+pub fn print_crate_as_interface(
+    krate: &ast::Crate,
+    edition: Edition,
+    g: &AttrIdGenerator,
+) -> String {
     let mut s =
-        State { s: pp::Printer::new(), comments: Some(Comments::new(sm, filename, input)), ann };
+        State { s: pp::Printer::new(), comments: None, ann: &NoAnn, is_sdylib_interface: true };
+
+    print_crate_inner(&mut s, krate, false, edition, g);
+    s.s.eof()
+}
+
+fn print_crate_inner<'a>(
+    s: &mut State<'a>,
+    krate: &ast::Crate,
+    is_expanded: bool,
+    edition: Edition,
+    g: &AttrIdGenerator,
+) {
+    // We need to print shebang before anything else
+    // otherwise the resulting code will not compile
+    // and shebang will be useless.
+    s.maybe_print_shebang();
 
     if is_expanded && !krate.attrs.iter().any(|attr| attr.has_name(sym::no_core)) {
         // We need to print `#![no_std]` (and its feature gate) so that
@@ -250,7 +291,6 @@ pub fn print_crate<'a>(
         let fake_attr = attr::mk_attr_nested_word(
             g,
             ast::AttrStyle::Inner,
-            Safety::Default,
             sym::feature,
             sym::prelude_import,
             DUMMY_SP,
@@ -261,13 +301,7 @@ pub fn print_crate<'a>(
         // root, so this is not needed, and actually breaks things.
         if edition.is_rust_2015() {
             // `#![no_std]`
-            let fake_attr = attr::mk_attr_word(
-                g,
-                ast::AttrStyle::Inner,
-                Safety::Default,
-                sym::no_std,
-                DUMMY_SP,
-            );
+            let fake_attr = attr::mk_attr_word(g, ast::AttrStyle::Inner, sym::no_std, DUMMY_SP);
             s.print_attribute(&fake_attr);
         }
     }
@@ -277,8 +311,7 @@ pub fn print_crate<'a>(
         s.print_item(item);
     }
     s.print_remaining_comments();
-    s.ann.post(&mut s, AnnNode::Crate(krate));
-    s.s.eof()
+    s.ann.post(s, AnnNode::Crate(krate));
 }
 
 /// Should two consecutive tokens be printed with a space between them?
@@ -288,10 +321,19 @@ pub fn print_crate<'a>(
 /// - #63896: `#[allow(unused,` must be printed rather than `#[allow(unused ,`
 /// - #73345: `#[allow(unused)]` must be printed rather than `# [allow(unused)]`
 ///
+/// Returns `true` if both token trees are identifier-like tokens that would
+/// merge into a single token if printed without a space between them.
+/// E.g. `ident` + `where` would merge into `identwhere`.
+fn idents_would_merge(tt1: &TokenTree, tt2: &TokenTree) -> bool {
+    fn is_ident_like(tt: &TokenTree) -> bool {
+        matches!(tt, TokenTree::Token(tk::Token { kind: tk::Ident(..) | tk::NtIdent(..), .. }, _,))
+    }
+    is_ident_like(tt1) && is_ident_like(tt2)
+}
+
 fn space_between(tt1: &TokenTree, tt2: &TokenTree) -> bool {
-    use Delimiter::*;
     use TokenTree::{Delimited as Del, Token as Tok};
-    use token::*;
+    use tk::Delimiter::{Bracket, Parenthesis};
 
     fn is_punct(tt: &TokenTree) -> bool {
         matches!(tt, TokenTree::Token(tok, _) if tok.is_punct())
@@ -302,76 +344,91 @@ fn space_between(tt1: &TokenTree, tt2: &TokenTree) -> bool {
     // this match.
     match (tt1, tt2) {
         // No space after line doc comments.
-        (Tok(Token { kind: DocComment(CommentKind::Line, ..), .. }, _), _) => false,
+        (Tok(tk::Token { kind: tk::DocComment(tk::CommentKind::Line, ..), .. }, _), _) => false,
 
         // `.` + NON-PUNCT: `x.y`, `tup.0`
-        (Tok(Token { kind: Dot, .. }, _), tt2) if !is_punct(tt2) => false,
+        (Tok(tk::Token { kind: tk::Dot, .. }, _), tt2) if !is_punct(tt2) => false,
 
         // `$` + IDENT: `$e`
-        (Tok(Token { kind: Dollar, .. }, _), Tok(Token { kind: Ident(..), .. }, _)) => false,
+        (
+            Tok(tk::Token { kind: tk::Dollar, .. }, _),
+            Tok(tk::Token { kind: tk::Ident(..), .. }, _),
+        ) => false,
 
         // NON-PUNCT + `,`: `foo,`
         // NON-PUNCT + `;`: `x = 3;`, `[T; 3]`
         // NON-PUNCT + `.`: `x.y`, `tup.0`
-        (tt1, Tok(Token { kind: Comma | Semi | Dot, .. }, _)) if !is_punct(tt1) => false,
+        (tt1, Tok(tk::Token { kind: tk::Comma | tk::Semi | tk::Dot, .. }, _)) if !is_punct(tt1) => {
+            false
+        }
 
         // IDENT + `!`: `println!()`, but `if !x { ... }` needs a space after the `if`
-        (Tok(Token { kind: Ident(sym, is_raw), span }, _), Tok(Token { kind: Bang, .. }, _))
-            if !Ident::new(*sym, *span).is_reserved() || matches!(is_raw, IdentIsRaw::Yes) =>
-        {
+        (
+            Tok(tk::Token { kind: tk::Ident(sym, is_raw), span }, _),
+            Tok(tk::Token { kind: tk::Bang, .. }, _),
+        ) if !Ident::new(*sym, *span).is_reserved() || matches!(is_raw, tk::IdentIsRaw::Yes) => {
             false
         }
 
         // IDENT|`fn`|`Self`|`pub` + `(`: `f(3)`, `fn(x: u8)`, `Self()`, `pub(crate)`,
         //      but `let (a, b) = (1, 2)` needs a space after the `let`
-        (Tok(Token { kind: Ident(sym, is_raw), span }, _), Del(_, _, Parenthesis, _))
+        (Tok(tk::Token { kind: tk::Ident(sym, is_raw), span }, _), Del(_, _, Parenthesis, _))
             if !Ident::new(*sym, *span).is_reserved()
                 || *sym == kw::Fn
                 || *sym == kw::SelfUpper
                 || *sym == kw::Pub
-                || matches!(is_raw, IdentIsRaw::Yes) =>
+                || matches!(is_raw, tk::IdentIsRaw::Yes) =>
         {
             false
         }
 
         // `#` + `[`: `#[attr]`
-        (Tok(Token { kind: Pound, .. }, _), Del(_, _, Bracket, _)) => false,
+        (Tok(tk::Token { kind: tk::Pound, .. }, _), Del(_, _, Bracket, _)) => false,
 
         _ => true,
     }
 }
 
 pub fn doc_comment_to_string(
-    comment_kind: CommentKind,
+    fragment_kind: tk::DocFragmentKind,
     attr_style: ast::AttrStyle,
     data: Symbol,
 ) -> String {
-    match (comment_kind, attr_style) {
-        (CommentKind::Line, ast::AttrStyle::Outer) => format!("///{data}"),
-        (CommentKind::Line, ast::AttrStyle::Inner) => format!("//!{data}"),
-        (CommentKind::Block, ast::AttrStyle::Outer) => format!("/**{data}*/"),
-        (CommentKind::Block, ast::AttrStyle::Inner) => format!("/*!{data}*/"),
+    match fragment_kind {
+        tk::DocFragmentKind::Sugared(comment_kind) => match (comment_kind, attr_style) {
+            (tk::CommentKind::Line, ast::AttrStyle::Outer) => format!("///{data}"),
+            (tk::CommentKind::Line, ast::AttrStyle::Inner) => format!("//!{data}"),
+            (tk::CommentKind::Block, ast::AttrStyle::Outer) => format!("/**{data}*/"),
+            (tk::CommentKind::Block, ast::AttrStyle::Inner) => format!("/*!{data}*/"),
+        },
+        tk::DocFragmentKind::Raw(_) => {
+            format!(
+                "#{}[doc = {:?}]",
+                if attr_style == ast::AttrStyle::Inner { "!" } else { "" },
+                data.to_string(),
+            )
+        }
     }
 }
 
-fn literal_to_string(lit: token::Lit) -> String {
-    let token::Lit { kind, symbol, suffix } = lit;
+fn literal_to_string(lit: tk::Lit) -> String {
+    let tk::Lit { kind, symbol, suffix } = lit;
     let mut out = match kind {
-        token::Byte => format!("b'{symbol}'"),
-        token::Char => format!("'{symbol}'"),
-        token::Str => format!("\"{symbol}\""),
-        token::StrRaw(n) => {
+        tk::Byte => format!("b'{symbol}'"),
+        tk::Char => format!("'{symbol}'"),
+        tk::Str => format!("\"{symbol}\""),
+        tk::StrRaw(n) => {
             format!("r{delim}\"{string}\"{delim}", delim = "#".repeat(n as usize), string = symbol)
         }
-        token::ByteStr => format!("b\"{symbol}\""),
-        token::ByteStrRaw(n) => {
+        tk::ByteStr => format!("b\"{symbol}\""),
+        tk::ByteStrRaw(n) => {
             format!("br{delim}\"{string}\"{delim}", delim = "#".repeat(n as usize), string = symbol)
         }
-        token::CStr => format!("c\"{symbol}\""),
-        token::CStrRaw(n) => {
+        tk::CStr => format!("c\"{symbol}\""),
+        tk::CStrRaw(n) => {
             format!("cr{delim}\"{symbol}\"{delim}", delim = "#".repeat(n as usize))
         }
-        token::Integer | token::Float | token::Bool | token::Err(_) => symbol.to_string(),
+        tk::Integer | tk::Float | tk::Bool | tk::Err(_) => symbol.to_string(),
     };
 
     if let Some(suffix) = suffix {
@@ -402,7 +459,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     fn print_generic_args(&mut self, args: &ast::GenericArgs, colons_before_params: bool);
 
     fn print_ident(&mut self, ident: Ident) {
-        self.word(IdentPrinter::for_ast_ident(ident, ident.is_raw_guess()).to_string());
+        self.word(IdentPrinter::for_ast_ident(ident, ident.guess_print_mode()).to_string());
         self.ann_post(ident)
     }
 
@@ -532,10 +589,10 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     }
 
     fn maybe_print_trailing_comment(&mut self, span: rustc_span::Span, next_pos: Option<BytePos>) {
-        if let Some(cmnts) = self.comments_mut() {
-            if let Some(cmnt) = cmnts.trailing_comment(span, next_pos) {
-                self.print_comment(cmnt);
-            }
+        if let Some(cmnts) = self.comments_mut()
+            && let Some(cmnt) = cmnts.trailing_comment(span, next_pos)
+        {
+            self.print_comment(cmnt);
         }
     }
 
@@ -558,6 +615,20 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             }
         };
         self.word(st)
+    }
+
+    fn maybe_print_shebang(&mut self) {
+        if let Some(cmnt) = self.peek_comment() {
+            // Comment is a shebang if it's:
+            // Isolated, starts with #! and doesn't continue with `[`
+            // See [rustc_lexer::strip_shebang] and [gather_comments] from pprust/state.rs for details
+            if cmnt.style == CommentStyle::Isolated
+                && cmnt.lines.first().map_or(false, |l| l.starts_with("#!"))
+            {
+                let cmnt = self.next_comment().unwrap();
+                self.print_comment(cmnt);
+            }
+        }
     }
 
     fn print_inner_attributes(&mut self, attrs: &[ast::Attribute]) -> bool {
@@ -593,10 +664,14 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     }
 
     fn print_attribute_inline(&mut self, attr: &ast::Attribute, is_inline: bool) -> bool {
-        if attr.has_name(sym::cfg_trace) || attr.has_name(sym::cfg_attr_trace) {
-            // It's not a valid identifier, so avoid printing it
-            // to keep the printed code reasonably parse-able.
-            return false;
+        use ast::SyntheticAttr::*;
+        match attr.kind {
+            AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace(_)) => {
+                // These are internal synthetic attributes with no syntax, so avoid printing them
+                // to keep the printed code reasonably parse-able.
+                return false;
+            }
+            AttrKind::Normal(_) | AttrKind::DocComment(..) => {}
         }
         if !is_inline {
             self.hardbreak_if_not_bol();
@@ -611,8 +686,13 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                 self.print_attr_item(&normal.item, attr.span);
                 self.word("]");
             }
+            ast::AttrKind::Synthetic(..) => unreachable!(), // due to early return above
             ast::AttrKind::DocComment(comment_kind, data) => {
-                self.word(doc_comment_to_string(*comment_kind, attr.style, *data));
+                self.word(doc_comment_to_string(
+                    tk::DocFragmentKind::Sugared(*comment_kind),
+                    attr.style,
+                    *data,
+                ));
                 self.hardbreak()
             }
         }
@@ -634,6 +714,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                 false,
                 None,
                 *delim,
+                None,
                 tokens,
                 true,
                 span,
@@ -668,7 +749,24 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             TokenTree::Token(token, spacing) => {
                 let token_str = self.token_to_string_ext(token, convert_dollar_crate);
                 self.word(token_str);
-                if let token::DocComment(..) = token.kind {
+                // Emit hygiene annotations for identity-bearing tokens,
+                // matching how print_ident() and print_lifetime() call ann_post().
+                match token.kind {
+                    tk::Ident(name, _) => {
+                        self.ann_post(Ident::new(name, token.span));
+                    }
+                    tk::NtIdent(ident, _) => {
+                        self.ann_post(ident);
+                    }
+                    tk::Lifetime(name, _) => {
+                        self.ann_post(Ident::new(name, token.span));
+                    }
+                    tk::NtLifetime(ident, _) => {
+                        self.ann_post(ident);
+                    }
+                    _ => {}
+                }
+                if let tk::DocComment(..) = token.kind {
                     self.hardbreak()
                 }
                 *spacing
@@ -679,6 +777,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                     false,
                     None,
                     *delim,
+                    Some(spacing.open),
                     tts,
                     convert_dollar_crate,
                     dspan.entire(),
@@ -709,7 +808,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     // `,` is better printed as `x,` than `x ,`. (Even if the original source
     // code was `x ,`.)
     //
-    // Finally, we must be careful about changing the output. Token pretty
+    // Finally, we must be careful about changing the output. tk::Token pretty
     // printing is used by `stringify!` and `impl Display for
     // proc_macro::TokenStream`, and some programs rely on the output having a
     // particular form, even though they shouldn't. In particular, some proc
@@ -724,6 +823,13 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             if let Some(next) = iter.peek() {
                 if spacing == Spacing::Alone && space_between(tt, next) {
                     self.space();
+                } else if spacing != Spacing::Alone && idents_would_merge(tt, next) {
+                    // When tokens from macro `tt` captures preserve their
+                    // original `Joint`/`JointHidden` spacing, adjacent
+                    // identifier-like tokens can be concatenated without a
+                    // space (e.g. `$x:identwhere`). Insert a space to
+                    // prevent this.
+                    self.space();
                 }
             }
         }
@@ -734,12 +840,13 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         header: Option<MacHeader<'_>>,
         has_bang: bool,
         ident: Option<Ident>,
-        delim: Delimiter,
+        delim: tk::Delimiter,
+        open_spacing: Option<Spacing>,
         tts: &TokenStream,
         convert_dollar_crate: bool,
         span: Span,
     ) {
-        let cb = (delim == Delimiter::Brace).then(|| self.cbox(INDENT_UNIT));
+        let cb = (delim == tk::Delimiter::Brace).then(|| self.cbox(INDENT_UNIT));
         match header {
             Some(MacHeader::Path(path)) => self.print_path(path, false, 0),
             Some(MacHeader::Keyword(kw)) => self.word(kw),
@@ -753,21 +860,31 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             self.print_ident(ident);
         }
         match delim {
-            Delimiter::Brace => {
+            tk::Delimiter::Brace => {
                 if header.is_some() || has_bang || ident.is_some() {
                     self.nbsp();
                 }
                 self.word("{");
-                if !tts.is_empty() {
+
+                // Respect `Alone`, if provided, and print a space. Unless the list is empty.
+                let open_space = (open_spacing == None || open_spacing == Some(Spacing::Alone))
+                    && !tts.is_empty();
+                if open_space {
                     self.space();
                 }
                 let ib = self.ibox(0);
                 self.print_tts(tts, convert_dollar_crate);
                 self.end(ib);
-                let empty = tts.is_empty();
-                self.bclose(span, empty, cb.unwrap());
+
+                // Use `open_space` for the spacing *before* the closing delim.
+                // Because spacing on delimiters is lost when going through
+                // proc macros, and otherwise we can end up with ugly cases
+                // like `{ x}`. Symmetry is better.
+                self.bclose(span, !open_space, cb.unwrap());
             }
             delim => {
+                // `open_spacing` is ignored. We never print spaces after
+                // non-brace opening delims or before non-brace closing delims.
                 let token_str = self.token_kind_to_string(&delim.as_open_token_kind());
                 self.word(token_str);
                 let ib = self.ibox(0);
@@ -786,6 +903,17 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         sp: Span,
         print_visibility: impl FnOnce(&mut Self),
     ) {
+        if let Some(eii_decl) = &macro_def.eii_declaration {
+            self.word("#[eii_declaration(");
+            self.print_path(&eii_decl.foreign_item, false, 0);
+            if eii_decl.impl_unsafe {
+                self.word(",");
+                self.space();
+                self.word("unsafe");
+            }
+            self.word(")]");
+            self.hardbreak();
+        }
         let (kw, has_bang) = if macro_def.macro_rules {
             ("macro_rules", true)
         } else {
@@ -797,6 +925,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             has_bang,
             Some(*ident),
             macro_def.body.delim,
+            None,
             &macro_def.body.tokens,
             true,
             sp,
@@ -844,9 +973,9 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         self.end(ib);
     }
 
-    fn bclose_maybe_open(&mut self, span: rustc_span::Span, empty: bool, cb: Option<BoxMarker>) {
+    fn bclose_maybe_open(&mut self, span: rustc_span::Span, no_space: bool, cb: Option<BoxMarker>) {
         let has_comment = self.maybe_print_comment(span.hi());
-        if !empty || has_comment {
+        if !no_space || has_comment {
             self.break_offset_if_not_bol(1, -INDENT_UNIT);
         }
         self.word("}");
@@ -855,9 +984,9 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         }
     }
 
-    fn bclose(&mut self, span: rustc_span::Span, empty: bool, cb: BoxMarker) {
+    fn bclose(&mut self, span: rustc_span::Span, no_space: bool, cb: BoxMarker) {
         let cb = Some(cb);
-        self.bclose_maybe_open(span, empty, cb)
+        self.bclose_maybe_open(span, no_space, cb)
     }
 
     fn break_offset_if_not_bol(&mut self, n: usize, off: isize) {
@@ -876,105 +1005,109 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     }
 
     /// Print the token kind precisely, without converting `$crate` into its respective crate name.
-    fn token_kind_to_string(&self, tok: &TokenKind) -> Cow<'static, str> {
+    fn token_kind_to_string(&self, tok: &tk::TokenKind) -> Cow<'static, str> {
         self.token_kind_to_string_ext(tok, None)
     }
 
     fn token_kind_to_string_ext(
         &self,
-        tok: &TokenKind,
+        tok: &tk::TokenKind,
         convert_dollar_crate: Option<Span>,
     ) -> Cow<'static, str> {
         match *tok {
-            token::Eq => "=".into(),
-            token::Lt => "<".into(),
-            token::Le => "<=".into(),
-            token::EqEq => "==".into(),
-            token::Ne => "!=".into(),
-            token::Ge => ">=".into(),
-            token::Gt => ">".into(),
-            token::Bang => "!".into(),
-            token::Tilde => "~".into(),
-            token::OrOr => "||".into(),
-            token::AndAnd => "&&".into(),
-            token::Plus => "+".into(),
-            token::Minus => "-".into(),
-            token::Star => "*".into(),
-            token::Slash => "/".into(),
-            token::Percent => "%".into(),
-            token::Caret => "^".into(),
-            token::And => "&".into(),
-            token::Or => "|".into(),
-            token::Shl => "<<".into(),
-            token::Shr => ">>".into(),
-            token::PlusEq => "+=".into(),
-            token::MinusEq => "-=".into(),
-            token::StarEq => "*=".into(),
-            token::SlashEq => "/=".into(),
-            token::PercentEq => "%=".into(),
-            token::CaretEq => "^=".into(),
-            token::AndEq => "&=".into(),
-            token::OrEq => "|=".into(),
-            token::ShlEq => "<<=".into(),
-            token::ShrEq => ">>=".into(),
+            tk::Eq => "=".into(),
+            tk::Lt => "<".into(),
+            tk::Le => "<=".into(),
+            tk::EqEq => "==".into(),
+            tk::Ne => "!=".into(),
+            tk::Ge => ">=".into(),
+            tk::Gt => ">".into(),
+            tk::Bang => "!".into(),
+            tk::Tilde => "~".into(),
+            tk::OrOr => "||".into(),
+            tk::AndAnd => "&&".into(),
+            tk::Plus => "+".into(),
+            tk::Minus => "-".into(),
+            tk::Star => "*".into(),
+            tk::Slash => "/".into(),
+            tk::Percent => "%".into(),
+            tk::Caret => "^".into(),
+            tk::And => "&".into(),
+            tk::Or => "|".into(),
+            tk::Shl => "<<".into(),
+            tk::Shr => ">>".into(),
+            tk::PlusEq => "+=".into(),
+            tk::MinusEq => "-=".into(),
+            tk::StarEq => "*=".into(),
+            tk::SlashEq => "/=".into(),
+            tk::PercentEq => "%=".into(),
+            tk::CaretEq => "^=".into(),
+            tk::AndEq => "&=".into(),
+            tk::OrEq => "|=".into(),
+            tk::ShlEq => "<<=".into(),
+            tk::ShrEq => ">>=".into(),
 
             /* Structural symbols */
-            token::At => "@".into(),
-            token::Dot => ".".into(),
-            token::DotDot => "..".into(),
-            token::DotDotDot => "...".into(),
-            token::DotDotEq => "..=".into(),
-            token::Comma => ",".into(),
-            token::Semi => ";".into(),
-            token::Colon => ":".into(),
-            token::PathSep => "::".into(),
-            token::RArrow => "->".into(),
-            token::LArrow => "<-".into(),
-            token::FatArrow => "=>".into(),
-            token::OpenParen => "(".into(),
-            token::CloseParen => ")".into(),
-            token::OpenBracket => "[".into(),
-            token::CloseBracket => "]".into(),
-            token::OpenBrace => "{".into(),
-            token::CloseBrace => "}".into(),
-            token::OpenInvisible(_) | token::CloseInvisible(_) => "".into(),
-            token::Pound => "#".into(),
-            token::Dollar => "$".into(),
-            token::Question => "?".into(),
-            token::SingleQuote => "'".into(),
+            tk::At => "@".into(),
+            tk::Dot => ".".into(),
+            tk::DotDot => "..".into(),
+            tk::DotDotDot => "...".into(),
+            tk::DotDotEq => "..=".into(),
+            tk::Comma => ",".into(),
+            tk::Semi => ";".into(),
+            tk::Colon => ":".into(),
+            tk::PathSep => "::".into(),
+            tk::RArrow => "->".into(),
+            tk::LArrow => "<-".into(),
+            tk::FatArrow => "=>".into(),
+            tk::OpenParen => "(".into(),
+            tk::CloseParen => ")".into(),
+            tk::OpenBracket => "[".into(),
+            tk::CloseBracket => "]".into(),
+            tk::OpenBrace => "{".into(),
+            tk::CloseBrace => "}".into(),
+            tk::OpenInvisible(_) | tk::CloseInvisible(_) => "".into(),
+            tk::Pound => "#".into(),
+            tk::Dollar => "$".into(),
+            tk::Question => "?".into(),
+            tk::SingleQuote => "'".into(),
 
             /* Literals */
-            token::Literal(lit) => literal_to_string(lit).into(),
+            tk::Literal(lit) => literal_to_string(lit).into(),
 
             /* Name components */
-            token::Ident(name, is_raw) => {
-                IdentPrinter::new(name, is_raw.into(), convert_dollar_crate).to_string().into()
+            tk::Ident(name, is_raw) => {
+                IdentPrinter::new(name, is_raw.to_print_mode_ident(), convert_dollar_crate)
+                    .to_string()
+                    .into()
             }
-            token::NtIdent(ident, is_raw) => {
-                IdentPrinter::for_ast_ident(ident, is_raw.into()).to_string().into()
+            tk::NtIdent(ident, is_raw) => {
+                IdentPrinter::for_ast_ident(ident, is_raw.to_print_mode_ident()).to_string().into()
             }
 
-            token::Lifetime(name, IdentIsRaw::No)
-            | token::NtLifetime(Ident { name, .. }, IdentIsRaw::No) => name.to_string().into(),
-            token::Lifetime(name, IdentIsRaw::Yes)
-            | token::NtLifetime(Ident { name, .. }, IdentIsRaw::Yes) => {
-                format!("'r#{}", &name.as_str()[1..]).into()
+            tk::Lifetime(name, is_raw) | tk::NtLifetime(Ident { name, .. }, is_raw) => {
+                IdentPrinter::new(name, is_raw.to_print_mode_lifetime(), None).to_string().into()
             }
 
             /* Other */
-            token::DocComment(comment_kind, attr_style, data) => {
-                doc_comment_to_string(comment_kind, attr_style, data).into()
+            tk::DocComment(comment_kind, attr_style, data) => {
+                doc_comment_to_string(tk::DocFragmentKind::Sugared(comment_kind), attr_style, data)
+                    .into()
             }
-            token::Eof => "<eof>".into(),
+            tk::Eof => "<eof>".into(),
         }
     }
 
     /// Print the token precisely, without converting `$crate` into its respective crate name.
-    fn token_to_string(&self, token: &Token) -> Cow<'static, str> {
+    fn token_to_string(&self, token: &tk::Token) -> Cow<'static, str> {
         self.token_to_string_ext(token, false)
     }
 
-    fn token_to_string_ext(&self, token: &Token, convert_dollar_crate: bool) -> Cow<'static, str> {
+    fn token_to_string_ext(
+        &self,
+        token: &tk::Token,
+        convert_dollar_crate: bool,
+    ) -> Cow<'static, str> {
         let convert_dollar_crate = convert_dollar_crate.then_some(token.span);
         self.token_kind_to_string_ext(&token.kind, convert_dollar_crate)
     }
@@ -1003,12 +1136,28 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         Self::to_string(|s| s.print_item(i))
     }
 
+    fn assoc_item_to_string(&self, i: &ast::AssocItem) -> String {
+        Self::to_string(|s| s.print_assoc_item(i))
+    }
+
+    fn foreign_item_to_string(&self, i: &ast::ForeignItem) -> String {
+        Self::to_string(|s| s.print_foreign_item(i))
+    }
+
     fn path_to_string(&self, p: &ast::Path) -> String {
         Self::to_string(|s| s.print_path(p, false, 0))
     }
 
     fn vis_to_string(&self, v: &ast::Visibility) -> String {
         Self::to_string(|s| s.print_visibility(v))
+    }
+
+    fn impl_restriction_to_string(&self, r: &ast::ImplRestriction) -> String {
+        Self::to_string(|s| s.print_impl_restriction(r))
+    }
+
+    fn mut_restriction_to_string(&self, r: &ast::MutRestriction) -> String {
+        Self::to_string(|s| s.print_mut_restriction(r))
     }
 
     fn block_to_string(&self, blk: &ast::Block) -> String {
@@ -1078,7 +1227,7 @@ impl<'a> PrintState<'a> for State<'a> {
 
 impl<'a> State<'a> {
     pub fn new() -> State<'a> {
-        State { s: pp::Printer::new(), comments: None, ann: &NoAnn }
+        State { s: pp::Printer::new(), comments: None, ann: &NoAnn, is_sdylib_interface: false }
     }
 
     fn commasep_cmnt<T, F, G>(&mut self, b: Breaks, elts: &[T], mut op: F, mut get_span: G)
@@ -1102,7 +1251,7 @@ impl<'a> State<'a> {
         self.end(rb);
     }
 
-    fn commasep_exprs(&mut self, b: Breaks, exprs: &[P<ast::Expr>]) {
+    fn commasep_exprs(&mut self, b: Breaks, exprs: &[Box<ast::Expr>]) {
         self.commasep_cmnt(b, exprs, |s, e| s.print_expr(e, FixupContext::default()), |e| e.span)
     }
 
@@ -1111,6 +1260,20 @@ impl<'a> State<'a> {
             self.print_lifetime(lt);
             self.nbsp();
         }
+    }
+
+    fn print_view(&mut self, fields: &[Ident]) {
+        self.word(".{");
+
+        if !fields.is_empty() {
+            self.space();
+            self.commasep(Consistent, fields, |s, field| {
+                s.print_ident(*field);
+            });
+            self.space();
+        }
+
+        self.word("}");
     }
 
     pub fn print_assoc_item_constraint(&mut self, constraint: &ast::AssocItemConstraint) {
@@ -1158,6 +1321,7 @@ impl<'a> State<'a> {
                     self.print_expr_anon_const(end, &[]);
                 }
             }
+            rustc_ast::TyPatKind::NotNull => self.word("!null"),
             rustc_ast::TyPatKind::Or(variants) => {
                 let mut first = true;
                 for pat in variants {
@@ -1217,7 +1381,7 @@ impl<'a> State<'a> {
                 self.print_type(typ);
                 self.pclose();
             }
-            ast::TyKind::BareFn(f) => {
+            ast::TyKind::FnPtr(f) => {
                 self.print_ty_fn(f.ext, f.safety, &f.decl, None, &f.generic_params);
             }
             ast::TyKind::UnsafeBinder(f) => {
@@ -1235,7 +1399,6 @@ impl<'a> State<'a> {
             ast::TyKind::TraitObject(bounds, syntax) => {
                 match syntax {
                     ast::TraitObjectSyntax::Dyn => self.word_nbsp("dyn"),
-                    ast::TraitObjectSyntax::DynStar => self.word_nbsp("dyn*"),
                     ast::TraitObjectSyntax::None => {}
                 }
                 self.print_type_bounds(bounds);
@@ -1250,11 +1413,6 @@ impl<'a> State<'a> {
                 self.word("; ");
                 self.print_expr(&length.value, FixupContext::default());
                 self.word("]");
-            }
-            ast::TyKind::Typeof(e) => {
-                self.word("typeof(");
-                self.print_expr(&e.value, FixupContext::default());
-                self.word(")");
             }
             ast::TyKind::Infer => {
                 self.word("_");
@@ -1283,6 +1441,33 @@ impl<'a> State<'a> {
                 self.word(" is ");
                 self.print_ty_pat(pat);
             }
+            ast::TyKind::FieldOf(ty, variant, field) => {
+                self.word("builtin # field_of");
+                self.popen();
+                let ib = self.ibox(0);
+                self.print_type(ty);
+                self.word(",");
+                self.space();
+
+                if let Some(variant) = variant {
+                    self.print_ident(*variant);
+                    self.word(".");
+                }
+                self.print_ident(*field);
+
+                self.end(ib);
+                self.pclose();
+            }
+            ast::TyKind::View(ty, fields) => {
+                self.print_type(ty);
+                self.print_view(fields);
+            }
+            ast::TyKind::DirectConstArg(expr) => {
+                self.word_nbsp("core::direct_const_arg!");
+                self.popen();
+                self.print_expr(expr, FixupContext::default());
+                self.pclose();
+            }
         }
         self.end(ib);
     }
@@ -1300,6 +1485,9 @@ impl<'a> State<'a> {
     }
 
     fn print_poly_trait_ref(&mut self, t: &ast::PolyTraitRef) {
+        if let ast::Parens::Yes = t.parens {
+            self.popen();
+        }
         self.print_formal_generic_params(&t.bound_generic_params);
 
         let ast::TraitBoundModifiers { constness, asyncness, polarity } = t.modifiers;
@@ -1322,7 +1510,10 @@ impl<'a> State<'a> {
             }
         }
 
-        self.print_trait_ref(&t.trait_ref)
+        self.print_trait_ref(&t.trait_ref);
+        if let ast::Parens::Yes = t.parens {
+            self.pclose();
+        }
     }
 
     fn print_stmt(&mut self, st: &ast::Stmt) {
@@ -1434,8 +1625,8 @@ impl<'a> State<'a> {
             }
         }
 
-        let empty = !has_attrs && blk.stmts.is_empty();
-        self.bclose_maybe_open(blk.span, empty, cb);
+        let no_space = !has_attrs && blk.stmts.is_empty();
+        self.bclose_maybe_open(blk.span, no_space, cb);
         self.ann.post(self, AnnNode::Block(blk))
     }
 
@@ -1482,10 +1673,90 @@ impl<'a> State<'a> {
             true,
             None,
             m.args.delim,
+            None,
             &m.args.tokens,
             true,
             m.span(),
         );
+    }
+
+    fn inline_asm_template_and_operands<'asm>(
+        asm: &'asm ast::InlineAsm,
+    ) -> (String, Vec<&'asm InlineAsmOperand>) {
+        fn is_explicit_reg(op: &InlineAsmOperand) -> bool {
+            match op {
+                InlineAsmOperand::In { reg, .. }
+                | InlineAsmOperand::Out { reg, .. }
+                | InlineAsmOperand::InOut { reg, .. }
+                | InlineAsmOperand::SplitInOut { reg, .. } => {
+                    matches!(reg, InlineAsmRegOrRegClass::Reg(_))
+                }
+                InlineAsmOperand::Const { .. }
+                | InlineAsmOperand::Sym { .. }
+                | InlineAsmOperand::Label { .. } => false,
+            }
+        }
+
+        // After macro expansion, named operands become positional. The grammar
+        // requires positional operands to precede explicit register operands,
+        // so we must reorder when any non-explicit operand follows an explicit
+        // one. When no reordering is needed, we use the original template
+        // string and operand order to avoid duplicating the Display logic in
+        // InlineAsmTemplatePiece.
+        let needs_reorder = {
+            let mut seen_explicit = false;
+            asm.operands.iter().any(|(op, _)| {
+                if is_explicit_reg(op) {
+                    seen_explicit = true;
+                    false
+                } else {
+                    seen_explicit
+                }
+            })
+        };
+
+        if !needs_reorder {
+            let template = InlineAsmTemplatePiece::to_string(&asm.template);
+            let operands = asm.operands.iter().map(|(op, _)| op).collect();
+            return (template, operands);
+        }
+
+        let mut non_explicit = Vec::new();
+        let mut explicit = Vec::new();
+        for (i, (op, _)) in asm.operands.iter().enumerate() {
+            if is_explicit_reg(op) {
+                explicit.push(i);
+            } else {
+                non_explicit.push(i);
+            }
+        }
+        let order = non_explicit.into_iter().chain(explicit).collect::<Vec<_>>();
+
+        // Build old-index -> new-index mapping for template renumbering.
+        let mut old_to_new = vec![0usize; asm.operands.len()];
+        for (new_idx, old_idx) in order.iter().copied().enumerate() {
+            old_to_new[old_idx] = new_idx;
+        }
+
+        // Remap template placeholder indices and reuse the existing Display
+        // impl to build the template string.
+        let remapped = asm
+            .template
+            .iter()
+            .map(|piece| match piece {
+                InlineAsmTemplatePiece::Placeholder { operand_idx, modifier, span } => {
+                    InlineAsmTemplatePiece::Placeholder {
+                        operand_idx: old_to_new[*operand_idx],
+                        modifier: *modifier,
+                        span: *span,
+                    }
+                }
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>();
+        let template = InlineAsmTemplatePiece::to_string(&remapped);
+        let operands = order.iter().map(|&idx| &asm.operands[idx].0).collect();
+        (template, operands)
     }
 
     fn print_inline_asm(&mut self, asm: &ast::InlineAsm) {
@@ -1496,8 +1767,9 @@ impl<'a> State<'a> {
             Options(InlineAsmOptions),
         }
 
-        let mut args = vec![AsmArg::Template(InlineAsmTemplatePiece::to_string(&asm.template))];
-        args.extend(asm.operands.iter().map(|(o, _)| AsmArg::Operand(o)));
+        let (template, operands) = Self::inline_asm_template_and_operands(asm);
+        let mut args = vec![AsmArg::Template(template)];
+        args.extend(operands.into_iter().map(AsmArg::Operand));
         for (abi, _) in &asm.clobber_abis {
             args.push(AsmArg::ClobberAbi(*abi));
         }
@@ -1625,6 +1897,23 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Print a pattern, parenthesizing it if it is an or-pattern (`A | B`).
+    ///
+    /// Or-patterns have the lowest precedence among patterns, so they need
+    /// parentheses when nested inside `@` bindings, `&` references, or `box`
+    /// patterns — otherwise `x @ A | B` parses as `(x @ A) | B`, `&A | B`
+    /// parses as `(&A) | B`, etc.
+    fn print_pat_paren_if_or(&mut self, pat: &ast::Pat) {
+        let needs_paren = matches!(pat.kind, PatKind::Or(..));
+        if needs_paren {
+            self.popen();
+        }
+        self.print_pat(pat);
+        if needs_paren {
+            self.pclose();
+        }
+    }
+
     fn print_pat(&mut self, pat: &ast::Pat) {
         self.maybe_print_comment(pat.span.lo());
         self.ann.pre(self, AnnNode::Pat(pat));
@@ -1637,17 +1926,22 @@ impl<'a> State<'a> {
                 if mutbl.is_mut() {
                     self.word_nbsp("mut");
                 }
-                if let ByRef::Yes(rmutbl) = by_ref {
+                if let ByRef::Yes(pinnedness, rmutbl) = by_ref {
                     self.word_nbsp("ref");
+                    if pinnedness.is_pinned() {
+                        self.word_nbsp("pin");
+                    }
                     if rmutbl.is_mut() {
                         self.word_nbsp("mut");
+                    } else if pinnedness.is_pinned() {
+                        self.word_nbsp("const");
                     }
                 }
                 self.print_ident(*ident);
                 if let Some(p) = sub {
                     self.space();
                     self.word_space("@");
-                    self.print_pat(p);
+                    self.print_pat_paren_if_or(p);
                 }
             }
             PatKind::TupleStruct(qself, path, elts) => {
@@ -1695,7 +1989,7 @@ impl<'a> State<'a> {
                     },
                     |f| f.pat.span,
                 );
-                if let ast::PatFieldsRest::Rest | ast::PatFieldsRest::Recovered(_) = etc {
+                if let ast::PatFieldsRest::Rest(_) | ast::PatFieldsRest::Recovered(_) = etc {
                     if !fields.is_empty() {
                         self.word_space(",");
                     }
@@ -1719,7 +2013,7 @@ impl<'a> State<'a> {
             }
             PatKind::Box(inner) => {
                 self.word("box ");
-                self.print_pat(inner);
+                self.print_pat_paren_if_or(inner);
             }
             PatKind::Deref(inner) => {
                 self.word("deref!");
@@ -1727,8 +2021,14 @@ impl<'a> State<'a> {
                 self.print_pat(inner);
                 self.pclose();
             }
-            PatKind::Ref(inner, mutbl) => {
+            PatKind::Ref(inner, pinned, mutbl) => {
                 self.word("&");
+                if pinned.is_pinned() {
+                    self.word("pin ");
+                    if mutbl.is_not() {
+                        self.word("const ");
+                    }
+                }
                 if mutbl.is_mut() {
                     self.word("mut ");
                 }
@@ -1737,7 +2037,7 @@ impl<'a> State<'a> {
                     self.print_pat(inner);
                     self.pclose();
                 } else {
-                    self.print_pat(inner);
+                    self.print_pat_paren_if_or(inner);
                 }
             }
             PatKind::Expr(e) => self.print_expr(e, FixupContext::default()),
@@ -1754,12 +2054,12 @@ impl<'a> State<'a> {
                     self.print_expr(e, FixupContext::default());
                 }
             }
-            PatKind::Guard(subpat, condition) => {
+            PatKind::Guard(subpat, guard) => {
                 self.popen();
                 self.print_pat(subpat);
                 self.space();
                 self.word_space("if");
-                self.print_expr(condition, FixupContext::default());
+                self.print_expr(&guard.cond, FixupContext::default());
                 self.pclose();
             }
             PatKind::Slice(elts) => {
@@ -1855,7 +2155,8 @@ impl<'a> State<'a> {
     }
 
     fn print_lifetime(&mut self, lifetime: ast::Lifetime) {
-        self.print_name(lifetime.ident.name)
+        self.word(lifetime.ident.name.to_string());
+        self.ann_post(lifetime.ident)
     }
 
     fn print_lifetime_bounds(&mut self, bounds: &ast::GenericBounds) {
@@ -2037,7 +2338,7 @@ impl<'a> State<'a> {
         self.print_token_literal(lit.as_token_lit(), lit.span)
     }
 
-    fn print_token_literal(&mut self, token_lit: token::Lit, span: Span) {
+    fn print_token_literal(&mut self, token_lit: tk::Lit, span: Span) {
         self.maybe_print_comment(span.lo());
         self.word(token_lit.to_string())
     }
@@ -2067,6 +2368,15 @@ impl<'a> State<'a> {
 
     fn print_meta_item(&mut self, item: &ast::MetaItem) {
         let ib = self.ibox(INDENT_UNIT);
+
+        match item.unsafety {
+            ast::Safety::Unsafe(_) => {
+                self.word("unsafe");
+                self.popen();
+            }
+            ast::Safety::Default | ast::Safety::Safe(_) => {}
+        }
+
         match &item.kind {
             ast::MetaItemKind::Word => self.print_path(&item.path, false, 0),
             ast::MetaItemKind::NameValue(value) => {
@@ -2082,6 +2392,12 @@ impl<'a> State<'a> {
                 self.pclose();
             }
         }
+
+        match item.unsafety {
+            ast::Safety::Unsafe(_) => self.pclose(),
+            ast::Safety::Default | ast::Safety::Safe(_) => {}
+        }
+
         self.end(ib);
     }
 

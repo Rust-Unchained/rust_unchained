@@ -207,5 +207,162 @@ help: use an automatic link instead
 LL | /// hey! <https://somewhere.com/a?hello=12&bye=11#xyz>
    |          +                                           +
 
-error: aborting due to 17 previous errors
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:41:26
+   |
+LL | #[doc = "here's a thing: https://example.com/"]
+   |                          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | #[doc = "here's a thing: <https://example.com/>"]
+   |                          +                    +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:45:5
+   |
+LL | /// https://example.com/sugar
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// <https://example.com/sugar>
+   |     +                         +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:47:10
+   |
+LL | #[doc = "https://example.com/raw"]
+   |          ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | #[doc = "<https://example.com/raw>"]
+   |          +                       +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:72:11
+   |
+LL | /// Visit https://example.com/docs.
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// Visit <https://example.com/docs>.
+   |           +                        +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:74:20
+   |
+LL | /// Two sentences. https://example.com. And more text.
+   |                    ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// Two sentences. <https://example.com>. And more text.
+   |                    +                   +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:76:23
+   |
+LL | /// Trailing ellipsis https://example.com/docs...
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// Trailing ellipsis <https://example.com/docs>...
+   |                       +                        +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:78:31
+   |
+LL | /// A period in the middle of https://example.com/a.b is part of the URL.
+   |                               ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// A period in the middle of <https://example.com/a.b> is part of the URL.
+   |                               +                       +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:82:5
+   |
+LL | /// [https://bloob.blob]
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL - /// [https://bloob.blob]
+LL + /// <https://bloob.blob>
+   |
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:84:7
+   |
+LL | /// [ https://bloob.blob ]
+   |       ^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// [ <https://bloob.blob> ]
+   |       +                  +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:86:7
+   |
+LL | /// [ https://bloob.blob]
+   |       ^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// [ <https://bloob.blob>]
+   |       +                  +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:88:6
+   |
+LL | /// [https://bloob.blob ]
+   |      ^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// [<https://bloob.blob> ]
+   |      +                  +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:90:6
+   |
+LL | /// [https://bloob.blob
+   |      ^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// [<https://bloob.blob>
+   |      +                  +
+
+error: this URL is not a hyperlink
+  --> $DIR/bare-urls.rs:92:5
+   |
+LL | /// https://bloob.blob]
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+help: use an automatic link instead
+   |
+LL | /// <https://bloob.blob>]
+   |     +                  +
+
+error: aborting due to 30 previous errors
 

@@ -3,9 +3,10 @@
 //! NOTE: The crate is undergoing refactors, don't believe everything the docs
 //! say :-)
 //!
-//! The parser doesn't know about concrete representation of tokens and syntax
-//! trees. Abstract [`TokenSource`] and [`TreeSink`] traits are used instead. As
-//! a consequence, this crate does not contain a lexer.
+//! The parser doesn't know about concrete representation of tokens
+//! and syntax trees. Abstract [`Input`] and [`Output`] traits are
+//! used to provide tokens instead. As a consequence, this crate does
+//! not contain a lexer.
 //!
 //! The [`Parser`] struct from the [`parser`] module is a cursor into the
 //! sequence of tokens.  Parsing routines use [`Parser`] to inspect current
@@ -23,9 +24,12 @@
 #[cfg(not(feature = "in-rust-tree"))]
 extern crate ra_ap_rustc_lexer as rustc_lexer;
 #[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+#[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
 mod event;
+mod frontmatter;
 mod grammar;
 mod input;
 mod lexed_str;
@@ -34,6 +38,8 @@ mod parser;
 mod shortcuts;
 mod syntax_kind;
 mod token_set;
+
+pub use T_ as T;
 
 #[cfg(test)]
 mod tests;
@@ -49,6 +55,13 @@ pub use crate::{
     shortcuts::StrStep,
     syntax_kind::SyntaxKind,
 };
+
+/// True if `c` is whitespace in Rust source (Unicode Pattern_White_Space as in the language reference).
+///
+/// See <https://doc.rust-lang.org/reference/whitespace.html>.
+pub fn is_rust_whitespace(c: char) -> bool {
+    frontmatter::is_whitespace(c)
+}
 
 /// Parse the whole of the input as a given syntactic construct.
 ///
@@ -85,7 +98,7 @@ pub enum TopEntryPoint {
 }
 
 impl TopEntryPoint {
-    pub fn parse(&self, input: &Input, edition: Edition) -> Output {
+    pub fn parse(&self, input: &Input) -> Output {
         let _p = tracing::info_span!("TopEntryPoint::parse", ?self).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
@@ -96,10 +109,10 @@ impl TopEntryPoint {
             TopEntryPoint::Expr => grammar::entry::top::expr,
             TopEntryPoint::MetaItem => grammar::entry::top::meta_item,
         };
-        let mut p = parser::Parser::new(input, edition);
+        let mut p = parser::Parser::new(input);
         entry_point(&mut p);
-        let events = p.finish();
-        let res = event::process(events);
+        let (events, errors) = p.finish();
+        let res = event::process(events, errors);
 
         if cfg!(debug_assertions) {
             let mut depth = 0;
@@ -148,7 +161,7 @@ pub enum PrefixEntryPoint {
 }
 
 impl PrefixEntryPoint {
-    pub fn parse(&self, input: &Input, edition: Edition) -> Output {
+    pub fn parse(&self, input: &Input) -> Output {
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             PrefixEntryPoint::Vis => grammar::entry::prefix::vis,
             PrefixEntryPoint::Block => grammar::entry::prefix::block,
@@ -161,10 +174,10 @@ impl PrefixEntryPoint {
             PrefixEntryPoint::Item => grammar::entry::prefix::item,
             PrefixEntryPoint::MetaItem => grammar::entry::prefix::meta_item,
         };
-        let mut p = parser::Parser::new(input, edition);
+        let mut p = parser::Parser::new(input);
         entry_point(&mut p);
-        let events = p.finish();
-        event::process(events)
+        let (events, errors) = p.finish();
+        event::process(events, errors)
     }
 }
 
@@ -185,11 +198,11 @@ impl Reparser {
     ///
     /// Tokens must start with `{`, end with `}` and form a valid brace
     /// sequence.
-    pub fn parse(self, tokens: &Input, edition: Edition) -> Output {
+    pub fn parse(self, tokens: &Input) -> Output {
         let Reparser(r) = self;
-        let mut p = parser::Parser::new(tokens, edition);
+        let mut p = parser::Parser::new(tokens);
         r(&mut p);
-        let events = p.finish();
-        event::process(events)
+        let (events, errors) = p.finish();
+        event::process(events, errors)
     }
 }

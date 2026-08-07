@@ -1,10 +1,6 @@
-use syntax::{
-    ast::{self, syntax_factory::SyntaxFactory},
-    syntax_editor::Position,
-    AstNode, SyntaxKind, T,
-};
+use syntax::{AstNode, SyntaxKind, T, ast, syntax_editor::Position};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: remove_parentheses
 //
@@ -21,7 +17,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     _ = 2 + 2;
 // }
 // ```
-pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let parens = ctx.find_node_at_offset::<ast::ParenExpr>()?;
 
     let cursor_in_range =
@@ -40,11 +36,12 @@ pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
 
     let target = parens.syntax().text_range();
     acc.add(
-        AssistId("remove_parentheses", AssistKind::Refactor),
+        AssistId::refactor("remove_parentheses"),
         "Remove redundant parentheses",
         target,
         |builder| {
-            let mut editor = builder.make_editor(parens.syntax());
+            let editor = builder.make_editor(parens.syntax());
+            let make = editor.make();
             let prev_token = parens.syntax().first_token().and_then(|it| it.prev_token());
             let need_to_add_ws = match prev_token {
                 Some(it) => {
@@ -54,12 +51,10 @@ pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
                 None => false,
             };
             if need_to_add_ws {
-                let make = SyntaxFactory::new();
                 editor.insert(Position::before(parens.syntax()), make.whitespace(" "));
-                editor.add_mappings(make.finish_with_mappings());
             }
             editor.replace(parens.syntax(), expr.syntax());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -163,6 +158,31 @@ mod tests {
     }
 
     #[test]
+    fn remove_parens_prefix_with_ret_like_prefix() {
+        check_assist(remove_parentheses, r#"fn f() { !$0(return) }"#, r#"fn f() { !return }"#);
+        // `break`, `continue` behave the same under prefix operators
+        check_assist(remove_parentheses, r#"fn f() { !$0(break) }"#, r#"fn f() { !break }"#);
+        check_assist(remove_parentheses, r#"fn f() { !$0(continue) }"#, r#"fn f() { !continue }"#);
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { !$0(return false) }"#,
+            r#"fn f() { !return false }"#,
+        );
+
+        // Binary operators should still allow removal unless a ret-like expression is immediately followed by `||` or `&&`.
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { true || $0(return) }"#,
+            r#"fn f() { true || return }"#,
+        );
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { cond && $0(return) }"#,
+            r#"fn f() { cond && return }"#,
+        );
+    }
+
+    #[test]
     fn remove_parens_return_with_value_followed_by_block() {
         check_assist(
             remove_parentheses,
@@ -221,6 +241,85 @@ mod tests {
             r#"fn f() { &$0(return ()) }"#,
             r#"fn f() { &return () }"#,
         );
+    }
+
+    #[test]
+    fn remove_parens_return_in_unary_not() {
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { cond && !$0(return) }"#,
+            r#"fn f() { cond && !return }"#,
+        );
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { cond && !$0(return false) }"#,
+            r#"fn f() { cond && !return false }"#,
+        );
+    }
+
+    #[test]
+    fn remove_parens_return_in_disjunction_with_closure_risk() {
+        // `return` may only be blocked when it would form `return ||` or `return &&`
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && $0(return) || true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && !$0(return) || true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && $0(return false) || true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && !$0(return false) || true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && $0(return) && true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && !$0(return) && true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && $0(return false) && true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = true && !$0(return false) && true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = $0(return) || true; }"#,
+        );
+        check_assist_not_applicable(
+            remove_parentheses,
+            r#"fn f() { let _x = $0(return) && true; }"#,
+        );
+    }
+
+    #[test]
+    fn remove_parens_return_in_disjunction_is_ok() {
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { let _x = true || $0(return); }"#,
+            r#"fn f() { let _x = true || return; }"#,
+        );
+        check_assist(
+            remove_parentheses,
+            r#"fn f() { let _x = true && $0(return); }"#,
+            r#"fn f() { let _x = true && return; }"#,
+        );
+    }
+
+    #[test]
+    fn remove_parens_conflict_cast_before_l_angle() {
+        check_assist_not_applicable(remove_parentheses, r#"fn f() { _ = $0(1 as u32) << 10; }"#);
+        check_assist_not_applicable(remove_parentheses, r#"fn f() { _ = $0(1 as u32) < 10; }"#);
     }
 
     #[test]

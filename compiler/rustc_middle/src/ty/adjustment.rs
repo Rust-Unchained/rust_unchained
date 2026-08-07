@@ -2,15 +2,16 @@ use rustc_abi::FieldIdx;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_span::Span;
 
 use crate::ty::{Ty, TyCtxt};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, StableHash)]
 pub enum PointerCoercion {
-    /// Go from a fn-item type to a fn-pointer type.
-    ReifyFnPointer,
+    /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+    /// It cannot convert an unsafe fn-item to a safe fn pointer.
+    ReifyFnPointer(hir::Safety),
 
     /// Go from a safe fn pointer to an unsafe fn pointer.
     UnsafeFnPointer,
@@ -36,9 +37,6 @@ pub enum PointerCoercion {
     /// type. Codegen backends and miri figure out what has to be done
     /// based on the precise source/target type at hand.
     Unsize,
-
-    /// Go from a pointer-like type to a `dyn*` object.
-    DynStar,
 }
 
 /// Represents coercing a value to a different type of value.
@@ -81,7 +79,7 @@ pub enum PointerCoercion {
 ///    At some point, of course, `Box` should move out of the compiler, in which
 ///    case this is analogous to transforming a struct. E.g., `Box<[i32; 4]>` ->
 ///    `Box<[i32]>` is an `Adjust::Unsize` with the target `Box<[i32]>`.
-#[derive(Clone, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
 pub struct Adjustment<'tcx> {
     pub kind: Adjust,
     pub target: Ty<'tcx>,
@@ -93,28 +91,40 @@ impl<'tcx> Adjustment<'tcx> {
     }
 }
 
-#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Debug, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
 pub enum Adjust {
     /// Go from ! to any type.
     NeverToAny,
 
     /// Dereference once, producing a place.
-    Deref(Option<OverloadedDeref>),
+    Deref(DerefAdjustKind),
 
     /// Take the address and produce either a `&` or `*` pointer.
     Borrow(AutoBorrow),
 
     Pointer(PointerCoercion),
 
-    /// Take a pinned reference and reborrow as a `Pin<&mut T>` or `Pin<&T>`.
-    ReborrowPin(hir::Mutability),
+    /// Take a user-type T implementing the Reborrow trait (for Mut) or the CoerceShared trait (for
+    /// Not) and reborrow as `T` or `CoreceShared<U>`.
+    ///
+    /// This produces an [`ExprKind::Reborrow`].
+    ///
+    /// [`ExprKind::Reborrow`]: crate::thir::ExprKind::Reborrow
+    GenericReborrow(hir::Mutability),
+}
+
+#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
+pub enum DerefAdjustKind {
+    Builtin,
+    Overloaded(OverloadedDeref),
+    Pin,
 }
 
 /// An overloaded autoderef step, representing a `Deref(Mut)::deref(_mut)`
 /// call, with the signature `&'a T -> &'a U` or `&'a mut T -> &'a mut U`.
 /// The target type is `U` in both cases, with the region and mutability
 /// being those shared by both the receiver and the returned reference.
-#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, StableHash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct OverloadedDeref {
     pub mutbl: hir::Mutability,
@@ -128,8 +138,8 @@ impl OverloadedDeref {
     /// for this overloaded deref's mutability.
     pub fn method_call<'tcx>(&self, tcx: TyCtxt<'tcx>) -> DefId {
         let trait_def_id = match self.mutbl {
-            hir::Mutability::Not => tcx.require_lang_item(LangItem::Deref, None),
-            hir::Mutability::Mut => tcx.require_lang_item(LangItem::DerefMut, None),
+            hir::Mutability::Not => tcx.require_lang_item(LangItem::Deref, self.span),
+            hir::Mutability::Mut => tcx.require_lang_item(LangItem::DerefMut, self.span),
         };
         tcx.associated_items(trait_def_id)
             .in_definition_order()
@@ -151,13 +161,13 @@ impl OverloadedDeref {
 /// new code via two-phase borrows, so we try to limit where we create two-phase
 /// capable mutable borrows.
 /// See #49434 for tracking.
-#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, StableHash)]
 pub enum AllowTwoPhase {
     Yes,
     No,
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, StableHash)]
 pub enum AutoBorrowMutability {
     Mut { allow_two_phase_borrow: AllowTwoPhase },
     Not,
@@ -184,7 +194,7 @@ impl From<AutoBorrowMutability> for hir::Mutability {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, PartialEq, Debug, TyEncodable, TyDecodable, StableHash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub enum AutoBorrow {
     /// Converts from T to &T.
@@ -192,6 +202,9 @@ pub enum AutoBorrow {
 
     /// Converts from T to *T.
     RawPtr(hir::Mutability),
+
+    /// Converts from T to Pin<&T>.
+    Pin(hir::Mutability),
 }
 
 /// Information for `CoerceUnsized` impls, storing information we
@@ -200,7 +213,7 @@ pub enum AutoBorrow {
 /// This struct can be obtained via the `coerce_impl_info` query.
 /// Demanding this struct also has the side-effect of reporting errors
 /// for inappropriate impls.
-#[derive(Clone, Copy, TyEncodable, TyDecodable, Debug, HashStable)]
+#[derive(Clone, Copy, TyEncodable, TyDecodable, Debug, StableHash)]
 pub struct CoerceUnsizedInfo {
     /// If this is a "custom coerce" impl, then what kind of custom
     /// coercion is it? This applies to impls of `CoerceUnsized` for
@@ -209,7 +222,7 @@ pub struct CoerceUnsizedInfo {
     pub custom_kind: Option<CustomCoerceUnsized>,
 }
 
-#[derive(Clone, Copy, TyEncodable, TyDecodable, Debug, HashStable)]
+#[derive(Clone, Copy, TyEncodable, TyDecodable, Debug, StableHash)]
 pub enum CustomCoerceUnsized {
     /// Records the index of the field being coerced.
     Struct(FieldIdx),
@@ -217,7 +230,7 @@ pub enum CustomCoerceUnsized {
 
 /// Represents an implicit coercion applied to the scrutinee of a match before testing a pattern
 /// against it. Currently, this is used only for implicit dereferences.
-#[derive(Clone, Copy, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Copy, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
 pub struct PatAdjustment<'tcx> {
     pub kind: PatAdjust,
     /// The type of the scrutinee before the adjustment is applied, or the "adjusted type" of the
@@ -226,7 +239,7 @@ pub struct PatAdjustment<'tcx> {
 }
 
 /// Represents implicit coercions of patterns' types, rather than values' types.
-#[derive(Clone, Copy, PartialEq, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Clone, Copy, PartialEq, Debug, TyEncodable, TyDecodable, StableHash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub enum PatAdjust {
     /// An implicit dereference before matching, such as when matching the pattern `0` against a
@@ -235,4 +248,7 @@ pub enum PatAdjust {
     /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
     /// pattern `[..]` against a scrutinee of type `Vec<T>`.
     OverloadedDeref,
+    /// An implicit dereference before matching a `&pin` reference (under feature `pin_ergonomics`),
+    /// which will be lowered as a builtin deref of the private field `__pointer` in `Pin`
+    PinDeref,
 }

@@ -1,11 +1,9 @@
 mod atom;
 
-use crate::grammar::attributes::ATTRIBUTE_FIRST;
-
 use super::*;
 
+pub(super) use atom::{EXPR_RECOVERY_SET, LITERAL_FIRST, literal, parse_asm_expr};
 pub(crate) use atom::{block_expr, match_arm_list};
-pub(super) use atom::{literal, LITERAL_FIRST};
 
 #[derive(PartialEq, Eq)]
 pub(super) enum Semicolon {
@@ -58,7 +56,7 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
     // }
     attributes::outer_attrs(p);
 
-    if p.at(T![let]) {
+    if p.at(T![let]) || (p.at(T![super]) && p.nth_at(1, T![let])) {
         let_stmt(p, semicolon);
         m.complete(p, LET_STMT);
         return;
@@ -77,44 +75,45 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
         return;
     }
 
-    if let Some((cm, blocklike)) = expr_stmt(p, Some(m)) {
-        if !(p.at(T!['}']) || (semicolon != Semicolon::Required && p.at(EOF))) {
-            // test no_semi_after_block
-            // fn foo() {
-            //     if true {}
-            //     loop {}
-            //     match () {}
-            //     while true {}
-            //     for _ in () {}
-            //     {}
-            //     {}
-            //     macro_rules! test {
-            //          () => {}
-            //     }
-            //     test!{}
-            // }
-            let m = cm.precede(p);
-            match semicolon {
-                Semicolon::Required => {
-                    if blocklike.is_block() {
-                        p.eat(T![;]);
-                    } else {
-                        p.expect(T![;]);
-                    }
-                }
-                Semicolon::Optional => {
+    if let Some((cm, blocklike)) = expr_stmt(p, Some(m))
+        && !(p.at(T!['}']) || (semicolon != Semicolon::Required && p.at(EOF)))
+    {
+        // test no_semi_after_block
+        // fn foo() {
+        //     if true {}
+        //     loop {}
+        //     match () {}
+        //     while true {}
+        //     for _ in () {}
+        //     {}
+        //     {}
+        //     macro_rules! test {
+        //          () => {}
+        //     }
+        //     test!{}
+        // }
+        let m = cm.precede(p);
+        match semicolon {
+            Semicolon::Required => {
+                if blocklike.is_block() {
                     p.eat(T![;]);
+                } else {
+                    p.expect(T![;]);
                 }
-                Semicolon::Forbidden => (),
             }
-            m.complete(p, EXPR_STMT);
+            Semicolon::Optional => {
+                p.eat(T![;]);
+            }
+            Semicolon::Forbidden => (),
         }
+        m.complete(p, EXPR_STMT);
     }
 }
 
 // test let_stmt
-// fn f() { let x: i32 = 92; }
+// fn f() { let x: i32 = 92; super let y; super::foo; }
 pub(super) fn let_stmt(p: &mut Parser<'_>, with_semi: Semicolon) {
+    p.eat(T![super]);
     p.bump(T![let]);
     patterns::pattern(p);
     if p.at(T![:]) {
@@ -133,14 +132,11 @@ pub(super) fn let_stmt(p: &mut Parser<'_>, with_semi: Semicolon) {
     if p.at(T![else]) {
         // test_err let_else_right_curly_brace
         // fn func() { let Some(_) = {Some(1)} else { panic!("h") };}
-        if let Some(expr) = expr_after_eq {
-            if let Some(token) = expr.last_token(p) {
-                if token == T!['}'] {
-                    p.error(
-                        "right curly brace `}` before `else` in a `let...else` statement not allowed"
-                    )
-                }
-            }
+        if let Some(expr) = expr_after_eq
+            && let Some(token) = expr.last_token(p)
+            && token == T!['}']
+        {
+            p.error("right curly brace `}` before `else` in a `let...else` statement not allowed")
         }
 
         // test let_else
@@ -303,8 +299,16 @@ fn expr_bp(
             //     match 1.. { _ => () };
             //     match a.b()..S { _ => () };
             // }
+
+            // test closure_postfix_range_method_call
+            // fn foo() {
+            //     || 1.. .method();
+            //     || 1.. .field;
+            // }
+            let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
+            let struct_forbidden = r.forbid_structs && p.at(T!['{']);
             let has_trailing_expression =
-                p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{']));
+                p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden;
             if !has_trailing_expression {
                 // no RHS
                 lhs = m.complete(p, RANGE_EXPR);
@@ -326,7 +330,7 @@ fn expr_bp(
 }
 
 const LHS_FIRST: TokenSet =
-    atom::ATOM_EXPR_FIRST.union(TokenSet::new(&[T![&], T![*], T![!], T![.], T![-], T![_]]));
+    atom::ATOM_EXPR_FIRST.union(TokenSet::new(&[T![&], T![*], T![!], T![.], T![-], T![_], T![#]]));
 
 fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLike)> {
     let m;
@@ -386,6 +390,7 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                     // }
                     let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
                     let struct_forbidden = r.forbid_structs && p.at(T!['{']);
+                    // NOTE: Similar logic `is_range` flag in expr_bp()
                     if p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden {
                         expr_bp(p, None, r, 2);
                     }
@@ -432,6 +437,11 @@ fn postfix_expr(
             // }
             T!['('] if allow_calls => call_expr(p, lhs),
             T!['['] if allow_calls => index_expr(p, lhs),
+            // test_err postfix_dot_expr_ambiguity
+            // fn foo() {
+            //     x.
+            //     ()
+            // }
             T![.] => match postfix_dot_expr::<false>(p, lhs) {
                 Ok(it) => it,
                 Err(it) => {
@@ -460,6 +470,7 @@ fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
 
     if PATH_NAME_REF_KINDS.contains(p.nth(nth1))
         && (p.nth(nth2) == T!['('] || p.nth_at(nth2, T![::]))
+        || p.nth(nth1) == T!['(']
     {
         return Ok(method_call_expr::<FLOAT_RECOVERY>(p, lhs));
     }
@@ -528,19 +539,26 @@ fn method_call_expr<const FLOAT_RECOVERY: bool>(
     lhs: CompletedMarker,
 ) -> CompletedMarker {
     if FLOAT_RECOVERY {
-        assert!(p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::])));
-    } else {
         assert!(
-            p.at(T![.])
-                && PATH_NAME_REF_KINDS.contains(p.nth(1))
-                && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
+            p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::]))
+                || p.current() == T!['(']
+        );
+    } else {
+        assert!(p.at(T![.]));
+        assert!(
+            PATH_NAME_REF_KINDS.contains(p.nth(1)) && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
+                || p.nth(1) == T!['(']
         );
     }
     let m = lhs.precede(p);
     if !FLOAT_RECOVERY {
         p.bump(T![.]);
     }
-    name_ref_mod_path(p);
+    if p.at_ts(PATH_NAME_REF_KINDS) {
+        name_ref_mod_path(p);
+    } else {
+        p.error("expected method name, field name or number");
+    }
     generic_args::opt_generic_arg_list_expr(p);
     if p.at(T!['(']) {
         arg_list(p);
@@ -642,7 +660,7 @@ fn arg_list(p: &mut Parser<'_>) {
         T![')'],
         T![,],
         || "expected expression".into(),
-        EXPR_FIRST.union(ATTRIBUTE_FIRST),
+        EXPR_FIRST,
         |p| expr(p).is_some(),
     );
     m.complete(p, ARG_LIST);

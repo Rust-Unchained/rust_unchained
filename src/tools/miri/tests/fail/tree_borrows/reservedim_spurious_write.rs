@@ -1,7 +1,7 @@
 // Illustrating a problematic interaction between Reserved, interior mutability,
 // and protectors, that makes spurious writes fail in the previous model of Tree Borrows.
 // As for all similar tests, we disable preemption so that the error message is deterministic.
-//@compile-flags: -Zmiri-tree-borrows -Zmiri-preemption-rate=0
+//@compile-flags: -Zmiri-tree-borrows -Zmiri-deterministic-concurrency
 //
 // One revision without spurious read (default source code) and one with spurious read.
 // Both are expected to be UB. Both revisions are expected to have the *same* error
@@ -60,8 +60,7 @@ fn main() {
         fn inner(x: &mut u8, b: IdxBarrier) {
             *x = 42; // activate immediately
             synchronized!(b, "[lazy] retag y (&mut, protect, IM)");
-            // A spurious write should be valid here because `x` is
-            // `Active` and protected.
+            // A spurious write should be valid here because `x` is `Unique` and protected.
             if cfg!(with) {
                 synchronized!(b, "spurious write x (executed)");
                 *x = 64;

@@ -10,15 +10,15 @@ use std::mem;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def::{CtorKind, DefKind, Res};
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Arm, Block, Expr, LetStmt, Pat, PatKind, Stmt};
 use rustc_index::Idx;
-use rustc_middle::bug;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint;
-use rustc_span::source_map;
+use rustc_span::Spanned;
 use tracing::debug;
 
 #[derive(Debug, Copy, Clone)]
@@ -33,14 +33,6 @@ struct Context {
 struct ScopeResolutionVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
 
-    // The number of expressions and patterns visited in the current body.
-    expr_and_pat_count: usize,
-    // When this is `true`, we record the `Scopes` we encounter
-    // when processing a Yield expression. This allows us to fix
-    // up their indices.
-    pessimistic_yield: bool,
-    // Stores scopes when `pessimistic_yield` is `true`.
-    fixup_scopes: Vec<Scope>,
     // The generated scope tree.
     scope_tree: ScopeTree,
 
@@ -107,7 +99,7 @@ fn resolve_block<'tcx>(
         for (i, statement) in blk.stmts.iter().enumerate() {
             match statement.kind {
                 hir::StmtKind::Let(LetStmt { els: Some(els), .. }) => {
-                    // Let-else has a special lexical structure for variables.
+                    // let-else has a special lexical structure for variables.
                     // First we take a checkpoint of the current scope context here.
                     let mut prev_cx = visitor.cx;
 
@@ -156,7 +148,7 @@ fn resolve_block<'tcx>(
             if !terminating
                 && !visitor
                     .tcx
-                    .lints_that_dont_need_to_run(())
+                    .skippable_lints(())
                     .contains(&lint::LintId::of(lint::builtin::TAIL_EXPR_DROP_ORDER))
             {
                 // If this temporary scope will be changing once the codebase adopts Rust 2024,
@@ -175,15 +167,31 @@ fn resolve_block<'tcx>(
     visitor.cx = prev_cx;
 }
 
-fn resolve_arm<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, arm: &'tcx hir::Arm<'tcx>) {
-    fn has_let_expr(expr: &Expr<'_>) -> bool {
-        match &expr.kind {
-            hir::ExprKind::Binary(_, lhs, rhs) => has_let_expr(lhs) || has_let_expr(rhs),
-            hir::ExprKind::Let(..) => true,
-            _ => false,
-        }
-    }
+/// Resolve a condition from an `if` expression or match guard so that it is a terminating scope
+/// if it doesn't contain `let` expressions.
+fn resolve_cond<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, cond: &'tcx hir::Expr<'tcx>) {
+    let terminate = match cond.kind {
+        // Temporaries for `let` expressions must live into the success branch.
+        hir::ExprKind::Let(_) => false,
+        // Logical operator chains are handled in `resolve_expr`. Since logical operator chains in
+        // conditions are lowered to control-flow rather than boolean temporaries, there's no
+        // temporary to drop for logical operators themselves. `resolve_expr` will also recursively
+        // wrap any operands in terminating scopes, other than `let` expressions (which we shouldn't
+        // terminate) and other logical operators (which don't need a terminating scope, since their
+        // operands will be terminated). Any temporaries that would need to be dropped will be
+        // dropped before we leave this operator's scope; terminating them here would be redundant.
+        hir::ExprKind::Binary(
+            Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+            _,
+            _,
+        ) => false,
+        // Otherwise, conditions should always drop their temporaries.
+        _ => true,
+    };
+    resolve_expr(visitor, cond, terminate);
+}
 
+fn resolve_arm<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, arm: &'tcx hir::Arm<'tcx>) {
     let prev_cx = visitor.cx;
 
     visitor.enter_node_scope_with_dtor(arm.hir_id.local_id, true);
@@ -191,26 +199,26 @@ fn resolve_arm<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, arm: &'tcx hir:
 
     resolve_pat(visitor, arm.pat);
     if let Some(guard) = arm.guard {
-        resolve_expr(visitor, guard, !has_let_expr(guard));
+        // We introduce a new scope to contain bindings and temporaries from `if let` guards, to
+        // ensure they're dropped before the arm's pattern's bindings. This extends to the end of
+        // the arm body and is the scope of its locals as well.
+        visitor.enter_scope(Scope { local_id: arm.hir_id.local_id, data: ScopeData::MatchGuard });
+        visitor.cx.var_parent = visitor.cx.parent;
+        resolve_cond(visitor, guard);
     }
     resolve_expr(visitor, arm.body, false);
 
     visitor.cx = prev_cx;
 }
 
+#[tracing::instrument(level = "debug", skip(visitor))]
 fn resolve_pat<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, pat: &'tcx hir::Pat<'tcx>) {
     // If this is a binding then record the lifetime of that binding.
     if let PatKind::Binding(..) = pat.kind {
         record_var_lifetime(visitor, pat.hir_id.local_id);
     }
 
-    debug!("resolve_pat - pre-increment {} pat = {:?}", visitor.expr_and_pat_count, pat);
-
     intravisit::walk_pat(visitor, pat);
-
-    visitor.expr_and_pat_count += 1;
-
-    debug!("resolve_pat - post-increment {} pat = {:?}", visitor.expr_and_pat_count, pat);
 }
 
 fn resolve_stmt<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, stmt: &'tcx hir::Stmt<'tcx>) {
@@ -242,74 +250,21 @@ fn resolve_stmt<'tcx>(visitor: &mut ScopeResolutionVisitor<'tcx>, stmt: &'tcx hi
     }
 }
 
+#[tracing::instrument(level = "debug", skip(visitor))]
 fn resolve_expr<'tcx>(
     visitor: &mut ScopeResolutionVisitor<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
     terminating: bool,
 ) {
-    debug!("resolve_expr - pre-increment {} expr = {:?}", visitor.expr_and_pat_count, expr);
-
     let prev_cx = visitor.cx;
     visitor.enter_node_scope_with_dtor(expr.hir_id.local_id, terminating);
-
-    let prev_pessimistic = visitor.pessimistic_yield;
-
-    // Ordinarily, we can rely on the visit order of HIR intravisit
-    // to correspond to the actual execution order of statements.
-    // However, there's a weird corner case with compound assignment
-    // operators (e.g. `a += b`). The evaluation order depends on whether
-    // or not the operator is overloaded (e.g. whether or not a trait
-    // like AddAssign is implemented).
-
-    // For primitive types (which, despite having a trait impl, don't actually
-    // end up calling it), the evaluation order is right-to-left. For example,
-    // the following code snippet:
-    //
-    //    let y = &mut 0;
-    //    *{println!("LHS!"); y} += {println!("RHS!"); 1};
-    //
-    // will print:
-    //
-    // RHS!
-    // LHS!
-    //
-    // However, if the operator is used on a non-primitive type,
-    // the evaluation order will be left-to-right, since the operator
-    // actually get desugared to a method call. For example, this
-    // nearly identical code snippet:
-    //
-    //     let y = &mut String::new();
-    //    *{println!("LHS String"); y} += {println!("RHS String"); "hi"};
-    //
-    // will print:
-    // LHS String
-    // RHS String
-    //
-    // To determine the actual execution order, we need to perform
-    // trait resolution. Unfortunately, we need to be able to compute
-    // yield_in_scope before type checking is even done, as it gets
-    // used by AST borrowcheck.
-    //
-    // Fortunately, we don't need to know the actual execution order.
-    // It suffices to know the 'worst case' order with respect to yields.
-    // Specifically, we need to know the highest 'expr_and_pat_count'
-    // that we could assign to the yield expression. To do this,
-    // we pick the greater of the two values from the left-hand
-    // and right-hand expressions. This makes us overly conservative
-    // about what types could possibly live across yield points,
-    // but we will never fail to detect that a type does actually
-    // live across a yield point. The latter part is critical -
-    // we're already overly conservative about what types will live
-    // across yield points, as the generated MIR will determine
-    // when things are actually live. However, for typecheck to work
-    // properly, we can't miss any types.
 
     match expr.kind {
         // Conditional or repeating scopes are always terminating
         // scopes, meaning that temporaries cannot outlive them.
         // This ensures fixed size stacks.
         hir::ExprKind::Binary(
-            source_map::Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+            Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
             left,
             right,
         ) => {
@@ -338,7 +293,7 @@ fn resolve_expr<'tcx>(
                 // This is purely an optimization to reduce the number of
                 // terminating scopes.
                 hir::ExprKind::Binary(
-                    source_map::Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
+                    Spanned { node: hir::BinOpKind::And | hir::BinOpKind::Or, .. },
                     ..,
                 ) => false,
                 // otherwise: mark it as terminating
@@ -359,55 +314,42 @@ fn resolve_expr<'tcx>(
             let body = visitor.tcx.hir_body(body);
             visitor.visit_body(body);
         }
+        // Ordinarily, we can rely on the visit order of HIR intravisit
+        // to correspond to the actual execution order of statements.
+        // However, there's a weird corner case with compound assignment
+        // operators (e.g. `a += b`). The evaluation order depends on whether
+        // or not the operator is overloaded (e.g. whether or not a trait
+        // like AddAssign is implemented).
+        //
+        // For primitive types (which, despite having a trait impl, don't actually
+        // end up calling it), the evaluation order is right-to-left. For example,
+        // the following code snippet:
+        //
+        //    let y = &mut 0;
+        //    *{println!("LHS!"); y} += {println!("RHS!"); 1};
+        //
+        // will print:
+        //
+        // RHS!
+        // LHS!
+        //
+        // However, if the operator is used on a non-primitive type,
+        // the evaluation order will be left-to-right, since the operator
+        // actually get desugared to a method call. For example, this
+        // nearly identical code snippet:
+        //
+        //     let y = &mut String::new();
+        //    *{println!("LHS String"); y} += {println!("RHS String"); "hi"};
+        //
+        // will print:
+        // LHS String
+        // RHS String
+        //
+        // To determine the actual execution order, we need to perform
+        // trait resolution. Fortunately, we don't need to know the actual execution order.
         hir::ExprKind::AssignOp(_, left_expr, right_expr) => {
-            debug!(
-                "resolve_expr - enabling pessimistic_yield, was previously {}",
-                prev_pessimistic
-            );
-
-            let start_point = visitor.fixup_scopes.len();
-            visitor.pessimistic_yield = true;
-
-            // If the actual execution order turns out to be right-to-left,
-            // then we're fine. However, if the actual execution order is left-to-right,
-            // then we'll assign too low a count to any `yield` expressions
-            // we encounter in 'right_expression' - they should really occur after all of the
-            // expressions in 'left_expression'.
             visitor.visit_expr(right_expr);
-            visitor.pessimistic_yield = prev_pessimistic;
-
-            debug!("resolve_expr - restoring pessimistic_yield to {}", prev_pessimistic);
             visitor.visit_expr(left_expr);
-            debug!("resolve_expr - fixing up counts to {}", visitor.expr_and_pat_count);
-
-            // Remove and process any scopes pushed by the visitor
-            let target_scopes = visitor.fixup_scopes.drain(start_point..);
-
-            for scope in target_scopes {
-                let yield_data =
-                    visitor.scope_tree.yield_in_scope.get_mut(&scope).unwrap().last_mut().unwrap();
-                let count = yield_data.expr_and_pat_count;
-                let span = yield_data.span;
-
-                // expr_and_pat_count never decreases. Since we recorded counts in yield_in_scope
-                // before walking the left-hand side, it should be impossible for the recorded
-                // count to be greater than the left-hand side count.
-                if count > visitor.expr_and_pat_count {
-                    bug!(
-                        "Encountered greater count {} at span {:?} - expected no greater than {}",
-                        count,
-                        span,
-                        visitor.expr_and_pat_count
-                    );
-                }
-                let new_count = visitor.expr_and_pat_count;
-                debug!(
-                    "resolve_expr - increasing count for scope {:?} from {} to {} at span {:?}",
-                    scope, count, new_count, span
-                );
-
-                yield_data.expr_and_pat_count = new_count;
-            }
         }
 
         hir::ExprKind::If(cond, then, Some(otherwise)) => {
@@ -419,7 +361,7 @@ fn resolve_expr<'tcx>(
             };
             visitor.enter_scope(Scope { local_id: then.hir_id.local_id, data });
             visitor.cx.var_parent = visitor.cx.parent;
-            visitor.visit_expr(cond);
+            resolve_cond(visitor, cond);
             resolve_expr(visitor, then, true);
             visitor.cx = expr_cx;
             resolve_expr(visitor, otherwise, true);
@@ -434,7 +376,7 @@ fn resolve_expr<'tcx>(
             };
             visitor.enter_scope(Scope { local_id: then.hir_id.local_id, data });
             visitor.cx.var_parent = visitor.cx.parent;
-            visitor.visit_expr(cond);
+            resolve_cond(visitor, cond);
             resolve_expr(visitor, then, true);
             visitor.cx = expr_cx;
         }
@@ -450,43 +392,6 @@ fn resolve_expr<'tcx>(
         }
 
         _ => intravisit::walk_expr(visitor, expr),
-    }
-
-    visitor.expr_and_pat_count += 1;
-
-    debug!("resolve_expr post-increment {}, expr = {:?}", visitor.expr_and_pat_count, expr);
-
-    if let hir::ExprKind::Yield(_, source) = &expr.kind {
-        // Mark this expr's scope and all parent scopes as containing `yield`.
-        let mut scope = Scope { local_id: expr.hir_id.local_id, data: ScopeData::Node };
-        loop {
-            let data = YieldData {
-                span: expr.span,
-                expr_and_pat_count: visitor.expr_and_pat_count,
-                source: *source,
-            };
-            match visitor.scope_tree.yield_in_scope.get_mut(&scope) {
-                Some(yields) => yields.push(data),
-                None => {
-                    visitor.scope_tree.yield_in_scope.insert(scope, vec![data]);
-                }
-            }
-
-            if visitor.pessimistic_yield {
-                debug!("resolve_expr in pessimistic_yield - marking scope {:?} for fixup", scope);
-                visitor.fixup_scopes.push(scope);
-            }
-
-            // Keep traversing up while we can.
-            match visitor.scope_tree.parent_map.get(&scope) {
-                // Don't cross from closure bodies to their parent.
-                Some(&superscope) => match superscope.data {
-                    ScopeData::CallSite => break,
-                    _ => scope = superscope,
-                },
-                None => break,
-            }
-        }
     }
 
     visitor.cx = prev_cx;
@@ -562,8 +467,12 @@ fn resolve_local<'tcx>(
     // A, but the inner rvalues `a()` and `b()` have an extended lifetime
     // due to rule C.
 
-    if let_kind == LetKind::Super {
-        if let Some(scope) = visitor.extended_super_lets.remove(&pat.unwrap().hir_id.local_id) {
+    let extend_initializer = match let_kind {
+        LetKind::Regular => true,
+        LetKind::Super
+            if let Some(scope) =
+                visitor.extended_super_lets.remove(&pat.unwrap().hir_id.local_id) =>
+        {
             // This expression was lifetime-extended by a parent let binding. E.g.
             //
             //     let a = {
@@ -576,7 +485,10 @@ fn resolve_local<'tcx>(
             // Processing of `let a` will have already decided to extend the lifetime of this
             // `super let` to its own var_scope. We use that scope.
             visitor.cx.var_parent = scope;
-        } else {
+            // Extend temporaries to live in the same scope as the parent `let`'s bindings.
+            true
+        }
+        LetKind::Super => {
             // This `super let` is not subject to lifetime extension from a parent let binding. E.g.
             //
             //     identity({ super let x = temp(); &x }).method();
@@ -585,34 +497,36 @@ fn resolve_local<'tcx>(
             //
             // Iterate up to the enclosing destruction scope to find the same scope that will also
             // be used for the result of the block itself.
-            while let Some(s) = visitor.cx.var_parent {
-                let parent = visitor.scope_tree.parent_map.get(&s).cloned();
-                if let Some(Scope { data: ScopeData::Destruction, .. }) = parent {
-                    break;
-                }
-                visitor.cx.var_parent = parent;
+            if let Some(inner_scope) = visitor.cx.var_parent {
+                visitor.cx.var_parent =
+                    Some(visitor.scope_tree.default_temporary_scope(inner_scope).0)
             }
+            // Don't lifetime-extend child `super let`s or block tail expressions' temporaries in
+            // the initializer when this `super let` is not itself extended by a parent `let`
+            // (#145784). Block tail expressions are temporary drop scopes in Editions 2024 and
+            // later, their temps shouldn't outlive the block in e.g. `f(pin!({ &temp() }))`.
+            false
         }
-    }
+    };
 
-    if let Some(expr) = init {
+    if let Some(expr) = init
+        && extend_initializer
+    {
         record_rvalue_scope_if_borrow_expr(visitor, expr, visitor.cx.var_parent);
 
         if let Some(pat) = pat {
             if is_binding_pat(pat) {
-                visitor.scope_tree.record_rvalue_candidate(
-                    expr.hir_id,
-                    RvalueCandidate {
-                        target: expr.hir_id.local_id,
-                        lifetime: visitor.cx.var_parent,
-                    },
+                record_subexpr_extended_temp_scopes(
+                    &mut visitor.scope_tree,
+                    expr,
+                    visitor.cx.var_parent,
                 );
             }
         }
     }
 
-    // Make sure we visit the initializer first, so expr_and_pat_count remains correct.
-    // The correct order, as shared between coroutine_interior, drop_ranges and intravisitor,
+    // Make sure we visit the initializer first.
+    // The correct order, as shared between drop_ranges and intravisitor,
     // is to walk initializer, followed by pattern bindings, finally followed by the `else` block.
     if let Some(expr) = init {
         visitor.visit_expr(expr);
@@ -659,7 +573,7 @@ fn resolve_local<'tcx>(
         // & expression, and its lifetime would be extended to the end of the block (due
         // to a different rule, not the below code).
         match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(_), _), ..) => true,
+            PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(..), _), ..) => true,
 
             PatKind::Struct(_, field_pats, _) => field_pats.iter().any(|fp| is_binding_pat(fp.pat)),
 
@@ -677,7 +591,7 @@ fn resolve_local<'tcx>(
                 is_binding_pat(subpat)
             }
 
-            PatKind::Ref(_, _)
+            PatKind::Ref(_, _, _)
             | PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), ..)
             | PatKind::Missing
             | PatKind::Wild
@@ -688,7 +602,7 @@ fn resolve_local<'tcx>(
         }
     }
 
-    /// If `expr` matches the `E&` grammar, then records an extended rvalue scope as appropriate:
+    /// If `expr` matches the `E&` grammar, then records an extended temporary scope as appropriate:
     ///
     /// ```text
     ///     E& = & ET
@@ -711,10 +625,7 @@ fn resolve_local<'tcx>(
         match expr.kind {
             hir::ExprKind::AddrOf(_, _, subexpr) => {
                 record_rvalue_scope_if_borrow_expr(visitor, subexpr, blk_id);
-                visitor.scope_tree.record_rvalue_candidate(
-                    subexpr.hir_id,
-                    RvalueCandidate { target: subexpr.hir_id.local_id, lifetime: blk_id },
-                );
+                record_subexpr_extended_temp_scopes(&mut visitor.scope_tree, subexpr, blk_id);
             }
             hir::ExprKind::Struct(_, fields, _) => {
                 for field in fields {
@@ -752,16 +663,63 @@ fn resolve_local<'tcx>(
                     record_rvalue_scope_if_borrow_expr(visitor, arm.body, blk_id);
                 }
             }
-            hir::ExprKind::Call(..) | hir::ExprKind::MethodCall(..) => {
-                // FIXME(@dingxiangfei2009): choose call arguments here
-                // for candidacy for extended parameter rule application
-            }
-            hir::ExprKind::Index(..) => {
-                // FIXME(@dingxiangfei2009): select the indices
-                // as candidate for rvalue scope rules
+            hir::ExprKind::Call(func, args) => {
+                // Recurse into tuple constructors, such as `Some(&temp())`.
+                //
+                // That way, there is no difference between `Some(..)` and `Some { 0: .. }`,
+                // even though the former is syntactically a function call.
+                if let hir::ExprKind::Path(path) = &func.kind
+                    && let hir::QPath::Resolved(None, path) = path
+                    && let Res::SelfCtor(_) | Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) = path.res
+                {
+                    for arg in args {
+                        record_rvalue_scope_if_borrow_expr(visitor, arg, blk_id);
+                    }
+                }
             }
             _ => {}
         }
+    }
+}
+
+/// Applied to an expression `expr` if `expr` -- or something owned or partially owned by
+/// `expr` -- is going to be indirectly referenced by a variable in a let statement. In that
+/// case, the "temporary lifetime" of `expr` is extended to be the block enclosing the `let`
+/// statement.
+///
+/// More formally, if `expr` matches the grammar `ET`, record the temporary scope of the matching
+/// `<rvalue>` as `lifetime`:
+///
+/// ```text
+///     ET = *ET
+///        | ET[...]
+///        | ET.f
+///        | (ET)
+///        | <rvalue>
+/// ```
+///
+/// Note: ET is intended to match "rvalues or places based on rvalues".
+fn record_subexpr_extended_temp_scopes(
+    scope_tree: &mut ScopeTree,
+    expr: &hir::Expr<'_>,
+    lifetime: Option<Scope>,
+) {
+    // Note: give all the expressions matching `ET` with the
+    // extended temporary lifetime, not just the innermost rvalue,
+    // because in MIR building if we must compile e.g., `*rvalue()`
+    // into a temporary, we request the temporary scope of the
+    // outer expression.
+
+    scope_tree.record_extended_temp_scope(expr.hir_id.local_id, lifetime);
+
+    match expr.kind {
+        hir::ExprKind::AddrOf(_, _, subexpr)
+        | hir::ExprKind::Unary(hir::UnOp::Deref, subexpr)
+        | hir::ExprKind::Field(subexpr, _)
+        | hir::ExprKind::Index(subexpr, _, _) => {
+            record_subexpr_extended_temp_scopes(scope_tree, subexpr, lifetime);
+        }
+        _ => {}
     }
 }
 
@@ -791,16 +749,7 @@ impl<'tcx> ScopeResolutionVisitor<'tcx> {
     }
 
     fn enter_body(&mut self, hir_id: hir::HirId, f: impl FnOnce(&mut Self)) {
-        // Save all state that is specific to the outer function
-        // body. These will be restored once down below, once we've
-        // visited the body.
-        let outer_ec = mem::replace(&mut self.expr_and_pat_count, 0);
         let outer_cx = self.cx;
-        // The 'pessimistic yield' flag is set to true when we are
-        // processing a `+=` statement and have to make pessimistic
-        // control flow assumptions. This doesn't apply to nested
-        // bodies within the `+=` statements. See #69307.
-        let outer_pessimistic_yield = mem::replace(&mut self.pessimistic_yield, false);
 
         self.enter_scope(Scope { local_id: hir_id.local_id, data: ScopeData::CallSite });
         self.enter_scope(Scope { local_id: hir_id.local_id, data: ScopeData::Arguments });
@@ -808,9 +757,7 @@ impl<'tcx> ScopeResolutionVisitor<'tcx> {
         f(self);
 
         // Restore context we had at the start.
-        self.expr_and_pat_count = outer_ec;
         self.cx = outer_cx;
-        self.pessimistic_yield = outer_pessimistic_yield;
     }
 }
 
@@ -842,10 +789,10 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
                 // The body of the every fn is a root scope.
                 resolve_expr(this, body.value, true);
             } else {
-                // Only functions have an outer terminating (drop) scope, while
-                // temporaries in constant initializers may be 'static, but only
-                // according to rvalue lifetime semantics, using the same
-                // syntactical rules used for let initializers.
+                // All bodies have an outer temporary drop scope, but temporaries
+                // and `super let` bindings in constant initializers may be extended
+                // to have 'static lifetimes, using the same syntactical rules used
+                // for `let` initializers.
                 //
                 // e.g., in `let x = &f();`, the temporary holding the result from
                 // the `f()` call lives for the entirety of the surrounding block.
@@ -902,20 +849,17 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
 /// re-use in incremental scenarios. We may sometimes need to rerun the
 /// type checker even when the HIR hasn't changed, and in those cases
 /// we can avoid reconstructing the region scope tree.
-pub(crate) fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
-    let typeck_root_def_id = tcx.typeck_root_def_id(def_id);
+pub(crate) fn region_scope_tree(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &ScopeTree {
+    let typeck_root_def_id = tcx.typeck_root_def_id_local(def_id);
     if typeck_root_def_id != def_id {
         return tcx.region_scope_tree(typeck_root_def_id);
     }
 
-    let scope_tree = if let Some(body) = tcx.hir_maybe_body_owned_by(def_id.expect_local()) {
+    let scope_tree = if let Some(body) = tcx.hir_maybe_body_owned_by(def_id) {
         let mut visitor = ScopeResolutionVisitor {
             tcx,
             scope_tree: ScopeTree::default(),
-            expr_and_pat_count: 0,
             cx: Context { parent: None, var_parent: None },
-            pessimistic_yield: false,
-            fixup_scopes: vec![],
             extended_super_lets: Default::default(),
         };
 

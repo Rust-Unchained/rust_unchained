@@ -4,7 +4,7 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_type_ir::TypeFoldable;
 
 use crate::ty::{
-    self, Binder, Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    self, Binder, Flags, Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitor,
 };
 
 ///////////////////////////////////////////////////////////////////////////
@@ -78,7 +78,9 @@ impl<'tcx> TyCtxt<'tcx> {
 
             fn visit_region(&mut self, r: ty::Region<'tcx>) -> Self::Result {
                 match r.kind() {
-                    ty::ReBound(debruijn, _) if debruijn < self.outer_index => {
+                    ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _)
+                        if debruijn < self.outer_index =>
+                    {
                         ControlFlow::Continue(())
                     }
                     _ => {
@@ -111,7 +113,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn collect_constrained_late_bound_regions<T>(
         self,
         value: Binder<'tcx, T>,
-    ) -> FxIndexSet<ty::BoundRegionKind>
+    ) -> FxIndexSet<ty::BoundRegionKind<'tcx>>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
@@ -122,7 +124,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn collect_referenced_late_bound_regions<T>(
         self,
         value: Binder<'tcx, T>,
-    ) -> FxIndexSet<ty::BoundRegionKind>
+    ) -> FxIndexSet<ty::BoundRegionKind<'tcx>>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
@@ -133,7 +135,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         value: Binder<'tcx, T>,
         just_constrained: bool,
-    ) -> FxIndexSet<ty::BoundRegionKind>
+    ) -> FxIndexSet<ty::BoundRegionKind<'tcx>>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
@@ -147,9 +149,9 @@ impl<'tcx> TyCtxt<'tcx> {
 
 /// Collects all the late-bound regions at the innermost binding level
 /// into a hash set.
-struct LateBoundRegionsCollector {
+struct LateBoundRegionsCollector<'tcx> {
     current_index: ty::DebruijnIndex,
-    regions: FxIndexSet<ty::BoundRegionKind>,
+    regions: FxIndexSet<ty::BoundRegionKind<'tcx>>,
 
     /// `true` if we only want regions that are known to be
     /// "constrained" when you equate this type with another type. In
@@ -161,13 +163,13 @@ struct LateBoundRegionsCollector {
     just_constrained: bool,
 }
 
-impl LateBoundRegionsCollector {
+impl LateBoundRegionsCollector<'_> {
     fn new(just_constrained: bool) -> Self {
         Self { current_index: ty::INNERMOST, regions: Default::default(), just_constrained }
     }
 }
 
-impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LateBoundRegionsCollector {
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LateBoundRegionsCollector<'tcx> {
     fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, t: &Binder<'tcx, T>) {
         self.current_index.shift_in(1);
         t.super_visit_with(self);
@@ -179,11 +181,16 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LateBoundRegionsCollector {
             match t.kind() {
                 // If we are only looking for "constrained" regions, we have to ignore the
                 // inputs to a projection as they may not appear in the normalized form.
-                ty::Alias(ty::Projection | ty::Inherent | ty::Opaque, _) => {
-                    return;
+                ty::Alias(_, alias_ty) => {
+                    match alias_ty.kind {
+                        ty::Projection { .. } | ty::Inherent { .. } | ty::Opaque { .. } => return,
+
+                        // All free alias types should've been expanded beforehand.
+                        ty::Free { .. } => {
+                            bug!("unexpected free alias type")
+                        }
+                    }
                 }
-                // All free alias types should've been expanded beforehand.
-                ty::Alias(ty::Free, _) => bug!("unexpected free alias type"),
                 _ => {}
             }
         }
@@ -193,10 +200,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LateBoundRegionsCollector {
 
     fn visit_const(&mut self, c: ty::Const<'tcx>) {
         // if we are only looking for "constrained" region, we have to
-        // ignore the inputs of an unevaluated const, as they may not appear
+        // ignore the inputs of an alias const, as they may not appear
         // in the normalized form
         if self.just_constrained {
-            if let ty::ConstKind::Unevaluated(..) = c.kind() {
+            if let ty::ConstKind::Alias(..) = c.kind() {
                 return;
             }
         }
@@ -205,49 +212,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LateBoundRegionsCollector {
     }
 
     fn visit_region(&mut self, r: ty::Region<'tcx>) {
-        if let ty::ReBound(debruijn, br) = r.kind() {
+        if let ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br) = r.kind() {
             if debruijn == self.current_index {
                 self.regions.insert(br.kind);
             }
-        }
-    }
-}
-
-/// Finds the max universe present
-pub struct MaxUniverse {
-    max_universe: ty::UniverseIndex,
-}
-
-impl MaxUniverse {
-    pub fn new() -> Self {
-        MaxUniverse { max_universe: ty::UniverseIndex::ROOT }
-    }
-
-    pub fn max_universe(self) -> ty::UniverseIndex {
-        self.max_universe
-    }
-}
-
-impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for MaxUniverse {
-    fn visit_ty(&mut self, t: Ty<'tcx>) {
-        if let ty::Placeholder(placeholder) = t.kind() {
-            self.max_universe = self.max_universe.max(placeholder.universe);
-        }
-
-        t.super_visit_with(self)
-    }
-
-    fn visit_const(&mut self, c: ty::consts::Const<'tcx>) {
-        if let ty::ConstKind::Placeholder(placeholder) = c.kind() {
-            self.max_universe = self.max_universe.max(placeholder.universe);
-        }
-
-        c.super_visit_with(self)
-    }
-
-    fn visit_region(&mut self, r: ty::Region<'tcx>) {
-        if let ty::RePlaceholder(placeholder) = r.kind() {
-            self.max_universe = self.max_universe.max(placeholder.universe);
         }
     }
 }

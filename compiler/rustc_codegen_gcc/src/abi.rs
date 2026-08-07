@@ -1,6 +1,8 @@
 #[cfg(feature = "master")]
 use gccjit::FnAttribute;
 use gccjit::{ToLValue, ToRValue, Type};
+#[cfg(feature = "master")]
+use rustc_abi::{ArmCall, CanonAbi, InterruptKind, X86Call};
 use rustc_abi::{Reg, RegKind};
 use rustc_codegen_ssa::traits::{AbiBuilderMethods, BaseTypeCodegenMethods};
 use rustc_data_structures::fx::FxHashSet;
@@ -8,14 +10,13 @@ use rustc_middle::bug;
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::LayoutOf;
 #[cfg(feature = "master")]
-use rustc_session::config;
-#[cfg(feature = "master")]
-use rustc_target::callconv::Conv;
+use rustc_session::{Session, config};
 use rustc_target::callconv::{ArgAttributes, CastTarget, FnAbi, PassMode};
+#[cfg(feature = "master")]
+use rustc_target::spec::Arch;
 
 use crate::builder::Builder;
 use crate::context::CodegenCx;
-use crate::intrinsic::ArgAbiExt;
 use crate::type_of::LayoutGccExt;
 
 impl AbiBuilderMethods for Builder<'_, '_, '_> {
@@ -45,7 +46,7 @@ impl GccType for CastTarget {
             )
         };
 
-        if self.prefix.iter().all(|x| x.is_none()) {
+        if self.prefix.is_empty() {
             // Simplify to a single unit when there is no prefix and size <= unit size
             if self.rest.total <= self.rest.unit.size {
                 return rest_gcc_unit;
@@ -61,7 +62,7 @@ impl GccType for CastTarget {
         let mut args: Vec<_> = self
             .prefix
             .iter()
-            .flat_map(|option_reg| option_reg.map(|reg| reg.gcc_type(cx)))
+            .map(|reg| reg.gcc_type(cx))
             .chain((0..rest_count).map(|_| rest_gcc_unit))
             .collect();
 
@@ -89,7 +90,9 @@ impl GccType for Reg {
                 64 => cx.type_f64(),
                 _ => bug!("unsupported float: {:?}", self),
             },
-            RegKind::Vector => unimplemented!(), //cx.type_vector(cx.type_i8(), self.size.bytes()),
+            RegKind::Vector { hint_vector_elem: _ } => {
+                cx.type_vector(cx.type_i8(), self.size.bytes())
+            }
         }
     }
 }
@@ -104,7 +107,7 @@ pub struct FnAbiGcc<'gcc> {
 }
 
 pub trait FnAbiGccExt<'gcc, 'tcx> {
-    // TODO(antoyo): return a function pointer type instead?
+    // FIXME(antoyo): return a function pointer type instead?
     fn gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> FnAbiGcc<'gcc>;
     fn ptr_to_gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc>;
     #[cfg(feature = "master")]
@@ -125,7 +128,7 @@ impl<'gcc, 'tcx> FnAbiGccExt<'gcc, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             PassMode::Direct(_) | PassMode::Pair(..) => self.ret.layout.immediate_gcc_type(cx),
             PassMode::Cast { ref cast, .. } => cast.gcc_type(cx),
             PassMode::Indirect { .. } => {
-                argument_tys.push(cx.type_ptr_to(self.ret.memory_ty(cx)));
+                argument_tys.push(cx.type_ptr_to(self.ret.layout.gcc_type(cx)));
                 cx.type_void()
             }
         };
@@ -176,13 +179,13 @@ impl<'gcc, 'tcx> FnAbiGccExt<'gcc, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                 PassMode::Indirect { attrs: _, meta_attrs: None, on_stack: true } => {
                     // This is a "byval" argument, so we don't apply the `restrict` attribute on it.
                     on_stack_param_indices.insert(argument_tys.len());
-                    arg.memory_ty(cx)
+                    arg.layout.gcc_type(cx)
                 }
                 PassMode::Direct(attrs) => {
                     apply_attrs(arg.layout.immediate_gcc_type(cx), &attrs, argument_tys.len())
                 }
                 PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => {
-                    apply_attrs(cx.type_ptr_to(arg.memory_ty(cx)), &attrs, argument_tys.len())
+                    apply_attrs(cx.type_ptr_to(arg.layout.gcc_type(cx)), &attrs, argument_tys.len())
                 }
                 PassMode::Indirect { attrs, meta_attrs: Some(meta_attrs), on_stack } => {
                     assert!(!on_stack);
@@ -221,57 +224,69 @@ impl<'gcc, 'tcx> FnAbiGccExt<'gcc, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
 
     fn ptr_to_gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc> {
         // FIXME(antoyo): Should we do something with `FnAbiGcc::fn_attributes`?
-        let FnAbiGcc { return_type, arguments_type, is_c_variadic, on_stack_param_indices, .. } =
-            self.gcc_type(cx);
-        let pointer_type =
-            cx.context.new_function_pointer_type(None, return_type, &arguments_type, is_c_variadic);
-        cx.on_stack_params.borrow_mut().insert(
-            pointer_type.dyncast_function_ptr_type().expect("function ptr type"),
-            on_stack_param_indices,
-        );
-        pointer_type
+        let FnAbiGcc { return_type, arguments_type, is_c_variadic, .. } = self.gcc_type(cx);
+        cx.context.new_function_pointer_type(None, return_type, &arguments_type, is_c_variadic)
     }
 
     #[cfg(feature = "master")]
     fn gcc_cconv(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Option<FnAttribute<'gcc>> {
-        conv_to_fn_attribute(self.conv, &cx.tcx.sess.target.arch)
+        conv_to_fn_attribute(cx.sess(), self.conv)
     }
 }
 
 #[cfg(feature = "master")]
-pub fn conv_to_fn_attribute<'gcc>(conv: Conv, arch: &str) -> Option<FnAttribute<'gcc>> {
-    // TODO: handle the calling conventions returning None.
+pub fn conv_to_fn_attribute<'gcc>(sess: &Session, conv: CanonAbi) -> Option<FnAttribute<'gcc>> {
     let attribute = match conv {
-        Conv::C
-        | Conv::Rust
-        | Conv::CCmseNonSecureCall
-        | Conv::CCmseNonSecureEntry
-        | Conv::RiscvInterrupt { .. } => return None,
-        Conv::Cold => return None,
-        Conv::PreserveMost => return None,
-        Conv::PreserveAll => return None,
-        Conv::GpuKernel => {
-            // TODO(antoyo): remove clippy allow attribute when this is implemented.
-            #[allow(clippy::if_same_then_else)]
-            if arch == "amdgpu" {
-                return None;
-            } else if arch == "nvptx64" {
-                return None;
-            } else {
-                panic!("Architecture {} does not support GpuKernel calling convention", arch);
-            }
+        CanonAbi::C | CanonAbi::Rust => return None,
+        CanonAbi::RustPreserveNone => {
+            // This calling convention is LLVM-specific and unspecified.
+            sess.dcx()
+                .fatal("gcc/gccjit backend does not support RustPreserveNone calling convention")
         }
-        Conv::AvrInterrupt => return None,
-        Conv::AvrNonBlockingInterrupt => return None,
-        Conv::ArmAapcs => return None,
-        Conv::Msp430Intr => return None,
-        Conv::X86Fastcall => return None,
-        Conv::X86Intr => return None,
-        Conv::X86Stdcall => return None,
-        Conv::X86ThisCall => return None,
-        Conv::X86VectorCall => return None,
-        Conv::X86_64SysV => FnAttribute::SysvAbi,
-        Conv::X86_64Win64 => FnAttribute::MsAbi,
+        CanonAbi::RustTail => {
+            // This calling convention is LLVM-specific and unspecified.
+            sess.dcx().fatal("gcc/gccjit backend does not support RustTail calling convention")
+        }
+        CanonAbi::RustCold => FnAttribute::Cold,
+        // Functions with this calling convention can only be called from assembly, but it is
+        // possible to declare an `extern "custom"` block, so the backend still needs a calling
+        // convention for declaring foreign functions.
+        CanonAbi::Custom => return None,
+        CanonAbi::Swift => {
+            // gcc/gccjit does not have anything for Swift's calling convention.
+            sess.dcx().fatal("gcc/gccjit backend does not support Swift calling convention")
+        }
+        CanonAbi::Arm(arm_call) => match arm_call {
+            ArmCall::CCmseNonSecureCall => FnAttribute::ArmCmseNonsecureCall,
+            ArmCall::CCmseNonSecureEntry => FnAttribute::ArmCmseNonsecureEntry,
+            ArmCall::Aapcs => FnAttribute::ArmPcs("aapcs"),
+        },
+        CanonAbi::GpuKernel => match &sess.target.arch {
+            &Arch::AmdGpu => FnAttribute::GcnAmdGpuHsaKernel,
+            &Arch::Nvptx64 => FnAttribute::NvptxKernel,
+            arch => sess
+                .dcx()
+                .fatal(format!("Arch {arch} does not support GpuKernel calling convention")),
+        },
+        // FIXME(antoyo): check if those AVR attributes are mapped correctly.
+        CanonAbi::Interrupt(interrupt_kind) => match interrupt_kind {
+            InterruptKind::Avr => FnAttribute::AvrSignal,
+            InterruptKind::AvrNonBlocking => FnAttribute::AvrInterrupt,
+            InterruptKind::Msp430 => FnAttribute::Msp430Interrupt,
+            InterruptKind::RiscvMachine => FnAttribute::RiscvInterrupt("machine"),
+            InterruptKind::RiscvSupervisor => FnAttribute::RiscvInterrupt("supervisor"),
+            InterruptKind::X86 => FnAttribute::X86Interrupt,
+        },
+        CanonAbi::X86(x86_call) => match x86_call {
+            X86Call::Fastcall => FnAttribute::X86FastCall,
+            X86Call::Stdcall => FnAttribute::X86Stdcall,
+            X86Call::Thiscall => FnAttribute::X86ThisCall,
+            // // NOTE: the vectorcall calling convention is not yet implemented in GCC:
+            // // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89485
+            X86Call::Vectorcall => return None,
+            X86Call::SysV64 => FnAttribute::X86SysvAbi,
+            X86Call::Win64 => FnAttribute::X86MsAbi,
+        },
     };
     Some(attribute)
 }

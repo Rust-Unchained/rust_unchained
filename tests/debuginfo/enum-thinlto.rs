@@ -1,23 +1,24 @@
-//@ min-lldb-version: 1800
+// LLDB 1800+ tests were not tested in CI, broke, and now are disabled
+//@ ignore-lldb
 //@ compile-flags:-g -Z thinlto
+//@ disable-gdb-pretty-printers
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:run
+//@ gdb-command:run
 
-// gdb-command:print *abc
-// gdb-check:$1 = enum_thinlto::ABC::TheA{x: 0, y: 8970181431921507452}
+//@ gdb-command:print *abc
+//@ gdb-check:$1 = enum_thinlto::ABC::TheA{x: 0, y: 8970181431921507452}
 
 // === LLDB TESTS ==================================================================================
 
-// lldb-command:run
+//@ lldb-command:run
 
-// lldb-command:v *abc
-// lldb-check:(enum_thinlto::ABC) *abc = { value = { x = 0 y = 8970181431921507452 } $discr$ = 0 }
+//@ lldb-command:v *abc
+//@ lldb-check:(enum_thinlto::ABC) *abc = TheA{x:0, y:8970181431921507452} { x = 0 y = 8970181431921507452 }
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 // The first element is to ensure proper alignment, irrespective of the machines word size. Since
 // the size of the discriminant value is machine dependent, this has be taken into account when

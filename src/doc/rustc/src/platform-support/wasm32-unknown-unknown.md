@@ -157,7 +157,7 @@ $ cargo +nightly build -Zbuild-std=panic_abort,std --target wasm32-unknown-unkno
 ```
 
 Here the `mvp` "cpu" is a placeholder in LLVM for disabling all supported
-features by default. Cargo's `-Zbuild-std` feature, a Nightly Rust feature, is
+features by default. Cargo's [`-Zbuild-std`] feature, a Nightly Rust feature, is
 then used to recompile the standard library in addition to your own code. This
 will produce a binary that uses only the original WebAssembly features by
 default and no proposals since its inception.
@@ -208,119 +208,77 @@ platforms such as x86\_64 work, and this is due to the fact that WebAssembly
 binaries must only contain code the engine understands. Native binaries work so
 long as the CPU doesn't execute unknown code dynamically at runtime.
 
-## Broken `extern "C"` ABI
+## Unwinding
 
-This target has what is considered a broken `extern "C"` ABI implementation at
-this time. Notably the same signature in Rust and C will compile to different
-WebAssembly functions and be incompatible. This is considered a bug and it will
-be fixed in a future version of Rust.
+By default the `wasm32-unknown-unknown` target is compiled with `-Cpanic=abort`.
+Historically this was due to the fact that there was no way to catch panics in
+wasm, but since mid-2025 the WebAssembly [`exception-handling`
+proposal](https://github.com/WebAssembly/exception-handling) reached
+stabilization. LLVM has support for this proposal as well and when this is all
+combined together it's possible to enable `-Cpanic=unwind` on wasm targets.
 
-For example this Rust code:
+Compiling wasm targets with `-Cpanic=unwind` is not as easy as just passing
+`-Cpanic=unwind`, however:
 
-```rust,ignore (does-not-link)
-#[repr(C)]
-struct MyPair {
-    a: u32,
-    b: u32,
-}
-
-extern "C" {
-    fn take_my_pair(pair: MyPair) -> u32;
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn call_c() -> u32 {
-    take_my_pair(MyPair { a: 1, b: 2 })
-}
+```sh
+$ rustc foo.rs -Cpanic=unwind --target wasm32-unknown-unknown
+error: the crate `panic_unwind` does not have the panic strategy `unwind`
 ```
 
-compiles to a WebAssembly module that looks like:
+Notably the precompiled standard library that is shipped through Rustup is
+compiled with `-Cpanic=abort`, not `-Cpanic=unwind`. While this is the case
+you're going to be required to use Cargo's [`-Zbuild-std`] feature to build with
+unwinding support:
 
-```wasm
-(module
-  (import "env" "take_my_pair" (func $take_my_pair (param i32 i32) (result i32)))
-  (func $call_c
-    i32.const 1
-    i32.const 2
-    call $take_my_pair
-  )
-)
+```sh
+$ RUSTFLAGS='-Cpanic=unwind' cargo +nightly build --target wasm32-unknown-unknown -Zbuild-std
 ```
 
-The function when defined in C, however, looks like
+Note, however, that as of 2025-10-03 LLVM is still using the "legacy exception
+instructions" by default, not the officially standard version of the
+exception-handling proposal:
 
-```c
-struct my_pair {
-    unsigned a;
-    unsigned b;
-};
+```sh
+$ wasm-tools validate target/wasm32-unknown-unknown/debug/foo.wasm
+error: <sysroot>/library/std/src/sys/backtrace.rs:161:5
+function `std::sys::backtrace::__rust_begin_short_backtrace` failed to validate
 
-unsigned take_my_pair(struct my_pair pair) {
-    return pair.a + pair.b;
-}
+Caused by:
+    0: func 2 failed to validate
+    1: legacy_exceptions feature required for try instruction (at offset 0x880)
 ```
 
-```wasm
-(module
-  (import "env" "__linear_memory" (memory 0))
-  (func $take_my_pair (param i32) (result i32)
-    local.get 0
-    i32.load offset=4
-    local.get 0
-    i32.load
-    i32.add
-  )
-)
+Fixing this requires passing `-Cllvm-args=-wasm-use-legacy-eh=false` to the Rust
+compiler as well:
+
+```sh
+$ RUSTFLAGS='-Cpanic=unwind -Cllvm-args=-wasm-use-legacy-eh=false' cargo +nightly build --target wasm32-unknown-unknown -Zbuild-std
+$ wasm-tools validate target/wasm32-unknown-unknown/debug/foo.wasm
 ```
 
-Notice how Rust thinks `take_my_pair` takes two `i32` parameters but C thinks it
-only takes one.
+At this time there are no concrete plans for adding new targets to the Rust
+compiler which have `-Cpanic=unwind` enabled-by-default. The most likely route
+to having this enabled is that in a few years when the `exception-handling`
+target feature is enabled by default in LLVM (due to browsers/runtime support
+propagating widely enough) the targets will switch to using `-Cpanic=unwind` by
+default. This is not for certain, however, and will likely be accompanied with
+either an MCP or an RFC about changing all wasm targets in the same manner. In
+the meantime using `-Cpanic=unwind` will require using [`-Zbuild-std`] and
+passing the appropriate flags to rustc.
 
-The correct definition of the `extern "C"` ABI for WebAssembly is located in the
-[WebAssembly/tool-conventions](https://github.com/WebAssembly/tool-conventions/blob/main/BasicCABI.md)
-repository. The `wasm32-unknown-unknown` target (and only this target, not other
-WebAssembly targets Rust support) does not correctly follow this document.
+[`-Zbuild-std`]: ../../cargo/reference/unstable.html#build-std
 
-Example issues in the Rust repository about this bug are:
+### The exception tag for panics
 
-* [#115666](https://github.com/rust-lang/rust/issues/115666)
-* [#129486](https://github.com/rust-lang/rust/issues/129486)
+Rust panics are currently implemented as a specific class of C++ exceptions.
+This is because llvm only supports throwing and catching the C++ exception tag
+from `wasm_throw` intrinsic and the lowering for the catchpads emitted by the
+Rust try intrinsic.
 
-This current state of the `wasm32-unknown-unknown` backend is due to an
-unfortunate accident which got relied on. The `wasm-bindgen` project prior to
-0.2.89 was incompatible with the "correct" definition of `extern "C"` and it was
-seen as not worth the tradeoff of breaking `wasm-bindgen` historically to fix
-this issue in the compiler.
-
-Thanks to the heroic efforts of many involved in this, however, `wasm-bindgen`
-0.2.89 and later are compatible with the correct definition of `extern "C"` and
-the nightly compiler currently supports a `-Zwasm-c-abi` implemented in
-[#117919](https://github.com/rust-lang/rust/pull/117919). This nightly-only flag
-can be used to indicate whether the spec-defined version of `extern "C"` should
-be used instead of the "legacy" version of
-whatever-the-Rust-target-originally-implemented. For example using the above
-code you can see (lightly edited for clarity):
-
-```shell
-$ rustc +nightly -Zwasm-c-abi=spec foo.rs --target wasm32-unknown-unknown --crate-type lib --emit obj -O
-$ wasm-tools print foo.o
-(module
-  (import "env" "take_my_pair" (func $take_my_pair (param i32) (result i32)))
-  (func $call_c (result i32)
-    ;; ...
-  )
-  ;; ...
-)
-```
-
-which shows that the C and Rust definitions of the same function now agree like
-they should.
-
-The `-Zwasm-c-abi` compiler flag is tracked in
-[#122532](https://github.com/rust-lang/rust/issues/122532) and a lint was
-implemented in [#117918](https://github.com/rust-lang/rust/issues/117918) to
-help warn users about the transition if they're using `wasm-bindgen` 0.2.88 or
-prior. The current plan is to, in the future, switch `-Zwasm-c-api=spec` to
-being the default. Some time after that the `-Zwasm-c-abi` flag and the
-"legacy" implementation will all be removed. During this process users on a
-sufficiently updated version of `wasm-bindgen` should not experience breakage.
+In particular, llvm throw and catch blocks expect a `WebAssembly.Tag` symbol
+called `__cpp_exception`. If it is not defined somewhere, llvm will generate an
+Emscripten style import from `env.__cpp_exception`. We don't want this, so we
+define the symbol in `libunwind` but only for wasm32-unknown-unknown. WASI
+doesn't currently support unwinding at all, and the Emscripten linker provides
+the tag in an appropriate manner depending on what sort of binary is being
+linked.

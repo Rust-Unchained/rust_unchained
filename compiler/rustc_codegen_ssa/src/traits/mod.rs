@@ -48,9 +48,9 @@ pub use self::type_::{
     ArgAbiBuilderMethods, BaseTypeCodegenMethods, DerivedTypeCodegenMethods,
     LayoutTypeCodegenMethods, TypeCodegenMethods, TypeMembershipCodegenMethods,
 };
-pub use self::write::{ModuleBufferMethods, ThinBufferMethods, WriteBackendMethods};
+pub use self::write::{ModuleBufferMethods, WriteBackendMethods};
 
-pub trait CodegenObject = Copy + PartialEq + fmt::Debug;
+pub trait CodegenObject = Copy + fmt::Debug;
 
 pub trait CodegenMethods<'tcx> = LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>>
     + FnAbiOf<'tcx, FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>>

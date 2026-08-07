@@ -1,5 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{expr_or_init, fn_def_id_with_node_args, path_def_id};
+use clippy_utils::res::MaybeQPath;
+use clippy_utils::{expr_or_init, fn_def_id_with_node_args, sym};
 use rustc_ast::BinOpKind;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
@@ -12,8 +13,8 @@ use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::impl_lint_pass;
+use rustc_span::Span;
 use rustc_span::symbol::{Ident, kw};
-use rustc_span::{Span, sym};
 use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
 use std::ops::ControlFlow;
 
@@ -70,14 +71,14 @@ declare_clippy_lint! {
     "detect unconditional recursion in some traits implementation"
 }
 
+impl_lint_pass!(UnconditionalRecursion => [UNCONDITIONAL_RECURSION]);
+
 #[derive(Default)]
 pub struct UnconditionalRecursion {
     /// The key is the `DefId` of the type implementing the `Default` trait and the value is the
     /// `DefId` of the return call.
     default_impl_for_type: FxHashMap<DefId, DefId>,
 }
-
-impl_lint_pass!(UnconditionalRecursion => [UNCONDITIONAL_RECURSION]);
 
 fn span_error(cx: &LateContext<'_>, method_span: Span, expr: &Expr<'_>) {
     span_lint_and_then(
@@ -99,13 +100,16 @@ fn get_hir_ty_def_id<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: rustc_hir::Ty<'tcx>) -> Op
             let ty = lower_ty(tcx, &hir_ty);
 
             match ty.kind() {
-                ty::Alias(ty::Projection, proj) => {
-                    Res::<HirId>::Def(DefKind::Trait, proj.trait_ref(tcx).def_id).opt_def_id()
-                },
+                ty::Alias(
+                    _,
+                    proj @ ty::AliasTy {
+                        kind: ty::Projection { .. },
+                        ..
+                    },
+                ) => Res::<HirId>::Def(DefKind::Trait, proj.trait_ref(tcx).def_id).opt_def_id(),
                 _ => None,
             }
         },
-        QPath::LangItem(..) => None,
     }
 }
 
@@ -137,9 +141,9 @@ fn get_impl_trait_def_id(cx: &LateContext<'_>, method_def_id: LocalDefId) -> Opt
         // We exclude `impl` blocks generated from rustc's proc macros.
         && !cx.tcx.is_automatically_derived(owner_id.to_def_id())
         // It is a implementation of a trait.
-        && let Some(trait_) = impl_.of_trait
+        && let Some(of_trait) = impl_.of_trait
     {
-        trait_.trait_def_id()
+        of_trait.trait_ref.trait_def_id()
     } else {
         None
     }
@@ -206,7 +210,7 @@ fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: Loca
                 let arg_ty = cx.typeck_results().expr_ty_adjusted(arg);
 
                 if let Some(fn_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-                    && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
+                    && let Some(trait_id) = cx.tcx.trait_of_assoc(fn_id)
                     && trait_id == trait_def_id
                     && matches_ty(receiver_ty, arg_ty, self_arg, other_arg)
                 {
@@ -242,15 +246,15 @@ fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: Local
         // We exclude `impl` blocks generated from rustc's proc macros.
         && !cx.tcx.is_automatically_derived(owner_id.to_def_id())
         // It is a implementation of a trait.
-        && let Some(trait_) = impl_.of_trait
-        && let Some(trait_def_id) = trait_.trait_def_id()
+        && let Some(of_trait) = impl_.of_trait
+        && let Some(trait_def_id) = of_trait.trait_ref.trait_def_id()
         // The trait is `ToString`.
         && cx.tcx.is_diagnostic_item(sym::ToString, trait_def_id)
     {
         let is_bad = match expr.kind {
             ExprKind::MethodCall(segment, _receiver, &[_arg], _) if segment.ident.name == name.name => {
                 if let Some(fn_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-                    && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
+                    && let Some(trait_id) = cx.tcx.trait_of_assoc(fn_id)
                     && trait_id == trait_def_id
                 {
                     true
@@ -290,7 +294,6 @@ fn is_default_method_on_current_ty<'tcx>(tcx: TyCtxt<'tcx>, qpath: QPath<'tcx>, 
             }
             get_hir_ty_def_id(tcx, *ty) == Some(implemented_ty_id)
         },
-        QPath::LangItem(..) => false,
     }
 }
 
@@ -317,8 +320,8 @@ where
         if let ExprKind::Call(f, _) = expr.kind
             && let ExprKind::Path(qpath) = f.kind
             && is_default_method_on_current_ty(self.cx.tcx, qpath, self.implemented_ty_id)
-            && let Some(method_def_id) = path_def_id(self.cx, f)
-            && let Some(trait_def_id) = self.cx.tcx.trait_of_item(method_def_id)
+            && let Some(method_def_id) = f.res(self.cx).opt_def_id()
+            && let Some(trait_def_id) = self.cx.tcx.trait_of_assoc(method_def_id)
             && self.cx.tcx.is_diagnostic_item(sym::Default, trait_def_id)
         {
             span_error(self.cx, self.method_span, expr);
@@ -336,8 +339,8 @@ impl UnconditionalRecursion {
             let impls = cx.tcx.trait_impls_of(default_trait_id);
             for (ty, impl_def_ids) in impls.non_blanket_impls() {
                 let Some(self_def_id) = ty.def() else { continue };
-                for impl_def_id in impl_def_ids {
-                    if !cx.tcx.is_automatically_derived(*impl_def_id) &&
+                for &impl_def_id in impl_def_ids {
+                    if !cx.tcx.is_automatically_derived(impl_def_id) &&
                         let Some(assoc_item) = cx
                             .tcx
                             .associated_items(impl_def_id)
@@ -374,7 +377,7 @@ impl UnconditionalRecursion {
         method_def_id: LocalDefId,
     ) {
         // We're only interested into static methods.
-        if decl.implicit_self.has_implicit_self() {
+        if decl.implicit_self().has_implicit_self() {
             return;
         }
         // We don't check trait implementations.
@@ -426,7 +429,7 @@ fn check_from(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId
     if let Some((fn_def_id, node_args)) = fn_def_id_with_node_args(cx, expr)
         && let [s1, s2] = **node_args
         && let (Some(s1), Some(s2)) = (s1.as_type(), s2.as_type())
-        && let Some(trait_def_id) = cx.tcx.trait_of_item(fn_def_id)
+        && let Some(trait_def_id) = cx.tcx.trait_of_assoc(fn_def_id)
         && cx.tcx.is_diagnostic_item(sym::Into, trait_def_id)
         && get_impl_trait_def_id(cx, method_def_id) == cx.tcx.get_diagnostic_item(sym::From)
         && s1 == sig.inputs()[0]

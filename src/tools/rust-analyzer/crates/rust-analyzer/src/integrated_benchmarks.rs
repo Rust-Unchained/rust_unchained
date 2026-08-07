@@ -13,17 +13,17 @@
 use hir::ChangeWithProcMacros;
 use ide::{
     AnalysisHost, CallableSnippets, CompletionConfig, CompletionFieldsToResolve, DiagnosticsConfig,
-    FilePosition, TextSize,
+    FilePosition, RaFixtureConfig, TextSize,
 };
 use ide_db::{
-    imports::insert_use::{ImportGranularity, InsertUseConfig},
     SnippetCap,
+    imports::insert_use::{ImportGranularity, InsertUseConfig},
 };
 use project_model::CargoConfig;
 use test_utils::project_root;
 use vfs::{AbsPathBuf, VfsPath};
 
-use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 
 #[track_caller]
 fn file_id(vfs: &vfs::Vfs, path: &VfsPath) -> vfs::FileId {
@@ -53,6 +53,8 @@ fn integrated_highlighting_benchmark() {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: false,
+        num_worker_threads: 1,
+        proc_macro_processes: 1,
     };
 
     let (db, vfs, _proc_macro) = {
@@ -86,7 +88,7 @@ fn integrated_highlighting_benchmark() {
             "self.data.cargo_buildScripts_rebuildOnSave",
             "self. data. cargo_buildScripts_rebuildOnSave",
         );
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         change.change_file(file_id, Some(text));
         host.apply_change(change);
     }
@@ -121,6 +123,8 @@ fn integrated_completion_benchmark() {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: true,
+        num_worker_threads: 1,
+        proc_macro_processes: 1,
     };
 
     let (db, vfs, _proc_macro) = {
@@ -147,9 +151,9 @@ fn integrated_completion_benchmark() {
         let _it = stdx::timeit("change");
         let mut text = host.analysis().file_text(file_id).unwrap().to_string();
         let completion_offset =
-            patch(&mut text, "db.struct_data(self.id)", "sel;\ndb.struct_data(self.id)")
+            patch(&mut text, "db.struct_signature(self.id)", "sel;\ndb.struct_signature(self.id)")
                 + "sel".len();
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         change.change_file(file_id, Some(text));
         host.apply_change(change);
         completion_offset
@@ -158,35 +162,7 @@ fn integrated_completion_benchmark() {
     {
         let _span = profile::cpu_span();
         let analysis = host.analysis();
-        let config = CompletionConfig {
-            enable_postfix_completions: true,
-            enable_imports_on_the_fly: true,
-            enable_self_on_the_fly: true,
-            enable_private_editable: true,
-            enable_term_search: true,
-            term_search_fuel: 200,
-            full_function_signatures: false,
-            callable: Some(CallableSnippets::FillArguments),
-            snippet_cap: SnippetCap::new(true),
-            insert_use: InsertUseConfig {
-                granularity: ImportGranularity::Crate,
-                prefix_kind: hir::PrefixKind::ByCrate,
-                enforce_granularity: true,
-                group: true,
-                skip_glob_imports: true,
-            },
-            prefer_no_std: false,
-            prefer_prelude: true,
-            prefer_absolute: false,
-            snippets: Vec::new(),
-            limit: None,
-            add_semicolon_to_unit: true,
-            fields_to_resolve: CompletionFieldsToResolve::empty(),
-            exclude_flyimport: vec![],
-            exclude_traits: &[],
-            enable_auto_await: true,
-            enable_auto_iter: true,
-        };
+        let config = completion_config();
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
         analysis.completions(&config, position, None).unwrap();
@@ -197,10 +173,12 @@ fn integrated_completion_benchmark() {
     let completion_offset = {
         let _it = stdx::timeit("change");
         let mut text = host.analysis().file_text(file_id).unwrap().to_string();
-        let completion_offset =
-            patch(&mut text, "sel;\ndb.struct_data(self.id)", ";sel;\ndb.struct_data(self.id)")
-                + ";sel".len();
-        let mut change = ChangeWithProcMacros::new();
+        let completion_offset = patch(
+            &mut text,
+            "sel;\ndb.struct_signature(self.id)",
+            ";sel;\ndb.struct_signature(self.id)",
+        ) + ";sel".len();
+        let mut change = ChangeWithProcMacros::default();
         change.change_file(file_id, Some(text));
         host.apply_change(change);
         completion_offset
@@ -210,35 +188,7 @@ fn integrated_completion_benchmark() {
         let _p = tracing::info_span!("unqualified path completion").entered();
         let _span = profile::cpu_span();
         let analysis = host.analysis();
-        let config = CompletionConfig {
-            enable_postfix_completions: true,
-            enable_imports_on_the_fly: true,
-            enable_self_on_the_fly: true,
-            enable_private_editable: true,
-            enable_term_search: true,
-            term_search_fuel: 200,
-            full_function_signatures: false,
-            callable: Some(CallableSnippets::FillArguments),
-            snippet_cap: SnippetCap::new(true),
-            insert_use: InsertUseConfig {
-                granularity: ImportGranularity::Crate,
-                prefix_kind: hir::PrefixKind::ByCrate,
-                enforce_granularity: true,
-                group: true,
-                skip_glob_imports: true,
-            },
-            prefer_no_std: false,
-            prefer_prelude: true,
-            prefer_absolute: false,
-            snippets: Vec::new(),
-            limit: None,
-            add_semicolon_to_unit: true,
-            fields_to_resolve: CompletionFieldsToResolve::empty(),
-            exclude_flyimport: vec![],
-            exclude_traits: &[],
-            enable_auto_await: true,
-            enable_auto_iter: true,
-        };
+        let config = completion_config();
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
         analysis.completions(&config, position, None).unwrap();
@@ -247,10 +197,12 @@ fn integrated_completion_benchmark() {
     let completion_offset = {
         let _it = stdx::timeit("change");
         let mut text = host.analysis().file_text(file_id).unwrap().to_string();
-        let completion_offset =
-            patch(&mut text, "sel;\ndb.struct_data(self.id)", "self.;\ndb.struct_data(self.id)")
-                + "self.".len();
-        let mut change = ChangeWithProcMacros::new();
+        let completion_offset = patch(
+            &mut text,
+            "sel;\ndb.struct_signature(self.id)",
+            "self.;\ndb.struct_signature(self.id)",
+        ) + "self.".len();
+        let mut change = ChangeWithProcMacros::default();
         change.change_file(file_id, Some(text));
         host.apply_change(change);
         completion_offset
@@ -260,35 +212,7 @@ fn integrated_completion_benchmark() {
         let _p = tracing::info_span!("dot completion").entered();
         let _span = profile::cpu_span();
         let analysis = host.analysis();
-        let config = CompletionConfig {
-            enable_postfix_completions: true,
-            enable_imports_on_the_fly: true,
-            enable_self_on_the_fly: true,
-            enable_private_editable: true,
-            enable_term_search: true,
-            term_search_fuel: 200,
-            full_function_signatures: false,
-            callable: Some(CallableSnippets::FillArguments),
-            snippet_cap: SnippetCap::new(true),
-            insert_use: InsertUseConfig {
-                granularity: ImportGranularity::Crate,
-                prefix_kind: hir::PrefixKind::ByCrate,
-                enforce_granularity: true,
-                group: true,
-                skip_glob_imports: true,
-            },
-            prefer_no_std: false,
-            prefer_prelude: true,
-            prefer_absolute: false,
-            snippets: Vec::new(),
-            limit: None,
-            add_semicolon_to_unit: true,
-            fields_to_resolve: CompletionFieldsToResolve::empty(),
-            exclude_flyimport: vec![],
-            exclude_traits: &[],
-            enable_auto_await: true,
-            enable_auto_iter: true,
-        };
+        let config = completion_config();
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
         analysis.completions(&config, position, None).unwrap();
@@ -315,6 +239,8 @@ fn integrated_diagnostics_benchmark() {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: true,
+        num_worker_threads: 1,
+        proc_macro_processes: 1,
     };
 
     let (db, vfs, _proc_macro) = {
@@ -356,6 +282,7 @@ fn integrated_diagnostics_benchmark() {
         prefer_absolute: false,
         term_search_fuel: 400,
         term_search_borrowck: true,
+        show_rename_conflicts: true,
     };
     host.analysis()
         .full_diagnostics(&diagnostics_config, ide::AssistResolveStrategy::None, file_id)
@@ -366,8 +293,8 @@ fn integrated_diagnostics_benchmark() {
     {
         let _it = stdx::timeit("change");
         let mut text = host.analysis().file_text(file_id).unwrap().to_string();
-        patch(&mut text, "db.struct_data(self.id)", "();\ndb.struct_data(self.id)");
-        let mut change = ChangeWithProcMacros::new();
+        patch(&mut text, "db.struct_signature(self.id)", "();\ndb.struct_signature(self.id)");
+        let mut change = ChangeWithProcMacros::default();
         change.change_file(file_id, Some(text));
         host.apply_change(change);
     };
@@ -385,4 +312,38 @@ fn patch(what: &mut String, from: &str, to: &str) -> usize {
     let idx = what.find(from).unwrap();
     *what = what.replacen(from, to, 1);
     idx
+}
+
+fn completion_config() -> CompletionConfig<'static> {
+    CompletionConfig {
+        enable_postfix_completions: true,
+        enable_imports_on_the_fly: true,
+        enable_self_on_the_fly: true,
+        enable_private_editable: true,
+        enable_term_search: true,
+        term_search_fuel: 200,
+        full_function_signatures: false,
+        callable: Some(CallableSnippets::FillArguments),
+        snippet_cap: SnippetCap::new(true),
+        insert_use: InsertUseConfig {
+            granularity: ImportGranularity::Crate,
+            prefix_kind: hir::PrefixKind::ByCrate,
+            enforce_granularity: true,
+            group: true,
+            skip_glob_imports: true,
+        },
+        prefer_no_std: false,
+        prefer_prelude: true,
+        prefer_absolute: false,
+        snippets: Vec::new(),
+        limit: None,
+        add_colons_to_module: true,
+        add_semicolon_to_unit: true,
+        fields_to_resolve: CompletionFieldsToResolve::empty(),
+        exclude_flyimport: vec![],
+        exclude_traits: &[],
+        enable_auto_await: true,
+        enable_auto_iter: true,
+        ra_fixture: RaFixtureConfig::default(),
+    }
 }

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::num::NonZero;
 use std::path::PathBuf;
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Parser, Clone, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct LintcheckConfig {
@@ -68,6 +68,9 @@ pub(crate) enum Commands {
         /// This will limit the number of warnings that will be printed for each lint
         #[clap(long)]
         truncate: bool,
+        /// Write the diff summary to a JSON file if there are any changes
+        #[clap(long, value_name = "PATH")]
+        write_summary: Option<PathBuf>,
     },
     /// Create a lintcheck crates TOML file containing the top N popular crates
     Popular {

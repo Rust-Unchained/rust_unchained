@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
 use rand::Rng;
+use rand::distr::{Distribution, Uniform};
 use rand::seq::SliceRandom;
 use test::{Bencher, black_box};
 
@@ -106,7 +107,8 @@ macro_rules! map_find_rand_bench {
 
             // setup
             let mut rng = crate::bench_rng();
-            let mut keys: Vec<_> = (0..n).map(|_| rng.random::<u32>() % n).collect();
+            let mut keys: Vec<_> =
+                Uniform::new(0, n).unwrap().sample_iter(&mut rng).take(n as usize).collect();
 
             for &k in &keys {
                 map.insert(k, k);
@@ -386,7 +388,7 @@ pub fn clone_slim_100_and_clear(b: &mut Bencher) {
 #[bench]
 pub fn clone_slim_100_and_drain_all(b: &mut Bencher) {
     let src = slim_map(100);
-    b.iter(|| src.clone().extract_if(|_, _| true).count())
+    b.iter(|| src.clone().extract_if(.., |_, _| true).count())
 }
 
 #[bench]
@@ -394,7 +396,7 @@ pub fn clone_slim_100_and_drain_half(b: &mut Bencher) {
     let src = slim_map(100);
     b.iter(|| {
         let mut map = src.clone();
-        assert_eq!(map.extract_if(|i, _| i % 2 == 0).count(), 100 / 2);
+        assert_eq!(map.extract_if(.., |i, _| i % 2 == 0).count(), 100 / 2);
         assert_eq!(map.len(), 100 / 2);
     })
 }
@@ -457,7 +459,7 @@ pub fn clone_slim_10k_and_clear(b: &mut Bencher) {
 #[bench]
 pub fn clone_slim_10k_and_drain_all(b: &mut Bencher) {
     let src = slim_map(10_000);
-    b.iter(|| src.clone().extract_if(|_, _| true).count())
+    b.iter(|| src.clone().extract_if(.., |_, _| true).count())
 }
 
 #[bench]
@@ -465,7 +467,7 @@ pub fn clone_slim_10k_and_drain_half(b: &mut Bencher) {
     let src = slim_map(10_000);
     b.iter(|| {
         let mut map = src.clone();
-        assert_eq!(map.extract_if(|i, _| i % 2 == 0).count(), 10_000 / 2);
+        assert_eq!(map.extract_if(.., |i, _| i % 2 == 0).count(), 10_000 / 2);
         assert_eq!(map.len(), 10_000 / 2);
     })
 }
@@ -528,7 +530,7 @@ pub fn clone_fat_val_100_and_clear(b: &mut Bencher) {
 #[bench]
 pub fn clone_fat_val_100_and_drain_all(b: &mut Bencher) {
     let src = fat_val_map(100);
-    b.iter(|| src.clone().extract_if(|_, _| true).count())
+    b.iter(|| src.clone().extract_if(.., |_, _| true).count())
 }
 
 #[bench]
@@ -536,7 +538,7 @@ pub fn clone_fat_val_100_and_drain_half(b: &mut Bencher) {
     let src = fat_val_map(100);
     b.iter(|| {
         let mut map = src.clone();
-        assert_eq!(map.extract_if(|i, _| i % 2 == 0).count(), 100 / 2);
+        assert_eq!(map.extract_if(.., |i, _| i % 2 == 0).count(), 100 / 2);
         assert_eq!(map.len(), 100 / 2);
     })
 }

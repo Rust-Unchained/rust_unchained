@@ -24,7 +24,6 @@
 //!   - `sys/`
 //!   - `os/`
 //!
-//! `std/sys_common` should _not_ contain platform-specific code.
 //! Finally, because std contains tests with platform-specific
 //! `ignore` attributes, once the parser encounters `mod tests`,
 //! platform-specific cfgs are allowed. Not sure yet how to deal with
@@ -32,11 +31,14 @@
 
 use std::path::Path;
 
+use crate::diagnostics::{CheckId, RunningCheck, TidyCtx};
 use crate::walk::{filter_dirs, walk};
 
 // Paths that may contain platform-specific code.
 const EXCEPTION_PATHS: &[&str] = &[
-    "library/windows_targets",
+    "library/compiler-builtins",
+    "library/std_detect",
+    "library/windows_link",
     "library/panic_abort",
     "library/panic_unwind",
     "library/unwind",
@@ -51,25 +53,31 @@ const EXCEPTION_PATHS: &[&str] = &[
     // core::ffi contains platform-specific type and linkage configuration
     "library/core/src/ffi/mod.rs",
     "library/core/src/ffi/primitives.rs",
+    "library/core/src/os", // Platform-specific public interfaces
     "library/std/src/sys", // Platform-specific code for std lives here.
     "library/std/src/os",  // Platform-specific public interfaces
     // Temporary `std` exceptions
     // FIXME: platform-specific code should be moved to `sys`
-    "library/std/src/io/copy.rs",
     "library/std/src/io/stdio.rs",
     "library/std/src/lib.rs", // for miniz_oxide leaking docs, which itself workaround
     "library/std/src/path.rs",
-    "library/std/src/sys_common", // Should only contain abstractions over platforms
-    "library/std/src/net/test.rs", // Utility helpers for tests
     "library/std/src/io/error.rs", // Repr unpacked needed for UEFI
 ];
 
-pub fn check(path: &Path, bad: &mut bool) {
+pub fn check(library_path: &Path, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx.start_check(CheckId::new("pal").path(library_path));
+
+    let root_path = library_path.parent().unwrap();
+    // Let's double-check that this is the root path by making sure it has `x.py`.
+    assert!(root_path.join("x.py").is_file());
+
     // Sanity check that the complex parsing here works.
     let mut saw_target_arch = false;
     let mut saw_cfg_bang = false;
-    walk(path, |path, _is_dir| filter_dirs(path), &mut |entry, contents| {
+    walk(library_path, |path, _is_dir| filter_dirs(path), &mut |entry, contents| {
         let file = entry.path();
+        // We don't want the absolute path to matter, so make it relative.
+        let file = file.strip_prefix(root_path).unwrap();
         let filestr = file.to_string_lossy().replace("\\", "/");
         if !filestr.ends_with(".rs") {
             return;
@@ -85,7 +93,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             return;
         }
 
-        check_cfgs(contents, &file, bad, &mut saw_target_arch, &mut saw_cfg_bang);
+        check_cfgs(contents, file, &mut check, &mut saw_target_arch, &mut saw_cfg_bang);
     });
 
     assert!(saw_target_arch);
@@ -95,7 +103,7 @@ pub fn check(path: &Path, bad: &mut bool) {
 fn check_cfgs(
     contents: &str,
     file: &Path,
-    bad: &mut bool,
+    check: &mut RunningCheck,
     saw_target_arch: &mut bool,
     saw_cfg_bang: &mut bool,
 ) {
@@ -112,7 +120,7 @@ fn check_cfgs(
             Ok(_) => unreachable!(),
             Err(i) => i + 1,
         };
-        tidy_error!(bad, "{}:{}: platform-specific cfg: {}", file.display(), line, cfg);
+        check.error(format!("{}:{line}: platform-specific cfg: {cfg}", file.display()));
     };
 
     for (idx, cfg) in cfgs {

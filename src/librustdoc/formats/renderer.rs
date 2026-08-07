@@ -2,7 +2,7 @@ use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_middle::ty::TyCtxt;
 
 use crate::clean;
-use crate::config::RenderOptions;
+use crate::config::{EmitType, RenderOptions};
 use crate::error::Error;
 use crate::formats::cache::Cache;
 
@@ -10,13 +10,15 @@ use crate::formats::cache::Cache;
 /// backend renderer has hooks for initialization, documenting an item, entering and exiting a
 /// module, and cleanup/finalizing output.
 pub(crate) trait FormatRenderer<'tcx>: Sized {
-    /// Gives a description of the renderer. Used for performance profiling.
-    fn descr() -> &'static str;
+    /// A description of the renderer. Used for performance profiling.
+    const DESCR: &'static str;
 
-    /// Whether to call `item` recursively for modules
+    /// Whether to call `item` recursively for modules.
     ///
-    /// This is true for html, and false for json. See #80664
+    /// See [#80664](https://github.com/rust-lang/rust/issues/80664).
     const RUN_ON_MODULE: bool;
+
+    const NON_STATIC_FILE_EMIT_TYPE: EmitType;
 
     /// This associated type is the type where the current module information is stored.
     ///
@@ -30,15 +32,6 @@ pub(crate) trait FormatRenderer<'tcx>: Sized {
     /// is a module). To prevent it from impacting the other children of the current module, we need to
     /// reset the information between each call to `item` by using `restore_module_data`.
     type ModuleData;
-
-    /// Sets up any state required for the renderer. When this is called the cache has already been
-    /// populated.
-    fn init(
-        krate: clean::Crate,
-        options: RenderOptions,
-        cache: Cache,
-        tcx: TyCtxt<'tcx>,
-    ) -> Result<(Self, clean::Crate), Error>;
 
     /// This method is called right before call [`Self::item`]. This method returns a type
     /// containing information that needs to be reset after the [`Self::item`] method has been
@@ -56,7 +49,7 @@ pub(crate) trait FormatRenderer<'tcx>: Sized {
     fn restore_module_data(&mut self, info: Self::ModuleData);
 
     /// Renders a single non-module item. This means no recursive sub-item rendering is required.
-    fn item(&mut self, item: clean::Item) -> Result<(), Error>;
+    fn item(&mut self, item: &clean::Item) -> Result<(), Error>;
 
     /// Renders a module (should not handle recursing into children).
     fn mod_item_in(&mut self, item: &clean::Item) -> Result<(), Error>;
@@ -67,14 +60,12 @@ pub(crate) trait FormatRenderer<'tcx>: Sized {
     }
 
     /// Post processing hook for cleanup and dumping output to files.
-    fn after_krate(&mut self) -> Result<(), Error>;
-
-    fn cache(&self) -> &Cache;
+    fn after_krate(self) -> Result<(), Error>;
 }
 
 fn run_format_inner<'tcx, T: FormatRenderer<'tcx>>(
     cx: &mut T,
-    item: clean::Item,
+    item: &clean::Item,
     prof: &SelfProfilerRef,
 ) -> Result<(), Error> {
     if item.is_mod() && T::RUN_ON_MODULE {
@@ -83,13 +74,13 @@ fn run_format_inner<'tcx, T: FormatRenderer<'tcx>>(
         let _timer =
             prof.generic_activity_with_arg("render_mod_item", item.name.unwrap().to_string());
 
-        cx.mod_item_in(&item)?;
-        let (clean::StrippedItem(box clean::ModuleItem(module)) | clean::ModuleItem(module)) =
+        cx.mod_item_in(item)?;
+        let (clean::StrippedItem(clean::ModuleItem(ref module)) | clean::ModuleItem(ref module)) =
             item.inner.kind
         else {
             unreachable!()
         };
-        for it in module.items {
+        for it in module.items.iter() {
             let info = cx.save_module_data();
             run_format_inner(cx, it, prof)?;
             cx.restore_module_data(info);
@@ -107,26 +98,31 @@ fn run_format_inner<'tcx, T: FormatRenderer<'tcx>>(
 }
 
 /// Main method for rendering a crate.
-pub(crate) fn run_format<'tcx, T: FormatRenderer<'tcx>>(
+pub(crate) fn run_format<
+    'tcx,
+    T: FormatRenderer<'tcx>,
+    F: FnOnce(clean::Crate, RenderOptions, Cache, TyCtxt<'tcx>) -> Result<(T, clean::Crate), Error>,
+>(
     krate: clean::Crate,
     options: RenderOptions,
     cache: Cache,
     tcx: TyCtxt<'tcx>,
+    init: F,
 ) -> Result<(), Error> {
     let prof = &tcx.sess.prof;
 
-    let emit_crate = options.should_emit_crate();
+    let emit_non_static_files = options.emit.contains(&T::NON_STATIC_FILE_EMIT_TYPE);
     let (mut format_renderer, krate) = prof
-        .verbose_generic_activity_with_arg("create_renderer", T::descr())
-        .run(|| T::init(krate, options, cache, tcx))?;
+        .verbose_generic_activity_with_arg("create_renderer", T::DESCR)
+        .run(|| init(krate, options, cache, tcx))?;
 
-    if !emit_crate {
+    if !emit_non_static_files {
         return Ok(());
     }
 
     // Render the crate documentation
-    run_format_inner(&mut format_renderer, krate.module, prof)?;
+    run_format_inner(&mut format_renderer, &krate.module, prof)?;
 
-    prof.verbose_generic_activity_with_arg("renderer_after_krate", T::descr())
+    prof.verbose_generic_activity_with_arg("renderer_after_krate", T::DESCR)
         .run(|| format_renderer.after_krate())
 }

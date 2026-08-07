@@ -2,7 +2,7 @@
 
 Apple visionOS / xrOS targets.
 
-**Tier: 3**
+**Tier: 2 (without Host Tools)**
 
 - `aarch64-apple-visionos`: Apple visionOS on arm64.
 - `aarch64-apple-visionos-sim`: Apple visionOS Simulator on arm64.
@@ -31,35 +31,19 @@ case `XROS_DEPLOYMENT_TARGET`.
 
 ## Building the target
 
-The targets can be built by enabling them for a `rustc` build in
-`bootstrap.toml`, by adding, for example:
-
-```toml
-[build]
-target = ["aarch64-apple-visionos", "aarch64-apple-visionos-sim"]
+The targets are distributed through `rustup`, and can be installed using one of:
+```console
+$ rustup target add aarch64-apple-visionos
+$ rustup target add aarch64-apple-visionos-sim
 ```
-
-Using the unstable `-Zbuild-std` with a nightly Cargo may also work.
-
-Note: Currently, a newer version of `libc` and `cc` may be required, this will
-be fixed in [#124560](https://github.com/rust-lang/rust/pull/124560).
 
 ## Building Rust programs
 
-Rust programs can be built for these targets by specifying `--target`, if
-`rustc` has been built with support for them. For example:
-
-```console
-$ rustc --target aarch64-apple-visionos-sim your-code.rs
-```
+See [the instructions for iOS](./apple-ios.md#building-rust-programs).
 
 ## Testing
 
-There is no support for running the Rust or standard library testsuite at the
-moment. Testing has mostly been done manually with builds of static libraries
-embedded into applications called from Xcode or a simulator.
-
-It hopefully will be possible to improve this in the future.
+See [the instructions for iOS](./apple-ios.md#testing).
 
 ## Cross-compilation toolchains and C code
 

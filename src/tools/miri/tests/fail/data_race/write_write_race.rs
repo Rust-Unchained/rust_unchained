@@ -1,7 +1,5 @@
-// We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
-// Avoid accidental synchronization via address reuse inside `thread::spawn`.
-//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
 
 use std::thread::spawn;
 
@@ -11,7 +9,7 @@ struct EvilSend<T>(pub T);
 unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
 
-pub fn main() {
+fn main() {
     let mut a = 0u32;
     let b = &mut a as *mut u32;
     let c = EvilSend(b);

@@ -1,34 +1,27 @@
-error[E0277]: the trait bound `dep_2_reexport::Type: Trait` is not satisfied
+error[E0277]: the trait bound `dep_2_reexport::Type: dependency::Trait` is not satisfied
   --> replaced
    |
 LL |     do_something(Type);
-   |     ------------ ^^^^ the trait `Trait` is not implemented for `dep_2_reexport::Type`
+   |     ------------ ^^^^ the trait `dependency::Trait` is not implemented for `dep_2_reexport::Type`
    |     |
    |     required by a bound introduced by this call
    |
 note: there are multiple different versions of crate `dependency` in the dependency graph
   --> replaced
    |
-LL | pub struct Type(pub i32);
-   | --------------- this type implements the required trait
 LL | pub trait Trait {
-   | ^^^^^^^^^^^^^^^ this is the required trait
+   | ^^^^^^^^^^^^^^^ this is the expected trait
    |
   ::: replaced
    |
-LL | extern crate dep_2_reexport;
-   | ---------------------------- one version of crate `dependency` used here, as a dependency of crate `foo`
-LL | extern crate dependency;
-   | ------------------------ one version of crate `dependency` used here, as a direct dependency of the current crate
-   |
-  ::: replaced
-   |
-LL | pub struct Type;
-   | --------------- this type doesn't implement the required trait
 LL | pub trait Trait {
    | --------------- this is the found trait
-   = note: two types coming from two different versions of the same crate are different types even if they look the same
    = help: you can use `cargo tree` to explore your dependency tree
+help: the trait `dependency::Trait` is implemented for `dependency::Type`
+  --> replaced
+   |
+LL | impl Trait for Type {
+   | ^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `do_something`
   --> replaced
    |
@@ -39,56 +32,43 @@ error[E0599]: no method named `foo` found for struct `dep_2_reexport::Type` in t
   --> replaced
    |
 LL |     Type.foo();
-   |          ^^^ method not found in `Type`
+   |          ^^^ method not found in `dep_2_reexport::Type`
    |
 note: there are multiple different versions of crate `dependency` in the dependency graph
   --> replaced
    |
 LL | pub trait Trait {
-   | ^^^^^^^^^^^^^^^ this is the trait that is needed
-LL |     fn foo(&self);
-   |     -------------- the method is available for `dep_2_reexport::Type` here
-   |
-  ::: replaced
-   |
-LL | use dependency::{Trait, do_something, do_something_trait, do_something_type};
-   |                  ----- `Trait` imported here doesn't correspond to the right version of crate `dependency`
+   | ^^^^^^^^^^^^^^^ this is the expected trait
    |
   ::: replaced
    |
 LL | pub trait Trait {
    | --------------- this is the trait that was imported
+   = help: you can use `cargo tree` to explore your dependency tree
 
-error[E0599]: no function or associated item named `bar` found for struct `dep_2_reexport::Type` in the current scope
+error[E0599]: no associated function or constant named `bar` found for struct `dep_2_reexport::Type` in the current scope
   --> replaced
    |
 LL |     Type::bar();
-   |           ^^^ function or associated item not found in `Type`
+   |           ^^^ associated function or constant not found in `dep_2_reexport::Type`
    |
 note: there are multiple different versions of crate `dependency` in the dependency graph
   --> replaced
    |
 LL | pub trait Trait {
-   | ^^^^^^^^^^^^^^^ this is the trait that is needed
-LL |     fn foo(&self);
-LL |     fn bar();
-   |     --------- the associated function is available for `dep_2_reexport::Type` here
-   |
-  ::: replaced
-   |
-LL | use dependency::{Trait, do_something, do_something_trait, do_something_type};
-   |                  ----- `Trait` imported here doesn't correspond to the right version of crate `dependency`
+   | ^^^^^^^^^^^^^^^ this is the expected trait
    |
   ::: replaced
    |
 LL | pub trait Trait {
    | --------------- this is the trait that was imported
+   = help: you can use `cargo tree` to explore your dependency tree
 
-error[E0277]: the trait bound `OtherType: Trait` is not satisfied
+error[E0277]: the trait bound `OtherType: dependency::Trait` is not satisfied
   --> replaced
    |
 LL |     do_something(OtherType);
-   |     ------------ ^^^^^^^^^ the trait `Trait` is not implemented for `OtherType`
+   |     ------------ ^^^^^^^^^ the trait `dependency::Trait` is not implemented for `OtherType`
    |     |
    |     required by a bound introduced by this call
    |
@@ -96,25 +76,18 @@ note: there are multiple different versions of crate `dependency` in the depende
   --> replaced
    |
 LL | pub trait Trait {
-   | ^^^^^^^^^^^^^^^ this is the required trait
-   |
-  ::: replaced
-   |
-LL | extern crate dep_2_reexport;
-   | ---------------------------- one version of crate `dependency` used here, as a dependency of crate `foo`
-LL | extern crate dependency;
-   | ------------------------ one version of crate `dependency` used here, as a direct dependency of the current crate
-   |
-  ::: replaced
-   |
-LL | pub struct OtherType;
-   | -------------------- this type doesn't implement the required trait
+   | ^^^^^^^^^^^^^^^ this is the expected trait
    |
   ::: replaced
    |
 LL | pub trait Trait {
    | --------------- this is the found trait
    = help: you can use `cargo tree` to explore your dependency tree
+help: the trait `dependency::Trait` is implemented for `dependency::Type`
+  --> replaced
+   |
+LL | impl Trait for Type {
+   | ^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `do_something`
   --> replaced
    |
@@ -129,23 +102,16 @@ LL |     do_something_type(Type);
    |     |
    |     arguments to this function are incorrect
    |
-note: two different versions of crate `dependency` are being used; two types coming from two different versions of the same crate are different types even if they look the same
+note: there are multiple different versions of crate `dependency` in the dependency graph
   --> replaced
    |
 LL | pub struct Type(pub i32);
-   | ^^^^^^^^^^^^^^^ this is the expected type `dependency::Type`
+   | ^^^^^^^^^^^^^^^ this is the expected type
    |
   ::: replaced
    |
 LL | pub struct Type;
-   | ^^^^^^^^^^^^^^^ this is the found type `dep_2_reexport::Type`
-   |
-  ::: replaced
-   |
-LL | extern crate dep_2_reexport;
-   | ---------------------------- one version of crate `dependency` used here, as a dependency of crate `foo`
-LL | extern crate dependency;
-   | ------------------------ one version of crate `dependency` used here, as a direct dependency of the current crate
+   | --------------- this is the found type
    = help: you can use `cargo tree` to explore your dependency tree
 note: function defined here
   --> replaced
@@ -161,23 +127,16 @@ LL |     do_something_trait(Box::new(Type) as Box<dyn Trait2>);
    |     |
    |     arguments to this function are incorrect
    |
-note: two different versions of crate `dependency` are being used; two types coming from two different versions of the same crate are different types even if they look the same
+note: there are multiple different versions of crate `dependency` in the dependency graph
   --> replaced
    |
 LL | pub trait Trait2 {}
-   | ^^^^^^^^^^^^^^^^ this is the expected trait `dependency::Trait2`
+   | ^^^^^^^^^^^^^^^^ this is the expected trait
    |
   ::: replaced
    |
 LL | pub trait Trait2 {}
-   | ^^^^^^^^^^^^^^^^ this is the found trait `dep_2_reexport::Trait2`
-   |
-  ::: replaced
-   |
-LL | extern crate dep_2_reexport;
-   | ---------------------------- one version of crate `dependency` used here, as a dependency of crate `foo`
-LL | extern crate dependency;
-   | ------------------------ one version of crate `dependency` used here, as a direct dependency of the current crate
+   | ---------------- this is the found trait
    = help: you can use `cargo tree` to explore your dependency tree
 note: function defined here
   --> replaced
@@ -185,7 +144,51 @@ note: function defined here
 LL | pub fn do_something_trait(_: Box<dyn Trait2>) {}
    |        ^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 6 previous errors
+error[E0277]: `?` couldn't convert the error to `dependency::Error`
+  --> replaced
+   |
+LL | fn main() -> Result<(), Error> {
+   |              ----------------- expected `dependency::Error` because of this
+...
+LL |     Err(Error2)?;
+   |     -----------^ the trait `From<Error2>` is not implemented for `dependency::Error`
+   |     |
+   |     this can't be annotated with `?` because it has type `Result<_, Error2>`
+   |
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+help: the trait `From<Error2>` is not implemented for `dependency::Error`
+      but trait `From<()>` is implemented for it
+  --> replaced
+   |
+LL | impl From<()> for Error {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `()`, found `Error2`
+   = note: there are multiple different versions of crate `dependency` in the dependency graph
+   = help: you can use `cargo tree` to explore your dependency tree
+
+error[E0277]: `?` couldn't convert the error to `dependency::OtherError`
+  --> replaced
+   |
+LL | fn foo() -> Result<(), OtherError> {
+   |             ---------------------- expected `dependency::OtherError` because of this
+LL |     Err(Error2)?;
+   |     -----------^ the trait `From<Error2>` is not implemented for `dependency::OtherError`
+   |     |
+   |     this can't be annotated with `?` because it has type `Result<_, Error2>`
+   |
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+help: `dependency::OtherError` implements trait `From<T>`
+  --> replaced
+   |
+LL | impl From<()> for OtherError {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<()>`
+...
+LL | impl From<i32> for OtherError {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<i32>`
+   = note: there are multiple different versions of crate `dependency` in the dependency graph
+   = help: you can use `cargo tree` to explore your dependency tree
+
+error: aborting due to 8 previous errors
 
 Some errors have detailed explanations: E0277, E0308, E0599.
 For more information about an error, try `rustc --explain E0277`.

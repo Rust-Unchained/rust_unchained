@@ -1,6 +1,7 @@
+use std::env::consts::EXE_EXTENSION;
 use std::fmt::{Display, Formatter};
 
-use crate::core::build_steps::compile::{Std, Sysroot};
+use crate::core::build_steps::compile::Sysroot;
 use crate::core::build_steps::tool::{RustcPerf, Rustdoc};
 use crate::core::builder::Builder;
 use crate::core::config::DebuginfoLevel;
@@ -135,32 +136,9 @@ impl Display for Scenario {
 /// Performs profiling using `rustc-perf` on a built version of the compiler.
 pub fn perf(builder: &Builder<'_>, args: &PerfArgs) {
     let collector = builder.ensure(RustcPerf {
-        compiler: builder.compiler(0, builder.config.build),
-        target: builder.config.build,
+        compiler: builder.compiler(0, builder.config.host_target),
+        target: builder.config.host_target,
     });
-
-    let is_profiling = match &args.cmd {
-        PerfCommand::Eprintln { .. }
-        | PerfCommand::Samply { .. }
-        | PerfCommand::Cachegrind { .. } => true,
-        PerfCommand::Benchmark { .. } | PerfCommand::Compare { .. } => false,
-    };
-    if is_profiling && builder.build.config.rust_debuginfo_level_rustc == DebuginfoLevel::None {
-        builder.info(r#"WARNING: You are compiling rustc without debuginfo, this will make profiling less useful.
-Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
-    }
-
-    let compiler = builder.compiler(builder.top_stage, builder.config.build);
-    builder.ensure(Std::new(compiler, builder.config.build));
-
-    if let Some(opts) = args.cmd.shared_opts() {
-        if opts.profiles.contains(&Profile::Doc) {
-            builder.ensure(Rustdoc { compiler });
-        }
-    }
-
-    let sysroot = builder.ensure(Sysroot::new(compiler));
-    let rustc = sysroot.join("bin/rustc");
 
     let rustc_perf_dir = builder.build.tempdir().join("rustc-perf");
     let results_dir = rustc_perf_dir.join("results");
@@ -173,6 +151,35 @@ Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
     cmd.current_dir(builder.src.join("src/tools/rustc-perf"));
 
     let db_path = results_dir.join("results.db");
+
+    let is_profiling = match &args.cmd {
+        PerfCommand::Eprintln { .. }
+        | PerfCommand::Samply { .. }
+        | PerfCommand::Cachegrind { .. } => true,
+        PerfCommand::Benchmark { .. } | PerfCommand::Compare { .. } => false,
+    };
+    if is_profiling && builder.build.config.rust_debuginfo_level_rustc == DebuginfoLevel::None {
+        builder.info(r#"WARNING: You are compiling rustc without debuginfo, this will make profiling less useful.
+Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
+    }
+
+    let prepare_rustc = || {
+        let compiler = builder.compiler(builder.top_stage, builder.config.host_target);
+        builder.std(compiler, builder.config.host_target);
+
+        if let Some(opts) = args.cmd.shared_opts()
+            && opts.profiles.contains(&Profile::Doc)
+        {
+            builder.ensure(Rustdoc { target_compiler: compiler });
+        }
+
+        let sysroot = builder.ensure(Sysroot::new(compiler));
+        let mut rustc = sysroot.clone();
+        rustc.push("bin");
+        rustc.push("rustc");
+        rustc.set_extension(EXE_EXTENSION);
+        rustc
+    };
 
     match &args.cmd {
         PerfCommand::Eprintln { opts }
@@ -187,18 +194,18 @@ Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
             });
 
             cmd.arg("--out-dir").arg(&results_dir);
-            cmd.arg(rustc);
+            cmd.arg(prepare_rustc());
 
             apply_shared_opts(&mut cmd, opts);
             cmd.run(builder);
 
-            println!("You can find the results at `{}`", &results_dir.display());
+            println!("You can find the results at `{}`", results_dir.display());
         }
         PerfCommand::Benchmark { id, opts } => {
             cmd.arg("bench_local");
             cmd.arg("--db").arg(&db_path);
             cmd.arg("--id").arg(id);
-            cmd.arg(rustc);
+            cmd.arg(prepare_rustc());
 
             apply_shared_opts(&mut cmd, opts);
             cmd.run(builder);

@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 #![warn(clippy::manual_is_ascii_check)]
 
 fn main() {
@@ -108,11 +107,15 @@ fn generics() {
     //~^ manual_is_ascii_check
     take_while(|c: char| ('A'..='Z').contains(&c));
     //~^ manual_is_ascii_check
+    take_while(|c| matches!(c, 'A'..='Z'));
+    //~^ manual_is_ascii_check
 }
 
 fn adds_type_reference() {
     let digits: Vec<&char> = ['1', 'A'].iter().take_while(|c| ('0'..='9').contains(c)).collect();
     //~^ manual_is_ascii_check
     let digits: Vec<&mut char> = ['1', 'A'].iter_mut().take_while(|c| ('0'..='9').contains(c)).collect();
+    //~^ manual_is_ascii_check
+    let digits: Vec<&mut char> = ['1', 'A'].iter_mut().take_while(|c| matches!(c, '0'..='9')).collect();
     //~^ manual_is_ascii_check
 }

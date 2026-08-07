@@ -1,6 +1,8 @@
 //@ needs-sanitizer-support
 //@ needs-sanitizer-memory
 //
+//@ compile-flags: -C unsafe-allow-abi-mismatch=sanitizer
+//
 //@ revisions: unoptimized optimized
 //
 //@ [optimized]compile-flags: -Z sanitizer=memory -Zsanitizer-memory-track-origins -O
@@ -11,7 +13,6 @@
 // This test case intentionally limits the usage of the std,
 // since it will be linked with an uninstrumented version of it.
 
-#![feature(core_intrinsics)]
 #![allow(invalid_value)]
 #![no_main]
 

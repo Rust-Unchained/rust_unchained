@@ -1,5 +1,5 @@
 #[repr(align(16))]
-//~^ ERROR attribute should be applied to a struct, enum, function, associated function, or union
+//~^ ERROR attribute cannot be used on
 pub type Foo = i32;
 
 fn main() {}

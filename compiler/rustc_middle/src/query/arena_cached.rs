@@ -1,3 +1,10 @@
+use std::mem;
+
+use rustc_arena::TypedArena;
+use rustc_span::ErrorGuaranteed;
+
+use crate::ty::TyCtxt;
+
 /// Helper trait that allows `arena_cache` queries to return `Option<&T>`
 /// instead of `&Option<T>`, and avoid allocating `None` in the arena.
 ///
@@ -11,10 +18,11 @@ pub trait ArenaCached<'tcx>: Sized {
     /// Type that is stored in the arena.
     type Allocated: 'tcx;
 
-    /// Takes a provided value, and allocates it in the arena (if appropriate)
-    /// with the help of the given `arena_alloc` closure.
+    /// Takes a provided value, and allocates it in an appropriate arena,
+    /// unless the particular value doesn't need allocation (e.g. `None`).
     fn alloc_in_arena(
-        arena_alloc: impl Fn(Self::Allocated) -> &'tcx Self::Allocated,
+        tcx: TyCtxt<'tcx>,
+        typed_arena: &'tcx TypedArena<Self::Allocated>,
         value: Self::Provided,
     ) -> Self;
 }
@@ -23,12 +31,9 @@ impl<'tcx, T> ArenaCached<'tcx> for &'tcx T {
     type Provided = T;
     type Allocated = T;
 
-    fn alloc_in_arena(
-        arena_alloc: impl Fn(Self::Allocated) -> &'tcx Self::Allocated,
-        value: Self::Provided,
-    ) -> Self {
+    fn alloc_in_arena(tcx: TyCtxt<'tcx>, typed_arena: &'tcx TypedArena<T>, value: T) -> Self {
         // Just allocate in the arena normally.
-        arena_alloc(value)
+        do_alloc(tcx, typed_arena, value)
     }
 }
 
@@ -38,10 +43,32 @@ impl<'tcx, T> ArenaCached<'tcx> for Option<&'tcx T> {
     type Allocated = T;
 
     fn alloc_in_arena(
-        arena_alloc: impl Fn(Self::Allocated) -> &'tcx Self::Allocated,
-        value: Self::Provided,
+        tcx: TyCtxt<'tcx>,
+        typed_arena: &'tcx TypedArena<T>,
+        value: Option<T>,
     ) -> Self {
         // Don't store None in the arena, and wrap the allocated reference in Some.
-        value.map(arena_alloc)
+        try { do_alloc(tcx, typed_arena, value?) }
     }
+}
+
+impl<'tcx, T> ArenaCached<'tcx> for Result<&'tcx T, ErrorGuaranteed> {
+    type Provided = Result<T, ErrorGuaranteed>;
+    /// The provide value is `Result<T, ErrorGuaranteed>`, but we only store `T` in the arena.
+    type Allocated = T;
+
+    fn alloc_in_arena(
+        tcx: TyCtxt<'tcx>,
+        typed_arena: &'tcx TypedArena<T>,
+        value: Result<T, ErrorGuaranteed>,
+    ) -> Self {
+        // Don't store Err(ErrorGuaranteed) in the arena, and wrap the allocated reference in Ok.
+        try { do_alloc(tcx, typed_arena, value?) }
+    }
+}
+
+/// Allocates a value in either its dedicated arena, or in the common dropless
+/// arena, depending on whether it needs to be dropped.
+fn do_alloc<'tcx, T>(tcx: TyCtxt<'tcx>, typed_arena: &'tcx TypedArena<T>, value: T) -> &'tcx T {
+    if mem::needs_drop::<T>() { typed_arena.alloc(value) } else { tcx.arena.dropless.alloc(value) }
 }

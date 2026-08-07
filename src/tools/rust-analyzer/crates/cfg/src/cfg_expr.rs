@@ -47,13 +47,43 @@ impl fmt::Display for CfgAtom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(derive_arbitrary::Arbitrary))]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum CfgExpr {
     Invalid,
     Atom(CfgAtom),
     All(Box<[CfgExpr]>),
     Any(Box<[CfgExpr]>),
     Not(Box<CfgExpr>),
+}
+
+impl fmt::Display for CfgExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CfgExpr::Atom(atom) => atom.fmt(f),
+            CfgExpr::All(exprs) => {
+                write!(f, "all(")?;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    expr.fmt(f)?;
+                }
+                write!(f, ")")
+            }
+            CfgExpr::Any(exprs) => {
+                write!(f, "any(")?;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    expr.fmt(f)?;
+                }
+                write!(f, ")")
+            }
+            CfgExpr::Not(expr) => write!(f, "not({})", expr),
+            CfgExpr::Invalid => write!(f, "invalid"),
+        }
+    }
 }
 
 impl From<CfgAtom> for CfgExpr {
@@ -63,9 +93,67 @@ impl From<CfgAtom> for CfgExpr {
 }
 
 impl CfgExpr {
+    // FIXME: Parsing from `tt` is only used in a handful of places, reconsider
+    // if we should switch them to AST.
     #[cfg(feature = "tt")]
-    pub fn parse<S: Copy>(tt: &tt::TopSubtree<S>) -> CfgExpr {
+    pub fn parse(tt: &tt::TopSubtree) -> CfgExpr {
         next_cfg_expr(&mut tt.iter()).unwrap_or(CfgExpr::Invalid)
+    }
+
+    #[cfg(feature = "tt")]
+    pub fn parse_from_iter(tt: &mut tt::iter::TtIter<'_>) -> CfgExpr {
+        next_cfg_expr(tt).unwrap_or(CfgExpr::Invalid)
+    }
+
+    #[cfg(feature = "syntax")]
+    pub fn parse_from_ast(ast: syntax::ast::CfgPredicate) -> CfgExpr {
+        use intern::sym;
+        use syntax::ast::{self, AstToken};
+
+        match ast {
+            ast::CfgPredicate::CfgAtom(atom) => {
+                let atom = match atom.key() {
+                    Some(ast::CfgAtomKey::True) => CfgAtom::Flag(sym::true_),
+                    Some(ast::CfgAtomKey::False) => CfgAtom::Flag(sym::false_),
+                    Some(ast::CfgAtomKey::Ident(key)) => {
+                        let key = Symbol::intern(key.text());
+                        match atom.string_token().and_then(ast::String::cast) {
+                            Some(value) => {
+                                if let Ok(value) = value.value() {
+                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }
+                                } else {
+                                    return CfgExpr::Invalid;
+                                }
+                            }
+                            None => CfgAtom::Flag(key),
+                        }
+                    }
+                    None => return CfgExpr::Invalid,
+                };
+                CfgExpr::Atom(atom)
+            }
+            ast::CfgPredicate::CfgComposite(composite) => {
+                let Some(keyword) = composite.keyword() else {
+                    return CfgExpr::Invalid;
+                };
+                match keyword.text() {
+                    "all" => CfgExpr::All(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                    ),
+                    "any" => CfgExpr::Any(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                    ),
+                    "not" => {
+                        let mut inner = composite.cfg_predicates();
+                        let (Some(inner), None) = (inner.next(), inner.next()) else {
+                            return CfgExpr::Invalid;
+                        };
+                        CfgExpr::Not(Box::new(CfgExpr::parse_from_ast(inner)))
+                    }
+                    _ => CfgExpr::Invalid,
+                }
+            }
+        }
     }
 
     /// Fold the cfg by querying all basic `Atom` and `KeyValue` predicates.
@@ -85,7 +173,7 @@ impl CfgExpr {
 }
 
 #[cfg(feature = "tt")]
-fn next_cfg_expr<S: Copy>(it: &mut tt::iter::TtIter<'_, S>) -> Option<CfgExpr> {
+fn next_cfg_expr(it: &mut tt::iter::TtIter<'_>) -> Option<CfgExpr> {
     use intern::sym;
     use tt::iter::TtElement;
 
@@ -95,13 +183,21 @@ fn next_cfg_expr<S: Copy>(it: &mut tt::iter::TtIter<'_, S>) -> Option<CfgExpr> {
         Some(_) => return Some(CfgExpr::Invalid),
     };
 
-    let ret = match it.peek() {
-        Some(TtElement::Leaf(tt::Leaf::Punct(punct))) if punct.char == '=' => {
-            match it.remaining().flat_tokens().get(1) {
-                Some(tt::TokenTree::Leaf(tt::Leaf::Literal(literal))) => {
+    let mut it_clone = it.clone();
+    let ret = match it_clone.next() {
+        Some(TtElement::Leaf(tt::Leaf::Punct(punct)))
+            // Don't consume on e.g. `=>`.
+            if punct.char == '='
+                && (punct.spacing == tt::Spacing::Alone
+                    || it_clone.peek().is_none_or(|peek2| {
+                        !matches!(peek2, tt::TtElement::Leaf(tt::Leaf::Punct(_)))
+                    })) =>
+        {
+            match it_clone.next() {
+                Some(tt::TtElement::Leaf(tt::Leaf::Literal(literal))) => {
                     it.next();
                     it.next();
-                    CfgAtom::KeyValue { key: name, value: literal.symbol.clone() }.into()
+                    CfgAtom::KeyValue { key: name, value: Symbol::intern(literal.text()) }.into()
                 }
                 _ => return Some(CfgExpr::Invalid),
             }
@@ -122,10 +218,10 @@ fn next_cfg_expr<S: Copy>(it: &mut tt::iter::TtIter<'_, S>) -> Option<CfgExpr> {
     };
 
     // Eat comma separator
-    if let Some(TtElement::Leaf(tt::Leaf::Punct(punct))) = it.peek() {
-        if punct.char == ',' {
-            it.next();
-        }
+    if let Some(TtElement::Leaf(tt::Leaf::Punct(punct))) = it.peek()
+        && punct.char == ','
+    {
+        it.next();
     }
     Some(ret)
 }

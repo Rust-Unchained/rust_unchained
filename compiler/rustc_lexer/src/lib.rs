@@ -25,18 +25,32 @@
 #![deny(unstable_features)]
 // tidy-alphabetical-end
 
-mod cursor;
-
 #[cfg(test)]
 mod tests;
 
-use unicode_properties::UnicodeEmoji;
-pub use unicode_xid::UNICODE_VERSION as UNICODE_XID_VERSION;
+use std::str::Chars;
 
-use self::LiteralKind::*;
-use self::TokenKind::*;
-pub use crate::cursor::Cursor;
-use crate::cursor::EOF_CHAR;
+use LiteralKind::*;
+use TokenKind::*;
+pub use unicode_ident::UNICODE_VERSION;
+use unicode_properties::UnicodeEmoji;
+
+// Make sure that the Unicode version of the dependencies is the same.
+const _: () = {
+    let properties = unicode_properties::UNICODE_VERSION;
+    let ident = unicode_ident::UNICODE_VERSION;
+
+    if properties.0 != ident.0 as u64
+        || properties.1 != ident.1 as u64
+        || properties.2 != ident.2 as u64
+    {
+        panic!(
+            "unicode-properties and unicode-ident must use the same Unicode version, \
+            `unicode_properties::UNICODE_VERSION` and `unicode_ident::UNICODE_VERSION` are \
+            different."
+        );
+    }
+};
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -57,16 +71,26 @@ impl Token {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     /// A line comment, e.g. `// comment`.
-    LineComment { doc_style: Option<DocStyle> },
+    LineComment {
+        doc_style: Option<DocStyle>,
+    },
 
     /// A block comment, e.g. `/* block comment */`.
     ///
     /// Block comments can be recursive, so a sequence like `/* /* */`
     /// will not be considered terminated and will result in a parsing error.
-    BlockComment { doc_style: Option<DocStyle>, terminated: bool },
+    BlockComment {
+        doc_style: Option<DocStyle>,
+        terminated: bool,
+    },
 
     /// Any whitespace character sequence.
     Whitespace,
+
+    Frontmatter {
+        has_invalid_preceding_whitespace: bool,
+        invalid_infostring: bool,
+    },
 
     /// An identifier or keyword, e.g. `ident` or `continue`.
     Ident,
@@ -109,10 +133,15 @@ pub enum TokenKind {
     /// this type will need to check for and reject that case.
     ///
     /// See [LiteralKind] for more details.
-    Literal { kind: LiteralKind, suffix_start: u32 },
+    Literal {
+        kind: LiteralKind,
+        suffix_start: u32,
+    },
 
     /// A lifetime, e.g. `'a`.
-    Lifetime { starts_with_number: bool },
+    Lifetime {
+        starts_with_number: bool,
+    },
 
     /// `;`
     Semi,
@@ -259,14 +288,15 @@ pub fn strip_shebang(input: &str) -> Option<usize> {
     if let Some(input_tail) = input.strip_prefix("#!") {
         // Ok, this is a shebang but if the next non-whitespace token is `[`,
         // then it may be valid Rust code, so consider it Rust code.
-        let next_non_whitespace_token = tokenize(input_tail).map(|tok| tok.kind).find(|tok| {
-            !matches!(
-                tok,
-                TokenKind::Whitespace
-                    | TokenKind::LineComment { doc_style: None }
-                    | TokenKind::BlockComment { doc_style: None, .. }
-            )
-        });
+        let next_non_whitespace_token =
+            tokenize(input_tail, FrontmatterAllowed::No).map(|tok| tok.kind).find(|tok| {
+                !matches!(
+                    tok,
+                    TokenKind::Whitespace
+                        | TokenKind::LineComment { doc_style: None }
+                        | TokenKind::BlockComment { doc_style: None, .. }
+                )
+            });
         if next_non_whitespace_token != Some(TokenKind::OpenBracket) {
             // No other choice than to consider this a shebang.
             return Some(2 + input_tail.lines().next().unwrap_or_default().len());
@@ -280,7 +310,7 @@ pub fn strip_shebang(input: &str) -> Option<usize> {
 #[inline]
 pub fn validate_raw_str(input: &str, prefix_len: u32) -> Result<(), RawStrError> {
     debug_assert!(!input.is_empty());
-    let mut cursor = Cursor::new(input);
+    let mut cursor = Cursor::new(input, FrontmatterAllowed::No);
     // Move past the leading `r` or `br`.
     for _ in 0..prefix_len {
         cursor.bump().unwrap();
@@ -289,8 +319,16 @@ pub fn validate_raw_str(input: &str, prefix_len: u32) -> Result<(), RawStrError>
 }
 
 /// Creates an iterator that produces tokens from the input string.
-pub fn tokenize(input: &str) -> impl Iterator<Item = Token> {
-    let mut cursor = Cursor::new(input);
+///
+/// When parsing a full Rust document,
+/// first [`strip_shebang`] and then allow frontmatters with [`FrontmatterAllowed::Yes`].
+///
+/// When tokenizing a slice of a document, be sure to disallow frontmatters with [`FrontmatterAllowed::No`]
+pub fn tokenize(
+    input: &str,
+    frontmatter_allowed: FrontmatterAllowed,
+) -> impl Iterator<Item = Token> {
+    let mut cursor = Cursor::new(input, frontmatter_allowed);
     std::iter::from_fn(move || {
         let token = cursor.advance_token();
         if token.kind != TokenKind::Eof { Some(token) } else { None }
@@ -308,24 +346,38 @@ pub fn is_whitespace(c: char) -> bool {
 
     matches!(
         c,
-        // Usual ASCII suspects
-        '\u{0009}'   // \t
-        | '\u{000A}' // \n
+        // End-of-line characters
+        | '\u{000A}' // line feed (\n)
         | '\u{000B}' // vertical tab
         | '\u{000C}' // form feed
-        | '\u{000D}' // \r
-        | '\u{0020}' // space
+        | '\u{000D}' // carriage return (\r)
+        | '\u{0085}' // next line (from latin1)
+        | '\u{2028}' // LINE SEPARATOR
+        | '\u{2029}' // PARAGRAPH SEPARATOR
 
-        // NEXT LINE from latin1
-        | '\u{0085}'
-
-        // Bidi markers
+        // `Default_Ignorable_Code_Point` characters
         | '\u{200E}' // LEFT-TO-RIGHT MARK
         | '\u{200F}' // RIGHT-TO-LEFT MARK
 
-        // Dedicated whitespace characters from Unicode
-        | '\u{2028}' // LINE SEPARATOR
-        | '\u{2029}' // PARAGRAPH SEPARATOR
+        // Horizontal space characters
+        | '\u{0009}'   // tab (\t)
+        | '\u{0020}' // space
+    )
+}
+
+/// True if `c` is considered horizontal whitespace according to Rust language definition.
+pub fn is_horizontal_whitespace(c: char) -> bool {
+    // This is the horizontal space subset of `Pattern_White_Space` as
+    // categorized by UAX #31, Section 4.1.
+    //
+    // Note that this set is stable (ie, it doesn't change with different
+    // Unicode versions), so it's ok to just hard-code the values.
+
+    matches!(
+        c,
+        // Horizontal space characters
+        '\u{0009}'   // tab (\t)
+        | '\u{0020}' // space
     )
 }
 
@@ -334,14 +386,14 @@ pub fn is_whitespace(c: char) -> bool {
 /// a formal definition of valid identifier name.
 pub fn is_id_start(c: char) -> bool {
     // This is XID_Start OR '_' (which formally is not a XID_Start).
-    c == '_' || unicode_xid::UnicodeXID::is_xid_start(c)
+    c == '_' || unicode_ident::is_xid_start(c)
 }
 
 /// True if `c` is valid as a non-first character of an identifier.
 /// See [Rust language reference](https://doc.rust-lang.org/reference/identifiers.html) for
 /// a formal definition of valid identifier name.
 pub fn is_id_continue(c: char) -> bool {
-    unicode_xid::UnicodeXID::is_xid_continue(c)
+    unicode_ident::is_xid_continue(c)
 }
 
 /// The passed string is lexically an identifier.
@@ -354,14 +406,162 @@ pub fn is_ident(string: &str) -> bool {
     }
 }
 
-impl Cursor<'_> {
+pub enum FrontmatterAllowed {
+    Yes,
+    No,
+}
+
+/// Peekable iterator over a char sequence.
+///
+/// Next characters can be peeked via `first` method,
+/// and position can be shifted forward via `bump` method.
+pub struct Cursor<'a> {
+    len_remaining: usize,
+    /// Iterator over chars. Slightly faster than a &str.
+    chars: Chars<'a>,
+    pub(crate) frontmatter_allowed: FrontmatterAllowed,
+    #[cfg(debug_assertions)]
+    prev: char,
+}
+
+const EOF_CHAR: char = '\0';
+
+impl<'a> Cursor<'a> {
+    pub fn new(input: &'a str, frontmatter_allowed: FrontmatterAllowed) -> Cursor<'a> {
+        Cursor {
+            len_remaining: input.len(),
+            chars: input.chars(),
+            frontmatter_allowed,
+            #[cfg(debug_assertions)]
+            prev: EOF_CHAR,
+        }
+    }
+
+    pub fn as_str(&self) -> &'a str {
+        self.chars.as_str()
+    }
+
+    /// Returns the last eaten symbol (or `'\0'` in release builds).
+    /// (For debug assertions only.)
+    pub(crate) fn prev(&self) -> char {
+        #[cfg(debug_assertions)]
+        {
+            self.prev
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            EOF_CHAR
+        }
+    }
+
+    /// Peeks the next symbol from the input stream without consuming it.
+    /// If requested position doesn't exist, `EOF_CHAR` is returned.
+    /// However, getting `EOF_CHAR` doesn't always mean actual end of file,
+    /// it should be checked with `is_eof` method.
+    pub fn first(&self) -> char {
+        // `.next()` optimizes better than `.nth(0)`
+        self.chars.clone().next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Peeks the second symbol from the input stream without consuming it.
+    pub(crate) fn second(&self) -> char {
+        // `.next()` optimizes better than `.nth(1)`
+        let mut iter = self.chars.clone();
+        iter.next();
+        iter.next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Peeks the third symbol from the input stream without consuming it.
+    pub fn third(&self) -> char {
+        // `.next()` optimizes better than `.nth(2)`
+        let mut iter = self.chars.clone();
+        iter.next();
+        iter.next();
+        iter.next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Checks if there is nothing more to consume.
+    pub(crate) fn is_eof(&self) -> bool {
+        self.chars.as_str().is_empty()
+    }
+
+    /// Returns amount of already consumed symbols.
+    pub(crate) fn pos_within_token(&self) -> u32 {
+        (self.len_remaining - self.chars.as_str().len()) as u32
+    }
+
+    /// Resets the number of bytes consumed to 0.
+    pub(crate) fn reset_pos_within_token(&mut self) {
+        self.len_remaining = self.chars.as_str().len();
+    }
+
+    /// Moves to the next character.
+    pub(crate) fn bump(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+
+        #[cfg(debug_assertions)]
+        {
+            self.prev = c;
+        }
+
+        Some(c)
+    }
+
+    /// Moves to a substring by a number of bytes.
+    pub(crate) fn bump_bytes(&mut self, n: usize) {
+        self.chars = self.as_str()[n..].chars();
+    }
+
+    /// Eats symbols while predicate returns true or until the end of file is reached.
+    pub(crate) fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) {
+        // It was tried making optimized version of this for eg. line comments, but
+        // LLVM can inline all of this and compile it down to fast iteration over bytes.
+        while predicate(self.first()) && !self.is_eof() {
+            self.bump();
+        }
+    }
+
+    pub(crate) fn eat_until(&mut self, byte: u8) {
+        self.chars = match memchr::memchr(byte, self.as_str().as_bytes()) {
+            Some(index) => self.as_str()[index..].chars(),
+            None => "".chars(),
+        }
+    }
+
     /// Parses a token from the input string.
     pub fn advance_token(&mut self) -> Token {
-        let first_char = match self.bump() {
-            Some(c) => c,
-            None => return Token::new(TokenKind::Eof, 0),
+        let Some(first_char) = self.bump() else {
+            return Token::new(TokenKind::Eof, 0);
         };
+
         let token_kind = match first_char {
+            c if matches!(self.frontmatter_allowed, FrontmatterAllowed::Yes)
+                && is_whitespace(c) =>
+            {
+                let mut last = first_char;
+                while is_whitespace(self.first()) {
+                    let Some(c) = self.bump() else {
+                        break;
+                    };
+                    last = c;
+                }
+                // invalid frontmatter opening as whitespace preceding it isn't newline.
+                // combine the whitespace and the frontmatter to a single token as we shall
+                // error later.
+                if last != '\n' && self.as_str().starts_with("---") {
+                    self.bump();
+                    self.frontmatter(true)
+                } else {
+                    Whitespace
+                }
+            }
+            '-' if matches!(self.frontmatter_allowed, FrontmatterAllowed::Yes)
+                && self.as_str().starts_with("--") =>
+            {
+                // happy path
+                self.frontmatter(false)
+            }
             // Slash, comment or block comment.
             '/' => match self.first() {
                 '/' => self.line_comment(),
@@ -464,9 +664,104 @@ impl Cursor<'_> {
             c if !c.is_ascii() && c.is_emoji_char() => self.invalid_ident(),
             _ => Unknown,
         };
+        if matches!(self.frontmatter_allowed, FrontmatterAllowed::Yes)
+            && !matches!(token_kind, Whitespace)
+        {
+            // stop allowing frontmatters after first non-whitespace token
+            self.frontmatter_allowed = FrontmatterAllowed::No;
+        }
         let res = Token::new(token_kind, self.pos_within_token());
         self.reset_pos_within_token();
         res
+    }
+
+    /// Given that one `-` was eaten, eat the rest of the frontmatter.
+    fn frontmatter(&mut self, has_invalid_preceding_whitespace: bool) -> TokenKind {
+        debug_assert_eq!('-', self.prev());
+
+        let pos = self.pos_within_token();
+        self.eat_while(|c| c == '-');
+
+        // one `-` is eaten by the caller.
+        let length_opening = self.pos_within_token() - pos + 1;
+
+        // must be ensured by the caller
+        debug_assert!(length_opening >= 3);
+
+        // whitespace between the opening and the infostring.
+        self.eat_while(|ch| ch != '\n' && is_horizontal_whitespace(ch));
+
+        // copied from `eat_identifier`, but allows `-` and `.` in infostring to allow something like
+        // `---Cargo.toml` as a valid opener
+        if is_id_start(self.first()) {
+            self.bump();
+            self.eat_while(|c| is_id_continue(c) || c == '-' || c == '.');
+        }
+
+        self.eat_while(|ch| ch != '\n' && is_horizontal_whitespace(ch));
+        let invalid_infostring = self.first() != '\n';
+
+        let mut found = false;
+        let nl_fence_pattern = format!("\n{:-<1$}", "", length_opening as usize);
+        if let Some(closing) = self.as_str().find(&nl_fence_pattern) {
+            // candidate found
+            self.bump_bytes(closing + nl_fence_pattern.len());
+            // in case like
+            // ---cargo
+            // --- blahblah
+            // or
+            // ---cargo
+            // ----
+            // combine those stuff into this frontmatter token such that it gets detected later.
+            self.eat_until(b'\n');
+            found = true;
+        }
+
+        if !found {
+            // recovery strategy: a closing statement might have preceding whitespace/newline
+            // but not have enough dashes to properly close. In this case, we eat until there,
+            // and report a mismatch in the parser.
+            let mut rest = self.as_str();
+            // We can look for a shorter closing (starting with four dashes but closing with three)
+            // and other indications that Rust has started and the infostring has ended.
+            let mut potential_closing = rest
+                .find("\n---")
+                // n.b. only in the case where there are dashes, we move the index to the line where
+                // the dashes start as we eat to include that line. For other cases those are Rust code
+                // and not included in the frontmatter.
+                .map(|x| x + 1)
+                .or_else(|| rest.find("\nuse "))
+                .or_else(|| rest.find("\n//!"))
+                .or_else(|| rest.find("\n#!["));
+
+            if potential_closing.is_none() {
+                // a less fortunate recovery if all else fails which finds any dashes preceded by whitespace
+                // on a standalone line. Might be wrong.
+                let mut base_index = 0;
+                while let Some(closing) = rest.find("---") {
+                    let preceding_chars_start = rest[..closing].rfind("\n").map_or(0, |i| i + 1);
+                    if rest[preceding_chars_start..closing].chars().all(is_horizontal_whitespace) {
+                        // candidate found
+                        potential_closing = Some(closing + base_index);
+                        break;
+                    } else {
+                        rest = &rest[closing + 3..];
+                        base_index += closing + 3;
+                    }
+                }
+            }
+
+            if let Some(potential_closing) = potential_closing {
+                // bump to the potential closing, and eat everything on that line.
+                self.bump_bytes(potential_closing);
+                self.eat_until(b'\n');
+            } else {
+                // eat everything. this will get reported as an unclosed frontmatter.
+                self.eat_while(|_| true);
+            }
+        }
+
+        Frontmatter { has_invalid_preceding_whitespace, invalid_infostring }
     }
 
     fn line_comment(&mut self) -> TokenKind {
@@ -645,7 +940,7 @@ impl Cursor<'_> {
         } else {
             // No base prefix, parse number in the usual way.
             self.eat_decimal_digits();
-        };
+        }
 
         match self.first() {
             // Don't be greedy if this is actually an

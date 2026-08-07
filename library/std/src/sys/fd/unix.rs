@@ -18,15 +18,55 @@ use libc::off_t as off64_t;
 ))]
 use libc::off64_t;
 
+cfg_select! {
+    target_os = "vxworks" => {
+        // VxWorks does not have pread/pwrite.
+        // See <https://github.com/rust-lang/libc/issues/5328>.
+        pub unsafe fn pread64(
+            _fd: libc::c_int,
+            _buf: *mut libc::c_void,
+            _count: libc::size_t,
+            _offset: off64_t,
+        ) -> libc::ssize_t {
+            -1
+        }
+
+        pub unsafe fn pwrite64(
+            _fd: libc::c_int,
+            _buf: *const libc::c_void,
+            _count: libc::size_t,
+            _offset: off64_t,
+        ) -> libc::ssize_t {
+            -1
+        }
+    }
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "android",
+        target_os = "hurd",
+    ) => {
+        // Prefer explicit pread64 for 64-bit offset independently of libc
+        // #[cfg(gnu_file_offset_bits64)].
+        use libc::pread64;
+        use libc::pwrite64;
+    }
+    _ => {
+        use libc::pread as pread64;
+        use libc::pwrite as pwrite64;
+    }
+}
+
 use crate::cmp;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, Read};
-use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use crate::sys::cvt;
+use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
 use crate::sys::pal::weak::syscall;
-#[cfg(any(all(target_os = "android", target_pointer_width = "32"), target_vendor = "apple"))]
+#[cfg(any(
+    all(target_os = "android", target_pointer_width = "32"),
+    all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64")))
+))]
 use crate::sys::pal::weak::weak;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner, cvt};
 
 #[derive(Debug)]
 pub struct FileDesc(OwnedFd);
@@ -37,10 +77,10 @@ pub struct FileDesc(OwnedFd);
 //
 // On Apple targets however, apparently the 64-bit libc is either buggy or
 // intentionally showing odd behavior by rejecting any read with a size
-// larger than or equal to INT_MAX. To handle both of these the read
-// size is capped on both platforms.
+// larger than INT_MAX. To handle both of these the read size is capped on
+// both platforms.
 const READ_LIMIT: usize = if cfg!(target_vendor = "apple") {
-    libc::c_int::MAX as usize - 1
+    libc::c_int::MAX as usize
 } else {
     libc::ssize_t::MAX as usize
 };
@@ -62,6 +102,7 @@ const fn max_iov() -> usize {
     target_os = "emscripten",
     target_os = "linux",
     target_os = "nto",
+    target_os = "qnx",
 ))]
 const fn max_iov() -> usize {
     libc::UIO_MAXIOV as usize
@@ -77,6 +118,7 @@ const fn max_iov() -> usize {
     target_os = "netbsd",
     target_os = "nuttx",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "openbsd",
     target_os = "horizon",
     target_os = "vita",
@@ -137,7 +179,8 @@ impl FileDesc {
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
-            target_os = "nuttx"
+            target_os = "nuttx",
+            target_os = "wasi",
         )))
     }
 
@@ -146,44 +189,49 @@ impl FileDesc {
         (&mut me).read_to_end(buf)
     }
 
-    #[cfg_attr(target_os = "vxworks", allow(unused_unsafe))]
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        #[cfg(not(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            target_os = "android",
-            target_os = "hurd"
-        )))]
-        use libc::pread as pread64;
-        #[cfg(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            target_os = "android",
-            target_os = "hurd"
-        ))]
-        use libc::pread64;
-
-        unsafe {
-            cvt(pread64(
+        cvt(unsafe {
+            pread64(
                 self.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 cmp::min(buf.len(), READ_LIMIT),
-                offset as off64_t,
-            ))
-            .map(|n| n as usize)
-        }
+                offset as off64_t, // EINVAL if offset + count overflows
+            )
+        })
+        .map(|n| n as usize)
     }
 
-    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, mut cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
+        // SAFETY: `cursor.as_mut()` starts with `cursor.capacity()` writable bytes
         let ret = cvt(unsafe {
             libc::read(
                 self.as_raw_fd(),
-                cursor.as_mut().as_mut_ptr() as *mut libc::c_void,
+                cursor.as_mut().as_mut_ptr().cast::<libc::c_void>(),
                 cmp::min(cursor.capacity(), READ_LIMIT),
             )
         })?;
 
-        // Safety: `ret` bytes were written to the initialized portion of the buffer
+        // SAFETY: `ret` bytes were written to the initialized portion of the buffer
         unsafe {
-            cursor.advance_unchecked(ret as usize);
+            cursor.advance(ret as usize);
+        }
+        Ok(())
+    }
+
+    pub fn read_buf_at(&self, mut cursor: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        // SAFETY: `cursor.as_mut()` starts with `cursor.capacity()` writable bytes
+        let ret = cvt(unsafe {
+            pread64(
+                self.as_raw_fd(),
+                cursor.as_mut().as_mut_ptr().cast::<libc::c_void>(),
+                cmp::min(cursor.capacity(), READ_LIMIT),
+                offset as off64_t, // EINVAL if offset + count overflows
+            )
+        })?;
+
+        // SAFETY: `ret` bytes were written to the initialized portion of the buffer
+        unsafe {
+            cursor.advance(ret as usize);
         }
         Ok(())
     }
@@ -199,6 +247,7 @@ impl FileDesc {
         target_os = "linux",
         target_os = "netbsd",
         target_os = "openbsd", // OpenBSD 2.7
+        all(target_os = "macos", target_arch = "aarch64"),
     ))]
     pub fn read_vectored_at(&self, bufs: &mut [IoSliceMut<'_>], offset: u64) -> io::Result<usize> {
         let ret = cvt(unsafe {
@@ -287,14 +336,15 @@ impl FileDesc {
 
     // We support old MacOS, iOS, watchOS, tvOS and visionOS. `preadv` was added in the following
     // Apple OS versions:
-    // ios 14.0
-    // tvos 14.0
-    // macos 11.0
-    // watchos 7.0
+    // iOS 14.0
+    // tvOS 14.0
+    // macOS 11.0
+    // watchOS 7.0
     //
-    // These versions may be newer than the minimum supported versions of OS's we support so we must
-    // use "weak" linking.
-    #[cfg(target_vendor = "apple")]
+    // Since macOS 11.0 is also the first version with AArch64 support, we can
+    // `preadv` unconditionally there. But on all other targets we must use
+    // "weak" linking.
+    #[cfg(all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64"))))]
     pub fn read_vectored_at(&self, bufs: &mut [IoSliceMut<'_>], offset: u64) -> io::Result<usize> {
         weak!(
             fn preadv(
@@ -365,25 +415,12 @@ impl FileDesc {
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
-            target_os = "nuttx"
+            target_os = "nuttx",
+            target_os = "wasi",
         )))
     }
 
-    #[cfg_attr(target_os = "vxworks", allow(unused_unsafe))]
     pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        #[cfg(not(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            target_os = "android",
-            target_os = "hurd"
-        )))]
-        use libc::pwrite as pwrite64;
-        #[cfg(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            target_os = "android",
-            target_os = "hurd"
-        ))]
-        use libc::pwrite64;
-
         unsafe {
             cvt(pwrite64(
                 self.as_raw_fd(),
@@ -406,6 +443,7 @@ impl FileDesc {
         target_os = "linux",
         target_os = "netbsd",
         target_os = "openbsd", // OpenBSD 2.7
+        all(target_os = "macos", target_arch = "aarch64"),
     ))]
     pub fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> io::Result<usize> {
         let ret = cvt(unsafe {
@@ -494,14 +532,15 @@ impl FileDesc {
 
     // We support old MacOS, iOS, watchOS, tvOS and visionOS. `pwritev` was added in the following
     // Apple OS versions:
-    // ios 14.0
-    // tvos 14.0
-    // macos 11.0
-    // watchos 7.0
+    // iOS 14.0
+    // tvOS 14.0
+    // macOS 11.0
+    // watchOS 7.0
     //
-    // These versions may be newer than the minimum supported versions of OS's we support so we must
-    // use "weak" linking.
-    #[cfg(target_vendor = "apple")]
+    // Since macOS 11.0 is also the first version with AArch64 support, we can
+    // `pwritev` unconditionally there. But on all other targets we must use
+    // "weak" linking.
+    #[cfg(all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64")),))]
     pub fn write_vectored_at(&self, bufs: &[IoSlice<'_>], offset: u64) -> io::Result<usize> {
         weak!(
             fn pwritev(
@@ -541,6 +580,8 @@ impl FileDesc {
         target_os = "redox",
         target_os = "vxworks",
         target_os = "nto",
+        target_os = "qnx",
+        target_os = "wasi",
     )))]
     pub fn set_cloexec(&self) -> io::Result<()> {
         unsafe {
@@ -564,6 +605,8 @@ impl FileDesc {
         target_os = "redox",
         target_os = "vxworks",
         target_os = "nto",
+        target_os = "qnx",
+        target_os = "wasi",
     ))]
     pub fn set_cloexec(&self) -> io::Result<()> {
         unsafe {
@@ -618,7 +661,7 @@ impl<'a> Read for &'a FileDesc {
         (**self).read(buf)
     }
 
-    fn read_buf(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         (**self).read_buf(cursor)
     }
 

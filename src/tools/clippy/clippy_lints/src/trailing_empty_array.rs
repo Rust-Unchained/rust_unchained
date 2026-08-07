@@ -33,6 +33,7 @@ declare_clippy_lint! {
     nursery,
     "struct with a trailing zero-sized array but without `#[repr(C)]` or another `repr` attribute"
 }
+
 declare_lint_pass!(TrailingEmptyArray => [TRAILING_EMPTY_ARRAY]);
 
 impl<'tcx> LateLintPass<'tcx> for TrailingEmptyArray {
@@ -57,7 +58,7 @@ impl<'tcx> LateLintPass<'tcx> for TrailingEmptyArray {
 }
 
 fn is_struct_with_trailing_zero_sized_array<'tcx>(cx: &LateContext<'tcx>, item: &Item<'tcx>) -> bool {
-    if let ItemKind::Struct(_, data, _) = &item.kind
+    if let ItemKind::Struct(_, _, data) = &item.kind
         && let Some(last_field) = data.fields().last()
         && let field_ty = cx.tcx.normalize_erasing_regions(
             cx.typing_env(),

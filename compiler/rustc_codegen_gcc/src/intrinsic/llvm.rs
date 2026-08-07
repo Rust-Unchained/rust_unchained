@@ -4,7 +4,7 @@ use gccjit::{CType, Context, Field, Function, FunctionPtrType, RValue, ToRValue,
 use rustc_codegen_ssa::traits::BuilderMethods;
 
 use crate::builder::Builder;
-use crate::context::CodegenCx;
+use crate::context::{CodegenCx, new_array_type};
 
 fn encode_key_128_type<'a, 'gcc, 'tcx>(
     builder: &Builder<'a, 'gcc, 'tcx>,
@@ -85,7 +85,7 @@ fn wide_aes_output_type<'a, 'gcc, 'tcx>(
     (aes_output_type.as_type(), field1, field2)
 }
 
-#[cfg_attr(not(feature = "master"), allow(unused_variables))]
+#[cfg_attr(not(feature = "master"), expect(unused_variables))]
 pub fn adjust_function<'gcc>(
     context: &'gcc Context<'gcc>,
     func_name: &str,
@@ -123,7 +123,7 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
     mut args: Cow<'b, [RValue<'gcc>]>,
     func_name: &str,
 ) -> Cow<'b, [RValue<'gcc>]> {
-    // TODO: this might not be a good way to workaround the missing tile builtins.
+    // FIXME: this might not be a good way to workaround the missing tile builtins.
     if func_name == "__builtin_trap" {
         return vec![].into();
     }
@@ -585,7 +585,7 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
             "__builtin_ia32_encodekey128_u32" => {
                 let mut new_args = args.to_vec();
                 let m128i = builder.context.new_vector_type(builder.i64_type, 2);
-                let array_type = builder.context.new_array_type(None, m128i, 6);
+                let array_type = new_array_type(builder.context, None, m128i, 6);
                 let result = builder.current_func().new_local(None, array_type, "result");
                 new_args.push(result.get_address(None));
                 args = new_args.into();
@@ -593,7 +593,7 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
             "__builtin_ia32_encodekey256_u32" => {
                 let mut new_args = args.to_vec();
                 let m128i = builder.context.new_vector_type(builder.i64_type, 2);
-                let array_type = builder.context.new_array_type(None, m128i, 7);
+                let array_type = new_array_type(builder.context, None, m128i, 7);
                 let result = builder.current_func().new_local(None, array_type, "result");
                 new_args.push(result.get_address(None));
                 args = new_args.into();
@@ -620,7 +620,7 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
                 let first_value = old_args.swap_remove(0);
 
                 let element_type = first_value.get_type();
-                let array_type = builder.context.new_array_type(None, element_type, 8);
+                let array_type = new_array_type(builder.context, None, element_type, 8);
                 let result = builder.current_func().new_local(None, array_type, "result");
                 new_args.push(result.get_address(None));
 
@@ -646,6 +646,11 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
                 new_args.push(input_ptr);
 
                 new_args.push(handle);
+                args = new_args.into();
+            }
+            "__builtin_ia32_rdtscp" => {
+                let result = builder.current_func().new_local(None, builder.u32_type, "result");
+                let new_args = vec![result.get_address(None).to_rvalue()];
                 args = new_args.into();
             }
             _ => (),
@@ -764,6 +769,14 @@ pub fn adjust_intrinsic_arguments<'a, 'b, 'gcc, 'tcx>(
                 new_args.swap(0, 1);
                 args = new_args.into();
             }
+            "__builtin_ia32_dpps256" => {
+                let mut new_args = args.to_vec();
+                // NOTE: without this cast to u8 (and it needs to be a u8 to fix the issue), we
+                // would get the following error:
+                // the last argument must be an 8-bit immediate
+                new_args[2] = builder.context.new_cast(None, new_args[2], builder.cx.type_u8());
+                args = new_args.into();
+            }
             _ => (),
         }
     }
@@ -856,7 +869,7 @@ pub fn adjust_intrinsic_return_value<'a, 'gcc, 'tcx>(
             builder.llbb().add_assignment(None, field1, return_value);
             let field2 = result.access_field(None, field2);
             let field2_type = field2.to_rvalue().get_type();
-            let array_type = builder.context.new_array_type(None, field2_type, 6);
+            let array_type = new_array_type(builder.context, None, field2_type, 6);
             let ptr = builder.context.new_cast(None, args[2], array_type.make_pointer());
             let field2_ptr =
                 builder.context.new_cast(None, field2.get_address(None), array_type.make_pointer());
@@ -878,7 +891,7 @@ pub fn adjust_intrinsic_return_value<'a, 'gcc, 'tcx>(
             builder.llbb().add_assignment(None, field1, return_value);
             let field2 = result.access_field(None, field2);
             let field2_type = field2.to_rvalue().get_type();
-            let array_type = builder.context.new_array_type(None, field2_type, 7);
+            let array_type = new_array_type(builder.context, None, field2_type, 7);
             let ptr = builder.context.new_cast(None, args[3], array_type.make_pointer());
             let field2_ptr =
                 builder.context.new_cast(None, field2.get_address(None), array_type.make_pointer());
@@ -924,7 +937,7 @@ pub fn adjust_intrinsic_return_value<'a, 'gcc, 'tcx>(
             builder.llbb().add_assignment(None, field1, return_value);
             let field2 = result.access_field(None, field2);
             let field2_type = field2.to_rvalue().get_type();
-            let array_type = builder.context.new_array_type(None, field2_type, 8);
+            let array_type = new_array_type(builder.context, None, field2_type, 8);
             let ptr = builder.context.new_cast(None, args[0], array_type.make_pointer());
             let field2_ptr =
                 builder.context.new_cast(None, field2.get_address(None), array_type.make_pointer());
@@ -934,6 +947,19 @@ pub fn adjust_intrinsic_return_value<'a, 'gcc, 'tcx>(
                 ptr.dereference(None),
             );
             return_value = result.to_rvalue();
+        }
+        "__builtin_ia32_rdtscp" => {
+            let field1 = builder.context.new_field(None, return_value.get_type(), "rdtscpField1");
+            let return2 = args[0].dereference(None).to_rvalue();
+            let field2 = builder.context.new_field(None, return2.get_type(), "rdtscpField2");
+            let struct_type =
+                builder.context.new_struct_type(None, "rdtscpResult", &[field1, field2]);
+            return_value = builder.context.new_struct_constructor(
+                None,
+                struct_type.as_type(),
+                None,
+                &[return_value, return2],
+            );
         }
         _ => (),
     }
@@ -1012,13 +1038,13 @@ pub fn intrinsic<'gcc, 'tcx>(name: &str, cx: &CodegenCx<'gcc, 'tcx>) -> Function
     };
     let func = cx.context.get_builtin_function(gcc_name);
     cx.functions.borrow_mut().insert(gcc_name.to_string(), func);
-    return func;
+    func
 }
 
 #[cfg(feature = "master")]
 pub fn intrinsic<'gcc, 'tcx>(name: &str, cx: &CodegenCx<'gcc, 'tcx>) -> Function<'gcc> {
     let gcc_name = match name {
-        "llvm.prefetch" => {
+        "llvm.prefetch.p0" => {
             let gcc_name = "__builtin_prefetch";
             let func = cx.context.get_builtin_function(gcc_name);
             cx.functions.borrow_mut().insert(gcc_name.to_string(), func);
@@ -1035,7 +1061,18 @@ pub fn intrinsic<'gcc, 'tcx>(name: &str, cx: &CodegenCx<'gcc, 'tcx>) -> Function
 
         "llvm.x86.xgetbv" => "__builtin_ia32_xgetbv",
         // NOTE: this doc specifies the equivalent GCC builtins: http://huonw.github.io/llvmint/llvmint/x86/index.html
+        // FIXME: Should handle other targets than `ia32`.
         "llvm.sqrt.v2f64" => "__builtin_ia32_sqrtpd",
+        // FIXME: Should handle other targets than `ia32`.
+        "llvm.sqrt.v4f32" => "__builtin_ia32_sqrtps",
+        "llvm.sqrt.f32" => {
+            let gcc_name = "__builtin_sqrtf";
+            let func = cx.context.get_builtin_function(gcc_name);
+            cx.functions.borrow_mut().insert(gcc_name.to_string(), func);
+            return func;
+        }
+        // FIXME: Should handle other targets than `ia32`.
+        "llvm.smax.v4i32" => "__builtin_ia32_pmaxsd128",
         "llvm.x86.avx512.pmul.dq.512" => "__builtin_ia32_pmuldq512_mask",
         "llvm.x86.avx512.pmulu.dq.512" => "__builtin_ia32_pmuludq512_mask",
         "llvm.x86.avx512.max.ps.512" => "__builtin_ia32_maxps512_mask",
@@ -1529,29 +1566,60 @@ pub fn intrinsic<'gcc, 'tcx>(name: &str, cx: &CodegenCx<'gcc, 'tcx>) -> Function
         "llvm.x86.aesdecwide128kl" => "__builtin_ia32_aesdecwide128kl_u8",
         "llvm.x86.aesencwide256kl" => "__builtin_ia32_aesencwide256kl_u8",
         "llvm.x86.aesdecwide256kl" => "__builtin_ia32_aesdecwide256kl_u8",
+        "llvm.x86.avx512.uitofp.round.v8f16.v8i16" => "__builtin_ia32_vcvtuw2ph128_mask",
+        "llvm.x86.avx512.uitofp.round.v16f16.v16i16" => "__builtin_ia32_vcvtuw2ph256_mask",
+        "llvm.x86.avx512.uitofp.round.v32f16.v32i16" => "__builtin_ia32_vcvtuw2ph512_mask_round",
+        "llvm.x86.avx512.uitofp.round.v8f16.v8i32" => "__builtin_ia32_vcvtudq2ph256_mask",
+        "llvm.x86.avx512.uitofp.round.v16f16.v16i32" => "__builtin_ia32_vcvtudq2ph512_mask_round",
+        "llvm.x86.avx512.uitofp.round.v8f16.v8i64" => "__builtin_ia32_vcvtuqq2ph512_mask_round",
+        "llvm.x86.avx512.uitofp.round.v8f64.v8i64" => "__builtin_ia32_cvtuqq2pd512_mask",
+        "llvm.x86.avx512.uitofp.round.v2f64.v2i64" => "__builtin_ia32_cvtuqq2pd128_mask",
+        "llvm.x86.avx512.uitofp.round.v4f64.v4i64" => "__builtin_ia32_cvtuqq2pd256_mask",
+        "llvm.x86.avx512.uitofp.round.v8f32.v8i64" => "__builtin_ia32_cvtuqq2ps512_mask",
+        "llvm.x86.avx512.uitofp.round.v4f32.v4i64" => "__builtin_ia32_cvtuqq2ps256_mask",
 
-        // TODO: support the tile builtins:
+        // FIXME: support the tile builtins:
         "llvm.x86.ldtilecfg" => "__builtin_trap",
         "llvm.x86.sttilecfg" => "__builtin_trap",
         "llvm.x86.tileloadd64" => "__builtin_trap",
         "llvm.x86.tilerelease" => "__builtin_trap",
         "llvm.x86.tilestored64" => "__builtin_trap",
+        "llvm.x86.tileloaddrs64" => "__builtin_trap",
         "llvm.x86.tileloaddt164" => "__builtin_trap",
+        "llvm.x86.tileloaddrst164" => "__builtin_trap",
         "llvm.x86.tilezero" => "__builtin_trap",
+        "llvm.x86.tilemovrow" => "__builtin_trap",
+        "llvm.x86.tilemovrowi" => "__builtin_trap",
+        "llvm.x86.tdpbhf8ps" => "__builtin_trap",
+        "llvm.x86.tdphbf8ps" => "__builtin_trap",
+        "llvm.x86.tdpbf8ps" => "__builtin_trap",
+        "llvm.x86.tdphf8ps" => "__builtin_trap",
         "llvm.x86.tdpbf16ps" => "__builtin_trap",
         "llvm.x86.tdpbssd" => "__builtin_trap",
         "llvm.x86.tdpbsud" => "__builtin_trap",
         "llvm.x86.tdpbusd" => "__builtin_trap",
         "llvm.x86.tdpbuud" => "__builtin_trap",
         "llvm.x86.tdpfp16ps" => "__builtin_trap",
+        "llvm.x86.tmmultf32ps" => "__builtin_trap",
+        "llvm.x86.tcvtrowps2phh" => "__builtin_trap",
+        "llvm.x86.tcvtrowps2phl" => "__builtin_trap",
+        "llvm.x86.tcvtrowd2ps" => "__builtin_trap",
+        "llvm.x86.tcvtrowd2psi" => "__builtin_trap",
+        "llvm.x86.tcvtrowps2phhi" => "__builtin_trap",
+        "llvm.x86.tcvtrowps2phli" => "__builtin_trap",
         "llvm.x86.tcmmimfp16ps" => "__builtin_trap",
         "llvm.x86.tcmmrlfp16ps" => "__builtin_trap",
 
         // NOTE: this file is generated by https://github.com/GuillaumeGomez/llvmint/blob/master/generate_list.py
-        _ => include!("archs.rs"),
+        _ => map_arch_intrinsic(name),
     };
 
     let func = cx.context.get_target_builtin_function(gcc_name);
     cx.functions.borrow_mut().insert(gcc_name.to_string(), func);
     func
 }
+
+#[cfg(feature = "master")]
+include!("old_archs.rs");
+#[cfg(feature = "master")]
+include!("archs.rs");

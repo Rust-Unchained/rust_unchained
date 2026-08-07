@@ -1,7 +1,6 @@
 //@compile-flags: --test
 
 #![warn(clippy::module_name_repetitions)]
-#![allow(dead_code)]
 
 pub mod foo {
     pub fn foo() {}
@@ -55,3 +54,21 @@ pub mod foo {
 }
 
 fn main() {}
+
+pub mod issue14095 {
+    pub mod widget {
+        #[macro_export]
+        macro_rules! define_widget {
+            ($id:ident) => {
+                /* ... */
+            };
+        }
+
+        #[macro_export]
+        macro_rules! widget_impl {
+            ($id:ident) => {
+                /* ... */
+            };
+        }
+    }
+}

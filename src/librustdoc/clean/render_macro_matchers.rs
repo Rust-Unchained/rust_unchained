@@ -3,6 +3,7 @@ use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_ast_pretty::pprust::PrintState;
 use rustc_ast_pretty::pprust::state::State as Printer;
 use rustc_middle::ty::TyCtxt;
+use rustc_parse::lexer::StripTokens;
 use rustc_session::parse::ParseSess;
 use rustc_span::symbol::{Ident, Symbol, kw};
 use rustc_span::{FileName, Span};
@@ -62,16 +63,20 @@ fn snippet_equal_to_token(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Option<String
     let snippet = source_map.span_to_snippet(span).ok()?;
 
     // Create a Parser.
-    let psess = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let psess = ParseSess::new();
     let file_name = FileName::macro_expansion_source_code(&snippet);
-    let mut parser =
-        match rustc_parse::new_parser_from_source_str(&psess, file_name, snippet.clone()) {
-            Ok(parser) => parser,
-            Err(errs) => {
-                errs.into_iter().for_each(|err| err.cancel());
-                return None;
-            }
-        };
+    let mut parser = match rustc_parse::new_parser_from_source_str(
+        &psess,
+        file_name,
+        snippet.clone(),
+        StripTokens::Nothing,
+    ) {
+        Ok(parser) => parser,
+        Err(errs) => {
+            errs.into_iter().for_each(|err| err.cancel());
+            return None;
+        }
+    };
 
     // Reparse a single token tree.
     if parser.token == token::Eof {
@@ -167,7 +172,7 @@ fn print_tts(printer: &mut Printer<'_>, tts: &TokenStream) {
 }
 
 fn usually_needs_space_between_keyword_and_open_delim(symbol: Symbol, span: Span) -> bool {
-    let ident = Ident { name: symbol, span };
+    let ident = Ident::new(symbol, span);
     let is_keyword = ident.is_used_keyword() || ident.is_unused_keyword();
     if !is_keyword {
         // An identifier that is not a keyword usually does not need a space

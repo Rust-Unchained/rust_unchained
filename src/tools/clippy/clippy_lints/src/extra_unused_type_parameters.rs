@@ -40,6 +40,8 @@ declare_clippy_lint! {
     "unused type parameters in function definitions"
 }
 
+impl_lint_pass!(ExtraUnusedTypeParameters => [EXTRA_UNUSED_TYPE_PARAMETERS]);
+
 pub struct ExtraUnusedTypeParameters {
     avoid_breaking_exported_api: bool,
 }
@@ -51,8 +53,6 @@ impl ExtraUnusedTypeParameters {
         }
     }
 }
-
-impl_lint_pass!(ExtraUnusedTypeParameters => [EXTRA_UNUSED_TYPE_PARAMETERS]);
 
 /// A visitor struct that walks a given function and gathers generic type parameters, plus any
 /// trait bounds those parameters have.
@@ -102,7 +102,7 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
     fn emit_sugg(&self, spans: Vec<Span>, msg: String, help: &'static str) {
         let suggestions: Vec<(Span, String)> = spans.iter().copied().zip(std::iter::repeat(String::new())).collect();
         span_lint_and_then(self.cx, EXTRA_UNUSED_TYPE_PARAMETERS, spans, msg, |diag| {
-            diag.multipart_suggestion(help, suggestions, Applicability::MachineApplicable);
+            diag.multipart_suggestion(help, suggestions, Applicability::MaybeIncorrect);
         });
     }
 
@@ -157,6 +157,11 @@ impl<'cx, 'tcx> TypeWalker<'cx, 'tcx> {
             let spans = if explicit_params.len() == extra_params.len() {
                 vec![self.generics.span] // Remove the entire list of generics
             } else {
+                // 1. Start from the last extra param
+                // 2. While the params preceding it are also extra, construct spans going from the current param to
+                //    the comma before it
+                // 3. Once this chain of extra params stops, switch to constructing spans going from the current
+                //    param to the comma _after_ it
                 let mut end: Option<LocalDefId> = None;
                 extra_params
                     .iter()
@@ -273,7 +278,7 @@ impl<'tcx> LateLintPass<'tcx> for ExtraUnusedTypeParameters {
         // Only lint on inherent methods, not trait methods.
         if let ImplItemKind::Fn(.., body_id) = item.kind
             && !item.generics.params.is_empty()
-            && trait_ref_of_method(cx, item.owner_id.def_id).is_none()
+            && trait_ref_of_method(cx, item.owner_id).is_none()
             && !is_empty_body(cx, body_id)
             && (!self.avoid_breaking_exported_api || !cx.effective_visibilities.is_exported(item.owner_id.def_id))
             && !item.span.in_external_macro(cx.sess().source_map())

@@ -1,4 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::source::SpanExt as _;
+use itertools::Itertools;
 use rustc_errors::Applicability;
 use rustc_hir::Item;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
@@ -33,6 +35,7 @@ declare_clippy_lint! {
     suspicious,
     "comments with 4 forward slashes (`////`) likely intended to be doc comments (`///`)"
 }
+
 declare_lint_pass!(FourForwardSlashes => [FOUR_FORWARD_SLASHES]);
 
 impl<'tcx> LateLintPass<'tcx> for FourForwardSlashes {
@@ -45,7 +48,7 @@ impl<'tcx> LateLintPass<'tcx> for FourForwardSlashes {
             .tcx
             .hir_attrs(item.hir_id())
             .iter()
-            .filter(|i| i.is_doc_comment())
+            .filter(|i| i.is_doc_comment().is_some())
             .fold(item.span.shrink_to_lo(), |span, attr| span.to(attr.span()));
         let (Some(file), _, _, end_line, _) = sm.span_to_location_info(span) else {
             return;
@@ -81,6 +84,14 @@ impl<'tcx> LateLintPass<'tcx> for FourForwardSlashes {
                         "turn these into doc comments by removing one `/`"
                     };
 
+                    // If the comment contains a bare CR (not followed by a LF), do not propose an auto-fix
+                    // as bare CR are not allowed in doc comments.
+                    if span.check_text(cx, contains_bare_cr) {
+                        diag.help(msg)
+                            .note("bare CR characters are not allowed in doc comments");
+                        return;
+                    }
+
                     diag.multipart_suggestion(
                         msg,
                         bad_comments
@@ -96,4 +107,9 @@ impl<'tcx> LateLintPass<'tcx> for FourForwardSlashes {
             );
         }
     }
+}
+
+/// Checks if `text` contains any CR not followed by a LF
+fn contains_bare_cr(text: &str) -> bool {
+    text.bytes().tuple_windows().any(|(a, b)| a == b'\r' && b != b'\n')
 }

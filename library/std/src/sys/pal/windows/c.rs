@@ -5,7 +5,7 @@
 #![unstable(issue = "none", feature = "windows_c")]
 #![allow(clippy::style)]
 
-use core::ffi::{CStr, c_uint, c_ulong, c_ushort, c_void};
+use core::ffi::{CStr, c_int, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr;
 
 mod windows_sys;
@@ -35,13 +35,6 @@ pub const FRS_ERR_SYSVOL_POPULATE_TIMEOUT: u32 =
 // See: https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/using-ntstatus-values
 pub fn nt_success(status: NTSTATUS) -> bool {
     status >= 0
-}
-
-impl UNICODE_STRING {
-    pub fn from_ref(slice: &[u16]) -> Self {
-        let len = size_of_val(slice);
-        Self { Length: len as _, MaximumLength: len as _, Buffer: slice.as_ptr() as _ }
-    }
 }
 
 impl OBJECT_ATTRIBUTES {
@@ -102,11 +95,8 @@ pub struct MOUNT_POINT_REPARSE_BUFFER {
 }
 
 // Desktop specific functions & types
-cfg_if::cfg_if! {
-if #[cfg(not(target_vendor = "uwp"))] {
-    pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-}
-}
+#[cfg(not(target_vendor = "uwp"))]
+pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 // Use raw-dylib to import ProcessPrng as we can't rely on there being an import library.
 #[cfg(not(target_vendor = "win7"))]
@@ -118,6 +108,23 @@ if #[cfg(not(target_vendor = "uwp"))] {
 unsafe extern "system" {
     pub fn ProcessPrng(pbdata: *mut u8, cbdata: usize) -> BOOL;
 }
+
+windows_link::link!("ntdll.dll" "system" fn NtCreateNamedPipeFile(
+    filehandle: *mut HANDLE,
+    desiredaccess: FILE_ACCESS_RIGHTS,
+    objectattributes: *const OBJECT_ATTRIBUTES,
+    iostatusblock: *mut IO_STATUS_BLOCK,
+    shareaccess: FILE_SHARE_MODE,
+    createdisposition: NTCREATEFILE_CREATE_DISPOSITION,
+    createoptions: NTCREATEFILE_CREATE_OPTIONS,
+    namedpipetype: u32,
+    readmode: u32,
+    completionmode: u32,
+    maximuminstances: u32,
+    inboundquota: u32,
+    outboundquota: u32,
+    defaulttimeout: *const u64,
+) -> NTSTATUS);
 
 // Functions that aren't available on every version of Windows that we support,
 // but we still use them and just provide some form of a fallback implementation.
@@ -187,7 +194,7 @@ compat_fn_optional! {
     pub fn WakeByAddressSingle(address: *const c_void);
 }
 
-#[cfg(any(target_vendor = "win7", target_vendor = "uwp"))]
+#[cfg(any(target_vendor = "win7"))]
 compat_fn_with_fallback! {
     pub static NTDLL: &CStr = c"ntdll";
 
@@ -218,65 +225,23 @@ compat_fn_with_fallback! {
     ) -> NTSTATUS {
         panic!("keyed events not available")
     }
+}
 
-    // These functions are available on UWP when lazily loaded. They will fail WACK if loaded statically.
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtCreateFile(
-        filehandle: *mut HANDLE,
-        desiredaccess: FILE_ACCESS_RIGHTS,
-        objectattributes: *const OBJECT_ATTRIBUTES,
-        iostatusblock: *mut IO_STATUS_BLOCK,
-        allocationsize: *const i64,
-        fileattributes: FILE_FLAGS_AND_ATTRIBUTES,
-        shareaccess: FILE_SHARE_MODE,
-        createdisposition: NTCREATEFILE_CREATE_DISPOSITION,
-        createoptions: NTCREATEFILE_CREATE_OPTIONS,
-        eabuffer: *const c_void,
-        ealength: u32
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
+cfg_select! {
+    target_vendor = "uwp" => {
+        windows_link::link_raw_dylib!("ntdll.dll" "system" fn NtCreateFile(filehandle : *mut HANDLE, desiredaccess : FILE_ACCESS_RIGHTS, objectattributes : *const OBJECT_ATTRIBUTES, iostatusblock : *mut IO_STATUS_BLOCK, allocationsize : *const i64, fileattributes : FILE_FLAGS_AND_ATTRIBUTES, shareaccess : FILE_SHARE_MODE, createdisposition : NTCREATEFILE_CREATE_DISPOSITION, createoptions : NTCREATEFILE_CREATE_OPTIONS, eabuffer : *const core::ffi::c_void, ealength : u32) -> NTSTATUS);
+        windows_link::link_raw_dylib!("ntdll.dll" "system" fn NtOpenFile(filehandle : *mut HANDLE, desiredaccess : u32, objectattributes : *const OBJECT_ATTRIBUTES, iostatusblock : *mut IO_STATUS_BLOCK, shareaccess : u32, openoptions : u32) -> NTSTATUS);
+        windows_link::link_raw_dylib!("ntdll.dll" "system" fn NtReadFile(filehandle : HANDLE, event : HANDLE, apcroutine : PIO_APC_ROUTINE, apccontext : *const core::ffi::c_void, iostatusblock : *mut IO_STATUS_BLOCK, buffer : *mut core::ffi::c_void, length : u32, byteoffset : *const i64, key : *const u32) -> NTSTATUS);
+        windows_link::link_raw_dylib!("ntdll.dll" "system" fn NtWriteFile(filehandle : HANDLE, event : HANDLE, apcroutine : PIO_APC_ROUTINE, apccontext : *const core::ffi::c_void, iostatusblock : *mut IO_STATUS_BLOCK, buffer : *const core::ffi::c_void, length : u32, byteoffset : *const i64, key : *const u32) -> NTSTATUS);
+        windows_link::link_raw_dylib!("ntdll.dll" "system" fn RtlNtStatusToDosError(status : NTSTATUS) -> u32);
     }
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtOpenFile(
-        filehandle: *mut HANDLE,
-        desiredaccess: u32,
-        objectattributes: *const OBJECT_ATTRIBUTES,
-        iostatusblock: *mut IO_STATUS_BLOCK,
-        shareaccess: u32,
-        openoptions: u32
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtReadFile(
-        filehandle: HANDLE,
-        event: HANDLE,
-        apcroutine: PIO_APC_ROUTINE,
-        apccontext: *const c_void,
-        iostatusblock: *mut IO_STATUS_BLOCK,
-        buffer: *mut c_void,
-        length: u32,
-        byteoffset: *const i64,
-        key: *const u32
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtWriteFile(
-        filehandle: HANDLE,
-        event: HANDLE,
-        apcroutine: PIO_APC_ROUTINE,
-        apccontext: *const c_void,
-        iostatusblock: *mut IO_STATUS_BLOCK,
-        buffer: *const c_void,
-        length: u32,
-        byteoffset: *const i64,
-        key: *const u32
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32 {
-        Status as u32
-    }
+    _ => {}
+}
+
+// Only available starting with Windows 8.
+#[cfg(not(target_vendor = "win7"))]
+windows_link::link!("ws2_32.dll" "system" fn GetHostNameW(name : PWSTR, namelen : i32) -> i32);
+
+unsafe extern "C" {
+    pub fn atexit(cb: unsafe extern "C" fn()) -> c_int;
 }

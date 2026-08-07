@@ -15,11 +15,11 @@ impl Drop for NotDropImpl {
     fn drop(&mut self) {}
 }
 
-#[const_trait] trait Foo {}
+const trait Foo {}
 impl Foo for () {}
 
 struct Conditional<T: Foo>(T);
-impl<T> const Drop for Conditional<T> where T: ~const Foo {
+const impl<T> Drop for Conditional<T> where T: [const] Foo + [const] Destruct {
     fn drop(&mut self) {}
 }
 

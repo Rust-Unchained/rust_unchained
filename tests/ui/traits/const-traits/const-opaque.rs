@@ -4,17 +4,16 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Foo {
+const trait Foo {
     fn method(&self);
 }
 
-impl<T: ~const Foo> const Foo for (T,) {
+const impl<T: [const] Foo> Foo for (T,) {
     fn method(&self) {}
 }
 
 #[cfg(yes)]
-impl const Foo for () {
+const impl Foo for () {
     fn method(&self) {}
 }
 
@@ -23,7 +22,7 @@ impl Foo for () {
     fn method(&self) {}
 }
 
-const fn bar<T: ~const Foo>(t: T) -> impl ~const Foo {
+const fn bar<T: [const] Foo>(t: T) -> impl [const] Foo {
     (t,)
 }
 

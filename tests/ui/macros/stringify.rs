@@ -1,22 +1,26 @@
 //@ run-pass
-//@ edition:2021
+//@ edition:2024
 //@ compile-flags: --test
 
 #![allow(incomplete_features)]
+#![allow(unused_features)]
 #![feature(auto_traits)]
 #![feature(box_patterns)]
+#![feature(const_block_items)]
 #![feature(const_trait_impl)]
 #![feature(coroutines)]
 #![feature(decl_macro)]
-#![feature(explicit_tail_calls)]
-#![feature(if_let_guard)]
-#![feature(let_chains)]
+#![feature(impl_restriction)]
+#![feature(macro_guard_matcher)]
 #![feature(more_qualified_paths)]
+#![feature(move_expr)]
+#![feature(mut_restriction)]
 #![feature(never_patterns)]
+#![feature(specialization)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
-#![feature(type_ascription)]
 #![feature(yeet_expr)]
+#![feature(unsafe_fields)]
 #![deny(unused_macros)]
 
 // These macros force the use of AST pretty-printing by converting the input to
@@ -30,6 +34,7 @@ macro_rules! path { ($path:path) => { stringify!($path) }; }
 macro_rules! stmt { ($stmt:stmt) => { stringify!($stmt) }; }
 macro_rules! ty { ($ty:ty) => { stringify!($ty) }; }
 macro_rules! vis { ($vis:vis) => { stringify!($vis) }; }
+macro_rules! guard { ($guard:guard) => { stringify!($guard) }; }
 
 macro_rules! c1 {
     ($frag:ident, [$($tt:tt)*], $s:literal) => {
@@ -110,6 +115,7 @@ fn test_expr() {
     c1!(expr, [ *expr ], "*expr");
     c1!(expr, [ !expr ], "!expr");
     c1!(expr, [ -expr ], "-expr");
+    c1!(expr, [ move(expr) ], "move(expr)");
 
     // ExprKind::Lit
     c1!(expr, [ 'x' ], "'x'");
@@ -288,6 +294,9 @@ fn test_expr() {
     // ExprKind::OffsetOf: untestable because this test works pre-expansion.
 
     // ExprKind::MacCall
+    c1!(expr, [ mac!() ], "mac!()");
+    c1!(expr, [ mac![] ], "mac![]");
+    c1!(expr, [ mac! {} ], "mac! {}");
     c1!(expr, [ mac!(...) ], "mac!(...)");
     c1!(expr, [ mac![...] ], "mac![...]");
     c1!(expr, [ mac! { ... } ], "mac! { ... }");
@@ -353,7 +362,8 @@ fn test_item() {
     c1!(item, [ pub extern crate self as std; ], "pub extern crate self as std;");
 
     // ItemKind::Use
-    c1!(item, [ pub use crate::{a, b::c}; ], "pub use crate::{ a, b::c };"); // FIXME
+    c1!(item, [ pub use crate::{a, b::c}; ], "pub use crate::{a, b::c};");
+    c1!(item, [ pub use crate::{ e, ff }; ], "pub use crate::{ e, ff };");
     c1!(item, [ pub use A::*; ], "pub use A::*;");
 
     // ItemKind::Static
@@ -365,6 +375,9 @@ fn test_item() {
     // ItemKind::Const
     c1!(item, [ pub const S: () = {}; ], "pub const S: () = {};");
     c1!(item, [ const S: (); ], "const S: ();");
+
+    // ItemKind::ConstBlock
+    c1!(item, [ const {} ], "const {}");
 
     // ItemKind::Fn
     c1!(item,
@@ -478,13 +491,15 @@ fn test_item() {
     c1!(item, [ pub impl Struct {} ], "pub impl Struct {}");
     c1!(item, [ impl<T> Struct<T> {} ], "impl<T> Struct<T> {}");
     c1!(item, [ pub impl Trait for Struct {} ], "pub impl Trait for Struct {}");
-    c1!(item, [ impl<T> const Trait for T {} ], "impl<T> const Trait for T {}");
-    c1!(item, [ impl ~const Struct {} ], "impl ~const Struct {}");
+    c1!(item, [ const impl<T> Trait for T {} ], "const impl<T> Trait for T {}");
 
     // ItemKind::MacCall
+    c1!(item, [ mac!(); ], "mac!();");
+    c1!(item, [ mac![]; ], "mac![];");
+    c1!(item, [ mac! {} ], "mac! {}");
     c1!(item, [ mac!(...); ], "mac!(...);");
     c1!(item, [ mac![...]; ], "mac![...];");
-    c1!(item, [ mac! { ... } ], "mac! { ... }");
+    c1!(item, [ mac! {...} ], "mac! {...}");
 
     // ItemKind::MacroDef
     c1!(item,
@@ -598,8 +613,11 @@ fn test_pat() {
     c1!(pat, [ (pat) ], "(pat)");
 
     // PatKind::MacCall
+    c1!(pat, [ mac!() ], "mac!()");
+    c1!(pat, [ mac![] ], "mac![]");
+    c1!(pat, [ mac! {} ], "mac! {}");
     c1!(pat, [ mac!(...) ], "mac!(...)");
-    c1!(pat, [ mac![...] ], "mac![...]");
+    c1!(pat, [ mac! [ ... ] ], "mac! [...]");
     c1!(pat, [ mac! { ... } ], "mac! { ... }");
 
     // Attributes are not allowed on patterns.
@@ -644,6 +662,9 @@ fn test_stmt() {
     c1!(stmt, [ ; ], ";");
 
     // StmtKind::MacCall
+    c1!(stmt, [ mac! ( ) ], "mac! ()");
+    c1!(stmt, [ mac![] ], "mac![]");
+    c1!(stmt, [ mac!{} ], "mac!{}");
     c1!(stmt, [ mac!(...) ], "mac!(...)");
     c1!(stmt, [ mac![...] ], "mac![...]");
     c1!(stmt, [ mac! { ... } ], "mac! { ... }");
@@ -717,7 +738,7 @@ fn test_ty() {
     c1!(ty, [ dyn Send + 'a ], "dyn Send + 'a");
     c1!(ty, [ dyn 'a + Send ], "dyn 'a + Send");
     c1!(ty, [ dyn ?Sized ], "dyn ?Sized");
-    c1!(ty, [ dyn ~const Clone ], "dyn ~const Clone");
+    c1!(ty, [ dyn [const] Clone ], "dyn [const] Clone");
     c1!(ty, [ dyn for<'a> Send ], "dyn for<'a> Send");
 
     // TyKind::ImplTrait
@@ -725,7 +746,7 @@ fn test_ty() {
     c1!(ty, [ impl Send + 'a ], "impl Send + 'a");
     c1!(ty, [ impl 'a + Send ], "impl 'a + Send");
     c1!(ty, [ impl ?Sized ], "impl ?Sized");
-    c1!(ty, [ impl ~const Clone ], "impl ~const Clone");
+    c1!(ty, [ impl [const] Clone ], "impl [const] Clone");
     c1!(ty, [ impl for<'a> Send ], "impl for<'a> Send");
 
     // TyKind::Paren
@@ -739,6 +760,9 @@ fn test_ty() {
     // TyKind::ImplicitSelf: there is no syntax for this.
 
     // TyKind::MacCall
+    c1!(ty, [ mac!() ], "mac!()");
+    c1!(ty, [ mac![] ], "mac![]");
+    c1!(ty, [ mac! { } ], "mac! {}");
     c1!(ty, [ mac!(...) ], "mac!(...)");
     c1!(ty, [ mac![...] ], "mac![...]");
     c1!(ty, [ mac! { ... } ], "mac! { ... }");
@@ -777,10 +801,189 @@ fn test_vis() {
     // Attributes are not allowed on visibilities.
 }
 
+#[test]
+fn test_guard() {
+    c1!(guard, [ if true ], "if true");
+    c1!(guard, [ if let Some(x) = Some(1) ], "if let Some(x) = Some(1)");
+    c1!(guard, [ if let Some(x) = Some(1) && x == 1 ], "if let Some(x) = Some(1) && x == 1");
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(1) = x ],
+        "if let Some(x) = Some(Some(1)) && let Some(1) = x"
+    );
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1 ],
+        "if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1"
+    );
+}
+
 macro_rules! p {
     ([$($tt:tt)*], $s:literal) => {
         assert_eq!(stringify!($($tt)*), $s);
     };
+}
+
+#[test]
+fn test_impl_restriction() {
+    assert_eq!(
+        stringify!(pub impl(crate) trait Foo {}),
+        "pub impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate) trait Foo {}),
+        "pub impl(in crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(super) trait Foo {}),
+        "pub impl(super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super) trait Foo {}),
+        "pub impl(in super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(self) trait Foo {}),
+        "pub impl(self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self) trait Foo {}),
+        "pub impl(in self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in path::to) trait Foo {}),
+        "pub impl(in path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in ::path::to) trait Foo {}),
+        "pub impl(in ::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self::path::to) trait Foo {}),
+        "pub impl(in self::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super::path::to) trait Foo {}),
+        "pub impl(in super::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) trait Foo {}),
+        "pub impl(in crate::path::to) trait Foo {}"
+    );
+
+    assert_eq!(
+        stringify!(pub impl(crate) auto trait Foo {}),
+        "pub impl(crate) auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) auto trait Foo {}),
+        "pub impl(in crate::path::to) auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) unsafe trait Foo {}),
+        "pub impl(crate) unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) unsafe trait Foo {}),
+        "pub impl(in crate::path::to) unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const trait Foo {}),
+        "pub impl(crate) const trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const trait Foo {}),
+        "pub impl(in crate::path::to) const trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) unsafe auto trait Foo {}),
+        "pub impl(crate) unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) unsafe auto trait Foo {}),
+        "pub impl(in crate::path::to) unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const auto trait Foo {}),
+        "pub impl(crate) const auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const auto trait Foo {}),
+        "pub impl(in crate::path::to) const auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const unsafe trait Foo {}),
+        "pub impl(crate) const unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const unsafe trait Foo {}),
+        "pub impl(in crate::path::to) const unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const unsafe auto trait Foo {}),
+        "pub impl(crate) const unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe auto impl(in crate::path::to) trait Foo {}),
+        "pub const unsafe auto impl(in crate::path::to) trait Foo {}"
+    );
+}
+
+#[test]
+fn test_mut_restriction() {
+    assert_eq!(
+        stringify!(pub struct Foo { pub mut(crate) x: u8, pub mut(self) unsafe y: u8 }),
+        "pub struct Foo { pub mut(crate) x: u8, pub mut(self) unsafe y: u8 }"
+    );
+    assert_eq!(
+        stringify!(pub struct Foo { pub mut(super) x: u8, pub mut(in path::to) unsafe y: u8 }),
+        "pub struct Foo { pub mut(super) x: u8, pub mut(in path::to) unsafe y: u8 }"
+    );
+    assert_eq!(
+        stringify!(pub struct Foo { pub mut(in crate::path::to) x: u8 }),
+        "pub struct Foo { pub mut(in crate::path::to) x: u8 }"
+    );
+
+    assert_eq!(
+        stringify!(pub struct Foo(pub mut(crate) u8, pub mut(self) u8, pub mut(super) u8)),
+        "pub struct Foo(pub mut(crate) u8, pub mut(self) u8, pub mut(super) u8)"
+    );
+    assert_eq!(
+        stringify!(pub struct Foo(pub mut(in path::to) u8, pub mut(in crate::path::to) u8)),
+        "pub struct Foo(pub mut(in path::to) u8, pub mut(in crate::path::to) u8)"
+    );
+
+    assert_eq!(
+        stringify!(pub enum Foo { Var{ pub mut(crate) x: u8, pub mut(self) unsafe y: u8 } }),
+        "pub enum Foo { Var{ pub mut(crate) x: u8, pub mut(self) unsafe y: u8 } }"
+    );
+    assert_eq!(
+        stringify!(pub enum Foo { Var{ pub mut(super) x: u8, pub mut(in path::to) y: u8 } }),
+        "pub enum Foo { Var{ pub mut(super) x: u8, pub mut(in path::to) y: u8 } }"
+    );
+    assert_eq!(
+        stringify!(pub enum Foo { Var{ pub mut(in crate::path::to) x: u8 } }),
+        "pub enum Foo { Var{ pub mut(in crate::path::to) x: u8 } }"
+    );
+    assert_eq!(
+        stringify!(pub enum Foo { Tup(pub mut(crate) u8, pub mut(self) u8, pub mut(super) u8) }),
+        "pub enum Foo { Tup(pub mut(crate) u8, pub mut(self) u8, pub mut(super) u8) }"
+    );
+    assert_eq!(
+        stringify!(pub enum Foo { Tup(pub mut(in path::to) u8, pub mut(in crate::path::to) u8) }),
+        "pub enum Foo { Tup(pub mut(in path::to) u8, pub mut(in crate::path::to) u8) }"
+    );
+
+    assert_eq!(
+        stringify!(pub union Foo { x: pub mut(crate) u8, y: pub mut(self) unsafe u8 }),
+        "pub union Foo { x: pub mut(crate) u8, y: pub mut(self) unsafe u8 }"
+    );
+    assert_eq!(
+        stringify!(pub union Foo { x: pub mut(super) u8, y: pub mut(in path::to) unsafe u8 }),
+        "pub union Foo { x: pub mut(super) u8, y: pub mut(in path::to) unsafe u8 }"
+    );
+    assert_eq!(
+        stringify!(pub union Foo { x: pub mut(in crate::path::to) u8 }),
+        "pub union Foo { x: pub mut(in crate::path::to) u8 }"
+    );
 }
 
 #[test]

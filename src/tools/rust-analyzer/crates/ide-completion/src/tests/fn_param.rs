@@ -43,7 +43,7 @@ fn bar(file_id: usize) {}
 fn baz(file$0 id: u32) {}
 "#,
         expect![[r#"
-            bn file_id: usize,
+            bn file_id: usize
             kw mut
             kw ref
         "#]],
@@ -85,7 +85,11 @@ pub(crate) trait SourceRoot {
 }
 "#,
         expect![[r#"
+            bn &mut self
+            bn &self
             bn file_id: usize
+            bn mut self
+            bn self
             kw mut
             kw ref
         "#]],
@@ -183,6 +187,44 @@ impl A {
     )
 }
 
+#[test]
+fn in_trait_only_param() {
+    check(
+        r#"
+trait A {
+    fn foo(file_id: usize) {}
+    fn new($0) {}
+}
+"#,
+        expect![[r#"
+            bn &mut self
+            bn &self
+            bn file_id: usize
+            bn mut self
+            bn self
+            kw mut
+            kw ref
+        "#]],
+    )
+}
+
+#[test]
+fn in_trait_after_self() {
+    check(
+        r#"
+trait A {
+    fn foo(file_id: usize) {}
+    fn new(self, $0) {}
+}
+"#,
+        expect![[r#"
+            bn file_id: usize
+            kw mut
+            kw ref
+        "#]],
+    )
+}
+
 // doesn't complete qux due to there being no expression after
 // see source_analyzer::adjust comment
 #[test]
@@ -248,6 +290,60 @@ fn bar(bar$0) {}
             kw ref
         "#]],
     )
+}
+
+#[test]
+fn not_shows_fully_equal_inside_pattern_params() {
+    check(
+        r#"
+fn foo(bar: u32) {}
+fn bar((a, bar$0)) {}
+"#,
+        expect![[r#"
+            kw mut
+            kw ref
+        "#]],
+    )
+}
+
+#[test]
+fn not_shows_locals_inside_pattern_params() {
+    check(
+        r#"
+fn outer() {
+    let foo = 3;
+    {
+        let bar = 3;
+        |($0)| {};
+        let baz = 3;
+        let qux = 3;
+    }
+    let fez = 3;
+}
+"#,
+        expect![[r#"
+            kw mut
+            kw ref
+        "#]],
+    );
+    check(
+        r#"
+fn outer() {
+    let foo = 3;
+    {
+        let bar = 3;
+        fn inner(($0)) {}
+        let baz = 3;
+        let qux = 3;
+    }
+    let fez = 3;
+}
+"#,
+        expect![[r#"
+            kw mut
+            kw ref
+        "#]],
+    );
 }
 
 #[test]

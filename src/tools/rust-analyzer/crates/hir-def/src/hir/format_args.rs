@@ -4,11 +4,11 @@ use either::Either;
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_parse_format as parse;
-use span::SyntaxContextId;
+use span::SyntaxContext;
 use stdx::TupleExt;
 use syntax::{
+    AstPtr, TextRange,
     ast::{self, IsString},
-    TextRange,
 };
 
 use crate::hir::ExprId;
@@ -146,6 +146,7 @@ pub enum FormatCount {
 pub struct FormatArgument {
     pub kind: FormatArgumentKind,
     pub expr: ExprId,
+    pub syntax: Option<AstPtr<ast::Expr>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -171,12 +172,13 @@ use PositionUsedAs::*;
 #[allow(clippy::unnecessary_lazy_evaluations)]
 pub(crate) fn parse(
     s: &ast::String,
+    string_ptr: AstPtr<ast::Expr>,
     fmt_snippet: Option<String>,
     mut args: FormatArgumentsCollector,
     is_direct_literal: bool,
     mut synth: impl FnMut(Name, Option<TextRange>) -> ExprId,
     mut record_usage: impl FnMut(Name, Option<TextRange>),
-    call_ctx: SyntaxContextId,
+    call_ctx: SyntaxContext,
 ) -> FormatArgs {
     let Ok(text) = s.value() else {
         return FormatArgs {
@@ -214,7 +216,7 @@ pub(crate) fn parse(
         };
     }
 
-    let to_span = |inner_span: parse::InnerSpan| {
+    let to_span = |inner_span: std::ops::Range<usize>| {
         is_source_literal.then(|| {
             TextRange::new(inner_span.start.try_into().unwrap(), inner_span.end.try_into().unwrap())
         })
@@ -273,6 +275,11 @@ pub(crate) fn parse(
                             // FIXME: This is problematic, we might want to synthesize a dummy
                             // expression proper and/or desugar these.
                             expr: synth(name, span),
+                            // FIXME: This will lead us to show failed trait bounds (e.g. `T: Display`)
+                            // on the whole template string for implicit arguments instead of just their name.
+                            // Fixing this is hard since we don't have an `AstPtr` for the arg, and it's
+                            // only part of an expression.
+                            syntax: Some(string_ptr),
                         }))
                     }
                 }
@@ -297,7 +304,8 @@ pub(crate) fn parse(
                     unfinished_literal.clear();
                 }
 
-                let span = parser.arg_places.get(placeholder_index).and_then(|&s| to_span(s));
+                let span =
+                    parser.arg_places.get(placeholder_index).and_then(|s| to_span(s.clone()));
                 placeholder_index += 1;
 
                 let position_span = to_span(position_span);
@@ -458,10 +466,6 @@ impl FormatArgumentsCollector {
             num_explicit_args: self.num_explicit_args,
             names: self.names.into_boxed_slice(),
         }
-    }
-
-    pub fn new() -> Self {
-        Default::default()
     }
 
     pub fn add(&mut self, arg: FormatArgument) -> usize {

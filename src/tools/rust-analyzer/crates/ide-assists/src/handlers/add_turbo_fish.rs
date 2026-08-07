@@ -1,14 +1,14 @@
 use either::Either;
 use ide_db::defs::{Definition, NameRefClass};
 use syntax::{
-    ast::{self, make, syntax_factory::SyntaxFactory, HasArgList, HasGenericArgs},
-    syntax_editor::Position,
     AstNode,
+    ast::{self, HasArgList, HasGenericArgs, syntax_factory::SyntaxFactory},
+    syntax_editor::Position,
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
-    AssistId, AssistKind,
 };
 
 // Assist: add_turbo_fish
@@ -28,7 +28,7 @@ use crate::{
 //     let x = make::<${0:_}>();
 // }
 // ```
-pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let turbofish_target =
         ctx.find_node_at_offset::<ast::PathSegment>().map(Either::Left).or_else(|| {
             let callable_expr = ctx.find_node_at_offset::<ast::CallableExpr>()?;
@@ -71,7 +71,7 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
     let def = match NameRefClass::classify(&ctx.sema, &name_ref)? {
         NameRefClass::Definition(def, _) => def,
         NameRefClass::FieldShorthand { .. } | NameRefClass::ExternCrateShorthand { .. } => {
-            return None
+            return None;
         }
     };
     let fun = match def {
@@ -89,25 +89,26 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
             let_stmt.pat()?;
 
             acc.add(
-                AssistId("add_type_ascription", AssistKind::RefactorRewrite),
+                AssistId::refactor_rewrite("add_type_ascription"),
                 "Add `: _` before assignment operator",
                 ident.text_range(),
                 |builder| {
-                    let mut editor = builder.make_editor(let_stmt.syntax());
+                    let editor = builder.make_editor(let_stmt.syntax());
+                    let make = editor.make();
 
                     if let_stmt.semicolon_token().is_none() {
                         editor.insert(
                             Position::last_child_of(let_stmt.syntax()),
-                            make::tokens::semicolon(),
+                            make.token(syntax::SyntaxKind::SEMICOLON),
                         );
                     }
 
-                    let placeholder_ty = make::ty_placeholder().clone_for_update();
+                    let placeholder_ty = make.ty_placeholder();
 
                     if let Some(pat) = let_stmt.pat() {
                         let elements = vec![
-                            make::token(syntax::SyntaxKind::COLON).into(),
-                            make::token(syntax::SyntaxKind::WHITESPACE).into(),
+                            make.token(syntax::SyntaxKind::COLON).into(),
+                            make.whitespace(" ").into(),
                             placeholder_ty.syntax().clone().into(),
                         ];
                         editor.insert_all(Position::after(pat.syntax()), elements);
@@ -119,7 +120,7 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                         }
                     }
 
-                    builder.add_file_edits(ctx.file_id(), editor);
+                    builder.add_file_edits(ctx.vfs_file_id(), editor);
                 },
             )?
         } else {
@@ -135,19 +136,17 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         .count();
 
     acc.add(
-        AssistId("add_turbo_fish", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("add_turbo_fish"),
         "Add `::<>`",
         ident.text_range(),
         |builder| {
             builder.trigger_parameter_hints();
-
-            let make = SyntaxFactory::new();
-            let mut editor = match &turbofish_target {
+            let editor = match &turbofish_target {
                 Either::Left(it) => builder.make_editor(it.syntax()),
                 Either::Right(it) => builder.make_editor(it.syntax()),
             };
 
-            let fish_head = get_fish_head(&make, number_of_arguments);
+            let fish_head = get_fish_head(editor.make(), number_of_arguments);
 
             match turbofish_target {
                 Either::Left(path_segment) => {
@@ -179,16 +178,14 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                     editor.add_annotation(arg.syntax(), builder.make_placeholder_snippet(cap));
                 }
             }
-
-            editor.add_mappings(make.finish_with_mappings());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
 /// This will create a turbofish generic arg list corresponding to the number of arguments
 fn get_fish_head(make: &SyntaxFactory, number_of_arguments: usize) -> ast::GenericArgList {
-    let args = (0..number_of_arguments).map(|_| make::type_arg(make::ty_placeholder()).into());
+    let args = (0..number_of_arguments).map(|_| make.type_arg(make.ty_placeholder()).into());
     make.generic_arg_list(args, true)
 }
 

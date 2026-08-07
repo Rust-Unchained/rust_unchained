@@ -1,67 +1,68 @@
-//@ min-lldb-version: 1800
+// LLDB 1800+ tests were not tested in CI, broke, and now are disabled
+//@ ignore-lldb
 //@ min-gdb-version: 13.0
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 //@ ignore-windows-gnu: #128973
+//@ ignore-aarch64-unknown-linux-gnu (gdb tries to read from 0x0; FIXME: #128973)
+//@ ignore-powerpc64: #128973 on both -gnu and -musl
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:run
+//@ gdb-command:run
 
-// gdb-command:print s
-// gdb-check:$1 = by_value_non_immediate_argument::Struct {a: 1, b: 2.5}
-// gdb-command:continue
+//@ gdb-command:print s
+//@ gdb-check:$1 = by_value_non_immediate_argument::Struct {a: 1, b: 2.5}
+//@ gdb-command:continue
 
-// gdb-command:print x
-// gdb-check:$2 = by_value_non_immediate_argument::Struct {a: 3, b: 4.5}
-// gdb-command:print y
-// gdb-check:$3 = 5
-// gdb-command:print z
-// gdb-check:$4 = 6.5
-// gdb-command:continue
+//@ gdb-command:print x
+//@ gdb-check:$2 = by_value_non_immediate_argument::Struct {a: 3, b: 4.5}
+//@ gdb-command:print y
+//@ gdb-check:$3 = 5
+//@ gdb-command:print z
+//@ gdb-check:$4 = 6.5
+//@ gdb-command:continue
 
-// gdb-command:print a
-// gdb-check:$5 = (7, 8, 9.5, 10.5)
-// gdb-command:continue
+//@ gdb-command:print a
+//@ gdb-check:$5 = (7, 8, 9.5, 10.5)
+//@ gdb-command:continue
 
-// gdb-command:print a
-// gdb-check:$6 = by_value_non_immediate_argument::Newtype (11.5, 12.5, 13, 14)
-// gdb-command:continue
+//@ gdb-command:print a
+//@ gdb-check:$6 = by_value_non_immediate_argument::Newtype (11.5, 12.5, 13, 14)
+//@ gdb-command:continue
 
-// gdb-command:print x
-// gdb-check:$7 = by_value_non_immediate_argument::Enum::Case1{x: 0, y: 8970181431921507452}
-// gdb-command:continue
+//@ gdb-command:print x
+//@ gdb-check:$7 = by_value_non_immediate_argument::Enum::Case1{x: 0, y: 8970181431921507452}
+//@ gdb-command:continue
 
 
 // === LLDB TESTS ==================================================================================
 
-// lldb-command:run
+//@ lldb-command:run
 
-// lldb-command:v s
-// lldb-check:[...] Struct { a = 1 b = 2.5 }
-// lldb-command:continue
+//@ lldb-command:v s
+//@ lldb-check:[...] Struct { a = 1 b = 2.5 }
+//@ lldb-command:continue
 
-// lldb-command:v x
-// lldb-check:[...] Struct { a = 3 b = 4.5 }
-// lldb-command:v y
-// lldb-check:[...] 5
-// lldb-command:v z
-// lldb-check:[...] 6.5
-// lldb-command:continue
+//@ lldb-command:v x
+//@ lldb-check:[...] Struct { a = 3 b = 4.5 }
+//@ lldb-command:v y
+//@ lldb-check:[...] 5
+//@ lldb-command:v z
+//@ lldb-check:[...] 6.5
+//@ lldb-command:continue
 
-// lldb-command:v a
-// lldb-check:[...] (7, 8, 9.5, 10.5)
-// lldb-command:continue
+//@ lldb-command:v a
+//@ lldb-check:[...] (7, 8, 9.5, 10.5)
+//@ lldb-command:continue
 
-// lldb-command:v a
-// lldb-check:[...] Newtype(11.5, 12.5, 13, 14)
-// lldb-command:continue
+//@ lldb-command:v a
+//@ lldb-check:[...] Newtype(11.5, 12.5, 13, 14)
+//@ lldb-command:continue
 
-// lldb-command:v x
-// lldb-check:[...] Case1 { x: 0, y: 8970181431921507452 }
-// lldb-command:continue
-
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
+//@ lldb-command:v x
+//@ lldb-check:[...] Case1 { x: 0, y: 8970181431921507452 }
+//@ lldb-command:continue
 
 #[derive(Clone)]
 struct Struct {

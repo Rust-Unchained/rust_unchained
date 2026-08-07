@@ -9,8 +9,9 @@
 ## Target maintainers
 
 [@chriswailes](https://github.com/chriswailes)
+[@jfgoog](https://github.com/jfgoog)
 [@maurer](https://github.com/maurer)
-[@mgeisler](https://github.com/mgeisler)
+[@pirama-arumuga-nainar](https://github.com/pirama-arumuga-nainar)
 
 ## Requirements
 
@@ -23,9 +24,12 @@ Android targets support std. Generated binaries use the ELF file format.
 
 ## NDK/API Update Policy
 
-Rust will support the most recent Long Term Support (LTS) Android Native
-Development Kit (NDK).  By default Rust will support all API levels supported
-by the NDK, but a higher minimum API level may be required if deemed necessary.
+Rust will support the most recent Long Term Support (LTS) [Android Native
+Development Kit (NDK)][NDK].  By default Rust will support all [API levels supported
+by the NDK][API-levels], but a higher minimum API level may be required if deemed necessary.
+
+[NDK]: https://github.com/android/ndk/wiki
+[API-levels]: https://github.com/android/ndk/wiki/Compatibility
 
 ## Building the target
 

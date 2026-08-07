@@ -43,7 +43,7 @@ impl DebugContext {
         let _: Result<()> = sections.for_each(|id, section| {
             if let Some(section_id) = section_map.get(&id) {
                 for reloc in &section.relocs {
-                    product.add_debug_reloc(&section_map, section_id, reloc);
+                    product.add_debug_reloc(&section_map, section_id, reloc, true);
                 }
             }
             Ok(())
@@ -85,9 +85,14 @@ impl WriterRelocate {
             match reloc.name {
                 super::DebugRelocName::Section(_) => unreachable!(),
                 super::DebugRelocName::Symbol(sym) => {
-                    let addr = jit_module.get_finalized_function(
-                        cranelift_module::FuncId::from_u32(sym.try_into().unwrap()),
-                    );
+                    let addr = if sym & 1 << 31 == 0 {
+                        let func_id = FuncId::from_u32(sym.try_into().unwrap());
+                        jit_module.get_address(&func_id.into())
+                    } else {
+                        let data_id = DataId::from_u32(u32::try_from(sym).unwrap() & !(1 << 31));
+                        jit_module.get_address(&data_id.into())
+                    };
+
                     let val = (addr as u64 as i64 + reloc.addend) as u64;
                     self.writer.write_udata_at(reloc.offset as usize, val, reloc.size).unwrap();
                 }
@@ -193,6 +198,16 @@ impl Writer for WriterRelocate {
                         name: DebugRelocName::Symbol(symbol),
                         addend,
                         kind: object::RelocationKind::Relative,
+                    });
+                    self.write_udata(0, size)
+                }
+                gimli::DW_EH_PE_absptr => {
+                    self.relocs.push(DebugReloc {
+                        offset: self.len() as u32,
+                        size,
+                        name: DebugRelocName::Symbol(symbol),
+                        addend,
+                        kind: object::RelocationKind::Absolute,
                     });
                     self.write_udata(0, size)
                 }

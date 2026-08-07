@@ -1,6 +1,5 @@
 use rustc_abi::{Align, Size};
 use rustc_middle::mir::interpret::{InterpResult, Pointer};
-use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, ExistentialPredicateStableCmpExt, Ty, TyCtxt, VtblEntry};
 use tracing::trace;
 
@@ -24,11 +23,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     ) -> InterpResult<'tcx, Pointer<Option<M::Provenance>>> {
         trace!("get_vtable(ty={ty:?}, dyn_ty={dyn_ty:?})");
 
-        let (ty, dyn_ty) = self.tcx.erase_regions((ty, dyn_ty));
+        let (ty, dyn_ty) = self.tcx.erase_and_anonymize_regions((ty, dyn_ty));
 
         // All vtables must be monomorphic, bail out otherwise.
-        ensure_monomorphic_enough(*self.tcx, ty)?;
-        ensure_monomorphic_enough(*self.tcx, dyn_ty)?;
+        ensure_monomorphic_enough(ty)?;
+        ensure_monomorphic_enough(dyn_ty)?;
 
         let salt = M::get_global_alloc_salt(self, None);
         let vtable_symbolic_allocation = self.tcx.reserve_and_set_vtable_alloc(ty, dyn_ty, salt);
@@ -54,8 +53,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     ) -> &'tcx [VtblEntry<'tcx>] {
         if let Some(trait_) = trait_ {
             let trait_ref = trait_.with_self_ty(*self.tcx, dyn_ty);
-            let trait_ref =
-                self.tcx.erase_regions(self.tcx.instantiate_bound_regions_with_erased(trait_ref));
+            let trait_ref = self.tcx.erase_and_anonymize_regions(
+                self.tcx.instantiate_bound_regions_with_erased(trait_ref),
+            );
             self.tcx.vtable_entries(trait_ref)
         } else {
             TyCtxt::COMMON_VTABLE_ENTRIES
@@ -109,7 +109,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         expected_trait: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
         assert!(
-            matches!(mplace.layout.ty.kind(), ty::Dynamic(_, _, ty::Dyn)),
+            matches!(mplace.layout.ty.kind(), ty::Dynamic(_, _)),
             "`unpack_dyn_trait` only makes sense on `dyn*` types"
         );
         let vtable = mplace.meta().unwrap_meta().to_pointer(self)?;
@@ -125,25 +125,5 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             self,
         )?;
         interp_ok(mplace)
-    }
-
-    /// Turn a `dyn* Trait` type into an value with the actual dynamic type.
-    pub(super) fn unpack_dyn_star<P: Projectable<'tcx, M::Provenance>>(
-        &self,
-        val: &P,
-        expected_trait: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
-    ) -> InterpResult<'tcx, P> {
-        assert!(
-            matches!(val.layout().ty.kind(), ty::Dynamic(_, _, ty::DynStar)),
-            "`unpack_dyn_star` only makes sense on `dyn*` types"
-        );
-        let data = self.project_field(val, 0)?;
-        let vtable = self.project_field(val, 1)?;
-        let vtable = self.read_pointer(&vtable.to_op(self)?)?;
-        let ty = self.get_ptr_vtable_ty(vtable, Some(expected_trait))?;
-        // `data` is already the right thing but has the wrong type. So we transmute it.
-        let layout = self.layout_of(ty)?;
-        let data = data.transmute(layout, self)?;
-        interp_ok(data)
     }
 }

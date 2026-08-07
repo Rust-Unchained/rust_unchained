@@ -7,8 +7,9 @@ use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use stdx::to_lower_snake_case;
 use syntax::{
+    AstNode, Edition, SmolStr, SmolStrBuilder, ToSmolStr,
     ast::{self, HasName},
-    match_ast, AstNode, Edition, SmolStr, SmolStrBuilder, ToSmolStr,
+    match_ast,
 };
 
 use crate::RootDatabase;
@@ -43,7 +44,7 @@ const SEQUENCE_TYPES: &[&str] = &["Vec", "VecDeque", "LinkedList"];
 /// `vec.as_slice()` -> `slice`
 /// `args.into_config()` -> `config`
 /// `bytes.to_vec()` -> `vec`
-const USELESS_METHOD_PREFIXES: &[&str] = &["into_", "as_", "to_"];
+const USELESS_METHOD_PREFIXES: &[&str] = &["try_into_", "into_", "as_", "to_"];
 
 /// Useless methods that are stripped from expression
 ///
@@ -82,12 +83,18 @@ const USELESS_METHODS: &[&str] = &[
 ///
 /// ```
 /// # use ide_db::syntax_helpers::suggest_name::NameGenerator;
-/// let mut generator = NameGenerator::new();
+/// let mut generator = NameGenerator::default();
 /// assert_eq!(generator.suggest_name("a"), "a");
 /// assert_eq!(generator.suggest_name("a"), "a1");
 ///
 /// assert_eq!(generator.suggest_name("b2"), "b2");
 /// assert_eq!(generator.suggest_name("b"), "b3");
+///
+/// // Multi-byte UTF-8 identifiers (e.g. CJK) are handled correctly
+/// assert_eq!(generator.suggest_name("日本語"), "日本語");
+/// assert_eq!(generator.suggest_name("日本語"), "日本語1");
+/// assert_eq!(generator.suggest_name("données3"), "données3");
+/// assert_eq!(generator.suggest_name("données"), "données4");
 /// ```
 #[derive(Debug, Default)]
 pub struct NameGenerator {
@@ -95,26 +102,35 @@ pub struct NameGenerator {
 }
 
 impl NameGenerator {
-    /// Create a new empty generator
-    pub fn new() -> Self {
-        Self { pool: FxHashMap::default() }
-    }
-
     /// Create a new generator with existing names. When suggesting a name, it will
     /// avoid conflicts with existing names.
     pub fn new_with_names<'a>(existing_names: impl Iterator<Item = &'a str>) -> Self {
-        let mut generator = Self::new();
+        let mut generator = Self::default();
         existing_names.for_each(|name| generator.insert(name));
         generator
     }
 
     pub fn new_from_scope_locals(scope: Option<SemanticsScope<'_>>) -> Self {
-        let mut generator = Self::new();
+        let mut generator = Self::default();
         if let Some(scope) = scope {
             scope.process_all_names(&mut |name, scope| {
                 if let hir::ScopeDef::Local(_) = scope {
                     generator.insert(name.as_str());
                 }
+            });
+        }
+
+        generator
+    }
+
+    pub fn new_from_scope_non_locals(scope: Option<SemanticsScope<'_>>) -> Self {
+        let mut generator = Self::default();
+        if let Some(scope) = scope {
+            scope.process_all_names(&mut |name, scope| {
+                if let hir::ScopeDef::Local(_) = scope {
+                    return;
+                }
+                generator.insert(name.as_str());
             });
         }
 
@@ -155,10 +171,10 @@ impl NameGenerator {
     /// - If `ty` is an `impl Trait`, it will suggest the name of the first trait.
     ///
     /// If the suggested name conflicts with reserved keywords, it will return `None`.
-    pub fn for_type(
+    pub fn for_type<'db>(
         &mut self,
-        ty: &hir::Type,
-        db: &RootDatabase,
+        ty: &hir::Type<'db>,
+        db: &'db RootDatabase,
         edition: Edition,
     ) -> Option<SmolStr> {
         let name = name_of_type(ty, db, edition)?;
@@ -177,7 +193,10 @@ impl NameGenerator {
     pub fn for_impl_trait_as_generic(&mut self, ty: &ast::ImplTraitType) -> SmolStr {
         let c = ty
             .type_bound_list()
-            .and_then(|bounds| bounds.syntax().text().char_at(0.into()))
+            .and_then(|bounds| {
+                let ty = bounds.bounds().next()?.ty()?;
+                ty.syntax().text().char_at(0.into()).filter(|ch| ch.is_alphabetic())
+            })
             .unwrap_or('T');
 
         self.suggest_name(&c.to_string())
@@ -201,19 +220,29 @@ impl NameGenerator {
         expr: &ast::Expr,
         sema: &Semantics<'_, RootDatabase>,
     ) -> SmolStr {
+        self.try_for_variable(expr, sema).unwrap_or(SmolStr::new_static("var_name"))
+    }
+
+    /// Similar to `for_variable`, but fallback returns `None`
+    pub fn try_for_variable(
+        &mut self,
+        expr: &ast::Expr,
+        sema: &Semantics<'_, RootDatabase>,
+    ) -> Option<SmolStr> {
+        let edition = sema.scope(expr.syntax())?.krate().edition(sema.db);
         // `from_param` does not benefit from stripping it need the largest
         // context possible so we check firstmost
-        if let Some(name) = from_param(expr, sema) {
-            return self.suggest_name(&name);
+        if let Some(name) = from_param(expr, sema, edition) {
+            return Some(self.suggest_name(&name));
         }
 
         let mut next_expr = Some(expr.clone());
         while let Some(expr) = next_expr {
-            let name = from_call(&expr)
-                .or_else(|| from_type(&expr, sema))
-                .or_else(|| from_field_name(&expr));
+            let name = from_call(&expr, edition)
+                .or_else(|| from_type(&expr, sema, edition))
+                .or_else(|| from_field_name(&expr, edition));
             if let Some(name) = name {
-                return self.suggest_name(&name);
+                return Some(self.suggest_name(&name));
             }
 
             match expr {
@@ -233,7 +262,7 @@ impl NameGenerator {
             }
         }
 
-        self.suggest_name("var_name")
+        None
     }
 
     /// Insert a name into the pool
@@ -256,16 +285,20 @@ impl NameGenerator {
     /// Remove the numeric suffix from the name
     ///
     /// # Examples
-    /// `a1b2c3` -> `a1b2c`
+    /// `a1b2c3` -> (`a1b2c`, Some(3))
     fn split_numeric_suffix(name: &str) -> (&str, Option<usize>) {
         let pos =
             name.rfind(|c: char| !c.is_numeric()).expect("Name cannot be empty or all-numeric");
-        let (prefix, suffix) = name.split_at(pos + 1);
+        // `rfind` returns the byte offset of the matched character, which may be
+        // multi-byte (e.g. CJK identifiers). Use `ceil_char_boundary` to advance
+        // past the full character to the next valid split point.
+        let split = name.ceil_char_boundary(pos + 1);
+        let (prefix, suffix) = name.split_at(split);
         (prefix, suffix.parse().ok())
     }
 }
 
-fn normalize(name: &str) -> Option<SmolStr> {
+fn normalize(name: &str, edition: syntax::Edition) -> Option<SmolStr> {
     let name = to_lower_snake_case(name).to_smolstr();
 
     if USELESS_NAMES.contains(&name.as_str()) {
@@ -276,16 +309,16 @@ fn normalize(name: &str) -> Option<SmolStr> {
         return None;
     }
 
-    if !is_valid_name(&name) {
+    if !is_valid_name(&name, edition) {
         return None;
     }
 
     Some(name)
 }
 
-fn is_valid_name(name: &str) -> bool {
+fn is_valid_name(name: &str, edition: syntax::Edition) -> bool {
     matches!(
-        super::LexedStr::single_token(syntax::Edition::CURRENT_FIXME, name),
+        super::LexedStr::single_token(edition, name),
         Some((syntax::SyntaxKind::IDENT, _error))
     )
 }
@@ -299,11 +332,11 @@ fn is_useless_method(method: &ast::MethodCallExpr) -> bool {
     }
 }
 
-fn from_call(expr: &ast::Expr) -> Option<SmolStr> {
-    from_func_call(expr).or_else(|| from_method_call(expr))
+fn from_call(expr: &ast::Expr, edition: syntax::Edition) -> Option<SmolStr> {
+    from_func_call(expr, edition).or_else(|| from_method_call(expr, edition))
 }
 
-fn from_func_call(expr: &ast::Expr) -> Option<SmolStr> {
+fn from_func_call(expr: &ast::Expr, edition: syntax::Edition) -> Option<SmolStr> {
     let call = match expr {
         ast::Expr::CallExpr(call) => call,
         _ => return None,
@@ -313,10 +346,10 @@ fn from_func_call(expr: &ast::Expr) -> Option<SmolStr> {
         _ => return None,
     };
     let ident = func.path()?.segment()?.name_ref()?.ident_token()?;
-    normalize(ident.text())
+    normalize(ident.text(), edition)
 }
 
-fn from_method_call(expr: &ast::Expr) -> Option<SmolStr> {
+fn from_method_call(expr: &ast::Expr, edition: syntax::Edition) -> Option<SmolStr> {
     let method = match expr {
         ast::Expr::MethodCallExpr(call) => call,
         _ => return None,
@@ -335,10 +368,14 @@ fn from_method_call(expr: &ast::Expr) -> Option<SmolStr> {
         }
     }
 
-    normalize(name)
+    normalize(name, edition)
 }
 
-fn from_param(expr: &ast::Expr, sema: &Semantics<'_, RootDatabase>) -> Option<SmolStr> {
+fn from_param(
+    expr: &ast::Expr,
+    sema: &Semantics<'_, RootDatabase>,
+    edition: Edition,
+) -> Option<SmolStr> {
     let arg_list = expr.syntax().parent().and_then(ast::ArgList::cast)?;
     let args_parent = arg_list.syntax().parent()?;
     let func = match_ast! {
@@ -357,7 +394,7 @@ fn from_param(expr: &ast::Expr, sema: &Semantics<'_, RootDatabase>) -> Option<Sm
     let param = func.params().into_iter().nth(idx)?;
     let pat = sema.source(param)?.value.right()?.pat()?;
     let name = var_name_from_pat(&pat)?;
-    normalize(&name.to_smolstr())
+    normalize(&name.to_smolstr(), edition)
 }
 
 fn var_name_from_pat(pat: &ast::Pat) -> Option<ast::Name> {
@@ -369,15 +406,22 @@ fn var_name_from_pat(pat: &ast::Pat) -> Option<ast::Name> {
     }
 }
 
-fn from_type(expr: &ast::Expr, sema: &Semantics<'_, RootDatabase>) -> Option<SmolStr> {
+fn from_type(
+    expr: &ast::Expr,
+    sema: &Semantics<'_, RootDatabase>,
+    edition: Edition,
+) -> Option<SmolStr> {
     let ty = sema.type_of_expr(expr)?.adjusted();
-    let ty = ty.remove_ref().unwrap_or(ty);
-    let edition = sema.scope(expr.syntax())?.krate().edition(sema.db);
+    let ty = ty.strip_reference();
 
     name_of_type(&ty, sema.db, edition)
 }
 
-fn name_of_type(ty: &hir::Type, db: &RootDatabase, edition: Edition) -> Option<SmolStr> {
+fn name_of_type<'db>(
+    ty: &hir::Type<'db>,
+    db: &'db RootDatabase,
+    edition: Edition,
+) -> Option<SmolStr> {
     let name = if let Some(adt) = ty.as_adt() {
         let name = adt.name(db).display(db, edition).to_string();
 
@@ -401,17 +445,20 @@ fn name_of_type(ty: &hir::Type, db: &RootDatabase, edition: Edition) -> Option<S
             return None;
         }
         name
-    } else if let Some(inner_ty) = ty.remove_ref() {
+    } else if let Some((inner_ty, _)) = ty.as_reference() {
         return name_of_type(&inner_ty, db, edition);
-    } else if let Some(inner_ty) = ty.as_slice() {
-        return Some(sequence_name(Some(&inner_ty), db, edition));
     } else {
-        return None;
+        let inner_ty = ty.as_slice()?;
+        return Some(sequence_name(Some(&inner_ty), db, edition));
     };
-    normalize(&name)
+    normalize(&name, edition)
 }
 
-fn sequence_name(inner_ty: Option<&hir::Type>, db: &RootDatabase, edition: Edition) -> SmolStr {
+fn sequence_name<'db>(
+    inner_ty: Option<&hir::Type<'db>>,
+    db: &'db RootDatabase,
+    edition: Edition,
+) -> SmolStr {
     let items_str = SmolStr::new_static("items");
     let Some(inner_ty) = inner_ty else {
         return items_str;
@@ -437,13 +484,13 @@ fn trait_name(trait_: &hir::Trait, db: &RootDatabase, edition: Edition) -> Optio
     Some(name)
 }
 
-fn from_field_name(expr: &ast::Expr) -> Option<SmolStr> {
+fn from_field_name(expr: &ast::Expr, edition: syntax::Edition) -> Option<SmolStr> {
     let field = match expr {
         ast::Expr::FieldExpr(field) => field,
         _ => return None,
     };
     let ident = field.name_ref()?.ident_token()?;
-    normalize(ident.text())
+    normalize(ident.text(), edition)
 }
 
 #[cfg(test)]
@@ -457,9 +504,10 @@ mod tests {
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &str) {
         let (db, file_id, range_or_offset) = RootDatabase::with_range_or_offset(ra_fixture);
         let frange = FileRange { file_id, range: range_or_offset.into() };
-
         let sema = Semantics::new(&db);
+
         let source_file = sema.parse(frange.file_id);
+
         let element = source_file.syntax().covering_element(frange.range);
         let expr =
             element.ancestors().find_map(ast::Expr::cast).expect("selection is not an expression");
@@ -468,7 +516,7 @@ mod tests {
             frange.range,
             "selection is not an expression(yet contained in one)"
         );
-        let name = NameGenerator::new().for_variable(&expr, &sema);
+        let name = hir::attach_db(sema.db, || NameGenerator::default().for_variable(&expr, &sema));
         assert_eq!(&name, expected);
     }
 
@@ -1115,7 +1163,7 @@ fn main() {
 
     #[test]
     fn conflicts_with_existing_names() {
-        let mut generator = NameGenerator::new();
+        let mut generator = NameGenerator::default();
         assert_eq!(generator.suggest_name("a"), "a");
         assert_eq!(generator.suggest_name("a"), "a1");
         assert_eq!(generator.suggest_name("a"), "a2");

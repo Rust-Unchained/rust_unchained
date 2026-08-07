@@ -1,5 +1,5 @@
 #![warn(clippy::cast_enum_constructor)]
-#![allow(clippy::fn_to_numeric_cast)]
+#![expect(function_casts_as_integer, clippy::fn_to_numeric_cast)]
 
 fn main() {
     enum Foo {

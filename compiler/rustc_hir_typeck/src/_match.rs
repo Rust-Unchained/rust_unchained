@@ -1,17 +1,18 @@
+use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag};
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{self as hir, ExprKind, PatKind};
+use rustc_hir::{self as hir, ExprKind, HirId, PatKind};
 use rustc_hir_pretty::ty_to_string;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::Span;
+use rustc_span::{Span, sym};
 use rustc_trait_selection::traits::{
-    IfExpressionCause, MatchExpressionArmCause, ObligationCause, ObligationCauseCode,
+    MatchExpressionArmCause, ObligationCause, ObligationCauseCode,
 };
 use tracing::{debug, instrument};
 
-use crate::coercion::{AsCoercionSite, CoerceMany};
-use crate::{Diverges, Expectation, FnCtxt, Needs};
+use crate::coercion::CoerceMany;
+use crate::{Diverges, Expectation, FnCtxt, GatherLocalsVisitor, Needs};
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[instrument(skip(self), level = "debug", ret)]
@@ -43,6 +44,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // #55810: Type check patterns first so we get types for all bindings.
         let scrut_span = scrut.span.find_ancestor_inside(expr.span).unwrap_or(scrut.span);
         for arm in arms {
+            GatherLocalsVisitor::gather_from_arm(self, arm);
+
             self.check_pat_top(arm.pat, scrutinee_ty, Some(scrut_span), Some(scrut), None);
         }
 
@@ -57,8 +60,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // type in that case)
         let mut all_arms_diverge = Diverges::WarnedAlways;
 
-        let expected =
-            orig_expected.try_structurally_resolve_and_adjust_for_branches(self, expr.span);
+        let expected = orig_expected.try_structurally_resolve_and_adjust_for_branches(self);
         debug!(?expected);
 
         let mut coercion = {
@@ -71,7 +73,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Expectation::ExpectHasType(ety) if ety != tcx.types.unit => ety,
                 _ => self.next_ty_var(expr.span),
             };
-            CoerceMany::with_coercion_sites(coerce_first, arms)
+            CoerceMany::with_capacity(coerce_first, arms.len())
         };
 
         let mut prior_non_diverging_arms = vec![]; // Used only for diagnostics.
@@ -214,7 +216,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         prior_arm: Option<(Option<hir::HirId>, Ty<'tcx>, Span)>,
     ) {
         // First, check that we're actually in the tail of a function.
-        let Some(body) = self.tcx.hir_maybe_body_owned_by(self.body_id) else {
+        let Some(body) = self.tcx.hir_maybe_body_owned_by(self.body_def_id) else {
             return;
         };
         let hir::ExprKind::Block(block, _) = body.value.kind else {
@@ -231,7 +233,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // Next, make sure that we have no type expectation.
         let Some(ret) =
-            self.tcx.hir_node_by_def_id(self.body_id).fn_decl().map(|decl| decl.output.span())
+            self.tcx.hir_node_by_def_id(self.body_def_id).fn_decl().map(|decl| decl.output.span())
         else {
             return;
         };
@@ -243,7 +245,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.may_coerce(arm_ty, ret_ty)
                     && prior_arm.is_none_or(|(_, ty, _)| self.may_coerce(ty, ret_ty))
                     // The match arms need to unify for the case of `impl Trait`.
-                    && !matches!(ret_ty.kind(), ty::Alias(ty::Opaque, ..))
+                    && !matches!(ret_ty.kind(), ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }))
             }
             _ => false,
         };
@@ -252,7 +254,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let semi = expr.span.shrink_to_hi().with_hi(semi_span.hi());
-        let sugg = crate::errors::RemoveSemiForCoerce { expr: expr.span, ret, semi };
+        let sugg = crate::diagnostics::RemoveSemiForCoerce { expr: expr.span, ret, semi };
         diag.subdiagnostic(sugg);
     }
 
@@ -267,16 +269,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Handle the fallback arm of a desugared if(-let) like a missing else.
     ///
     /// Returns `true` if there was an error forcing the coercion to the `()` type.
-    pub(super) fn if_fallback_coercion<T>(
+    pub(super) fn if_fallback_coercion(
         &self,
         if_span: Span,
         cond_expr: &'tcx hir::Expr<'tcx>,
         then_expr: &'tcx hir::Expr<'tcx>,
-        coercion: &mut CoerceMany<'tcx, '_, T>,
-    ) -> bool
-    where
-        T: AsCoercionSite,
-    {
+        coercion: &mut CoerceMany<'tcx>,
+    ) -> bool {
         // If this `if` expr is the parent's function return expr,
         // the cause of the type coercion is the return type, point at it. (#25228)
         let hir_id = self.tcx.parent_hir_id(self.tcx.parent_hir_id(then_expr.hir_id));
@@ -292,6 +291,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         error
     }
 
+    /// Check if the span comes from an assert-like macro expansion.
+    fn is_from_assert_macro(&self, span: Span) -> bool {
+        span.ctxt().outer_expn_data().macro_def_id.is_some_and(|def_id| {
+            matches!(
+                self.tcx.get_diagnostic_name(def_id),
+                Some(
+                    sym::assert_macro
+                        | sym::debug_assert_macro
+                        | sym::assert_eq_macro
+                        | sym::assert_ne_macro
+                        | sym::debug_assert_eq_macro
+                        | sym::debug_assert_ne_macro
+                )
+            )
+        })
+    }
+
     /// Explain why `if` expressions without `else` evaluate to `()` and detect likely irrefutable
     /// `if let PAT = EXPR {}` expressions that could be turned into `let PAT = EXPR;`.
     fn explain_if_expr(
@@ -303,6 +319,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         then_expr: &'tcx hir::Expr<'tcx>,
         error: &mut bool,
     ) {
+        let is_assert_macro = self.is_from_assert_macro(if_span);
+
         if let Some((if_span, msg)) = ret_reason {
             err.span_label(if_span, msg);
         } else if let ExprKind::Block(block, _) = then_expr.kind
@@ -310,8 +328,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         {
             err.span_label(expr.span, "found here");
         }
-        err.note("`if` expressions without `else` evaluate to `()`");
-        err.help("consider adding an `else` block that evaluates to the expected type");
+
+        if is_assert_macro {
+            err.code(E0308);
+            err.primary_message("mismatched types");
+        } else {
+            err.note("`if` expressions without `else` evaluate to `()`");
+            err.help("consider adding an `else` block that evaluates to the expected type");
+        }
         *error = true;
         if let ExprKind::Let(hir::LetExpr { span, pat, init, .. }) = cond_expr.kind
             && let ExprKind::Block(block, _) = then_expr.kind
@@ -397,7 +421,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return self.get_fn_decl(hir_id).map(|(_, fn_decl)| {
                         let (ty, span) = match fn_decl.output {
                             hir::FnRetTy::DefaultReturn(span) => ("()".to_string(), span),
-                            hir::FnRetTy::Return(ty) => (ty_to_string(&self.tcx, ty), ty.span),
+                            hir::FnRetTy::Return(ty) => (ty_to_string(self, ty), ty.span),
                         };
                         (span, format!("expected `{ty}` because of this return type"))
                     });
@@ -412,105 +436,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     pub(crate) fn if_cause(
         &self,
-        span: Span,
-        cond_span: Span,
-        then_expr: &'tcx hir::Expr<'tcx>,
+        expr_id: HirId,
         else_expr: &'tcx hir::Expr<'tcx>,
-        then_ty: Ty<'tcx>,
-        else_ty: Ty<'tcx>,
         tail_defines_return_position_impl_trait: Option<LocalDefId>,
     ) -> ObligationCause<'tcx> {
-        let mut outer_span = if self.tcx.sess.source_map().is_multiline(span) {
-            // The `if`/`else` isn't in one line in the output, include some context to make it
-            // clear it is an if/else expression:
-            // ```
-            // LL |      let x = if true {
-            //    | _____________-
-            // LL ||         10i32
-            //    ||         ----- expected because of this
-            // LL ||     } else {
-            // LL ||         10u32
-            //    ||         ^^^^^ expected `i32`, found `u32`
-            // LL ||     };
-            //    ||_____- `if` and `else` have incompatible types
-            // ```
-            Some(span)
-        } else {
-            // The entire expression is in one line, only point at the arms
-            // ```
-            // LL |     let x = if true { 10i32 } else { 10u32 };
-            //    |                       -----          ^^^^^ expected `i32`, found `u32`
-            //    |                       |
-            //    |                       expected because of this
-            // ```
-            None
-        };
-
-        let (error_sp, else_id) = if let ExprKind::Block(block, _) = &else_expr.kind {
-            let block = block.innermost_block();
-
-            // Avoid overlapping spans that aren't as readable:
-            // ```
-            // 2 |        let x = if true {
-            //   |   _____________-
-            // 3 |  |         3
-            //   |  |         - expected because of this
-            // 4 |  |     } else {
-            //   |  |____________^
-            // 5 | ||
-            // 6 | ||     };
-            //   | ||     ^
-            //   | ||_____|
-            //   | |______if and else have incompatible types
-            //   |        expected integer, found `()`
-            // ```
-            // by not pointing at the entire expression:
-            // ```
-            // 2 |       let x = if true {
-            //   |               ------- `if` and `else` have incompatible types
-            // 3 |           3
-            //   |           - expected because of this
-            // 4 |       } else {
-            //   |  ____________^
-            // 5 | |
-            // 6 | |     };
-            //   | |_____^ expected integer, found `()`
-            // ```
-            if block.expr.is_none()
-                && block.stmts.is_empty()
-                && let Some(outer_span) = &mut outer_span
-                && let Some(cond_span) = cond_span.find_ancestor_inside(*outer_span)
-            {
-                *outer_span = outer_span.with_hi(cond_span.hi())
-            }
-
-            (self.find_block_span(block), block.hir_id)
-        } else {
-            (else_expr.span, else_expr.hir_id)
-        };
-
-        let then_id = if let ExprKind::Block(block, _) = &then_expr.kind {
-            let block = block.innermost_block();
-            // Exclude overlapping spans
-            if block.expr.is_none() && block.stmts.is_empty() {
-                outer_span = None;
-            }
-            block.hir_id
-        } else {
-            then_expr.hir_id
-        };
+        let error_sp = self.find_block_span_from_hir_id(else_expr.hir_id);
 
         // Finally construct the cause:
         self.cause(
             error_sp,
-            ObligationCauseCode::IfExpression(Box::new(IfExpressionCause {
-                else_id,
-                then_id,
-                then_ty,
-                else_ty,
-                outer_span,
-                tail_defines_return_position_impl_trait,
-            })),
+            ObligationCauseCode::IfExpression { expr_id, tail_defines_return_position_impl_trait },
         )
     }
 
@@ -597,11 +532,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let expected_ty = expectation.to_option(self)?;
         let (def_id, args) = match *expected_ty.kind() {
             // FIXME: Could also check that the RPIT is not defined
-            ty::Alias(ty::Opaque, alias_ty) => (alias_ty.def_id.as_local()?, alias_ty.args),
-            // FIXME(-Znext-solver): Remove this branch once `replace_opaque_types_with_infer` is gone.
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+                (def_id.as_local()?, args)
+            }
+            // FIXME(-Znext-solver=no): Remove this branch once `replace_opaque_types_with_infer` is gone.
             ty::Infer(ty::TyVar(_)) => self
                 .inner
-                .borrow()
+                .borrow_mut()
+                .opaque_types()
                 .iter_opaque_types()
                 .find(|(_, v)| v.ty == expected_ty)
                 .map(|(k, _)| (k.def_id, k.args))?,

@@ -4,18 +4,19 @@ use std::path::{Path, PathBuf};
 
 use rustc_abi::Endian;
 use rustc_data_structures::base_n::{CASE_INSENSITIVE, ToBaseN};
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_hashes::Hash128;
+use rustc_hir::attrs::NativeLibKind;
 use rustc_session::Session;
-use rustc_session::cstore::DllImport;
-use rustc_session::utils::NativeLibKind;
+use rustc_session::cstore::{DllImport, DllImportSymbolType};
 use rustc_span::Symbol;
+use rustc_target::spec::Arch;
 
 use crate::back::archive::ImportLibraryItem;
 use crate::back::link::ArchiveBuilderBuilder;
-use crate::errors::ErrorCreatingImportLibrary;
-use crate::{NativeLib, common, errors};
+use crate::diagnostics::ErrorCreatingImportLibrary;
+use crate::{NativeLib, common, diagnostics};
 
 /// Extract all symbols defined in raw-dylib libraries, collated by library name.
 ///
@@ -31,7 +32,7 @@ fn collate_raw_dylibs_windows<'a>(
     let mut dylib_table = FxIndexMap::<String, FxIndexMap<Symbol, &DllImport>>::default();
 
     for lib in used_libraries {
-        if lib.kind == NativeLibKind::RawDylib {
+        if let NativeLibKind::RawDylib { .. } = lib.kind {
             let ext = if lib.verbatim { "" } else { ".dll" };
             let name = format!("{}{}", lib.name, ext);
             let imports = dylib_table.entry(name.clone()).or_default();
@@ -40,7 +41,7 @@ fn collate_raw_dylibs_windows<'a>(
                     // FIXME: when we add support for ordinals, figure out if we need to do anything
                     // if we have two DllImport values with the same name but different ordinals.
                     if import.calling_convention != old_import.calling_convention {
-                        sess.dcx().emit_err(errors::MultipleExternalFuncDecl {
+                        sess.dcx().emit_err(diagnostics::MultipleExternalFuncDecl {
                             span: import.span,
                             function: import.name,
                             library_name: &name,
@@ -77,7 +78,7 @@ pub(super) fn create_raw_dylib_dll_import_libs<'a>(
             let items: Vec<ImportLibraryItem> = raw_dylib_imports
                 .iter()
                 .map(|import: &DllImport| {
-                    if sess.target.arch == "x86" {
+                    if sess.target.arch == Arch::X86 {
                         ImportLibraryItem {
                             name: common::i686_decorated_name(
                                 import,
@@ -94,14 +95,14 @@ pub(super) fn create_raw_dylib_dll_import_libs<'a>(
                                     true,
                                 )
                             }),
-                            is_data: !import.is_fn,
+                            is_data: import.symbol_type != DllImportSymbolType::Function,
                         }
                     } else {
                         ImportLibraryItem {
                             name: import.name.to_string(),
                             ordinal: import.ordinal(),
                             symbol_name: None,
-                            is_data: !import.is_fn,
+                            is_data: import.symbol_type != DllImportSymbolType::Function,
                         }
                     }
                 })
@@ -128,12 +129,12 @@ pub(super) fn create_raw_dylib_dll_import_libs<'a>(
 fn collate_raw_dylibs_elf<'a>(
     sess: &Session,
     used_libraries: impl IntoIterator<Item = &'a NativeLib>,
-) -> Vec<(String, Vec<DllImport>)> {
+) -> Vec<(String, Vec<DllImport>, bool)> {
     // Use index maps to preserve original order of imports and libraries.
-    let mut dylib_table = FxIndexMap::<String, FxIndexMap<Symbol, &DllImport>>::default();
+    let mut dylib_table = FxIndexMap::<String, (FxIndexMap<Symbol, &DllImport>, bool)>::default();
 
     for lib in used_libraries {
-        if lib.kind == NativeLibKind::RawDylib {
+        if let NativeLibKind::RawDylib { as_needed } = lib.kind {
             let filename = if lib.verbatim {
                 lib.name.as_str().to_owned()
             } else {
@@ -142,17 +143,19 @@ fn collate_raw_dylibs_elf<'a>(
                 format!("{prefix}{}{ext}", lib.name)
             };
 
-            let imports = dylib_table.entry(filename.clone()).or_default();
+            let (stub_imports, stub_as_needed) =
+                dylib_table.entry(filename.clone()).or_insert((Default::default(), true));
             for import in &lib.dll_imports {
-                imports.insert(import.name, import);
+                stub_imports.insert(import.name, import);
             }
+            *stub_as_needed = *stub_as_needed && as_needed.unwrap_or(true);
         }
     }
     sess.dcx().abort_if_errors();
     dylib_table
         .into_iter()
-        .map(|(name, imports)| {
-            (name, imports.into_iter().map(|(_, import)| import.clone()).collect())
+        .map(|(name, (imports, as_needed))| {
+            (name, imports.into_iter().map(|(_, import)| import.clone()).collect(), as_needed)
         })
         .collect()
 }
@@ -161,10 +164,10 @@ pub(super) fn create_raw_dylib_elf_stub_shared_objects<'a>(
     sess: &Session,
     used_libraries: impl IntoIterator<Item = &'a NativeLib>,
     raw_dylib_so_dir: &Path,
-) -> Vec<String> {
+) -> Vec<(String, bool)> {
     collate_raw_dylibs_elf(sess, used_libraries)
         .into_iter()
-        .map(|(load_filename, raw_dylib_imports)| {
+        .map(|(load_filename, raw_dylib_imports, as_needed)| {
             use std::hash::Hash;
 
             // `load_filename` is the *target/loader* filename that will end up in NEEDED.
@@ -205,7 +208,7 @@ pub(super) fn create_raw_dylib_elf_stub_shared_objects<'a>(
                 });
             };
 
-            temporary_lib_name
+            (temporary_lib_name, as_needed)
         })
         .collect()
 }
@@ -214,7 +217,7 @@ pub(super) fn create_raw_dylib_elf_stub_shared_objects<'a>(
 /// It exports all the provided symbols, but is otherwise empty.
 fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]) -> Vec<u8> {
     use object::write::elf as write;
-    use object::{Architecture, elf};
+    use object::{AddressSize, Architecture, elf};
 
     let mut stub_buf = Vec::new();
 
@@ -226,47 +229,6 @@ fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]
     // It is important that the order of reservation matches the order of writing.
     // The object crate contains many debug asserts that fire if you get this wrong.
 
-    let endianness = match sess.target.options.endian {
-        Endian::Little => object::Endianness::Little,
-        Endian::Big => object::Endianness::Big,
-    };
-    let mut stub = write::Writer::new(endianness, true, &mut stub_buf);
-
-    // These initial reservations don't reserve any bytes in the binary yet,
-    // they just allocate in the internal data structures.
-
-    // First, we crate the dynamic symbol table. It starts with a null symbol
-    // and then all the symbols and their dynamic strings.
-    stub.reserve_null_dynamic_symbol_index();
-
-    let dynstrs = symbols
-        .iter()
-        .map(|sym| {
-            stub.reserve_dynamic_symbol_index();
-            (sym, stub.add_dynamic_string(sym.name.as_str().as_bytes()))
-        })
-        .collect::<Vec<_>>();
-
-    let soname = stub.add_dynamic_string(soname.as_bytes());
-
-    // Reserve the sections.
-    // We have the minimal sections for a dynamic SO and .text where we point our dummy symbols to.
-    stub.reserve_shstrtab_section_index();
-    let text_section_name = stub.add_section_name(".text".as_bytes());
-    let text_section = stub.reserve_section_index();
-    stub.reserve_dynstr_section_index();
-    stub.reserve_dynsym_section_index();
-    stub.reserve_dynamic_section_index();
-
-    // These reservations now determine the actual layout order of the object file.
-    stub.reserve_file_header();
-    stub.reserve_shstrtab();
-    stub.reserve_section_headers();
-    stub.reserve_dynstr();
-    stub.reserve_dynsym();
-    stub.reserve_dynamic(2); // DT_SONAME, DT_NULL
-
-    // First write the ELF header with the arch information.
     let Some((arch, sub_arch)) = sess.target.object_architecture(&sess.unstable_target_features)
     else {
         sess.dcx().fatal(format!(
@@ -274,6 +236,92 @@ fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]
             sess.target.arch
         ));
     };
+
+    let endianness = match sess.target.options.endian {
+        Endian::Little => object::Endianness::Little,
+        Endian::Big => object::Endianness::Big,
+    };
+
+    let is_64 = match arch.address_size() {
+        Some(AddressSize::U8 | AddressSize::U16 | AddressSize::U32) => false,
+        Some(AddressSize::U64) => true,
+        _ => sess.dcx().fatal(format!(
+            "raw-dylib is not supported for the architecture `{}`",
+            sess.target.arch
+        )),
+    };
+
+    let mut stub = write::Writer::new(endianness, is_64, &mut stub_buf);
+
+    let mut vers = Vec::new();
+    let mut vers_map = FxHashMap::default();
+    let mut syms = Vec::new();
+
+    for symbol in symbols {
+        let symbol_name = symbol.name.as_str();
+        if let Some((name, version_name)) = symbol_name.split_once('@') {
+            assert!(!version_name.contains('@'));
+            let dynstr = stub.add_dynamic_string(name.as_bytes());
+            let ver = if let Some(&ver_id) = vers_map.get(version_name) {
+                ver_id
+            } else {
+                let id = vers.len();
+                vers_map.insert(version_name, id);
+                let dynstr = stub.add_dynamic_string(version_name.as_bytes());
+                vers.push((version_name, dynstr));
+                id
+            };
+            syms.push((name, dynstr, Some(ver), symbol.symbol_type, symbol.size));
+        } else {
+            let dynstr = stub.add_dynamic_string(symbol_name.as_bytes());
+            syms.push((symbol_name, dynstr, None, symbol.symbol_type, symbol.size));
+        }
+    }
+
+    let soname = stub.add_dynamic_string(soname.as_bytes());
+
+    // These initial reservations don't reserve any bytes in the binary yet,
+    // they just allocate in the internal data structures.
+
+    // First, we create the dynamic symbol table. It starts with a null symbol
+    // and then all the symbols and their dynamic strings.
+    stub.reserve_null_dynamic_symbol_index();
+
+    for _ in syms.iter() {
+        stub.reserve_dynamic_symbol_index();
+    }
+
+    // Reserve the sections.
+    // We have the minimal sections for a dynamic SO and .text where we point our dummy symbols to.
+    stub.reserve_shstrtab_section_index();
+    let text_section_name = stub.add_section_name(".text".as_bytes());
+    let text_section = stub.reserve_section_index();
+    let data_section_name = stub.add_section_name(".data".as_bytes());
+    let data_section = stub.reserve_section_index();
+    stub.reserve_dynsym_section_index();
+    stub.reserve_dynstr_section_index();
+    if !vers.is_empty() {
+        stub.reserve_gnu_versym_section_index();
+        stub.reserve_gnu_verdef_section_index();
+    }
+    stub.reserve_dynamic_section_index();
+
+    // These reservations now determine the actual layout order of the object file.
+    stub.reserve_file_header();
+    stub.reserve_shstrtab();
+    stub.reserve_section_headers();
+    stub.reserve_dynsym();
+    stub.reserve_dynstr();
+    let verdef_count = 1 + vers.len();
+    let mut dynamic_entries = 2; // DT_SONAME, DT_NULL
+    if !vers.is_empty() {
+        stub.reserve_gnu_versym();
+        stub.reserve_gnu_verdef(verdef_count, verdef_count);
+        dynamic_entries += 1; // DT_VERDEFNUM
+    }
+    stub.reserve_dynamic(dynamic_entries);
+
+    // First write the ELF header with the arch information.
     let e_machine = match (arch, sub_arch) {
         (Architecture::Aarch64, None) => elf::EM_AARCH64,
         (Architecture::Aarch64_Ilp32, None) => elf::EM_AARCH64,
@@ -287,6 +335,7 @@ fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]
         (Architecture::X86_64, None) => elf::EM_X86_64,
         (Architecture::X86_64_X32, None) => elf::EM_X86_64,
         (Architecture::Hexagon, None) => elf::EM_HEXAGON,
+        (Architecture::LoongArch32, None) => elf::EM_LOONGARCH,
         (Architecture::LoongArch64, None) => elf::EM_LOONGARCH,
         (Architecture::M68k, None) => elf::EM_68K,
         (Architecture::Mips, None) => elf::EM_MIPS,
@@ -328,7 +377,7 @@ fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]
     // Section headers
     stub.write_null_section_header();
     stub.write_shstrtab_section_header();
-    // Create a dummy .text section for our dummy symbols.
+    // Create a dummy .text section for our dummy non-data symbols.
     stub.write_section_header(&write::SectionHeader {
         name: Some(text_section_name),
         sh_type: elf::SHT_PROGBITS,
@@ -338,35 +387,102 @@ fn create_elf_raw_dylib_stub(sess: &Session, soname: &str, symbols: &[DllImport]
         sh_size: 0,
         sh_link: 0,
         sh_info: 0,
-        sh_addralign: 1,
+        sh_addralign: 16,
         sh_entsize: 0,
     });
-    stub.write_dynstr_section_header(0);
+    // And also a dummy .data section for our dummy data symbols.
+    stub.write_section_header(&write::SectionHeader {
+        name: Some(data_section_name),
+        sh_type: elf::SHT_PROGBITS,
+        sh_flags: (elf::SHF_WRITE | elf::SHF_ALLOC) as u64,
+        sh_addr: 0,
+        sh_offset: 0,
+        sh_size: 0,
+        sh_link: 0,
+        sh_info: 0,
+        sh_addralign: 16,
+        sh_entsize: 0,
+    });
     stub.write_dynsym_section_header(0, 1);
+    stub.write_dynstr_section_header(0);
+    if !vers.is_empty() {
+        stub.write_gnu_versym_section_header(0);
+        stub.write_gnu_verdef_section_header(0);
+    }
     stub.write_dynamic_section_header(0);
+
+    // .dynsym
+    stub.write_null_dynamic_symbol();
+    // Linkers like LLD require at least somewhat reasonable symbol values rather than zero,
+    // otherwise all the symbols might get put at the same address. Thus we increment the value
+    // every time we write a symbol.
+    let mut st_value = 0;
+    for (_name, dynstr, _ver, symbol_type, size) in syms.iter().copied() {
+        let sym_type = match symbol_type {
+            DllImportSymbolType::Function => elf::STT_FUNC,
+            DllImportSymbolType::Static => elf::STT_OBJECT,
+            DllImportSymbolType::ThreadLocal => elf::STT_TLS,
+        };
+        let section =
+            if symbol_type == DllImportSymbolType::Static { data_section } else { text_section };
+        stub.write_dynamic_symbol(&write::Sym {
+            name: Some(dynstr),
+            st_info: (elf::STB_GLOBAL << 4) | sym_type,
+            st_other: elf::STV_DEFAULT,
+            section: Some(section),
+            st_shndx: 0, // ignored by object in favor of the `section` field
+            st_value,
+            st_size: size.bytes(),
+        });
+        st_value += 8;
+    }
 
     // .dynstr
     stub.write_dynstr();
 
-    // .dynsym
-    stub.write_null_dynamic_symbol();
-    for (_, name) in dynstrs {
-        stub.write_dynamic_symbol(&write::Sym {
-            name: Some(name),
-            st_info: (elf::STB_GLOBAL << 4) | elf::STT_NOTYPE,
-            st_other: elf::STV_DEFAULT,
-            section: Some(text_section),
-            st_shndx: 0, // ignored by object in favor of the `section` field
-            st_value: 0,
-            st_size: 0,
+    // ld.bfd is unhappy if these sections exist without any symbols, so we only generate them when necessary.
+    if !vers.is_empty() {
+        // .gnu_version
+        stub.write_null_gnu_versym();
+        for (_name, _dynstr, ver, _symbol_type, _size) in syms.iter().copied() {
+            stub.write_gnu_versym(if let Some(ver) = ver {
+                assert!((2 + ver as u16) < elf::VERSYM_HIDDEN);
+                elf::VERSYM_HIDDEN | (2 + ver as u16)
+            } else {
+                1
+            });
+        }
+
+        // .gnu_version_d
+        stub.write_align_gnu_verdef();
+        stub.write_gnu_verdef(&write::Verdef {
+            version: elf::VER_DEF_CURRENT,
+            flags: elf::VER_FLG_BASE,
+            index: 1,
+            aux_count: 1,
+            name: soname,
         });
+        for (ver, (_name, dynstr)) in vers.into_iter().enumerate() {
+            stub.write_gnu_verdef(&write::Verdef {
+                version: elf::VER_DEF_CURRENT,
+                flags: 0,
+                index: 2 + ver as u16,
+                aux_count: 1,
+                name: dynstr,
+            });
+        }
     }
 
     // .dynamic
     // the DT_SONAME will be used by the linker to populate DT_NEEDED
     // which the loader uses to find the library.
-    // DT_NULL terminates the .dynamic table.
+    stub.write_align_dynamic();
     stub.write_dynamic_string(elf::DT_SONAME, soname);
+    // LSB section "2.7. Symbol Versioning" requires `DT_VERDEFNUM` to be reliable.
+    if verdef_count > 1 {
+        stub.write_dynamic(elf::DT_VERDEFNUM, verdef_count as u64);
+    }
+    // DT_NULL terminates the .dynamic table.
     stub.write_dynamic(elf::DT_NULL, 0);
 
     stub_buf

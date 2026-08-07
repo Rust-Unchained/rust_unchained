@@ -83,7 +83,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
             return Ok(());
         }
 
-        let mini_graph = MiniGraph::new(tcx, &self, only_consider_snapshot);
+        let mini_graph = MiniGraph::new(&self, only_consider_snapshot);
 
         let mut leak_check = LeakCheck::new(tcx, outer_universe, max_universe, mini_graph, self);
         leak_check.assign_placeholder_values()?;
@@ -105,7 +105,7 @@ struct LeakCheck<'a, 'tcx> {
     // is repurposed to store some placeholder `P` such that the weaker
     // condition `S: P` must hold. (This is true if `S: S1` transitively and `S1
     // = P`.)
-    scc_placeholders: IndexVec<LeakCheckScc, Option<ty::PlaceholderRegion>>,
+    scc_placeholders: IndexVec<LeakCheckScc, Option<ty::PlaceholderRegion<'tcx>>>,
 
     // For each SCC S, track the minimum universe that flows into it. Note that
     // this is both the minimum of the universes for every region that is a
@@ -258,15 +258,15 @@ impl<'a, 'tcx> LeakCheck<'a, 'tcx> {
 
     fn placeholder_error(
         &self,
-        placeholder1: ty::PlaceholderRegion,
-        placeholder2: ty::PlaceholderRegion,
+        placeholder1: ty::PlaceholderRegion<'tcx>,
+        placeholder2: ty::PlaceholderRegion<'tcx>,
     ) -> TypeError<'tcx> {
         self.error(placeholder1, ty::Region::new_placeholder(self.tcx, placeholder2))
     }
 
     fn error(
         &self,
-        placeholder: ty::PlaceholderRegion,
+        placeholder: ty::PlaceholderRegion<'tcx>,
         other_region: ty::Region<'tcx>,
     ) -> TypeError<'tcx> {
         debug!("error: placeholder={:?}, other_region={:?}", placeholder, other_region);
@@ -359,7 +359,6 @@ struct MiniGraph<'tcx> {
 
 impl<'tcx> MiniGraph<'tcx> {
     fn new(
-        tcx: TyCtxt<'tcx>,
         region_constraints: &RegionConstraintCollector<'_, 'tcx>,
         only_consider_snapshot: Option<&CombinedSnapshot<'tcx>>,
     ) -> Self {
@@ -368,7 +367,6 @@ impl<'tcx> MiniGraph<'tcx> {
 
         // Note that if `R2: R1`, we get a callback `r1, r2`, so `target` is first parameter.
         Self::iterate_region_constraints(
-            tcx,
             region_constraints,
             only_consider_snapshot,
             |target, source| {
@@ -384,33 +382,25 @@ impl<'tcx> MiniGraph<'tcx> {
 
     /// Invokes `each_edge(R1, R2)` for each edge where `R2: R1`
     fn iterate_region_constraints(
-        tcx: TyCtxt<'tcx>,
         region_constraints: &RegionConstraintCollector<'_, 'tcx>,
         only_consider_snapshot: Option<&CombinedSnapshot<'tcx>>,
         mut each_edge: impl FnMut(ty::Region<'tcx>, ty::Region<'tcx>),
     ) {
-        let mut each_constraint = |constraint| match constraint {
-            &Constraint::VarSubVar(a, b) => {
-                each_edge(ty::Region::new_var(tcx, a), ty::Region::new_var(tcx, b));
-            }
-            &Constraint::RegSubVar(a, b) => {
-                each_edge(a, ty::Region::new_var(tcx, b));
-            }
-            &Constraint::VarSubReg(a, b) => {
-                each_edge(ty::Region::new_var(tcx, a), b);
-            }
-            &Constraint::RegSubReg(a, b) => {
-                each_edge(a, b);
-            }
-        };
-
         if let Some(snapshot) = only_consider_snapshot {
             for undo_entry in
                 region_constraints.undo_log.region_constraints_in_snapshot(&snapshot.undo_snapshot)
             {
                 match undo_entry {
                     &AddConstraint(i) => {
-                        each_constraint(&region_constraints.data().constraints[i].0);
+                        region_constraints.data().constraints[i].0.iter_outlives().for_each(
+                            |Constraint { kind: _, sub, sup, visible_for_leak_check }| {
+                                match visible_for_leak_check {
+                                    ty::VisibleForLeakCheck::Yes => each_edge(sub, sup),
+                                    ty::VisibleForLeakCheck::No => {}
+                                    ty::VisibleForLeakCheck::Unreachable => unreachable!(),
+                                }
+                            },
+                        );
                     }
                     &AddVerify(i) => span_bug!(
                         region_constraints.data().verifys[i].origin.span(),
@@ -424,7 +414,14 @@ impl<'tcx> MiniGraph<'tcx> {
                 .data()
                 .constraints
                 .iter()
-                .for_each(|(constraint, _)| each_constraint(constraint));
+                .flat_map(|(c, _)| c.iter_outlives())
+                .for_each(|Constraint { kind: _, sub, sup, visible_for_leak_check }| {
+                    match visible_for_leak_check {
+                        ty::VisibleForLeakCheck::Yes => each_edge(sub, sup),
+                        ty::VisibleForLeakCheck::No => {}
+                        ty::VisibleForLeakCheck::Unreachable => unreachable!(),
+                    }
+                })
         }
     }
 

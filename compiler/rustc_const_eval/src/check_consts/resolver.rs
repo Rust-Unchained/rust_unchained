@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use rustc_index::bit_set::MixedBitSet;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{
-    self, BasicBlock, CallReturnPlaces, Local, Location, Statement, StatementKind, TerminatorEdges,
+    self, BasicBlock, CallReturnPlaces, Local, Location, Statement, StatementKind,
 };
 use rustc_mir_dataflow::fmt::DebugWithContext;
 use rustc_mir_dataflow::{Analysis, JoinSemiLattice};
@@ -137,14 +137,14 @@ where
 
         // If a local with no projections is moved from (e.g. `x` in `y = x`), record that
         // it no longer needs to be dropped.
-        if let mir::Operand::Move(place) = operand {
-            if let Some(local) = place.as_local() {
-                // For backward compatibility with the MaybeMutBorrowedLocals used in an earlier
-                // implementation we retain qualif if a local had been borrowed before. This might
-                // not be strictly necessary since the local is no longer initialized.
-                if !self.state.borrow.contains(local) {
-                    self.state.qualif.remove(local);
-                }
+        if let mir::Operand::Move(place) = operand
+            && let Some(local) = place.as_local()
+        {
+            // For backward compatibility with the MaybeMutBorrowedLocals used in an earlier
+            // implementation we retain qualif if a local had been borrowed before. This might
+            // not be strictly necessary since the local is no longer initialized.
+            if !self.state.borrow.contains(local) {
+                self.state.qualif.remove(local);
             }
         }
     }
@@ -191,15 +191,25 @@ where
                 }
             }
 
+            mir::Rvalue::Reborrow(target, mutability, borrowed_place) => {
+                // A Reborrow allows mutation if it is Reborrow or if the CoerceShared target isn't
+                // Freeze.
+                if !borrowed_place.is_indirect()
+                    && (mutability.is_mut() || !target.is_freeze(self.ccx.tcx, self.ccx.typing_env))
+                {
+                    if Q::in_any_value_of_ty(self.ccx, *target) {
+                        self.state.qualif.insert(borrowed_place.local);
+                        self.state.borrow.insert(borrowed_place.local);
+                    }
+                }
+            }
+
             mir::Rvalue::Cast(..)
-            | mir::Rvalue::ShallowInitBox(..)
             | mir::Rvalue::Use(..)
             | mir::Rvalue::CopyForDeref(..)
             | mir::Rvalue::ThreadLocalRef(..)
             | mir::Rvalue::Repeat(..)
-            | mir::Rvalue::Len(..)
             | mir::Rvalue::BinaryOp(..)
-            | mir::Rvalue::NullaryOp(..)
             | mir::Rvalue::UnaryOp(..)
             | mir::Rvalue::Discriminant(..)
             | mir::Rvalue::Aggregate(..)
@@ -333,7 +343,7 @@ where
     }
 
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         statement: &mir::Statement<'tcx>,
         location: Location,
@@ -341,18 +351,17 @@ where
         self.transfer_function(state).visit_statement(statement, location);
     }
 
-    fn apply_primary_terminator_effect<'mir>(
-        &mut self,
+    fn apply_primary_terminator_effect(
+        &self,
         state: &mut Self::Domain,
-        terminator: &'mir mir::Terminator<'tcx>,
+        terminator: &mir::Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) {
         self.transfer_function(state).visit_terminator(terminator, location);
-        terminator.edges()
     }
 
     fn apply_call_return_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         block: BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,

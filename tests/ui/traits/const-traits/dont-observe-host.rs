@@ -3,12 +3,11 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Trait {
+const trait Trait {
     fn method() {}
 }
 
-impl const Trait for () {}
+const impl Trait for () {}
 
 fn main() {
     let mut x = const {

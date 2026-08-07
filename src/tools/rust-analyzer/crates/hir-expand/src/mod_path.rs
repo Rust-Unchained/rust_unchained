@@ -2,26 +2,28 @@
 
 use std::{
     fmt::{self, Display as _},
-    iter,
+    iter::{self, Peekable},
 };
 
 use crate::{
-    db::ExpandDatabase,
-    hygiene::{marks_rev, SyntaxContextExt, Transparency},
+    hygiene::Transparency,
     name::{AsName, Name},
     tt,
 };
-use base_db::CrateId;
-use intern::sym;
+use base_db::{Crate, SourceDatabase};
+use intern::{Symbol, sym};
+use parser::T;
 use smallvec::SmallVec;
-use span::{Edition, SyntaxContextId};
-use syntax::{ast, AstNode};
+use span::{Edition, SyntaxContext};
+use syntax::{AstNode, SyntaxToken, ast};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModPath {
     pub kind: PathKind,
     segments: SmallVec<[Name; 1]>,
 }
+
+intern::impl_internable!(ModPath);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathKind {
@@ -33,7 +35,7 @@ pub enum PathKind {
     Abs,
     // FIXME: Can we remove this somehow?
     /// `$crate` from macro expansion
-    DollarCrate(CrateId),
+    DollarCrate(Crate),
 }
 
 impl PathKind {
@@ -42,14 +44,14 @@ impl PathKind {
 
 impl ModPath {
     pub fn from_src(
-        db: &dyn ExpandDatabase,
+        db: &dyn SourceDatabase,
         path: ast::Path,
-        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
     ) -> Option<ModPath> {
         convert_path(db, path, span_for_range)
     }
 
-    pub fn from_tt(db: &dyn ExpandDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+    pub fn from_tt(db: &dyn SourceDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
         convert_path_tt(db, tt)
     }
 
@@ -62,6 +64,58 @@ impl ModPath {
     /// Creates a `ModPath` from a `PathKind`, with no extra path segments.
     pub const fn from_kind(kind: PathKind) -> ModPath {
         ModPath { kind, segments: SmallVec::new_const() }
+    }
+
+    pub fn from_tokens(
+        db: &dyn SourceDatabase,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+        is_abs: bool,
+        segments: impl Iterator<Item = SyntaxToken>,
+    ) -> Option<ModPath> {
+        let mut segments = segments.peekable();
+        let mut result = SmallVec::new_const();
+        let path_kind = if is_abs {
+            PathKind::Abs
+        } else {
+            let first = segments.next()?;
+            match first.kind() {
+                T![crate] => PathKind::Crate,
+                T![self] => PathKind::Super(handle_super(&mut segments)),
+                T![super] => PathKind::Super(1 + handle_super(&mut segments)),
+                T![ident] => {
+                    let first_text = first.text();
+                    if first_text == "$crate" {
+                        let ctxt = span_for_range(first.text_range());
+                        resolve_crate_root(db, ctxt)
+                            .map(PathKind::DollarCrate)
+                            .unwrap_or(PathKind::Crate)
+                    } else {
+                        result.push(Name::new_symbol_root(Symbol::intern(first_text)));
+                        PathKind::Plain
+                    }
+                }
+                _ => return None,
+            }
+        };
+        for segment in segments {
+            if segment.kind() != T![ident] {
+                return None;
+            }
+            result.push(Name::new_symbol_root(Symbol::intern(segment.text())));
+        }
+        if result.is_empty() {
+            return None;
+        }
+        result.shrink_to_fit();
+        return Some(ModPath { kind: path_kind, segments: result });
+
+        fn handle_super(segments: &mut Peekable<impl Iterator<Item = SyntaxToken>>) -> u8 {
+            let mut result = 0;
+            while segments.next_if(|it| it.kind() == T![super]).is_some() {
+                result += 1;
+            }
+            result
+        }
     }
 
     pub fn segments(&self) -> &[Name] {
@@ -111,8 +165,7 @@ impl ModPath {
 
     #[allow(non_snake_case)]
     pub fn is_Self(&self) -> bool {
-        self.kind == PathKind::Plain
-            && matches!(&*self.segments, [name] if *name == sym::Self_.clone())
+        self.kind == PathKind::Plain && matches!(&*self.segments, [name] if *name == sym::Self_)
     }
 
     /// If this path is a single identifier, like `foo`, return its name.
@@ -126,16 +179,13 @@ impl ModPath {
             _ => None,
         }
     }
-    pub fn display_verbatim<'a>(
-        &'a self,
-        db: &'a dyn crate::db::ExpandDatabase,
-    ) -> impl fmt::Display + 'a {
+    pub fn display_verbatim<'a>(&'a self, db: &'a dyn SourceDatabase) -> impl fmt::Display + 'a {
         Display { db, path: self, edition: None }
     }
 
     pub fn display<'a>(
         &'a self,
-        db: &'a dyn crate::db::ExpandDatabase,
+        db: &'a dyn SourceDatabase,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         Display { db, path: self, edition: Some(edition) }
@@ -149,7 +199,7 @@ impl Extend<Name> for ModPath {
 }
 
 struct Display<'a> {
-    db: &'a dyn ExpandDatabase,
+    db: &'a dyn SourceDatabase,
     path: &'a ModPath,
     edition: Option<Edition>,
 }
@@ -167,7 +217,7 @@ impl From<Name> for ModPath {
 }
 
 fn display_fmt_path(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     path: &ModPath,
     f: &mut fmt::Formatter<'_>,
     edition: Option<Edition>,
@@ -207,9 +257,9 @@ fn display_fmt_path(
 }
 
 fn convert_path(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     path: ast::Path,
-    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
+    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
 ) -> Option<ModPath> {
     let mut segments = path.segments();
 
@@ -251,7 +301,7 @@ fn convert_path(
             }
         }
         ast::PathSegmentKind::SelfTypeKw => {
-            ModPath::from_segments(PathKind::Plain, Some(Name::new_symbol_root(sym::Self_.clone())))
+            ModPath::from_segments(PathKind::Plain, Some(Name::new_symbol_root(sym::Self_)))
         }
         ast::PathSegmentKind::CrateKw => ModPath::from_segments(PathKind::Crate, iter::empty()),
         ast::PathSegmentKind::SelfKw => handle_super_kw(0)?,
@@ -274,16 +324,17 @@ fn convert_path(
     // Basically, even in rustc it is quite hacky:
     // https://github.com/rust-lang/rust/blob/614f273e9388ddd7804d5cbc80b8865068a3744e/src/librustc_resolve/macros.rs#L456
     // We follow what it did anyway :)
-    if mod_path.segments.len() == 1 && mod_path.kind == PathKind::Plain {
-        if let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast) {
-            let syn_ctx = span_for_range(segment.syntax().text_range());
-            if let Some(macro_call_id) = db.lookup_intern_syntax_context(syn_ctx).outer_expn {
-                if db.lookup_intern_macro_call(macro_call_id).def.local_inner {
-                    mod_path.kind = match resolve_crate_root(db, syn_ctx) {
-                        Some(crate_root) => PathKind::DollarCrate(crate_root),
-                        None => PathKind::Crate,
-                    }
-                }
+    if mod_path.segments.len() == 1
+        && mod_path.kind == PathKind::Plain
+        && let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast)
+    {
+        let syn_ctx = span_for_range(segment.syntax().text_range());
+        if let Some(macro_call_id) = syn_ctx.outer_expn(db)
+            && crate::MacroCallId::from(macro_call_id).loc(db).def.local_inner
+        {
+            mod_path.kind = match resolve_crate_root(db, syn_ctx) {
+                Some(crate_root) => PathKind::DollarCrate(crate_root),
+                None => PathKind::Crate,
             }
         }
     }
@@ -291,7 +342,7 @@ fn convert_path(
     Some(mod_path)
 }
 
-fn convert_path_tt(db: &dyn ExpandDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+fn convert_path_tt(db: &dyn SourceDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
     let mut leaves = tt.iter().filter_map(|tt| match tt {
         tt::TtElement::Leaf(leaf) => Some(leaf),
         tt::TtElement::Subtree(..) => None,
@@ -302,16 +353,16 @@ fn convert_path_tt(db: &dyn ExpandDatabase, tt: tt::TokenTreesView<'_>) -> Optio
             tt::Leaf::Punct(tt::Punct { char: ':', .. }) => PathKind::Abs,
             _ => return None,
         },
-        tt::Leaf::Ident(tt::Ident { sym: text, span, .. }) if *text == sym::dollar_crate => {
+        tt::Leaf::Ident(tt::Ident { sym: text, span, .. }) if text == sym::dollar_crate => {
             resolve_crate_root(db, span.ctx).map(PathKind::DollarCrate).unwrap_or(PathKind::Crate)
         }
-        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if *text == sym::self_ => PathKind::SELF,
-        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if *text == sym::super_ => {
+        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::self_ => PathKind::SELF,
+        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::super_ => {
             let mut deg = 1;
             while let Some(tt::Leaf::Ident(tt::Ident { sym: text, span, is_raw: _ })) =
                 leaves.next()
             {
-                if *text != sym::super_ {
+                if text != sym::super_ {
                     segments.push(Name::new_symbol(text.clone(), span.ctx));
                     break;
                 }
@@ -319,7 +370,7 @@ fn convert_path_tt(db: &dyn ExpandDatabase, tt: tt::TokenTreesView<'_>) -> Optio
             }
             PathKind::Super(deg)
         }
-        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if *text == sym::crate_ => PathKind::Crate,
+        tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::crate_ => PathKind::Crate,
         tt::Leaf::Ident(ident) => {
             segments.push(Name::new_symbol(ident.sym.clone(), ident.span.ctx));
             PathKind::Plain
@@ -333,27 +384,27 @@ fn convert_path_tt(db: &dyn ExpandDatabase, tt: tt::TokenTreesView<'_>) -> Optio
     Some(ModPath { kind, segments })
 }
 
-pub fn resolve_crate_root(db: &dyn ExpandDatabase, mut ctxt: SyntaxContextId) -> Option<CrateId> {
+pub fn resolve_crate_root(db: &dyn SourceDatabase, mut ctxt: SyntaxContext) -> Option<Crate> {
     // When resolving `$crate` from a `macro_rules!` invoked in a `macro`,
     // we don't want to pretend that the `macro_rules!` definition is in the `macro`
-    // as described in `SyntaxContext::apply_mark`, so we ignore prepended opaque marks.
+    // as described in `SyntaxContextId::apply_mark`, so we ignore prepended opaque marks.
     // FIXME: This is only a guess and it doesn't work correctly for `macro_rules!`
     // definitions actually produced by `macro` and `macro` definitions produced by
     // `macro_rules!`, but at least such configurations are not stable yet.
     ctxt = ctxt.normalize_to_macro_rules(db);
-    let mut iter = marks_rev(ctxt, db).peekable();
+    let mut iter = ctxt.marks_rev(db).peekable();
     let mut result_mark = None;
     // Find the last opaque mark from the end if it exists.
     while let Some(&(mark, Transparency::Opaque)) = iter.peek() {
         result_mark = Some(mark);
         iter.next();
     }
-    // Then find the last semi-transparent mark from the end if it exists.
-    while let Some((mark, Transparency::SemiTransparent)) = iter.next() {
+    // Then find the last semi-opaque mark from the end if it exists.
+    while let Some((mark, Transparency::SemiOpaque)) = iter.next() {
         result_mark = Some(mark);
     }
 
-    result_mark.map(|call| db.lookup_intern_macro_call(call).def.krate)
+    result_mark.map(|call| crate::MacroCallId::from(call).loc(db).def.krate)
 }
 
 pub use crate::name as __name;
@@ -370,6 +421,11 @@ macro_rules! __known_path {
     (core::ops::RangeTo) => {};
     (core::ops::RangeToInclusive) => {};
     (core::ops::RangeInclusive) => {};
+    (core::range::Range) => {};
+    (core::range::RangeFrom) => {};
+    (core::range::RangeInclusive) => {};
+    (core::range::RangeToInclusive) => {};
+    (core::async_iter::AsyncIterator) => {};
     (core::future::Future) => {};
     (core::future::IntoFuture) => {};
     (core::fmt::Debug) => {};
@@ -399,7 +455,7 @@ pub use crate::__path as path;
 macro_rules! __tool_path {
     ($start:ident $(:: $seg:ident)*) => ({
         $crate::mod_path::ModPath::from_segments($crate::mod_path::PathKind::Plain, vec![
-            $crate::name::Name::new_symbol_root($crate::intern::sym::rust_analyzer.clone()), $crate::name::Name::new_symbol_root($crate::intern::sym::$start.clone()), $($crate::name::Name::new_symbol_root($crate::intern::sym::$seg.clone()),)*
+            $crate::name::Name::new_symbol_root($crate::intern::sym::rust_analyzer), $crate::name::Name::new_symbol_root($crate::intern::sym::$start.clone()), $($crate::name::Name::new_symbol_root($crate::intern::sym::$seg.clone()),)*
         ])
     });
 }

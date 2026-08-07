@@ -1,3 +1,6 @@
+// ignore-tidy-file-linelength
+//
+//@ compile-flags: --enable-index-page -Z unstable-options
 //! The point of this crate is to be able to have enough different "kinds" of
 //! documentation generated so we can test each different features.
 #![doc(html_playground_url="https://play.rust-lang.org/")]
@@ -7,6 +10,9 @@
 #![feature(rustdoc_internals)]
 #![feature(doc_cfg)]
 #![feature(associated_type_defaults)]
+#![feature(macro_attr)]
+#![feature(macro_derive)]
+#![feature(negative_impls)]
 
 /*!
 Enable the feature <span class="stab portability"><code>some-feature</code></span> to enjoy
@@ -79,10 +85,24 @@ impl Foo {
     pub fn warning2() {}
 }
 
+/// <a href="#implementations"><code id="trait-impl-link-in-summary">A collapsible trait impl with a link</code></a>
 impl AsRef<str> for Foo {
     fn as_ref(&self) -> &str {
         "hello"
     }
+}
+
+unsafe impl Send for Foo {}
+impl !Sync for Foo {}
+
+impl From<u8> for Foo {
+    fn from(value: u8) -> Self { todo!(); }
+}
+impl From<u16> for Foo {
+    fn from(value: u16) -> Self { todo!(); }
+}
+impl From<u32> for Foo {
+    fn from(value: u32) -> Self { todo!(); }
 }
 
 /// <div id="doc-warning-0" class="warning">I have warnings!</div>
@@ -159,6 +179,10 @@ pub enum AnEnum {
 #[doc(keyword = "for")]
 /// Some keyword.
 pub mod keyword {}
+
+#[doc(attribute = "forbid")]
+/// Some attribute.
+pub mod repr {}
 
 /// Just some type alias.
 pub type SomeType = u32;
@@ -454,10 +478,10 @@ pub fn safe_fn() {}
 
 #[repr(C)]
 pub struct WithGenerics<T: TraitWithNoDocblocks, S = String, E = WhoLetTheDogOut, P = i8> {
-    s: S,
-    t: T,
-    e: E,
-    p: P,
+    pub s: S,
+    pub t: T,
+    pub e: E,
+    pub p: P,
 }
 
 pub struct StructWithPublicUndocumentedFields {
@@ -679,7 +703,6 @@ impl ImplDoc {
     pub fn bar2() {}
 }
 
-// ignore-tidy-linelength
 /// | this::is::a::kinda::very::long::header::number::one | this::is::a::kinda::very::long::header::number::two | this::is::a::kinda::very::long::header::number::three |
 /// |-|-|-|
 /// | bla | bli | blob |
@@ -765,4 +788,28 @@ pub mod impls_indent {
         /// bla
         pub fn bar() {}
     }
+}
+
+pub mod tooltips {
+    pub struct X;
+
+    impl X {
+        pub fn bar() -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    pub fn bar() -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+pub mod tyalias {
+    pub struct X<T>(pub T);
+
+    impl<T: std::fmt::Debug> X<T> {
+        pub fn blob(&self) {}
+    }
+
+    pub type Y = X<u8>;
 }

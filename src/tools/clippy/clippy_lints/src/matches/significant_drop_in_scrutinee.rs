@@ -4,15 +4,15 @@ use crate::FxHashSet;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::{first_line_of_span, indent_of, snippet};
 use clippy_utils::ty::{for_each_top_level_late_bound_region, is_copy};
-use clippy_utils::{get_attr, is_lint_allowed};
+use clippy_utils::{get_builtin_attr, is_lint_allowed, sym};
 use itertools::Itertools;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{Applicability, Diag};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{Arm, Expr, ExprKind, MatchSource};
-use rustc_lint::{LateContext, LintContext};
-use rustc_middle::ty::{GenericArgKind, Region, RegionKind, Ty, TyCtxt, TypeVisitable, TypeVisitor};
+use rustc_lint::LateContext;
+use rustc_middle::ty::{GenericArgKind, RegionKind, Ty, TypeVisitableExt};
 use rustc_span::Span;
 
 use super::SIGNIFICANT_DROP_IN_SCRUTINEE;
@@ -183,10 +183,10 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
 
     fn has_sig_drop_attr_impl(&mut self, ty: Ty<'tcx>) -> bool {
         if let Some(adt) = ty.ty_adt_def()
-            && get_attr(
-                self.cx.sess(),
-                self.cx.tcx.get_attrs_unchecked(adt.did()),
-                "has_significant_drop",
+            && get_builtin_attr(
+                #[allow(deprecated)]
+                self.cx.tcx.get_all_attrs(adt.did()),
+                sym::has_significant_drop,
             )
             .count()
                 > 0
@@ -203,17 +203,17 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
                 // if some field has significant drop,
                 adt.all_fields()
                     .map(|field| field.ty(self.cx.tcx, args))
-                    .any(|ty| self.has_sig_drop_attr_impl(ty))
+                    .any(|ty| self.has_sig_drop_attr_impl(ty.skip_norm_wip()))
                     // or if there is no generic lifetime and..
                     // (to avoid false positive on `Ref<'a, MutexGuard<Foo>>`)
                     || (args
                         .iter()
-                        .all(|arg| !matches!(arg.unpack(), GenericArgKind::Lifetime(_)))
+                        .all(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)))
                         // some generic parameter has significant drop
                         // (to avoid false negative on `Box<MutexGuard<Foo>>`)
                         && args
                             .iter()
-                            .filter_map(|arg| match arg.unpack() {
+                            .filter_map(|arg| match arg.kind() {
                                 GenericArgKind::Type(ty) => Some(ty),
                                 _ => None,
                             })
@@ -226,11 +226,12 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 enum SigDropHolder {
     /// No values with significant drop present in this expression.
     ///
     /// Expressions that we've emitted lints do not count.
+    #[default]
     None,
     /// Some field in this expression references to values with significant drop.
     ///
@@ -242,12 +243,6 @@ enum SigDropHolder {
     DirectRef,
     /// This expression should be moved out to avoid significant drop in scrutinee.
     Moved,
-}
-
-impl Default for SigDropHolder {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 struct SigDropHelper<'a, 'tcx> {
@@ -308,13 +303,13 @@ impl<'a, 'tcx> SigDropHelper<'a, 'tcx> {
 
         if self.sig_drop_holder != SigDropHolder::None {
             let parent_ty = self.cx.typeck_results().expr_ty(parent_expr);
-            if !ty_has_erased_regions(parent_ty) && !parent_expr.is_syntactic_place_expr() {
+            if !parent_ty.has_erased_regions() && !parent_expr.is_syntactic_place_expr() {
                 self.replace_current_sig_drop(parent_expr.span, parent_ty.is_unit(), 0);
                 self.sig_drop_holder = SigDropHolder::Moved;
             }
 
             let (peel_ref_ty, peel_ref_times) = ty_peel_refs(parent_ty);
-            if !ty_has_erased_regions(peel_ref_ty) && is_copy(self.cx, peel_ref_ty) {
+            if !peel_ref_ty.has_erased_regions() && is_copy(self.cx, peel_ref_ty) {
                 self.replace_current_sig_drop(parent_expr.span, peel_ref_ty.is_unit(), peel_ref_times);
                 self.sig_drop_holder = SigDropHolder::Moved;
             }
@@ -348,7 +343,7 @@ impl<'a, 'tcx> SigDropHelper<'a, 'tcx> {
         };
 
         let fn_sig = if let Some(def_id) = self.cx.typeck_results().type_dependent_def_id(parent_expr.hir_id) {
-            self.cx.tcx.fn_sig(def_id).instantiate_identity()
+            self.cx.tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip()
         } else {
             return;
         };
@@ -402,24 +397,6 @@ fn ty_peel_refs(mut ty: Ty<'_>) -> (Ty<'_>, usize) {
         n += 1;
     }
     (ty, n)
-}
-
-fn ty_has_erased_regions(ty: Ty<'_>) -> bool {
-    struct V;
-
-    impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for V {
-        type Result = ControlFlow<()>;
-
-        fn visit_region(&mut self, region: Region<'tcx>) -> Self::Result {
-            if region.is_erased() {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        }
-    }
-
-    ty.visit_with(&mut V).is_break()
 }
 
 impl<'tcx> Visitor<'tcx> for SigDropHelper<'_, 'tcx> {

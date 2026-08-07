@@ -1,7 +1,7 @@
 use super::USELESS_ATTRIBUTE;
 use super::utils::{is_lint_level, is_word, namespace_and_lint};
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::{SpanRangeExt, first_line_of_span};
+use clippy_utils::source::{SpanExt, first_line_of_span};
 use clippy_utils::sym;
 use rustc_ast::{Attribute, Item, ItemKind};
 use rustc_errors::Applicability;
@@ -15,7 +15,7 @@ pub(super) fn check(cx: &EarlyContext<'_>, item: &Item, attrs: &[Attribute]) {
             return;
         }
         if let Some(lint_list) = &attr.meta_item_list()
-            && attr.ident().is_some_and(|ident| is_lint_level(ident.name, attr.id))
+            && attr.name().is_some_and(is_lint_level)
         {
             for lint in lint_list {
                 match item.kind {
@@ -26,16 +26,19 @@ pub(super) fn check(cx: &EarlyContext<'_>, item: &Item, attrs: &[Attribute]) {
 
                         if namespace.is_none()
                             && matches!(
-                                name.as_str(),
-                                "ambiguous_glob_reexports"
-                                    | "dead_code"
-                                    | "deprecated"
-                                    | "hidden_glob_reexports"
-                                    | "unreachable_pub"
-                                    | "unused"
-                                    | "unused_braces"
-                                    | "unused_import_braces"
-                                    | "unused_imports"
+                                name,
+                                sym::ambiguous_glob_reexports
+                                    | sym::dead_code
+                                    | sym::deprecated
+                                    | sym::deprecated_in_future
+                                    | sym::exported_private_dependencies
+                                    | sym::hidden_glob_reexports
+                                    | sym::unreachable_pub
+                                    | sym::unused
+                                    | sym::unused_braces
+                                    | sym::unused_import_braces
+                                    | sym::unused_imports
+                                    | sym::redundant_imports
                             )
                         {
                             return;
@@ -43,16 +46,16 @@ pub(super) fn check(cx: &EarlyContext<'_>, item: &Item, attrs: &[Attribute]) {
 
                         if namespace == Some(sym::clippy)
                             && matches!(
-                                name.as_str(),
-                                "wildcard_imports"
-                                    | "enum_glob_use"
-                                    | "redundant_pub_crate"
-                                    | "macro_use_imports"
-                                    | "unsafe_removed_from_name"
-                                    | "module_name_repetitions"
-                                    | "single_component_path_imports"
-                                    | "disallowed_types"
-                                    | "unused_trait_names"
+                                name,
+                                sym::wildcard_imports
+                                    | sym::enum_glob_use
+                                    | sym::redundant_pub_crate
+                                    | sym::macro_use_imports
+                                    | sym::unsafe_removed_from_name
+                                    | sym::module_name_repetitions
+                                    | sym::single_component_path_imports
+                                    | sym::disallowed_types
+                                    | sym::unused_trait_names
                             )
                         {
                             return;
@@ -71,7 +74,7 @@ pub(super) fn check(cx: &EarlyContext<'_>, item: &Item, attrs: &[Attribute]) {
             }
             let line_span = first_line_of_span(cx, attr.span);
 
-            if let Some(src) = line_span.get_source_text(cx)
+            if let Some(src) = line_span.get_text(cx)
                 && src.contains("#[")
             {
                 #[expect(clippy::collapsible_span_lint_calls)]

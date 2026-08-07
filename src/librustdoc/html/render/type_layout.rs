@@ -3,9 +3,8 @@ use std::fmt;
 use askama::Template;
 use rustc_abi::{Primitive, TagEncoding, Variants};
 use rustc_hir::def_id::DefId;
-use rustc_middle::span_bug;
 use rustc_middle::ty::layout::LayoutError;
-use rustc_middle::ty::{self};
+use rustc_middle::{span_bug, ty};
 use rustc_span::symbol::Symbol;
 
 use crate::html::render::Context;
@@ -33,7 +32,7 @@ pub(crate) fn document_type_layout(cx: &Context<'_>, ty_def_id: DefId) -> impl f
 
         let tcx = cx.tcx();
         let typing_env = ty::TypingEnv::post_analysis(tcx, ty_def_id);
-        let ty = tcx.type_of(ty_def_id).instantiate_identity();
+        let ty = tcx.type_of(ty_def_id).instantiate_identity().skip_norm_wip();
         let type_layout = tcx.layout_of(typing_env.as_query_input(ty));
 
         let variants = if let Ok(type_layout) = type_layout
@@ -55,7 +54,7 @@ pub(crate) fn document_type_layout(cx: &Context<'_>, ty_def_id: DefId) -> impl f
                         span_bug!(tcx.def_span(ty_def_id), "not an adt")
                     };
                     let name = adt.variant(variant_idx).name;
-                    let is_unsized = variant_layout.is_unsized();
+                    let is_unsized = variant_layout.backend_repr.is_unsized();
                     let is_uninhabited = variant_layout.is_uninhabited();
                     let size = variant_layout.size.bytes() - tag_size;
                     let type_layout_size = TypeLayoutSize { is_unsized, is_uninhabited, size };

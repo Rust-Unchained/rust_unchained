@@ -31,12 +31,18 @@ pub fn fn_like_mk_literals(_args: TokenStream) -> TokenStream {
         TokenTree::from(Literal::byte_string(b"byte_string")),
         TokenTree::from(Literal::character('c')),
         TokenTree::from(Literal::string("string")),
+        TokenTree::from(Literal::string("-string")),
+        TokenTree::from(Literal::c_string(c"cstring")),
         // as of 2022-07-21, there's no method on `Literal` to build a raw
         // string or a raw byte string
         TokenTree::from(Literal::f64_suffixed(3.14)),
+        TokenTree::from(Literal::f64_suffixed(-3.14)),
         TokenTree::from(Literal::f64_unsuffixed(3.14)),
+        TokenTree::from(Literal::f64_unsuffixed(-3.14)),
         TokenTree::from(Literal::i64_suffixed(123)),
+        TokenTree::from(Literal::i64_suffixed(-123)),
         TokenTree::from(Literal::i64_unsuffixed(123)),
+        TokenTree::from(Literal::i64_unsuffixed(-123)),
     ];
     TokenStream::from_iter(trees)
 }
@@ -73,6 +79,16 @@ pub fn fn_like_span_ops(args: TokenStream) -> TokenStream {
     TokenStream::from_iter(vec![first, second, third])
 }
 
+/// Returns the line and column of the first token's span as two integer literals.
+#[proc_macro]
+pub fn fn_like_span_line_column(args: TokenStream) -> TokenStream {
+    let first = args.into_iter().next().unwrap();
+    let span = first.span();
+    let line = Literal::usize_unsuffixed(span.line());
+    let column = Literal::usize_unsuffixed(span.column());
+    TokenStream::from_iter(vec![TokenTree::Literal(line), TokenTree::Literal(column)])
+}
+
 #[proc_macro_attribute]
 pub fn attr_noop(_args: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -88,9 +104,14 @@ pub fn attr_error(args: TokenStream, item: TokenStream) -> TokenStream {
     format!("compile_error!(\"#[attr_error({})] {}\");", args, item).parse().unwrap()
 }
 
+#[proc_macro_derive(DeriveReemit, attributes(helper))]
+pub fn derive_reemit(item: TokenStream) -> TokenStream {
+    item
+}
+
 #[proc_macro_derive(DeriveEmpty)]
 pub fn derive_empty(_item: TokenStream) -> TokenStream {
-    TokenStream::new()
+    TokenStream::default()
 }
 
 #[proc_macro_derive(DerivePanic)]

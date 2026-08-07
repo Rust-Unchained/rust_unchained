@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 
+use rustc_data_structures::fx::FxHashMap;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::visit::{NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
+use smallvec::SmallVec;
 
 use super::MaybeBorrowedLocals;
-use crate::{Analysis, GenKill, ResultsCursor};
+use crate::{Analysis, GenKill, Results, ResultsCursor};
 
 /// The set of locals in a MIR body that do not have `StorageLive`/`StorageDead` annotations.
 ///
@@ -53,7 +55,7 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeStorageLive<'a> {
     }
 
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         stmt: &Statement<'tcx>,
         _: Location,
@@ -97,7 +99,7 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeStorageDead<'a> {
     }
 
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         stmt: &Statement<'tcx>,
         _: Location,
@@ -110,21 +112,51 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeStorageDead<'a> {
     }
 }
 
-type BorrowedLocalsResults<'mir, 'tcx> = ResultsCursor<'mir, 'tcx, MaybeBorrowedLocals>;
+/// For each location, records which locals can be killed by `MaybeRequiresStorage`.
+type KillableLocals = FxHashMap<Location, SmallVec<[Local; 4]>>;
 
 /// Dataflow analysis that determines whether each local requires storage at a
 /// given location; i.e. whether its storage can go away without being observed.
-pub struct MaybeRequiresStorage<'mir, 'tcx> {
-    borrowed_locals: BorrowedLocalsResults<'mir, 'tcx>,
+pub struct MaybeRequiresStorage {
+    /// Used to kill locals that are fully moved and have not been borrowed.
+    killable_locals: KillableLocals,
 }
 
-impl<'mir, 'tcx> MaybeRequiresStorage<'mir, 'tcx> {
-    pub fn new(borrowed_locals: BorrowedLocalsResults<'mir, 'tcx>) -> Self {
-        MaybeRequiresStorage { borrowed_locals }
+impl MaybeRequiresStorage {
+    pub fn new<'tcx>(
+        body: &Body<'tcx>,
+        borrowed_locals: &Results<'tcx, MaybeBorrowedLocals>,
+    ) -> Self {
+        struct KillableLocalsVisitor<'mir, 'tcx> {
+            borrowed_locals_cursor: ResultsCursor<'mir, 'tcx, MaybeBorrowedLocals>,
+            killable_locals: KillableLocals,
+        }
+
+        impl<'tcx> Visitor<'tcx> for KillableLocalsVisitor<'_, 'tcx> {
+            fn visit_local(&mut self, local: Local, context: PlaceContext, loc: Location) {
+                if PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) == context {
+                    self.borrowed_locals_cursor.seek_before_primary_effect(loc);
+                    if !self.borrowed_locals_cursor.get().contains(local) {
+                        self.killable_locals.entry(loc).or_default().push(local);
+                    }
+                }
+            }
+        }
+
+        let mut visitor = KillableLocalsVisitor {
+            borrowed_locals_cursor: ResultsCursor::new_borrowing(body, borrowed_locals),
+            killable_locals: Default::default(),
+        };
+
+        for (bb, data) in traversal::reachable(body) {
+            visitor.visit_basic_block_data(bb, data);
+        }
+
+        MaybeRequiresStorage { killable_locals: visitor.killable_locals }
     }
 }
 
-impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
+impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage {
     type Domain = DenseBitSet<Local>;
 
     const NAME: &'static str = "requires_storage";
@@ -143,7 +175,7 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
     }
 
     fn apply_early_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         stmt: &Statement<'tcx>,
         loc: Location,
@@ -154,10 +186,10 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
         match &stmt.kind {
             StatementKind::StorageDead(l) => state.kill(*l),
 
-            // If a place is assigned to in a statement, it needs storage for that statement.
-            StatementKind::Assign(box (place, _))
-            | StatementKind::SetDiscriminant { box place, .. }
-            | StatementKind::Deinit(box place) => {
+            StatementKind::Assign((place, _)) => {
+                state.gen_(place.local);
+            }
+            StatementKind::SetDiscriminant { place, .. } => {
                 state.gen_(place.local);
             }
 
@@ -169,7 +201,6 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
             | StatementKind::FakeRead(..)
             | StatementKind::ConstEvalCounter
             | StatementKind::Nop
-            | StatementKind::Retag(..)
             | StatementKind::Intrinsic(..)
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::StorageLive(..) => {}
@@ -177,18 +208,40 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
     }
 
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
-        _: &Statement<'tcx>,
+        stmt: &Statement<'tcx>,
         loc: Location,
     ) {
-        // If we move from a place then it only stops needing storage *after*
-        // that statement.
+        // If we move from a place then it only stops needing storage *after* that statement.
         self.check_for_move(state, loc);
+
+        match &stmt.kind {
+            // If a place is assigned to in a statement, it needs storage after that statement.
+            // Even if the place was moved from in the rvalue (e.g. `x = x + 1` or `x = f(move x)`),
+            // the assignment restores a valid value into the place.
+            StatementKind::Assign((place, _)) => {
+                state.gen_(place.local);
+            }
+            StatementKind::SetDiscriminant { place, .. } => {
+                state.gen_(place.local);
+            }
+
+            StatementKind::StorageDead(_)
+            | StatementKind::AscribeUserType(..)
+            | StatementKind::PlaceMention(..)
+            | StatementKind::Coverage(..)
+            | StatementKind::FakeRead(..)
+            | StatementKind::ConstEvalCounter
+            | StatementKind::Nop
+            | StatementKind::Intrinsic(..)
+            | StatementKind::BackwardIncompatibleDropHint { .. }
+            | StatementKind::StorageLive(..) => {}
+        }
     }
 
     fn apply_early_terminator_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         terminator: &Terminator<'tcx>,
         loc: Location,
@@ -242,12 +295,12 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
         }
     }
 
-    fn apply_primary_terminator_effect<'t>(
-        &mut self,
+    fn apply_primary_terminator_effect(
+        &self,
         state: &mut Self::Domain,
-        terminator: &'t Terminator<'tcx>,
+        terminator: &Terminator<'tcx>,
         loc: Location,
-    ) -> TerminatorEdges<'t, 'tcx> {
+    ) {
         match terminator.kind {
             // For call terminators the destination requires storage for the call
             // and after the call returns successfully, but not after a panic.
@@ -280,11 +333,10 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
         }
 
         self.check_for_move(state, loc);
-        terminator.edges()
     }
 
     fn apply_call_return_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         _block: BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
@@ -293,26 +345,12 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
     }
 }
 
-impl<'tcx> MaybeRequiresStorage<'_, 'tcx> {
+impl MaybeRequiresStorage {
     /// Kill locals that are fully moved and have not been borrowed.
-    fn check_for_move(&mut self, state: &mut <Self as Analysis<'tcx>>::Domain, loc: Location) {
-        let body = self.borrowed_locals.body();
-        let mut visitor = MoveVisitor { state, borrowed_locals: &mut self.borrowed_locals };
-        visitor.visit_location(body, loc);
-    }
-}
-
-struct MoveVisitor<'a, 'mir, 'tcx> {
-    borrowed_locals: &'a mut BorrowedLocalsResults<'mir, 'tcx>,
-    state: &'a mut DenseBitSet<Local>,
-}
-
-impl<'tcx> Visitor<'tcx> for MoveVisitor<'_, '_, 'tcx> {
-    fn visit_local(&mut self, local: Local, context: PlaceContext, loc: Location) {
-        if PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) == context {
-            self.borrowed_locals.seek_before_primary_effect(loc);
-            if !self.borrowed_locals.get().contains(local) {
-                self.state.kill(local);
+    fn check_for_move(&self, state: &mut <Self as Analysis<'_>>::Domain, loc: Location) {
+        if let Some(locals) = self.killable_locals.get(&loc) {
+            for &l in locals {
+                state.kill(l);
             }
         }
     }

@@ -2,12 +2,11 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Trait {
+const trait Trait {
   type Out;
 }
 
-const fn needs_const<T: ~const Trait>(_: &T) {}
+const fn needs_const<T: [const] Trait>(_: &T) {}
 
 const IN_CONST: () = {
   needs_const(&());

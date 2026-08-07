@@ -5,15 +5,13 @@ use rustc_middle::mir::{Body, Local, Location, SourceInfo};
 use rustc_middle::span_bug;
 use rustc_middle::ty::relate::Relate;
 use rustc_middle::ty::{GenericArgsRef, Region, RegionVid, Ty, TyCtxt, TypeVisitable};
-use rustc_mir_dataflow::ResultsCursor;
-use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
 use rustc_mir_dataflow::move_paths::MoveData;
 use rustc_mir_dataflow::points::DenseLocationMap;
 use tracing::debug;
 
 use super::TypeChecker;
 use crate::constraints::OutlivesConstraintSet;
-use crate::polonius::PoloniusLivenessContext;
+use crate::polonius::PoloniusContext;
 use crate::region_infer::values::LivenessValues;
 use crate::universal_regions::UniversalRegions;
 
@@ -28,10 +26,9 @@ mod trace;
 ///
 /// N.B., this computation requires normalization; therefore, it must be
 /// performed before
-pub(super) fn generate<'a, 'tcx>(
+pub(super) fn generate<'tcx>(
     typeck: &mut TypeChecker<'_, 'tcx>,
     location_map: &DenseLocationMap,
-    flow_inits: ResultsCursor<'a, 'tcx, MaybeInitializedPlaces<'a, 'tcx>>,
     move_data: &MoveData<'tcx>,
 ) {
     debug!("liveness::generate");
@@ -51,14 +48,14 @@ pub(super) fn generate<'a, 'tcx>(
     if typeck.tcx().sess.opts.unstable_opts.polonius.is_next_enabled() {
         let (_, boring_locals) =
             compute_relevant_live_locals(typeck.tcx(), &free_regions, typeck.body);
-        typeck.polonius_liveness.as_mut().unwrap().boring_nll_locals =
+        typeck.polonius_context.as_mut().unwrap().boring_nll_locals =
             boring_locals.into_iter().collect();
         free_regions = typeck.universal_regions.universal_regions_iter().collect();
     }
     let (relevant_live_locals, boring_locals) =
         compute_relevant_live_locals(typeck.tcx(), &free_regions, typeck.body);
 
-    trace::trace(typeck, location_map, flow_inits, move_data, relevant_live_locals, boring_locals);
+    trace::trace(typeck, location_map, move_data, relevant_live_locals, boring_locals);
 
     // Mark regions that should be live where they appear within rvalues or within a call: like
     // args, regions, and types.
@@ -66,7 +63,7 @@ pub(super) fn generate<'a, 'tcx>(
         typeck.tcx(),
         &mut typeck.constraints.liveness_constraints,
         &typeck.universal_regions,
-        &mut typeck.polonius_liveness,
+        &mut typeck.polonius_context,
         typeck.body,
     );
 }
@@ -143,11 +140,11 @@ fn record_regular_live_regions<'tcx>(
     tcx: TyCtxt<'tcx>,
     liveness_constraints: &mut LivenessValues,
     universal_regions: &UniversalRegions<'tcx>,
-    polonius_liveness: &mut Option<PoloniusLivenessContext>,
+    polonius_context: &mut Option<PoloniusContext>,
     body: &Body<'tcx>,
 ) {
     let mut visitor =
-        LiveVariablesVisitor { tcx, liveness_constraints, universal_regions, polonius_liveness };
+        LiveVariablesVisitor { tcx, liveness_constraints, universal_regions, polonius_context };
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         visitor.visit_basic_block_data(bb, data);
     }
@@ -158,7 +155,7 @@ struct LiveVariablesVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     liveness_constraints: &'a mut LivenessValues,
     universal_regions: &'a UniversalRegions<'tcx>,
-    polonius_liveness: &'a mut Option<PoloniusLivenessContext>,
+    polonius_context: &'a mut Option<PoloniusContext>,
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for LiveVariablesVisitor<'a, 'tcx> {
@@ -210,8 +207,8 @@ impl<'a, 'tcx> LiveVariablesVisitor<'a, 'tcx> {
         });
 
         // When using `-Zpolonius=next`, we record the variance of each live region.
-        if let Some(polonius_liveness) = self.polonius_liveness {
-            polonius_liveness.record_live_region_variance(self.tcx, self.universal_regions, value);
+        if let Some(polonius_context) = self.polonius_context {
+            polonius_context.record_live_region_variance(self.tcx, self.universal_regions, value);
         }
     }
 }

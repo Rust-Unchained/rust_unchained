@@ -1,6 +1,4 @@
-use std::assert_matches::assert_matches;
-use std::fmt;
-use std::path::PathBuf;
+use std::{assert_matches, fmt};
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
@@ -8,19 +6,18 @@ use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Namespace};
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::lang_items::LangItem;
-use rustc_index::bit_set::FiniteBitSet;
-use rustc_macros::{Decodable, Encodable, HashStable, Lift, TyDecodable, TyEncodable};
+use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable};
 use rustc_span::def_id::LOCAL_CRATE;
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, instrument};
 
 use crate::error;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::ty::normalize_erasing_regions::NormalizationError;
-use crate::ty::print::{FmtPrinter, Printer, shrunk_instance_name};
+use crate::ty::print::{FmtPrinter, Print};
 use crate::ty::{
-    self, EarlyBinder, GenericArgs, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable,
-    TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, AssocContainer, EarlyBinder, GenericArgs, GenericArgsRef, Ty, TyCtxt, TypeFoldable,
+    TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
 
 /// An `InstanceKind` along with the args that are needed to substitute the instance.
@@ -32,7 +29,7 @@ use crate::ty::{
 /// Note: the `Lift` impl is currently not used by rustc, but is used by
 /// rustc_codegen_cranelift when the `jit` feature is enabled.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, TyEncodable, TyDecodable)]
-#[derive(HashStable, Lift, TypeFoldable, TypeVisitable)]
+#[derive(StableHash, Lift, TypeFoldable, TypeVisitable)]
 pub struct Instance<'tcx> {
     pub def: InstanceKind<'tcx>,
     pub args: GenericArgsRef<'tcx>,
@@ -44,7 +41,7 @@ pub struct Instance<'tcx> {
 /// Currently, this is only used when KCFI is enabled, as only KCFI needs to treat those two
 /// `ReifyShim`s differently.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[derive(TyEncodable, TyDecodable, HashStable)]
+#[derive(TyEncodable, TyDecodable, StableHash)]
 pub enum ReifyReason {
     /// The `ReifyShim` was created to produce a function pointer. This happens when:
     /// * A vtable entry is directly converted to a function call (e.g. creating a fn ptr from a
@@ -61,7 +58,7 @@ pub enum ReifyReason {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable, Lift)]
+#[derive(TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable, Lift)]
 pub enum InstanceKind<'tcx> {
     /// A user-defined callable item.
     ///
@@ -71,19 +68,42 @@ pub enum InstanceKind<'tcx> {
     /// - coroutines
     Item(DefId),
 
-    /// An intrinsic `fn` item (with`#[rustc_instrinsic]`).
+    /// An intrinsic `fn` item (with`#[rustc_intrinsic]`).
     ///
-    /// Alongside `Virtual`, this is the only `InstanceKind` that does not have its own callable MIR.
-    /// Instead, codegen and const eval "magically" evaluate calls to intrinsics purely in the
-    /// caller.
+    /// Alongside `LlvmIntrinsic` and `Virtual`, this is the only `InstanceKind`
+    /// that does not have its own callable MIR. Instead, codegen and const eval
+    /// "magically" evaluate calls to intrinsics purely in the caller.
     Intrinsic(DefId),
 
+    /// An LLVM intrinsic `fn` item (with `extern "unadjusted"`).
+    ///
+    /// Alongside `Intrinsic` and `Virtual`, this is the only `InstanceKind`
+    /// that does not have its own callable MIR. Instead, codegen and const eval
+    /// "magically" evaluate calls to LLVM intrinsics purely in the caller.
+    LlvmIntrinsic(DefId),
+
+    /// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
+    ///
+    /// This `InstanceKind` may have a callable MIR as the default implementation.
+    /// Calls to `Virtual` instances must be codegen'd as virtual calls through the vtable.
+    /// *This means we might not know exactly what is being called.*
+    ///
+    /// If this is reified to a `fn` pointer, a `ReifyShim` is used (see `ReifyShim` above for more
+    /// details on that).
+    Virtual(DefId, usize),
+
+    Shim(ShimKind<'tcx>),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable, Lift)]
+pub enum ShimKind<'tcx> {
     /// `<T as Trait>::method` where `method` receives unsizeable `self: Self` (part of the
-    /// `unsized_locals` feature).
+    /// `unsized_fn_params` feature).
     ///
     /// The generated shim will take `Self` via `*mut Self` - conceptually this is `&owned Self` -
     /// and dereference the argument to call the original function.
-    VTableShim(DefId),
+    VTable(DefId),
 
     /// `fn()` pointer where the function itself cannot be turned into a pointer.
     ///
@@ -102,22 +122,12 @@ pub enum InstanceKind<'tcx> {
     ///
     /// This field will only be populated if we are compiling in a mode that needs these shims
     /// to be separable, currently only when KCFI is enabled.
-    ReifyShim(DefId, Option<ReifyReason>),
+    Reify(DefId, Option<ReifyReason>),
 
     /// `<fn() as FnTrait>::call_*` (generated `FnTrait` implementation for `fn()` pointers).
     ///
     /// `DefId` is `FnTrait::call_*`.
-    FnPtrShim(DefId, Ty<'tcx>),
-
-    /// Dynamic dispatch to `<dyn Trait as Trait>::fn`.
-    ///
-    /// This `InstanceKind` may have a callable MIR as the default implementation.
-    /// Calls to `Virtual` instances must be codegen'd as virtual calls through the vtable.
-    /// *This means we might not know exactly what is being called.*
-    ///
-    /// If this is reified to a `fn` pointer, a `ReifyShim` is used (see `ReifyShim` above for more
-    /// details on that).
-    Virtual(DefId, usize),
+    FnPtr(DefId, Ty<'tcx>),
 
     /// `<[FnMut/Fn closure] as FnOnce>::call_once`.
     ///
@@ -125,14 +135,14 @@ pub enum InstanceKind<'tcx> {
     ///
     /// This generates a body that will just borrow the (owned) self type,
     /// and dispatch to the `FnMut::call_mut` instance for the closure.
-    ClosureOnceShim { call_once: DefId, track_caller: bool },
+    ClosureOnce { call_once: DefId, closure: DefId, track_caller: bool },
 
     /// `<[FnMut/Fn coroutine-closure] as FnOnce>::call_once`
     ///
     /// The body generated here differs significantly from the `ClosureOnceShim`,
     /// since we need to generate a distinct coroutine type that will move the
     /// closure's upvars *out* of the closure.
-    ConstructCoroutineInClosureShim {
+    ConstructCoroutineInClosure {
         coroutine_closure_def_id: DefId,
         // Whether the generated MIR body takes the coroutine by-ref. This is
         // because the signature of `<{async fn} as FnMut>::call_mut` is:
@@ -145,13 +155,18 @@ pub enum InstanceKind<'tcx> {
     /// Compiler-generated accessor for thread locals which returns a reference to the thread local
     /// the `DefId` defines. This is used to export thread locals from dylibs on platforms lacking
     /// native support.
-    ThreadLocalShim(DefId),
+    ThreadLocal(DefId),
 
-    /// `core::ptr::drop_in_place::<T>`.
+    /// Proxy shim for async drop of future (def_id, proxy_cor_ty, impl_cor_ty)
+    FutureDropPoll(DefId, Ty<'tcx>, Ty<'tcx>),
+
+    /// `core::ptr::drop_glue::<T>`.
     ///
-    /// The `DefId` is for `core::ptr::drop_in_place`.
-    /// The `Option<Ty<'tcx>>` is either `Some(T)`, or `None` for empty drop
-    /// glue.
+    /// The `DefId` is for `core::ptr::drop_glue`.
+    /// The `Option<Ty<'tcx>>` is either `Some(T)`, or `None` for empty drop glue.
+    ///
+    /// The type must be monomorphic; for polymorphic drop glue use
+    /// `rustc_mir_transform::build_drop_shim`.
     DropGlue(DefId, Option<Ty<'tcx>>),
 
     /// Compiler-generated `<T as Clone>::clone` implementation.
@@ -160,20 +175,26 @@ pub enum InstanceKind<'tcx> {
     /// Additionally, arrays, tuples, and closures get a `Clone` shim even if they aren't `Copy`.
     ///
     /// The `DefId` is for `Clone::clone`, the `Ty` is the type `T` with the builtin `Clone` impl.
-    CloneShim(DefId, Ty<'tcx>),
+    Clone(DefId, Ty<'tcx>),
 
     /// Compiler-generated `<T as FnPtr>::addr` implementation.
     ///
     /// Automatically generated for all potentially higher-ranked `fn(I) -> R` types.
     ///
     /// The `DefId` is for `FnPtr::addr`, the `Ty` is the type `T`.
-    FnPtrAddrShim(DefId, Ty<'tcx>),
+    FnPtrAddr(DefId, Ty<'tcx>),
 
     /// `core::future::async_drop::async_drop_in_place::<'_, T>`.
     ///
     /// The `DefId` is for `core::future::async_drop::async_drop_in_place`, the `Ty`
     /// is the type `T`.
-    AsyncDropGlueCtorShim(DefId, Option<Ty<'tcx>>),
+    AsyncDropGlueCtor(DefId, Ty<'tcx>),
+
+    /// `core::future::async_drop::async_drop_in_place::<'_, T>::{closure}`.
+    ///
+    /// async_drop_in_place poll function implementation (for generated coroutine).
+    /// `Ty` here is `async_drop_in_place<T>::{closure}` coroutine type, not just `T`
+    AsyncDropGlue(DefId, Ty<'tcx>),
 }
 
 impl<'tcx> Instance<'tcx> {
@@ -203,7 +224,7 @@ impl<'tcx> Instance<'tcx> {
         if !tcx.sess.opts.share_generics()
             // However, if the def_id is marked inline(never), then it's fine to just reuse the
             // upstream monomorphization.
-            && tcx.codegen_fn_attrs(self.def_id()).inline != rustc_attr_data_structures::InlineAttr::Never
+            && tcx.codegen_fn_attrs(self.def_id()).inline != rustc_hir::attrs::InlineAttr::Never
         {
             return None;
         }
@@ -220,8 +241,12 @@ impl<'tcx> Instance<'tcx> {
             InstanceKind::Item(def) => tcx
                 .upstream_monomorphizations_for(def)
                 .and_then(|monos| monos.get(&self.args).cloned()),
-            InstanceKind::DropGlue(_, Some(_)) => tcx.upstream_drop_glue_for(self.args),
-            InstanceKind::AsyncDropGlueCtorShim(_, Some(_)) => {
+            InstanceKind::Shim(ShimKind::DropGlue(_, Some(_))) => {
+                tcx.upstream_drop_glue_for(self.args)
+            }
+            InstanceKind::Shim(ShimKind::AsyncDropGlue(_, _)) => None,
+            InstanceKind::Shim(ShimKind::FutureDropPoll(_, _, _)) => None,
+            InstanceKind::Shim(ShimKind::AsyncDropGlueCtor(_, _)) => {
                 tcx.upstream_async_drop_glue_for(self.args)
             }
             _ => None,
@@ -234,52 +259,22 @@ impl<'tcx> InstanceKind<'tcx> {
     pub fn def_id(self) -> DefId {
         match self {
             InstanceKind::Item(def_id)
-            | InstanceKind::VTableShim(def_id)
-            | InstanceKind::ReifyShim(def_id, _)
-            | InstanceKind::FnPtrShim(def_id, _)
             | InstanceKind::Virtual(def_id, _)
             | InstanceKind::Intrinsic(def_id)
-            | InstanceKind::ThreadLocalShim(def_id)
-            | InstanceKind::ClosureOnceShim { call_once: def_id, track_caller: _ }
-            | ty::InstanceKind::ConstructCoroutineInClosureShim {
-                coroutine_closure_def_id: def_id,
-                receiver_by_ref: _,
-            }
-            | InstanceKind::DropGlue(def_id, _)
-            | InstanceKind::CloneShim(def_id, _)
-            | InstanceKind::FnPtrAddrShim(def_id, _)
-            | InstanceKind::AsyncDropGlueCtorShim(def_id, _) => def_id,
+            | InstanceKind::LlvmIntrinsic(def_id) => def_id,
+            InstanceKind::Shim(shim) => shim.def_id(),
         }
     }
 
     /// Returns the `DefId` of instances which might not require codegen locally.
     pub fn def_id_if_not_guaranteed_local_codegen(self) -> Option<DefId> {
         match self {
-            ty::InstanceKind::Item(def) => Some(def),
-            ty::InstanceKind::DropGlue(def_id, Some(_))
-            | InstanceKind::AsyncDropGlueCtorShim(def_id, Some(_))
-            | InstanceKind::ThreadLocalShim(def_id) => Some(def_id),
-            InstanceKind::VTableShim(..)
-            | InstanceKind::ReifyShim(..)
-            | InstanceKind::FnPtrShim(..)
-            | InstanceKind::Virtual(..)
+            InstanceKind::Item(def) => Some(def),
+            InstanceKind::Virtual(..)
             | InstanceKind::Intrinsic(..)
-            | InstanceKind::ClosureOnceShim { .. }
-            | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
-            | InstanceKind::DropGlue(..)
-            | InstanceKind::AsyncDropGlueCtorShim(..)
-            | InstanceKind::CloneShim(..)
-            | InstanceKind::FnPtrAddrShim(..) => None,
+            | InstanceKind::LlvmIntrinsic(..) => None,
+            InstanceKind::Shim(shim) => shim.def_id_if_not_guaranteed_local_codegen(),
         }
-    }
-
-    #[inline]
-    pub fn get_attrs(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        attr: Symbol,
-    ) -> impl Iterator<Item = &'tcx hir::Attribute> {
-        tcx.get_attrs(self.def_id(), attr)
     }
 
     /// Returns `true` if the LLVM version of this instance is unconditionally
@@ -289,25 +284,30 @@ impl<'tcx> InstanceKind<'tcx> {
     /// `generates_cgu_internal_copy` for more information.
     pub fn requires_inline(&self, tcx: TyCtxt<'tcx>) -> bool {
         use rustc_hir::definitions::DefPathData;
-        let def_id = match *self {
-            ty::InstanceKind::Item(def) => def,
-            ty::InstanceKind::DropGlue(_, Some(_)) => return false,
-            ty::InstanceKind::AsyncDropGlueCtorShim(_, Some(_)) => return false,
-            ty::InstanceKind::ThreadLocalShim(_) => return false,
-            _ => return true,
-        };
-        matches!(
-            tcx.def_key(def_id).disambiguated_data.data,
-            DefPathData::Ctor | DefPathData::Closure
-        )
+        match *self {
+            InstanceKind::Item(def_id) => matches!(
+                tcx.def_key(def_id).disambiguated_data.data,
+                DefPathData::Ctor | DefPathData::Closure
+            ),
+            InstanceKind::Shim(shim) => shim.requires_inline(),
+            InstanceKind::Virtual(..)
+            | InstanceKind::Intrinsic(..)
+            | InstanceKind::LlvmIntrinsic(..) => true,
+        }
     }
 
     pub fn requires_caller_location(&self, tcx: TyCtxt<'_>) -> bool {
         match *self {
-            InstanceKind::Item(def_id) | InstanceKind::Virtual(def_id, _) => {
+            InstanceKind::Item(def_id)
+            | InstanceKind::Virtual(def_id, _)
+            | InstanceKind::Shim(ShimKind::VTable(def_id)) => {
                 tcx.body_codegen_attrs(def_id).flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
             }
-            InstanceKind::ClosureOnceShim { call_once: _, track_caller } => track_caller,
+            InstanceKind::Shim(ShimKind::ClosureOnce {
+                call_once: _,
+                closure: _,
+                track_caller,
+            }) => track_caller,
             _ => false,
         }
     }
@@ -320,21 +320,82 @@ impl<'tcx> InstanceKind<'tcx> {
     /// body should perform necessary instantiations.
     pub fn has_polymorphic_mir_body(&self) -> bool {
         match *self {
-            InstanceKind::CloneShim(..)
-            | InstanceKind::ThreadLocalShim(..)
-            | InstanceKind::FnPtrAddrShim(..)
-            | InstanceKind::FnPtrShim(..)
-            | InstanceKind::DropGlue(_, Some(_))
-            | InstanceKind::AsyncDropGlueCtorShim(_, Some(_)) => false,
-            InstanceKind::ClosureOnceShim { .. }
-            | InstanceKind::ConstructCoroutineInClosureShim { .. }
-            | InstanceKind::DropGlue(..)
-            | InstanceKind::AsyncDropGlueCtorShim(..)
-            | InstanceKind::Item(_)
+            InstanceKind::Item(_)
             | InstanceKind::Intrinsic(..)
-            | InstanceKind::ReifyShim(..)
-            | InstanceKind::Virtual(..)
-            | InstanceKind::VTableShim(..) => true,
+            | InstanceKind::LlvmIntrinsic(..)
+            | InstanceKind::Virtual(..) => true,
+            InstanceKind::Shim(shim) => shim.has_polymorphic_mir_body(),
+        }
+    }
+}
+
+impl<'tcx> ShimKind<'tcx> {
+    #[inline]
+    pub fn def_id(self) -> DefId {
+        match self {
+            ShimKind::VTable(def_id)
+            | ShimKind::Reify(def_id, _)
+            | ShimKind::FnPtr(def_id, _)
+            | ShimKind::ThreadLocal(def_id)
+            | ShimKind::ClosureOnce { call_once: def_id, closure: _, track_caller: _ }
+            | ShimKind::ConstructCoroutineInClosure {
+                coroutine_closure_def_id: def_id,
+                receiver_by_ref: _,
+            }
+            | ShimKind::DropGlue(def_id, _)
+            | ShimKind::Clone(def_id, _)
+            | ShimKind::FnPtrAddr(def_id, _)
+            | ShimKind::FutureDropPoll(def_id, _, _)
+            | ShimKind::AsyncDropGlue(def_id, _)
+            | ShimKind::AsyncDropGlueCtor(def_id, _) => def_id,
+        }
+    }
+
+    /// Returns the `DefId` of instances which might not require codegen locally.
+    pub fn def_id_if_not_guaranteed_local_codegen(self) -> Option<DefId> {
+        match self {
+            ShimKind::DropGlue(def_id, Some(_))
+            | ShimKind::AsyncDropGlueCtor(def_id, _)
+            | ShimKind::AsyncDropGlue(def_id, _)
+            | ShimKind::FutureDropPoll(def_id, ..)
+            | ShimKind::ThreadLocal(def_id) => Some(def_id),
+            ShimKind::VTable(..)
+            | ShimKind::Reify(..)
+            | ShimKind::FnPtr(..)
+            | ShimKind::ClosureOnce { .. }
+            | ShimKind::ConstructCoroutineInClosure { .. }
+            | ShimKind::DropGlue(..)
+            | ShimKind::Clone(..)
+            | ShimKind::FnPtrAddr(..) => None,
+        }
+    }
+
+    pub fn requires_inline(&self) -> bool {
+        match self {
+            ShimKind::DropGlue(_, Some(ty)) => ty.is_array(),
+            ShimKind::AsyncDropGlueCtor(_, ty) => ty.is_coroutine(),
+            ShimKind::FutureDropPoll(_, _, _) => false,
+            ShimKind::AsyncDropGlue(_, _) => false,
+            ShimKind::ThreadLocal(_) => false,
+            _ => true,
+        }
+    }
+
+    pub fn has_polymorphic_mir_body(&self) -> bool {
+        match *self {
+            ShimKind::Clone(..)
+            | ShimKind::ThreadLocal(..)
+            | ShimKind::FnPtrAddr(..)
+            | ShimKind::FnPtr(..)
+            | ShimKind::DropGlue(_, Some(_))
+            | ShimKind::FutureDropPoll(..)
+            | ShimKind::AsyncDropGlue(_, _) => false,
+            ShimKind::AsyncDropGlueCtor(_, _) => false,
+            ShimKind::ClosureOnce { .. }
+            | ShimKind::ConstructCoroutineInClosure { .. }
+            | ShimKind::DropGlue(..)
+            | ShimKind::Reify(..)
+            | ShimKind::VTable(..) => true,
         }
     }
 }
@@ -372,61 +433,80 @@ fn type_length<'tcx>(item: impl TypeVisitable<TyCtxt<'tcx>>) -> usize {
     visitor.type_length
 }
 
-pub fn fmt_instance(
-    f: &mut fmt::Formatter<'_>,
-    instance: Instance<'_>,
-    type_length: Option<rustc_session::Limit>,
-) -> fmt::Result {
-    ty::tls::with(|tcx| {
-        let args = tcx.lift(instance.args).expect("could not lift for printing");
-
-        let mut cx = if let Some(type_length) = type_length {
-            FmtPrinter::new_with_limit(tcx, Namespace::ValueNS, type_length)
-        } else {
-            FmtPrinter::new(tcx, Namespace::ValueNS)
-        };
-        cx.print_def_path(instance.def_id(), args)?;
-        let s = cx.into_buffer();
-        f.write_str(&s)
-    })?;
-
-    match instance.def {
-        InstanceKind::Item(_) => Ok(()),
-        InstanceKind::VTableShim(_) => write!(f, " - shim(vtable)"),
-        InstanceKind::ReifyShim(_, None) => write!(f, " - shim(reify)"),
-        InstanceKind::ReifyShim(_, Some(ReifyReason::FnPtr)) => write!(f, " - shim(reify-fnptr)"),
-        InstanceKind::ReifyShim(_, Some(ReifyReason::Vtable)) => write!(f, " - shim(reify-vtable)"),
-        InstanceKind::ThreadLocalShim(_) => write!(f, " - shim(tls)"),
-        InstanceKind::Intrinsic(_) => write!(f, " - intrinsic"),
-        InstanceKind::Virtual(_, num) => write!(f, " - virtual#{num}"),
-        InstanceKind::FnPtrShim(_, ty) => write!(f, " - shim({ty})"),
-        InstanceKind::ClosureOnceShim { .. } => write!(f, " - shim"),
-        InstanceKind::ConstructCoroutineInClosureShim { .. } => write!(f, " - shim"),
-        InstanceKind::DropGlue(_, None) => write!(f, " - shim(None)"),
-        InstanceKind::DropGlue(_, Some(ty)) => write!(f, " - shim(Some({ty}))"),
-        InstanceKind::CloneShim(_, ty) => write!(f, " - shim({ty})"),
-        InstanceKind::FnPtrAddrShim(_, ty) => write!(f, " - shim({ty})"),
-        InstanceKind::AsyncDropGlueCtorShim(_, None) => write!(f, " - shim(None)"),
-        InstanceKind::AsyncDropGlueCtorShim(_, Some(ty)) => write!(f, " - shim(Some({ty}))"),
-    }
-}
-
-pub struct ShortInstance<'tcx>(pub Instance<'tcx>, pub usize);
-
-impl<'tcx> fmt::Display for ShortInstance<'tcx> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_instance(f, self.0, Some(rustc_session::Limit(self.1)))
-    }
-}
-
 impl<'tcx> fmt::Display for Instance<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_instance(f, *self, None)
+        ty::tls::with(|tcx| {
+            let mut p = FmtPrinter::new(tcx, Namespace::ValueNS);
+            tcx.lift(*self).print(&mut p)?;
+            let s = p.into_buffer();
+            f.write_str(&s)
+        })
+    }
+}
+
+// async_drop_in_place<T>::coroutine.poll, when T is a standard coroutine,
+// should be resolved to this coroutine's future_drop_poll (through FutureDropPollShim proxy).
+// async_drop_in_place<async_drop_in_place<T>::coroutine>::coroutine.poll,
+// when T is a standard coroutine, should be resolved to this coroutine's future_drop_poll.
+// async_drop_in_place<async_drop_in_place<T>::coroutine>::coroutine.poll,
+// when T is not a coroutine, should be resolved to the innermost
+// async_drop_in_place<T>::coroutine's poll function (through FutureDropPollShim proxy)
+fn resolve_async_drop_poll<'tcx>(mut cor_ty: Ty<'tcx>) -> Instance<'tcx> {
+    let first_cor = cor_ty;
+    let ty::Coroutine(poll_def_id, proxy_args) = first_cor.kind() else {
+        bug!();
+    };
+    let poll_def_id = *poll_def_id;
+    let mut child_ty = cor_ty;
+    loop {
+        if let ty::Coroutine(child_def, child_args) = child_ty.kind() {
+            cor_ty = child_ty;
+            if *child_def == poll_def_id {
+                child_ty = child_args.first().unwrap().expect_ty();
+                continue;
+            } else {
+                return Instance {
+                    def: ty::InstanceKind::Shim(ShimKind::FutureDropPoll(
+                        poll_def_id,
+                        first_cor,
+                        cor_ty,
+                    )),
+                    args: proxy_args,
+                };
+            }
+        } else {
+            let ty::Coroutine(_, child_args) = cor_ty.kind() else {
+                bug!();
+            };
+            if first_cor != cor_ty {
+                return Instance {
+                    def: ty::InstanceKind::Shim(ShimKind::FutureDropPoll(
+                        poll_def_id,
+                        first_cor,
+                        cor_ty,
+                    )),
+                    args: proxy_args,
+                };
+            } else {
+                return Instance {
+                    def: ty::InstanceKind::Shim(ShimKind::AsyncDropGlue(poll_def_id, cor_ty)),
+                    args: child_args,
+                };
+            }
+        }
     }
 }
 
 impl<'tcx> Instance<'tcx> {
-    pub fn new(def_id: DefId, args: GenericArgsRef<'tcx>) -> Instance<'tcx> {
+    /// Creates a new [`InstanceKind::Item`] from the `def_id` and `args`.
+    ///
+    /// Note that this item corresponds to the body of `def_id` directly, which
+    /// likely does not make sense for trait items which need to be resolved to an
+    /// implementation, and which may not even have a body themselves. Usages of
+    /// this function should probably use [`Instance::expect_resolve`], or if run
+    /// in a polymorphic environment or within a lint (that may encounter ambiguity)
+    /// [`Instance::try_resolve`] instead.
+    pub fn new_raw(def_id: DefId, args: GenericArgsRef<'tcx>) -> Instance<'tcx> {
         assert!(
             !args.has_escaping_bound_vars(),
             "args of instance {def_id:?} has escaping bound vars: {args:?}"
@@ -445,7 +525,7 @@ impl<'tcx> Instance<'tcx> {
             }
         });
 
-        Instance::new(def_id, args)
+        Instance::new_raw(def_id, args)
     }
 
     #[inline]
@@ -489,10 +569,9 @@ impl<'tcx> Instance<'tcx> {
             tcx.def_kind(def_id),
             DefKind::Fn
                 | DefKind::AssocFn
-                | DefKind::Const
-                | DefKind::AssocConst
+                | DefKind::Const { .. }
+                | DefKind::AssocConst { .. }
                 | DefKind::AnonConst
-                | DefKind::InlineConst
                 | DefKind::Static { .. }
                 | DefKind::Ctor(_, CtorKind::Fn)
                 | DefKind::Closure
@@ -516,7 +595,9 @@ impl<'tcx> Instance<'tcx> {
 
         // All regions in the result of this query are erased, so it's
         // fine to erase all of the input regions.
-        tcx.resolve_instance_raw(tcx.erase_regions(typing_env.as_query_input((def_id, args))))
+        tcx.resolve_instance_raw(
+            tcx.erase_and_anonymize_regions(typing_env.as_query_input((def_id, args))),
+        )
     }
 
     pub fn expect_resolve(
@@ -537,23 +618,12 @@ impl<'tcx> Instance<'tcx> {
             Ok(None) => {
                 let type_length = type_length(args);
                 if !tcx.type_length_limit().value_within_limit(type_length) {
-                    let (shrunk, written_to_path) =
-                        shrunk_instance_name(tcx, Instance::new(def_id, args));
-                    let mut path = PathBuf::new();
-                    let was_written = if let Some(path2) = written_to_path {
-                        path = path2;
-                        true
-                    } else {
-                        false
-                    };
                     tcx.dcx().emit_fatal(error::TypeLengthLimit {
                         // We don't use `def_span(def_id)` so that diagnostics point
                         // to the crate root during mono instead of to foreign items.
                         // This is arguably better.
                         span: span_or_local_def_span(),
-                        shrunk,
-                        was_written,
-                        path,
+                        instance: Instance::new_raw(def_id, args),
                         type_length,
                     });
                 } else {
@@ -586,32 +656,33 @@ impl<'tcx> Instance<'tcx> {
             match resolved.def {
                 InstanceKind::Item(def) if resolved.def.requires_caller_location(tcx) => {
                     debug!(" => fn pointer created for function with #[track_caller]");
-                    resolved.def = InstanceKind::ReifyShim(def, reason);
+                    resolved.def = InstanceKind::Shim(ShimKind::Reify(def, reason));
                 }
                 InstanceKind::Virtual(def_id, _) => {
                     debug!(" => fn pointer created for virtual call");
-                    resolved.def = InstanceKind::ReifyShim(def_id, reason);
+                    resolved.def = InstanceKind::Shim(ShimKind::Reify(def_id, reason));
                 }
-                // Reify `Trait::method` implementations if KCFI is enabled
-                // FIXME(maurer) only reify it if it is a vtable-safe function
-                _ if tcx.sess.is_sanitizer_kcfi_enabled()
-                    && tcx
-                        .opt_associated_item(def_id)
-                        .and_then(|assoc| assoc.trait_item_def_id)
-                        .is_some() =>
-                {
-                    // If this function could also go in a vtable, we need to `ReifyShim` it with
-                    // KCFI because it can only attach one type per function.
-                    resolved.def = InstanceKind::ReifyShim(resolved.def_id(), reason)
-                }
-                // Reify `::call`-like method implementations if KCFI is enabled
-                _ if tcx.sess.is_sanitizer_kcfi_enabled()
-                    && tcx.is_closure_like(resolved.def_id()) =>
-                {
-                    // Reroute through a reify via the *unresolved* instance. The resolved one can't
-                    // be directly reified because it's closure-like. The reify can handle the
-                    // unresolved instance.
-                    resolved = Instance { def: InstanceKind::ReifyShim(def_id, reason), args }
+                _ if tcx.sess.is_sanitizer_kcfi_enabled() => {
+                    // Reify `::call`-like method implementations
+                    if tcx.is_closure_like(resolved.def_id()) {
+                        // Reroute through a reify via the *unresolved* instance. The resolved one can't
+                        // be directly reified because it's closure-like. The reify can handle the
+                        // unresolved instance.
+                        resolved = Instance {
+                            def: InstanceKind::Shim(ShimKind::Reify(def_id, reason)),
+                            args,
+                        }
+                    // Reify `Trait::method` implementations if the trait is dyn-compatible.
+                    } else if let Some(assoc) = tcx.opt_associated_item(def_id)
+                        && let AssocContainer::Trait | AssocContainer::TraitImpl(Ok(_)) =
+                            assoc.container
+                        && tcx.is_dyn_compatible(assoc.container_id(tcx))
+                    {
+                        // If this function could also go in a vtable, we need to `ReifyShim` it with
+                        // KCFI because it can only attach one type per function.
+                        resolved.def =
+                            InstanceKind::Shim(ShimKind::Reify(resolved.def_id(), reason))
+                    }
                 }
                 _ => {}
             }
@@ -628,14 +699,14 @@ impl<'tcx> Instance<'tcx> {
         span: Span,
     ) -> Instance<'tcx> {
         debug!("resolve_for_vtable(def_id={:?}, args={:?})", def_id, args);
-        let fn_sig = tcx.fn_sig(def_id).instantiate_identity();
+        let fn_sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
         let is_vtable_shim = !fn_sig.inputs().skip_binder().is_empty()
             && fn_sig.input(0).skip_binder().is_param(0)
             && tcx.generics_of(def_id).has_self;
 
         if is_vtable_shim {
             debug!(" => associated item with unsizeable self: Self");
-            return Instance { def: InstanceKind::VTableShim(def_id), args };
+            return Instance { def: InstanceKind::Shim(ShimKind::VTable(def_id)), args };
         }
 
         let mut resolved = Instance::expect_resolve(tcx, typing_env, def_id, args, span);
@@ -664,7 +735,7 @@ impl<'tcx> Instance<'tcx> {
                     && !matches!(
                         tcx.opt_associated_item(def),
                         Some(ty::AssocItem {
-                            container: ty::AssocItemContainer::Trait,
+                            container: ty::AssocContainer::Trait,
                             ..
                         })
                     );
@@ -678,19 +749,22 @@ impl<'tcx> Instance<'tcx> {
                         // Create a shim for the `FnOnce/FnMut/Fn` method we are calling
                         // - unlike functions, invoking a closure always goes through a
                         // trait.
-                        resolved = Instance { def: InstanceKind::ReifyShim(def_id, reason), args };
+                        resolved = Instance {
+                            def: InstanceKind::Shim(ShimKind::Reify(def_id, reason)),
+                            args,
+                        };
                     } else {
                         debug!(
                             " => vtable fn pointer created for function with #[track_caller]: {:?}",
                             def
                         );
-                        resolved.def = InstanceKind::ReifyShim(def, reason);
+                        resolved.def = InstanceKind::Shim(ShimKind::Reify(def, reason));
                     }
                 }
             }
             InstanceKind::Virtual(def_id, _) => {
                 debug!(" => vtable fn pointer created for virtual call");
-                resolved.def = InstanceKind::ReifyShim(def_id, reason)
+                resolved.def = InstanceKind::Shim(ShimKind::Reify(def_id, reason))
             }
             _ => {}
         }
@@ -708,12 +782,12 @@ impl<'tcx> Instance<'tcx> {
 
         match needs_fn_once_adapter_shim(actual_kind, requested_kind) {
             Ok(true) => Instance::fn_once_adapter_instance(tcx, def_id, args),
-            _ => Instance::new(def_id, args),
+            _ => Instance::new_raw(def_id, args),
         }
     }
 
-    pub fn resolve_drop_in_place(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ty::Instance<'tcx> {
-        let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
+    pub fn resolve_drop_glue(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ty::Instance<'tcx> {
+        let def_id = tcx.require_lang_item(LangItem::DropGlue, DUMMY_SP);
         let args = tcx.mk_args(&[ty.into()]);
         Instance::expect_resolve(
             tcx,
@@ -725,7 +799,7 @@ impl<'tcx> Instance<'tcx> {
     }
 
     pub fn resolve_async_drop_in_place(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ty::Instance<'tcx> {
-        let def_id = tcx.require_lang_item(LangItem::AsyncDropInPlace, None);
+        let def_id = tcx.require_lang_item(LangItem::AsyncDropInPlace, DUMMY_SP);
         let args = tcx.mk_args(&[ty.into()]);
         Instance::expect_resolve(
             tcx,
@@ -736,13 +810,22 @@ impl<'tcx> Instance<'tcx> {
         )
     }
 
+    pub fn resolve_async_drop_in_place_poll(
+        tcx: TyCtxt<'tcx>,
+        def_id: DefId,
+        ty: Ty<'tcx>,
+    ) -> ty::Instance<'tcx> {
+        let args = tcx.mk_args(&[ty.into()]);
+        Instance::expect_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, args, DUMMY_SP)
+    }
+
     #[instrument(level = "debug", skip(tcx), ret)]
     pub fn fn_once_adapter_instance(
         tcx: TyCtxt<'tcx>,
         closure_did: DefId,
         args: ty::GenericArgsRef<'tcx>,
     ) -> Instance<'tcx> {
-        let fn_once = tcx.require_lang_item(LangItem::FnOnce, None);
+        let fn_once = tcx.require_lang_item(LangItem::FnOnce, DUMMY_SP);
         let call_once = tcx
             .associated_items(fn_once)
             .in_definition_order()
@@ -751,7 +834,11 @@ impl<'tcx> Instance<'tcx> {
             .def_id;
         let track_caller =
             tcx.codegen_fn_attrs(closure_did).flags.contains(CodegenFnAttrFlags::TRACK_CALLER);
-        let def = ty::InstanceKind::ClosureOnceShim { call_once, track_caller };
+        let def = ty::InstanceKind::Shim(ShimKind::ClosureOnce {
+            call_once,
+            closure: closure_did,
+            track_caller,
+        });
 
         let self_ty = Ty::new_closure(tcx, closure_did, args);
 
@@ -800,6 +887,9 @@ impl<'tcx> Instance<'tcx> {
         };
 
         if tcx.is_lang_item(trait_item_id, coroutine_callable_item) {
+            if tcx.is_async_drop_in_place_coroutine(coroutine_def_id) {
+                return Some(resolve_async_drop_poll(rcvr_args.type_at(0)));
+            }
             let ty::Coroutine(_, id_args) = *tcx.type_of(coroutine_def_id).skip_binder().kind()
             else {
                 bug!()
@@ -822,7 +912,7 @@ impl<'tcx> Instance<'tcx> {
             // This is important for `Iterator`'s combinators, but also useful for
             // adding future default methods to `Future`, for instance.
             debug_assert!(tcx.defaultness(trait_item_id).has_value());
-            Some(Instance::new(trait_item_id, rcvr_args))
+            Some(Instance::new_raw(trait_item_id, rcvr_args))
         }
     }
 
@@ -840,15 +930,14 @@ impl<'tcx> Instance<'tcx> {
         self.def.has_polymorphic_mir_body().then_some(self.args)
     }
 
-    pub fn instantiate_mir<T>(&self, tcx: TyCtxt<'tcx>, v: EarlyBinder<'tcx, &T>) -> T
+    pub fn instantiate_mir<T>(&self, tcx: TyCtxt<'tcx>, v: EarlyBinder<'tcx, T>) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
-        let v = v.map_bound(|v| *v);
         if let Some(args) = self.args_for_mir_body() {
-            v.instantiate(tcx, args)
+            v.instantiate(tcx, args).skip_norm_wip()
         } else {
-            v.instantiate_identity()
+            v.instantiate_identity().skip_norm_wip()
         }
     }
 
@@ -906,69 +995,20 @@ fn needs_fn_once_adapter_shim(
             Ok(false)
         }
         (ty::ClosureKind::Fn, ty::ClosureKind::FnMut) => {
-            // The closure fn `llfn` is a `fn(&self, ...)`. We want a
-            // `fn(&mut self, ...)`. In fact, at codegen time, these are
-            // basically the same thing, so we can just return llfn.
+            // The closure fn is a `fn(&self, ...)`, but we want a `fn(&mut self, ...)`.
+            // At codegen time, these are basically the same, so we can just return the closure.
             Ok(false)
         }
         (ty::ClosureKind::Fn | ty::ClosureKind::FnMut, ty::ClosureKind::FnOnce) => {
-            // The closure fn `llfn` is a `fn(&self, ...)` or `fn(&mut
-            // self, ...)`. We want a `fn(self, ...)`. We can produce
-            // this by doing something like:
+            // The closure fn is a `fn(&self, ...)` or `fn(&mut self, ...)`, but
+            // we want a `fn(self, ...)`. We can produce this by doing something like:
             //
-            //     fn call_once(self, ...) { call_mut(&self, ...) }
-            //     fn call_once(mut self, ...) { call_mut(&mut self, ...) }
+            //     fn call_once(self, ...) { Fn::call(&self, ...) }
+            //     fn call_once(mut self, ...) { FnMut::call_mut(&mut self, ...) }
             //
             // These are both the same at codegen time.
             Ok(true)
         }
         (ty::ClosureKind::FnMut | ty::ClosureKind::FnOnce, _) => Err(()),
-    }
-}
-
-// Set bits represent unused generic parameters.
-// An empty set indicates that all parameters are used.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Decodable, Encodable, HashStable)]
-pub struct UnusedGenericParams(FiniteBitSet<u32>);
-
-impl Default for UnusedGenericParams {
-    fn default() -> Self {
-        UnusedGenericParams::new_all_used()
-    }
-}
-
-impl UnusedGenericParams {
-    pub fn new_all_unused(amount: u32) -> Self {
-        let mut bitset = FiniteBitSet::new_empty();
-        bitset.set_range(0..amount);
-        Self(bitset)
-    }
-
-    pub fn new_all_used() -> Self {
-        Self(FiniteBitSet::new_empty())
-    }
-
-    pub fn mark_used(&mut self, idx: u32) {
-        self.0.clear(idx);
-    }
-
-    pub fn is_unused(&self, idx: u32) -> bool {
-        self.0.contains(idx).unwrap_or(false)
-    }
-
-    pub fn is_used(&self, idx: u32) -> bool {
-        !self.is_unused(idx)
-    }
-
-    pub fn all_used(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn bits(&self) -> u32 {
-        self.0.0
-    }
-
-    pub fn from_bits(bits: u32) -> UnusedGenericParams {
-        UnusedGenericParams(FiniteBitSet(bits))
     }
 }

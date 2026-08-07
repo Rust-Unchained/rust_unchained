@@ -1,27 +1,25 @@
+extern crate std;
+#[attr = PreludeImport]
+use ::std::prelude::rust_2015::*;
 //@ pretty-compare-only
 //@ pretty-mode:hir
 //@ pp-exact:hir-fn-variadic.pp
-
-#![feature(c_variadic)]
-#[prelude_import]
-use ::std::prelude::rust_2015::*;
-#[macro_use]
-extern crate std;
 
 extern "C" {
     unsafe fn foo(x: i32, va1: ...);
 }
 
-unsafe extern "C" fn bar(_: i32, mut va2: ...) -> usize { va2.arg::<usize>() }
+unsafe extern "C" fn bar(_: i32, mut va2: ...)
+    -> usize { va2.next_arg::<usize>() }
 
 fn main() {
     fn g1(_: extern "C" fn(_: u8, va: ...)) { }
-    fn g2(_: extern "C" fn(_: u8, ...)) { }
+    fn g2(_: extern "C" fn(_: u8, _: ...)) { }
     fn g3(_: extern "C" fn(u8, va: ...)) { }
-    fn g4(_: extern "C" fn(u8, ...)) { }
+    fn g4(_: extern "C" fn(u8, _: ...)) { }
 
     fn g5(_: extern "C" fn(va: ...)) { }
-    fn g6(_: extern "C" fn(...)) { }
+    fn g6(_: extern "C" fn(_: ...)) { }
 
     {
         let _ =

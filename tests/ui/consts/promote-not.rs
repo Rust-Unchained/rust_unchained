@@ -1,12 +1,13 @@
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 // Test various things that we do not want to promote.
 #![allow(unconditional_panic)]
 
 use std::cell::Cell;
+use std::convert::identity;
 use std::mem::ManuallyDrop;
 
 // We do not promote mutable references.
-static mut TEST1: Option<&mut [i32]> = Some(&mut [1, 2, 3]); //~ ERROR temporary value dropped while borrowed
+static mut TEST1: &mut [i32] = identity(&mut [1, 2, 3]); //~ ERROR temporary value dropped while borrowed
 
 static mut TEST2: &'static mut [i32] = {
     let x = &mut [1,2,3]; //~ ERROR temporary value dropped while borrowed

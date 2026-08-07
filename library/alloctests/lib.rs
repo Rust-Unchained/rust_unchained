@@ -14,10 +14,19 @@
 //
 // Library features:
 // tidy-alphabetical-start
-#![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
 #![feature(array_into_iter_constructors)]
-#![feature(assert_matches)]
+#![feature(char_internals)]
+#![feature(const_alloc_error)]
+#![feature(const_cmp)]
+#![feature(const_convert)]
+#![feature(const_default)]
+#![feature(const_destruct)]
+#![feature(const_heap)]
+#![feature(const_option_ops)]
+#![feature(const_result_trait_fn)]
+#![feature(const_try)]
+#![feature(copied_into_inner)]
 #![feature(core_intrinsics)]
 #![feature(exact_size_is_empty)]
 #![feature(extend_one)]
@@ -26,34 +35,36 @@
 #![feature(inplace_iteration)]
 #![feature(iter_advance_by)]
 #![feature(iter_next_chunk)]
-#![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_uninit_array_transpose)]
-#![feature(nonnull_provenance)]
 #![feature(ptr_alignment_type)]
+#![feature(ptr_cast_slice)]
 #![feature(ptr_internals)]
+#![feature(rev_into_inner)]
 #![feature(sized_type_properties)]
 #![feature(slice_iter_mut_as_mut_slice)]
 #![feature(slice_ptr_get)]
 #![feature(slice_range)]
 #![feature(std_internals)]
 #![feature(temporary_niche_types)]
+#![feature(trivial_clone)]
 #![feature(trusted_fused)]
 #![feature(trusted_len)]
 #![feature(trusted_random_access)]
 #![feature(try_reserve_kind)]
 #![feature(try_trait_v2)]
+#![feature(unwrap_infallible)]
+#![feature(wtf8_internals)]
 // tidy-alphabetical-end
 //
 // Language features:
 // tidy-alphabetical-start
-#![feature(cfg_sanitize)]
+#![feature(const_closures)]
+#![feature(const_trait_impl)]
 #![feature(dropck_eyepatch)]
-#![feature(lang_items)]
 #![feature(min_specialization)]
-#![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(optimize_attribute)]
-#![feature(rustc_allow_const_fn_unstable)]
+#![feature(prelude_import)]
 #![feature(rustc_attrs)]
 #![feature(staged_api)]
 #![feature(test)]
@@ -62,21 +73,30 @@
 
 // Allow testing this library
 extern crate alloc as realalloc;
-#[macro_use]
+
+// This is needed to provide macros to the directly imported alloc modules below.
 extern crate std;
+#[prelude_import]
+#[allow(unused_imports)]
+use std::prelude::rust_2024::*;
+
 #[cfg(test)]
 extern crate test;
 mod testing;
+
 use realalloc::*;
 
-// We are directly including collections and raw_vec here as both use non-public
-// methods and fields in tests and as such need to have the types to test in the
-// same crate as the tests themself.
+// We are directly including collections, raw_vec, and wtf8 here as they use non-public
+// methods and fields in tests and as such need to have the types to test in the same
+// crate as the tests themself.
 #[path = "../alloc/src/collections/mod.rs"]
 mod collections;
 
 #[path = "../alloc/src/raw_vec/mod.rs"]
 mod raw_vec;
+
+#[path = "../alloc/src/wtf8/mod.rs"]
+mod wtf8;
 
 #[allow(dead_code)] // Not used in all configurations
 pub(crate) mod test_helpers {
@@ -87,8 +107,7 @@ pub(crate) mod test_helpers {
         let mut hasher = std::hash::RandomState::new().build_hasher();
         std::panic::Location::caller().hash(&mut hasher);
         let hc64 = hasher.finish();
-        let seed_vec =
-            hc64.to_le_bytes().into_iter().chain(0u8..8).collect::<crate::vec::Vec<u8>>();
+        let seed_vec = hc64.to_le_bytes().into_iter().chain(0u8..8).collect::<std::vec::Vec<u8>>();
         let seed: [u8; 16] = seed_vec.as_slice().try_into().unwrap();
         rand::SeedableRng::from_seed(seed)
     }

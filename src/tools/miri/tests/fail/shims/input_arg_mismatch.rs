@@ -1,5 +1,8 @@
 //@ignore-target: windows # File handling is not implemented yet
 //@compile-flags: -Zmiri-disable-isolation
+
+#![allow(suspicious_runtime_symbol_definitions)]
+
 use std::ffi::{CString, OsStr, c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 
@@ -16,6 +19,6 @@ fn main() {
     } as u32;
     let _ = unsafe {
         close(fd);
-        //~^ ERROR: calling a function with argument of type i32 passing data of type u32
+        //~^ ERROR: type i32 passing argument of type u32
     };
 }

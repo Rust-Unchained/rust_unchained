@@ -1,6 +1,5 @@
 mod context;
 
-use rustc_ast::ptr::P;
 use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::{DelimSpan, TokenStream};
 use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, Path, PathSegment, UnOp, token};
@@ -12,8 +11,8 @@ use rustc_parse::parser::Parser;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
 use thin_vec::thin_vec;
 
+use crate::diagnostics;
 use crate::edition_panic::use_panic_2021;
-use crate::errors;
 
 pub(crate) fn expand_assert<'cx>(
     cx: &'cx mut ExtCtxt<'_>,
@@ -42,7 +41,6 @@ pub(crate) fn expand_assert<'cx>(
                     .into_iter()
                     .map(|ident| PathSegment::from_ident(ident))
                     .collect(),
-                tokens: None,
             }
         } else {
             // Before edition 2021, we call `panic!()` unqualified,
@@ -55,9 +53,9 @@ pub(crate) fn expand_assert<'cx>(
     let expr = if let Some(tokens) = custom_message {
         let then = cx.expr(
             call_site_span,
-            ExprKind::MacCall(P(MacCall {
+            ExprKind::MacCall(Box::new(MacCall {
                 path: panic_path(),
-                args: P(DelimArgs {
+                args: Box::new(DelimArgs {
                     dspan: DelimSpan::from_single(call_site_span),
                     delim: Delimiter::Parenthesis,
                     tokens,
@@ -96,7 +94,7 @@ pub(crate) fn expand_assert<'cx>(
 }
 
 struct Assert {
-    cond_expr: P<Expr>,
+    cond_expr: Box<Expr>,
     custom_message: Option<TokenStream>,
 }
 
@@ -104,10 +102,10 @@ struct Assert {
 fn expr_if_not(
     cx: &ExtCtxt<'_>,
     span: Span,
-    cond: P<Expr>,
-    then: P<Expr>,
-    els: Option<P<Expr>>,
-) -> P<Expr> {
+    cond: Box<Expr>,
+    then: Box<Expr>,
+    els: Option<Box<Expr>>,
+) -> Box<Expr> {
     cx.expr_if(span, cx.expr(span, ExprKind::Unary(UnOp::Not, cond)), then, els)
 }
 
@@ -115,7 +113,7 @@ fn parse_assert<'a>(cx: &ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<
     let mut parser = cx.new_parser_from_tts(stream);
 
     if parser.token == token::Eof {
-        return Err(cx.dcx().create_err(errors::AssertRequiresBoolean { span: sp }));
+        return Err(cx.dcx().create_err(diagnostics::AssertRequiresBoolean { span: sp }));
     }
 
     let cond_expr = parser.parse_expr()?;
@@ -128,7 +126,8 @@ fn parse_assert<'a>(cx: &ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<
     //
     // Emit an error about semicolon and suggest removing it.
     if parser.token == token::Semi {
-        cx.dcx().emit_err(errors::AssertRequiresExpression { span: sp, token: parser.token.span });
+        cx.dcx()
+            .emit_err(diagnostics::AssertRequiresExpression { span: sp, token: parser.token.span });
         parser.bump();
     }
 
@@ -141,7 +140,7 @@ fn parse_assert<'a>(cx: &ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<
     let custom_message =
         if let token::Literal(token::Lit { kind: token::Str, .. }) = parser.token.kind {
             let comma = parser.prev_token.span.shrink_to_hi();
-            cx.dcx().emit_err(errors::AssertMissingComma { span: parser.token.span, comma });
+            cx.dcx().emit_err(diagnostics::AssertMissingComma { span: parser.token.span, comma });
 
             parse_custom_message(&mut parser)
         } else if parser.eat(exp!(Comma)) {

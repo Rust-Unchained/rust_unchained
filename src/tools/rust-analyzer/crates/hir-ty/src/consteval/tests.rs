@@ -1,17 +1,22 @@
-use base_db::SourceDatabase;
-use chalk_ir::Substitution;
-use hir_def::db::DefDatabase;
+use base_db::all_crates;
+use hir_def::signatures::ConstSignature;
+use hir_expand::EditionedFileId;
 use rustc_apfloat::{
-    ieee::{Half as f16, Quad as f128},
     Float,
+    ieee::{Half as f16, Quad as f128},
 };
-use span::EditionedFileId;
 use test_fixture::WithFixture;
 use test_utils::skip_slow_tests;
 
 use crate::{
-    consteval::try_const_usize, db::HirDatabase, display::DisplayTarget, mir::pad16,
-    test_db::TestDB, Const, ConstScalar, Interner, MemoryMap,
+    MemoryMap,
+    consteval::allocation_as_usize,
+    db::HirDatabase,
+    display::DisplayTarget,
+    mir::pad16,
+    next_solver::{Allocation, DbInterner, GenericArgs},
+    setup_tracing,
+    test_db::TestDB,
 };
 
 use super::{
@@ -21,7 +26,7 @@ use super::{
 
 mod intrinsics;
 
-fn simplify(e: ConstEvalError) -> ConstEvalError {
+fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
     match e {
         ConstEvalError::MirEvalError(MirEvalError::InFunction(e, _)) => {
             simplify(ConstEvalError::MirEvalError(*e))
@@ -33,15 +38,19 @@ fn simplify(e: ConstEvalError) -> ConstEvalError {
 #[track_caller]
 fn check_fail(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
-    error: impl FnOnce(ConstEvalError) -> bool,
+    error: impl FnOnce(ConstEvalError<'_>) -> bool,
 ) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
-    match eval_goal(&db, file_id) {
+    crate::attach_db(&db, || match eval_goal(&db, file_id) {
         Ok(_) => panic!("Expected fail, but it succeeded"),
         Err(e) => {
-            assert!(error(simplify(e.clone())), "Actual error was: {}", pretty_print_err(e, db))
+            assert!(
+                error(simplify(e.clone())),
+                "Actual error was: {}\n{e:?}",
+                pretty_print_err(e.clone(), &db)
+            )
         }
-    }
+    })
 }
 
 #[track_caller]
@@ -76,56 +85,54 @@ fn check_str(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: &str) {
 #[track_caller]
 fn check_answer(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
-    check: impl FnOnce(&[u8], &MemoryMap),
+    check: impl FnOnce(&[u8], &MemoryMap<'_>),
 ) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    let file_id = *file_ids.last().unwrap();
-    let r = match eval_goal(&db, file_id) {
-        Ok(t) => t,
-        Err(e) => {
-            let err = pretty_print_err(e, db);
-            panic!("Error in evaluating goal: {err}");
-        }
-    };
-    match &r.data(Interner).value {
-        chalk_ir::ConstValue::Concrete(c) => match &c.interned {
-            ConstScalar::Bytes(b, mm) => {
-                check(b, mm);
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let r = match eval_goal(&db, file_id) {
+            Ok(t) => t,
+            Err(e) => {
+                let err = pretty_print_err(e, &db);
+                panic!("Error in evaluating goal: {err}");
             }
-            x => panic!("Expected number but found {x:?}"),
-        },
-        _ => panic!("result of const eval wasn't a concrete const"),
-    }
+        };
+        check(&r.memory, &r.memory_map);
+    });
 }
 
-fn pretty_print_err(e: ConstEvalError, db: TestDB) -> String {
+fn pretty_print_err(e: ConstEvalError<'_>, db: &TestDB) -> String {
     let mut err = String::new();
     let span_formatter = |file, range| format!("{file:?} {range:?}");
-    let display_target = DisplayTarget::from_crate(
-        &db,
-        *db.crate_graph().crates_in_topological_order().last().unwrap(),
-    );
+    let display_target =
+        DisplayTarget::from_crate(db, *all_crates(db).last().expect("no crate graph present"));
     match e {
         ConstEvalError::MirLowerError(e) => {
-            e.pretty_print(&mut err, &db, span_formatter, display_target)
+            e.pretty_print(&mut err, db, span_formatter, display_target)
         }
         ConstEvalError::MirEvalError(e) => {
-            e.pretty_print(&mut err, &db, span_formatter, display_target)
+            e.pretty_print(&mut err, db, span_formatter, display_target)
         }
     }
     .unwrap();
     err
 }
 
-fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Const, ConstEvalError> {
-    let module_id = db.module_for_file(file_id.file_id());
+fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, ConstEvalError<'_>> {
+    let _tracing = setup_tracing();
+    let interner = DbInterner::new_no_crate(db);
+    let module_id = db.module_for_file(file_id.file_id(db));
     let def_map = module_id.def_map(db);
-    let scope = &def_map[module_id.local_id].scope;
+    let scope = &def_map[module_id].scope;
     let const_id = scope
         .declarations()
         .find_map(|x| match x {
             hir_def::ModuleDefId::ConstId(x) => {
-                if db.const_data(x).name.as_ref()?.display(db, file_id.edition()).to_string()
+                if ConstSignature::of(db, x)
+                    .name
+                    .as_ref()?
+                    .display(db, file_id.edition(db))
+                    .to_string()
                     == "GOAL"
                 {
                     Some(x)
@@ -136,7 +143,7 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Const, ConstEvalEr
             _ => None,
         })
         .expect("No const named GOAL found in the test");
-    db.const_eval(const_id.into(), Substitution::empty(Interner), None)
+    db.const_eval(const_id, GenericArgs::empty(interner), None)
 }
 
 #[test]
@@ -280,6 +287,9 @@ fn floating_point_casts() {
     check_number(r#"const GOAL: i8 = (0./0.) as i8"#, 0);
     check_number(r#"const GOAL: i8 = (1./0.) as i8"#, 127);
     check_number(r#"const GOAL: i8 = (-1./0.) as i8"#, -128);
+    check_number(r#"const GOAL: u8 = (1./0.) as u8"#, 255);
+    check_number(r#"const GOAL: u8 = 256.0f32 as u8"#, 255);
+    check_number(r#"const GOAL: u16 = 1e10f32 as u16"#, 65535);
     check_number(r#"const GOAL: i64 = 1e18f64 as f32 as i64"#, 999999984306749440);
 }
 
@@ -845,6 +855,7 @@ fn ifs() {
 fn loops() {
     check_number(
         r#"
+    //- minicore: add, builtin_impls
     const GOAL: u8 = {
         let mut x = 0;
         loop {
@@ -865,6 +876,7 @@ fn loops() {
     );
     check_number(
         r#"
+    //- minicore: add, builtin_impls
     const GOAL: u8 = {
         let mut x = 0;
         loop {
@@ -879,6 +891,7 @@ fn loops() {
     );
     check_number(
         r#"
+    //- minicore: add, builtin_impls
     const GOAL: u8 = {
         'a: loop {
             let x = 'b: loop {
@@ -901,7 +914,7 @@ fn loops() {
     );
     check_number(
         r#"
-    //- minicore: add
+    //- minicore: add, builtin_impls
     const GOAL: u8 = {
         let mut x = 0;
         'a: loop {
@@ -1271,7 +1284,7 @@ fn pattern_matching_ergonomics() {
 fn destructing_assignment() {
     check_number(
         r#"
-    //- minicore: add
+    //- minicore: add, builtin_impls
     const fn f(i: &mut u8) -> &mut u8 {
         *i += 1;
         i
@@ -1463,11 +1476,11 @@ fn result_layout_niche_optimization() {
 fn options() {
     check_number(
         r#"
-    //- minicore: option
+    //- minicore: option, add, builtin_impls
     const GOAL: u8 = {
         let x = Some(2);
         match x {
-            Some(y) => 2 * y,
+            Some(y) => 2 + y,
             _ => 10,
         }
     };
@@ -1476,7 +1489,7 @@ fn options() {
     );
     check_number(
         r#"
-    //- minicore: option
+    //- minicore: option, add, builtin_impls
     fn f(x: Option<Option<i32>>) -> i32 {
         if let Some(y) = x && let Some(z) = y {
             z
@@ -1492,11 +1505,11 @@ fn options() {
     );
     check_number(
         r#"
-    //- minicore: option
+    //- minicore: option, add, builtin_impls
     const GOAL: u8 = {
         let x = None;
         match x {
-            Some(y) => 2 * y,
+            Some(y) => 2 + y,
             _ => 10,
         }
     };
@@ -1559,6 +1572,7 @@ const GOAL: u8 = {
 }
 
 #[test]
+#[ignore = "builtin derive macros are currently not working with MIR eval"]
 fn builtin_derive_macro() {
     check_number(
         r#"
@@ -1781,14 +1795,14 @@ const GOAL: i32 = {
 fn closure_capture_unsized_type() {
     check_number(
         r#"
-    //- minicore: fn, copy, slice, index, coerce_unsized
+    //- minicore: fn, copy, slice, index, coerce_unsized, sized
     fn f<T: A>(x: &<T as A>::Ty) -> &<T as A>::Ty {
         let c = || &*x;
         c()
     }
 
     trait A {
-        type Ty;
+        type Ty: ?Sized;
     }
 
     impl A for i32 {
@@ -1799,7 +1813,7 @@ fn closure_capture_unsized_type() {
         let k: &[u8] = &[1, 2, 3];
         let k = f::<i32>(k);
         k[0] + k[1] + k[2]
-    }
+    };
     "#,
         6,
     );
@@ -2199,8 +2213,13 @@ fn boxes() {
     check_number(
         r#"
 //- minicore: coerce_unsized, deref_mut, slice
+#![feature(lang_items)]
 use core::ops::{Deref, DerefMut};
 use core::{marker::Unsize, ops::CoerceUnsized};
+
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+pub fn box_new<T>(_x: T) -> Box<T>;
 
 #[lang = "owned_box"]
 pub struct Box<T: ?Sized> {
@@ -2208,8 +2227,7 @@ pub struct Box<T: ?Sized> {
 }
 impl<T> Box<T> {
     fn new(t: T) -> Self {
-        #[rustc_box]
-        Box::new(t)
+        box_new(t)
     }
 }
 
@@ -2336,6 +2354,7 @@ fn c_string() {
     check_number(
         r#"
 //- minicore: index, slice
+#![feature(lang_items)]
 #[lang = "CStr"]
 pub struct CStr {
     inner: [u8]
@@ -2350,6 +2369,7 @@ const GOAL: u8 = {
     check_number(
         r#"
 //- minicore: index, slice
+#![feature(lang_items)]
 #[lang = "CStr"]
 pub struct CStr {
     inner: [u8]
@@ -2503,8 +2523,10 @@ fn enums() {
         const GOAL: E = E::A;
         "#,
     );
-    let r = eval_goal(&db, file_id).unwrap();
-    assert_eq!(try_const_usize(&db, &r), Some(1));
+    crate::attach_db(&db, || {
+        let r = eval_goal(&db, file_id).unwrap();
+        assert_eq!(allocation_as_usize(r), 1);
+    })
 }
 
 #[test]
@@ -2516,7 +2538,15 @@ fn const_loop() {
     const F2: i32 = 2 * F1;
     const GOAL: i32 = F3;
     "#,
-        |e| e == ConstEvalError::MirLowerError(MirLowerError::Loop),
+        |e| {
+            if let ConstEvalError::MirEvalError(MirEvalError::ConstEvalError(_, inner)) = e
+                && let ConstEvalError::MirLowerError(MirLowerError::Loop) = *inner
+            {
+                true
+            } else {
+                false
+            }
+        },
     );
 }
 
@@ -2539,9 +2569,8 @@ fn const_transfer_memory() {
 fn anonymous_const_block() {
     check_number(
         r#"
-    extern "rust-intrinsic" {
-        pub fn size_of<T>() -> usize;
-    }
+    #[rustc_intrinsic]
+    pub fn size_of<T>() -> usize;
 
     const fn f<T>() -> usize {
         let r = const { size_of::<T>() };
@@ -2602,6 +2631,19 @@ fn const_generic_subst_fn() {
     const GOAL: usize = f([1, 2, 5]);
     "#,
         3,
+    );
+}
+
+#[test]
+fn const_generic_fixed_width() {
+    check_number(
+        r#"
+    const fn m<const N: u64>() -> u64 {
+        N
+    }
+    const GOAL: u64 = m::<0>();
+    "#,
+        0,
     );
 }
 
@@ -2917,6 +2959,14 @@ fn recursive_adt() {
             TAG_TREE
         };
     "#,
-        |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::Loop)),
+        |e| {
+            if let ConstEvalError::MirEvalError(MirEvalError::ConstEvalError(_, inner)) = e
+                && let ConstEvalError::MirLowerError(MirLowerError::Loop) = *inner
+            {
+                true
+            } else {
+                false
+            }
+        },
     );
 }

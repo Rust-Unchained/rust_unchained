@@ -7,7 +7,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::environment::Environment;
 use crate::metrics::{load_metrics, record_metrics};
 use crate::timer::TimerSection;
-use crate::training::{BoltProfile, LlvmPGOProfile, RustcPGOProfile};
+use crate::training::{BoltProfile, LlvmPGOProfile, RustcPGOProfile, RustdocPGOProfile};
+use crate::utils::io::normalize_path;
 
 #[derive(Default)]
 pub struct CmdBuilder {
@@ -99,7 +100,7 @@ pub struct Bootstrap {
 
 impl Bootstrap {
     pub fn build(env: &Environment) -> Self {
-        let metrics_path = env.build_root().join("build").join("metrics.json");
+        let metrics_path = env.build_root().join("metrics.json");
         let cmd = cmd(&[
             env.python_binary(),
             env.checkout_path().join("x.py").as_str(),
@@ -113,31 +114,49 @@ impl Bootstrap {
             "library/std",
         ])
         .env("RUST_BACKTRACE", "full");
+        let cmd = add_shared_x_flags(env, cmd);
+
         Self { cmd, metrics_path }
     }
 
+    pub fn with_rustdoc(mut self) -> Self {
+        self.cmd = self.cmd.arg("rustdoc");
+        self
+    }
+
+    pub fn with_cargo(mut self) -> Self {
+        self.cmd = self.cmd.arg("cargo");
+        self
+    }
+
     pub fn dist(env: &Environment, dist_args: &[String]) -> Self {
-        let metrics_path = env.build_root().join("build").join("metrics.json");
-        let cmd = cmd(&dist_args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>())
-            .env("RUST_BACKTRACE", "full");
+        let metrics_path = env.build_root().join("metrics.json");
+        let args = dist_args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
+        let cmd = cmd(&args).env("RUST_BACKTRACE", "full");
+        let mut cmd = add_shared_x_flags(env, cmd);
+        if env.is_fast_try_build() {
+            // We set build.extended=false for fast try builds, but we still need Cargo
+            cmd = cmd.arg("cargo");
+        }
+
         Self { cmd, metrics_path }
     }
 
     pub fn llvm_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
-        self.cmd = self
-            .cmd
-            .arg("--llvm-profile-generate")
-            .env("LLVM_PROFILE_DIR", profile_dir.join("prof-%p").as_str());
+        self.cmd = self.cmd.arg("--set").arg(format!(
+            r#"pgo.llvm.generate="{}""#,
+            normalize_path(&profile_dir.join("prof-%p")).as_str()
+        ));
         self
     }
 
-    pub fn llvm_pgo_optimize(mut self, profile: &LlvmPGOProfile) -> Self {
-        self.cmd = self.cmd.arg("--llvm-profile-use").arg(profile.0.as_str());
-        self
-    }
-
-    pub fn rustc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
-        self.cmd = self.cmd.arg("--rust-profile-generate").arg(profile_dir.as_str());
+    pub fn llvm_pgo_optimize(mut self, profile: Option<&LlvmPGOProfile>) -> Self {
+        if let Some(prof) = profile {
+            self.cmd = self
+                .cmd
+                .arg("--set")
+                .arg(format!(r#"pgo.llvm.use="{}""#, normalize_path(&prof.0).as_str()));
+        }
         self
     }
 
@@ -151,8 +170,51 @@ impl Bootstrap {
         self
     }
 
+    pub fn rustc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustc.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
     pub fn rustc_pgo_optimize(mut self, profile: &RustcPGOProfile) -> Self {
-        self.cmd = self.cmd.arg("--rust-profile-use").arg(profile.0.as_str());
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustc.use="{}""#, normalize_path(&profile.0).as_str()));
+        self
+    }
+
+    pub fn rustdoc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustdoc.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
+    pub fn rustdoc_pgo_optimize(mut self, profile: &RustdocPGOProfile) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustdoc.use="{}""#, normalize_path(&profile.0).as_str()));
+        self
+    }
+
+    pub fn cargo_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.cargo.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
+    pub fn cargo_pgo_optimize(mut self, profile: &RustcPGOProfile) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.cargo.use="{}""#, normalize_path(&profile.0).as_str()));
         self
     }
 
@@ -166,8 +228,10 @@ impl Bootstrap {
         self
     }
 
-    pub fn with_bolt_profile(mut self, profile: BoltProfile) -> Self {
-        self.cmd = self.cmd.arg("--reproducible-artifact").arg(profile.0.as_str());
+    pub fn with_bolt_profile(mut self, profile: Option<BoltProfile>) -> Self {
+        if let Some(prof) = profile {
+            self.cmd = self.cmd.arg("--reproducible-artifact").arg(prof.0.as_str());
+        }
         self
     }
 
@@ -177,10 +241,33 @@ impl Bootstrap {
         self
     }
 
+    /// Rebuild rustc in case of statically linked LLVM
+    pub fn rustc_rebuild(mut self) -> Self {
+        self.cmd = self.cmd.arg("--keep-stage").arg("0");
+        self
+    }
+
     pub fn run(self, timer: &mut TimerSection) -> anyhow::Result<()> {
         self.cmd.run()?;
         let metrics = load_metrics(&self.metrics_path)?;
         record_metrics(&metrics, timer);
         Ok(())
+    }
+}
+
+fn add_shared_x_flags(env: &Environment, cmd: CmdBuilder) -> CmdBuilder {
+    if env.is_fast_try_build() {
+        // Skip things that cannot be skipped through `x ... --skip`
+        cmd.arg("--set")
+            .arg("rust.llvm-bitcode-linker=false")
+            // Skip wasm-component-ld. This also skips cargo, which we need to re-enable for dist
+            .arg("--set")
+            .arg("build.extended=false")
+            .arg("--set")
+            .arg("rust.codegen-backends=['llvm']")
+            .arg("--set")
+            .arg("rust.deny-warnings=false")
+    } else {
+        cmd
     }
 }

@@ -1,11 +1,11 @@
 //@ edition:2021
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 //@ only-x86_64
 //@ run-pass
 //@ needs-unwind Asserting on contents of error message
 
 #![allow(path_statements, unused_allocation)]
-#![feature(core_intrinsics, generic_assert)]
+#![feature(generic_assert)]
 
 macro_rules! test {
   (

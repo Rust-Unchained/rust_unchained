@@ -5,10 +5,12 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::{after, select, Receiver};
+use crossbeam_channel::{Receiver, after, select};
 use itertools::Itertools;
 use lsp_server::{Connection, Message, Notification, Request};
-use lsp_types::{notification::Exit, request::Shutdown, TextDocumentIdentifier, Url};
+use lsp_types::{
+    ExitNotification, PublishDiagnosticsParams, ShutdownRequest, TextDocumentIdentifier, Uri,
+};
 use parking_lot::{Mutex, MutexGuard};
 use paths::{Utf8Path, Utf8PathBuf};
 use rust_analyzer::{
@@ -17,7 +19,7 @@ use rust_analyzer::{
     lsp, main_loop,
 };
 use serde::Serialize;
-use serde_json::{json, to_string_pretty, Value};
+use serde_json::{Value, json, to_string_pretty};
 use test_utils::FixtureWithProjectMeta;
 use tracing_subscriber::fmt::TestWriter;
 use vfs::AbsPathBuf;
@@ -48,6 +50,7 @@ impl Project<'_> {
                         "enable": false,
                     },
                 },
+                "checkOnSave": false,
                 "procMacro": {
                     "enable": false,
                 }
@@ -88,11 +91,7 @@ impl Project<'_> {
 
     pub(crate) fn run_lsif(self) -> String {
         let tmp_dir = self.tmp_dir.unwrap_or_else(|| {
-            if self.root_dir_contains_symlink {
-                TestDir::new_symlink()
-            } else {
-                TestDir::new()
-            }
+            if self.root_dir_contains_symlink { TestDir::new_symlink() } else { TestDir::new() }
         });
 
         let FixtureWithProjectMeta {
@@ -101,6 +100,7 @@ impl Project<'_> {
             proc_macro_names,
             toolchain,
             target_data_layout: _,
+            target_arch: _,
         } = FixtureWithProjectMeta::parse(self.fixture);
         assert!(proc_macro_names.is_empty());
         assert!(mini_core.is_none());
@@ -116,7 +116,8 @@ impl Project<'_> {
         let mut buf = Vec::new();
         flags::Lsif::run(
             flags::Lsif {
-                path: tmp_dir_path.join(self.roots.iter().exactly_one().unwrap()).into(),
+                // FIXME: rewrite in terms of `#![feature(exact_length_collection)]`. See: #149266
+                path: tmp_dir_path.join(Itertools::exactly_one(self.roots.iter()).unwrap()).into(),
                 exclude_vendored_libraries: false,
             },
             &mut buf,
@@ -148,7 +149,10 @@ impl Project<'_> {
                 let guard = CONFIG_DIR_LOCK.lock();
                 let test_dir = TestDir::new();
                 let value = test_dir.path().to_owned();
-                env::set_var("__TEST_RA_USER_CONFIG_DIR", &value);
+                // SAFETY: This is safe because this is single-threaded.
+                unsafe {
+                    env::set_var("__TEST_RA_USER_CONFIG_DIR", &value);
+                }
                 (guard, test_dir)
             })
         } else {
@@ -156,11 +160,7 @@ impl Project<'_> {
         };
 
         let tmp_dir = self.tmp_dir.unwrap_or_else(|| {
-            if self.root_dir_contains_symlink {
-                TestDir::new_symlink()
-            } else {
-                TestDir::new()
-            }
+            if self.root_dir_contains_symlink { TestDir::new_symlink() } else { TestDir::new() }
         });
 
         static INIT: Once = Once::new();
@@ -170,10 +170,11 @@ impl Project<'_> {
                 // Deliberately enable all `error` logs if the user has not set RA_LOG, as there is usually
                 // useful information in there for debugging.
                 filter: std::env::var("RA_LOG").ok().unwrap_or_else(|| "error".to_owned()),
-                chalk_filter: std::env::var("CHALK_DEBUG").ok(),
+                solver_filter: std::env::var("SOLVER_DEBUG").ok(),
                 profile_filter: std::env::var("RA_PROFILE").ok(),
                 json_profile_filter: std::env::var("RA_PROFILE_JSON").ok(),
-            };
+            }
+            .init();
         });
 
         let FixtureWithProjectMeta {
@@ -182,6 +183,7 @@ impl Project<'_> {
             proc_macro_names,
             toolchain,
             target_data_layout: _,
+            target_arch: _,
         } = FixtureWithProjectMeta::parse(self.fixture);
         assert!(proc_macro_names.is_empty());
         assert!(mini_core.is_none());
@@ -207,7 +209,7 @@ impl Project<'_> {
         }
 
         let mut config = Config::new(
-            tmp_dir_path.clone(),
+            tmp_dir_path,
             lsp_types::ClientCapabilities {
                 workspace: Some(lsp_types::WorkspaceClientCapabilities {
                     did_change_watched_files: Some(
@@ -227,13 +229,13 @@ impl Project<'_> {
                     ..Default::default()
                 }),
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
-                    definition: Some(lsp_types::GotoCapability {
+                    definition: Some(lsp_types::DefinitionClientCapabilities {
                         link_support: Some(true),
                         ..Default::default()
                     }),
                     code_action: Some(lsp_types::CodeActionClientCapabilities {
                         code_action_literal_support: Some(
-                            lsp_types::CodeActionLiteralSupport::default(),
+                            lsp_types::ClientCodeActionLiteralOptions::default(),
                         ),
                         ..Default::default()
                     }),
@@ -242,7 +244,7 @@ impl Project<'_> {
                         ..Default::default()
                     }),
                     inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
-                        resolve_support: Some(lsp_types::InlayHintResolveClientCapabilities {
+                        resolve_support: Some(lsp_types::ClientInlayHintResolveOptions {
                             properties: vec![
                                 "textEdits".to_owned(),
                                 "tooltip".to_owned(),
@@ -303,8 +305,7 @@ impl Server {
     ) -> Server {
         let (connection, client) = Connection::memory();
 
-        let _thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker)
-            .name("test server".to_owned())
+        let _thread = stdx::thread::Builder::new(stdx::thread::ThreadIntent::Worker, "test server")
             .spawn(move || main_loop(config, connection).unwrap())
             .expect("failed to spawn a thread");
 
@@ -320,22 +321,22 @@ impl Server {
 
     pub(crate) fn doc_id(&self, rel_path: &str) -> TextDocumentIdentifier {
         let path = self.dir.path().join(rel_path);
-        TextDocumentIdentifier { uri: Url::from_file_path(path).unwrap() }
+        TextDocumentIdentifier { uri: Uri::from_file_path(path).unwrap() }
     }
 
     pub(crate) fn notification<N>(&self, params: N::Params)
     where
-        N: lsp_types::notification::Notification,
+        N: lsp_types::Notification,
         N::Params: Serialize,
     {
-        let r = Notification::new(N::METHOD.to_owned(), params);
+        let r = Notification::new(N::METHOD.into(), params);
         self.send_notification(r)
     }
 
     #[track_caller]
     pub(crate) fn request<R>(&self, params: R::Params, expected_resp: Value)
     where
-        R: lsp_types::request::Request,
+        R: lsp_types::Request,
         R::Params: Serialize,
     {
         let actual = self.send_request::<R>(params);
@@ -353,13 +354,13 @@ impl Server {
     #[track_caller]
     pub(crate) fn send_request<R>(&self, params: R::Params) -> Value
     where
-        R: lsp_types::request::Request,
+        R: lsp_types::Request,
         R::Params: Serialize,
     {
         let id = self.req_id.get();
         self.req_id.set(id.wrapping_add(1));
 
-        let r = Request::new(id.into(), R::METHOD.to_owned(), params);
+        let r = Request::new(id.into(), R::METHOD.into(), params);
         self.send_request_(r)
     }
     #[track_caller]
@@ -377,8 +378,9 @@ impl Server {
                         {
                             continue;
                         }
+                    } else if req.method != "workspace/diagnostic/refresh" {
+                        panic!("unexpected request: {req:?}")
                     }
-                    panic!("unexpected request: {req:?}")
                 }
                 Message::Notification(_) => (),
                 Message::Response(res) => {
@@ -409,6 +411,53 @@ impl Server {
         .unwrap_or_else(|Timeout| panic!("timeout while waiting for ws to load"));
         self
     }
+    pub(crate) fn wait_for_diagnostics(&self) -> PublishDiagnosticsParams {
+        for msg in self.messages.borrow().iter() {
+            if let Message::Notification(n) = msg
+                && n.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(n.params.clone()).unwrap();
+                if !params.diagnostics.is_empty() {
+                    return params;
+                }
+            }
+        }
+        loop {
+            let msg = self
+                .recv()
+                .unwrap_or_else(|Timeout| panic!("timeout while waiting for diagnostics"))
+                .expect("connection closed while waiting for diagnostics");
+            if let Message::Notification(n) = &msg
+                && n.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(n.params.clone()).unwrap();
+                if !params.diagnostics.is_empty() {
+                    return params;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_diagnostics_cleared(&self) {
+        loop {
+            let msg = self
+                .recv()
+                .unwrap_or_else(|Timeout| panic!("timeout while waiting for diagnostics to clear"))
+                .expect("connection closed while waiting for diagnostics to clear");
+            if let Message::Notification(n) = &msg
+                && n.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(n.params.clone()).unwrap();
+                if params.diagnostics.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
     fn wait_for_message_cond(
         &self,
         n: usize,
@@ -445,7 +494,7 @@ impl Server {
 
     pub(crate) fn write_file_and_save(&self, path: &str, text: String) {
         fs::write(self.dir.path().join(path), &text).unwrap();
-        self.notification::<lsp_types::notification::DidSaveTextDocument>(
+        self.notification::<lsp_types::DidSaveTextDocumentNotification>(
             lsp_types::DidSaveTextDocumentParams {
                 text_document: self.doc_id(path),
                 text: Some(text),
@@ -456,8 +505,8 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.request::<Shutdown>((), Value::Null);
-        self.notification::<Exit>(());
+        self.request::<ShutdownRequest>((), Value::Null);
+        self.notification::<ExitNotification>(());
     }
 }
 

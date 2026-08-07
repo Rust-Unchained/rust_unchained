@@ -1,5 +1,12 @@
 //! `completions` crate provides utilities for generating completions of user input.
 
+// It's useful to refer to code that is private in doc comments.
+#![allow(rustdoc::private_intra_doc_links)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 mod completions;
 mod config;
 mod context;
@@ -11,12 +18,12 @@ mod snippet;
 mod tests;
 
 use ide_db::{
+    FilePosition, FxHashSet, RootDatabase,
     imports::insert_use::{self, ImportScope},
     syntax_helpers::tree_diff::diff,
     text_edit::TextEdit,
-    FilePosition, FxHashSet, RootDatabase,
 };
-use syntax::ast::make;
+use syntax::{AstNode, syntax_editor::SyntaxEditor};
 
 use crate::{
     completions::Completions,
@@ -29,8 +36,8 @@ use crate::{
 pub use crate::{
     config::{AutoImportExclusionType, CallableSnippets, CompletionConfig},
     item::{
-        CompletionItem, CompletionItemKind, CompletionItemRefMode, CompletionRelevance,
-        CompletionRelevancePostfixMatch, CompletionRelevanceReturnType,
+        CompletionItem, CompletionItemImport, CompletionItemKind, CompletionItemRefMode,
+        CompletionRelevance, CompletionRelevancePostfixMatch, CompletionRelevanceReturnType,
         CompletionRelevanceTypeMatch,
     },
     snippet::{Snippet, SnippetScope},
@@ -187,7 +194,7 @@ pub fn completions(
     position: FilePosition,
     trigger_character: Option<char>,
 ) -> Option<Vec<CompletionItem>> {
-    let (ctx, analysis) = &CompletionContext::new(db, position, config)?;
+    let (ctx, analysis) = &CompletionContext::new(db, position, config, trigger_character)?;
     let mut completions = Completions::default();
 
     // prevent `(` from triggering unwanted completion noise
@@ -208,9 +215,9 @@ pub fn completions(
     // when the user types a bare `_` (that is it does not belong to an identifier)
     // the user might just wanted to type a `_` for type inference or pattern discarding
     // so try to suppress completions in those cases
-    if trigger_character == Some('_') && ctx.original_token.kind() == syntax::SyntaxKind::UNDERSCORE
-    {
-        if let CompletionAnalysis::NameRef(NameRefContext {
+    if trigger_character == Some('_')
+        && ctx.original_token.kind() == syntax::SyntaxKind::UNDERSCORE
+        && let CompletionAnalysis::NameRef(NameRefContext {
             kind:
                 NameRefKind::Path(
                     path_ctx @ PathCompletionCtx {
@@ -220,11 +227,9 @@ pub fn completions(
                 ),
             ..
         }) = analysis
-        {
-            if path_ctx.is_trivial_path() {
-                return None;
-            }
-        }
+        && path_ctx.is_trivial_path()
+    {
+        return None;
     }
 
     {
@@ -243,6 +248,7 @@ pub fn completions(
                 completions::extern_abi::complete_extern_abi(acc, ctx, expanded);
                 completions::format_string::format_string(acc, ctx, original, expanded);
                 completions::env_vars::complete_cargo_env_vars(acc, ctx, original, expanded);
+                completions::ra_fixture::complete_ra_fixture(acc, ctx, original, expanded);
             }
             CompletionAnalysis::UnexpandedAttrTT {
                 colon_prefix,
@@ -252,10 +258,14 @@ pub fn completions(
                 completions::attribute::complete_known_attribute_input(
                     acc,
                     ctx,
-                    colon_prefix,
+                    *colon_prefix,
                     attr,
                     extern_crate.as_ref(),
                 );
+            }
+            CompletionAnalysis::CfgPredicate => completions::attribute::complete_cfg(acc, ctx),
+            CompletionAnalysis::MacroSegment => {
+                completions::macro_def::complete_macro_segment(acc, ctx);
             }
             CompletionAnalysis::UnexpandedAttrTT { .. } | CompletionAnalysis::String { .. } => (),
         }
@@ -270,31 +280,42 @@ pub fn resolve_completion_edits(
     db: &RootDatabase,
     config: &CompletionConfig<'_>,
     FilePosition { file_id, offset }: FilePosition,
-    imports: impl IntoIterator<Item = String>,
+    imports: impl IntoIterator<Item = CompletionItemImport>,
 ) -> Option<Vec<TextEdit>> {
     let _p = tracing::info_span!("resolve_completion_edits").entered();
     let sema = hir::Semantics::new(db);
 
-    let original_file = sema.parse(sema.attach_first_edition(file_id)?);
+    let editioned_file_id = sema.attach_first_edition(file_id);
+
+    let original_file = sema.parse(editioned_file_id);
     let original_token =
         syntax::AstNode::syntax(&original_file).token_at_offset(offset).left_biased()?;
     let position_for_import = &original_token.parent()?;
     let scope = ImportScope::find_insert_use_container(position_for_import, &sema)?;
 
     let current_module = sema.scope(position_for_import)?.module();
-    let current_crate = current_module.krate();
+    let current_crate = current_module.krate(db);
     let current_edition = current_crate.edition(db);
-    let new_ast = scope.clone_for_update();
     let mut import_insert = TextEdit::builder();
+    let (editor, _) = SyntaxEditor::new(original_file.syntax().clone());
+    let make = editor.make();
 
-    imports.into_iter().for_each(|full_import_path| {
-        insert_use::insert_use(
-            &new_ast,
-            make::path_from_text_with_edition(&full_import_path, current_edition),
-            &config.insert_use,
-        );
+    imports.into_iter().for_each(|import| {
+        let full_path = make.path_from_text_with_edition(&import.path, current_edition);
+        if import.as_underscore {
+            insert_use::insert_use_as_alias_with_editor(
+                &scope,
+                full_path,
+                &config.insert_use,
+                current_edition,
+                &editor,
+            );
+        } else {
+            insert_use::insert_use_with_editor(&scope, full_path, &config.insert_use, &editor);
+        }
     });
 
-    diff(scope.as_syntax_node(), new_ast.as_syntax_node()).into_text_edit(&mut import_insert);
+    let edit = editor.finish();
+    diff(edit.old_root(), edit.new_root()).into_text_edit(&mut import_insert);
     Some(vec![import_insert.finish()])
 }

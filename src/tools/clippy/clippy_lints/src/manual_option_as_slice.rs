@@ -1,14 +1,14 @@
 use clippy_config::Conf;
-use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::Msrv;
-use clippy_utils::{is_none_arm, msrvs, peel_hir_expr_refs};
+use clippy_utils::res::{MaybeDef, MaybeQPath, MaybeResPath};
+use clippy_utils::source::snippet_with_context;
+use clippy_utils::{as_some_pattern, is_none_pattern, msrvs, peel_hir_expr_refs, sym};
 use rustc_errors::Applicability;
-use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{Arm, Expr, ExprKind, LangItem, Pat, PatKind, QPath, is_range_literal};
+use rustc_hir::{Arm, Expr, ExprKind, Pat, PatKind, QPath, is_range_literal};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty;
 use rustc_session::impl_lint_pass;
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -40,6 +40,8 @@ declare_clippy_lint! {
     "manual `Option::as_slice`"
 }
 
+impl_lint_pass!(ManualOptionAsSlice => [MANUAL_OPTION_AS_SLICE]);
+
 pub struct ManualOptionAsSlice {
     msrv: Msrv,
 }
@@ -50,8 +52,6 @@ impl ManualOptionAsSlice {
     }
 }
 
-impl_lint_pass!(ManualOptionAsSlice => [MANUAL_OPTION_AS_SLICE]);
-
 impl LateLintPass<'_> for ManualOptionAsSlice {
     fn check_expr(&mut self, cx: &LateContext<'_>, expr: &Expr<'_>) {
         let span = expr.span;
@@ -59,12 +59,11 @@ impl LateLintPass<'_> for ManualOptionAsSlice {
             return;
         }
         match expr.kind {
-            ExprKind::Match(scrutinee, [arm1, arm2], _) => {
-                if is_none_arm(cx, arm2) && check_arms(cx, arm2, arm1)
-                    || is_none_arm(cx, arm1) && check_arms(cx, arm1, arm2)
-                {
-                    check_as_ref(cx, scrutinee, span, self.msrv);
-                }
+            ExprKind::Match(scrutinee, [arm1, arm2], _)
+                if is_none_pattern(cx, arm2.pat) && check_arms(cx, arm2, arm1)
+                    || is_none_pattern(cx, arm1.pat) && check_arms(cx, arm1, arm2) =>
+            {
+                check_as_ref(cx, scrutinee, span, self.msrv);
             },
             ExprKind::If(cond, then, Some(other)) => {
                 if let ExprKind::Let(let_expr) = cond.kind
@@ -75,34 +74,24 @@ impl LateLintPass<'_> for ManualOptionAsSlice {
                     check_as_ref(cx, let_expr.init, span, self.msrv);
                 }
             },
-            ExprKind::MethodCall(seg, callee, [], _) => {
-                if seg.ident.name.as_str() == "unwrap_or_default" {
-                    check_map(cx, callee, span, self.msrv);
-                }
+            ExprKind::MethodCall(seg, callee, [], _) if seg.ident.name == sym::unwrap_or_default => {
+                check_map(cx, callee, span, self.msrv);
             },
-            ExprKind::MethodCall(seg, callee, [or], _) => match seg.ident.name.as_str() {
-                "unwrap_or" => {
-                    if is_empty_slice(cx, or) {
-                        check_map(cx, callee, span, self.msrv);
-                    }
+            ExprKind::MethodCall(seg, callee, [or], _) => match seg.ident.name {
+                sym::unwrap_or if is_empty_slice(cx, or) => {
+                    check_map(cx, callee, span, self.msrv);
                 },
-                "unwrap_or_else" => {
-                    if returns_empty_slice(cx, or) {
-                        check_map(cx, callee, span, self.msrv);
-                    }
+                sym::unwrap_or_else if returns_empty_slice(cx, or) => {
+                    check_map(cx, callee, span, self.msrv);
                 },
                 _ => {},
             },
-            ExprKind::MethodCall(seg, callee, [or_else, map], _) => match seg.ident.name.as_str() {
-                "map_or" => {
-                    if is_empty_slice(cx, or_else) && is_slice_from_ref(cx, map) {
-                        check_as_ref(cx, callee, span, self.msrv);
-                    }
+            ExprKind::MethodCall(seg, callee, [or_else, map], _) => match seg.ident.name {
+                sym::map_or if is_empty_slice(cx, or_else) && is_slice_from_ref(cx, map) => {
+                    check_as_ref(cx, callee, span, self.msrv);
                 },
-                "map_or_else" => {
-                    if returns_empty_slice(cx, or_else) && is_slice_from_ref(cx, map) {
-                        check_as_ref(cx, callee, span, self.msrv);
-                    }
+                sym::map_or_else if returns_empty_slice(cx, or_else) && is_slice_from_ref(cx, map) => {
+                    check_as_ref(cx, callee, span, self.msrv);
                 },
                 _ => {},
             },
@@ -123,8 +112,7 @@ fn check_map(cx: &LateContext<'_>, map: &Expr<'_>, span: Span, msrv: Msrv) {
 fn check_as_ref(cx: &LateContext<'_>, expr: &Expr<'_>, span: Span, msrv: Msrv) {
     if let ExprKind::MethodCall(seg, callee, [], _) = expr.kind
         && seg.ident.name == sym::as_ref
-        && let ty::Adt(adtdef, ..) = cx.typeck_results().expr_ty(callee).kind()
-        && cx.tcx.is_diagnostic_item(sym::Option, adtdef.did())
+        && cx.typeck_results().expr_ty(callee).is_diag_item(cx, sym::Option)
         && msrv.meets(
             cx,
             if clippy_utils::is_in_const_context(cx) {
@@ -134,27 +122,28 @@ fn check_as_ref(cx: &LateContext<'_>, expr: &Expr<'_>, span: Span, msrv: Msrv) {
             },
         )
     {
-        if let Some(snippet) = clippy_utils::source::snippet_opt(cx, callee.span) {
-            span_lint_and_sugg(
-                cx,
-                MANUAL_OPTION_AS_SLICE,
-                span,
-                "use `Option::as_slice`",
-                "use",
-                format!("{snippet}.as_slice()"),
-                Applicability::MachineApplicable,
-            );
-        } else {
-            span_lint(cx, MANUAL_OPTION_AS_SLICE, span, "use `Option_as_slice`");
-        }
+        span_lint_and_then(
+            cx,
+            MANUAL_OPTION_AS_SLICE,
+            span,
+            "manual implementation of `Option::as_slice`",
+            |diag| {
+                let mut app = Applicability::MachineApplicable;
+                let callee = snippet_with_context(cx, callee.span, expr.span.ctxt(), "_", &mut app).0;
+                diag.span_suggestion_verbose(
+                    span,
+                    "use `Option::as_slice` directly",
+                    format!("{callee}.as_slice()"),
+                    app,
+                );
+            },
+        );
     }
 }
 
 fn extract_ident_from_some_pat(cx: &LateContext<'_>, pat: &Pat<'_>) -> Option<Symbol> {
-    if let PatKind::TupleStruct(QPath::Resolved(None, path), [binding], _) = pat.kind
-        && let Res::Def(DefKind::Ctor(..), def_id) = path.res
+    if let Some([binding]) = as_some_pattern(cx, pat)
         && let PatKind::Binding(_mode, _hir_id, ident, _inner_pat) = binding.kind
-        && clippy_utils::is_lang_item_or_ctor(cx, def_id, LangItem::OptionSome)
     {
         Some(ident.name)
     } else {
@@ -189,7 +178,7 @@ fn check_arms(cx: &LateContext<'_>, none_arm: &Arm<'_>, some_arm: &Arm<'_>) -> b
 
 fn returns_empty_slice(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match expr.kind {
-        ExprKind::Path(_) => clippy_utils::is_path_diagnostic_item(cx, expr, sym::default_fn),
+        ExprKind::Path(_) => expr.res(cx).is_diag_item(cx, sym::default_fn),
         ExprKind::Closure(cl) => is_empty_slice(cx, cx.tcx.hir_body(cl.body).value),
         _ => false,
     }
@@ -206,19 +195,19 @@ fn is_empty_slice(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
         ExprKind::Index(arr, range, _) => match arr.kind {
             ExprKind::Array([]) => is_range_literal(range),
             ExprKind::Array(_) => {
-                let Some(range) = clippy_utils::higher::Range::hir(range) else {
+                let Some(range) = clippy_utils::higher::Range::hir(cx, range) else {
                     return false;
                 };
-                range.end.is_some_and(|e| clippy_utils::is_integer_const(cx, e, 0))
+                range.end.is_some_and(|e| clippy_utils::is_integer_literal(e, 0))
             },
             _ => false,
         },
         ExprKind::Array([]) => true,
-        ExprKind::Call(def, []) => clippy_utils::is_path_diagnostic_item(cx, def, sym::default_fn),
+        ExprKind::Call(def, []) => def.res(cx).is_diag_item(cx, sym::default_fn),
         _ => false,
     }
 }
 
 fn is_slice_from_ref(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    clippy_utils::is_expr_path_def_path(cx, expr, &["core", "slice", "raw", "from_ref"])
+    expr.basic_res().is_diag_item(cx, sym::slice_from_ref)
 }

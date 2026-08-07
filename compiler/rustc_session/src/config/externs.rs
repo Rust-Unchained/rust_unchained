@@ -43,13 +43,19 @@ pub(crate) fn split_extern_opt<'a>(
         }
     };
 
+    // Reject paths with more than two segments.
+    if unstable_opts.namespaced_crates && crate_name.split("::").count() > 2 {
+        return Err(early_dcx.early_struct_fatal(format!(
+            "crate name `{crate_name}` passed to `--extern` can have at most two segments."
+        )));
+    }
+
     if !valid_crate_name(&crate_name, unstable_opts) {
         let mut error = early_dcx.early_struct_fatal(format!(
             "crate name `{crate_name}` passed to `--extern` is not a valid ASCII identifier"
         ));
         let adjusted_name = crate_name.replace('-', "_");
         if is_ascii_ident(&adjusted_name) {
-            #[allow(rustc::diagnostic_outside_of_impl)] // FIXME
             error
                 .help(format!("consider replacing the dashes with underscores: `{adjusted_name}`"));
         }

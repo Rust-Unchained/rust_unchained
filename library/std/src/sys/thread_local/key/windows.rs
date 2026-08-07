@@ -60,6 +60,12 @@ impl LazyKey {
 
     #[inline]
     pub fn force(&'static self) -> Key {
+        if self.dtor.is_some() {
+            // Needs to be called on all threads where the key might have a non-null value!
+            // Otherwise, `run_dtors` might not be called on this thread.
+            guard::enable();
+        }
+
         match self.key.load(Acquire) {
             0 => unsafe { self.init() },
             key => key - 1,
@@ -81,18 +87,15 @@ impl LazyKey {
             } else {
                 let key = unsafe { c::TlsAlloc() };
                 if key == c::TLS_OUT_OF_INDEXES {
-                    // Wakeup the waiting threads before panicking to avoid deadlock.
-                    unsafe {
-                        c::InitOnceComplete(
-                            self.once.get(),
-                            c::INIT_ONCE_INIT_FAILED,
-                            ptr::null_mut(),
-                        );
-                    }
-                    panic!("out of TLS indexes");
+                    // Since we abort the process, there is no need to wake up
+                    // the waiting threads. If this were a panic, the wakeup
+                    // would need to occur first in order to avoid deadlock.
+                    rtabort!("out of TLS indexes");
                 }
 
                 unsafe {
+                    // Add ourselves to the `DTORS` list, so that when `run_dtors` gets called,
+                    // our dtor is invoked.
                     register_dtor(self);
                 }
 
@@ -112,7 +115,9 @@ impl LazyKey {
             // If there is no destructor to clean up, we can use racy initialization.
 
             let key = unsafe { c::TlsAlloc() };
-            assert_ne!(key, c::TLS_OUT_OF_INDEXES, "out of TLS indexes");
+            if key == c::TLS_OUT_OF_INDEXES {
+                rtabort!("out of TLS indexes");
+            }
 
             match self.key.compare_exchange(0, key + 1, AcqRel, Acquire) {
                 Ok(_) => key,
@@ -147,8 +152,6 @@ static DTORS: Atomic<*mut LazyKey> = AtomicPtr::new(ptr::null_mut());
 /// Should only be called once per key, otherwise loops or breaks may occur in
 /// the linked list.
 unsafe fn register_dtor(key: &'static LazyKey) {
-    guard::enable();
-
     let this = <*const LazyKey>::cast_mut(key);
     // Use acquire ordering to pass along the changes done by the previously
     // registered keys when we store the new head with release ordering.

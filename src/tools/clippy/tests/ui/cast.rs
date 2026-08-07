@@ -1,20 +1,18 @@
-//@no-rustfix
+//@no-rustfix: only some diagnostics have suggestions
 
-#![feature(repr128)]
-#![allow(incomplete_features)]
 #![warn(
-    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
 )]
-#![allow(
+#![expect(
     clippy::cast_abs_to_unsigned,
+    clippy::identity_op,
     clippy::no_effect,
-    clippy::unnecessary_min_or_max,
-    clippy::unnecessary_operation,
     clippy::unnecessary_literal_unwrap,
-    clippy::identity_op
+    clippy::unnecessary_min_or_max,
+    clippy::unnecessary_operation
 )]
 
 // FIXME(f16_f128): add tests once const casting is available for these types
@@ -570,4 +568,27 @@ fn issue12721() {
 
     (255 % 999999u64) as u8;
     //~^ cast_possible_truncation
+}
+
+mod issue14150 {
+    #[clippy::msrv = "1.87"]
+    fn msrv_supports_cast_signed() {
+        _ = 1u8 as i8;
+        //~^ cast_possible_wrap
+    }
+    #[clippy::msrv = "1.86"]
+    fn msrv_doesnt_supports_cast_signed() {
+        _ = 1u8 as i8;
+        //~^ cast_possible_wrap
+    }
+}
+
+fn issue16045() {
+    fn f() -> Result<(), ()> {
+        let val = Ok::<_, ()>(0u8);
+        _ = val? as i8;
+        //~^ cast_possible_wrap
+
+        Ok(())
+    }
 }

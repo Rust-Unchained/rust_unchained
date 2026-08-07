@@ -6,24 +6,21 @@ use std::{fmt, hash::Hash};
 use stdx::{always, itertools::Itertools};
 
 use crate::{
-    EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SpanData, SyntaxContextId, TextRange,
-    TextSize, ROOT_ERASED_FILE_AST_ID,
+    EditionedFileId, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, Span, SyntaxContext, TextRange,
+    TextSize,
 };
 
 /// Maps absolute text ranges for the corresponding file to the relevant span data.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct SpanMap<S> {
+pub struct SpanMap {
     /// The offset stored here is the *end* of the node.
-    spans: Vec<(TextSize, SpanData<S>)>,
+    spans: Vec<(TextSize, Span)>,
     /// Index of the matched macro arm on successful expansion for declarative macros.
     // FIXME: Does it make sense to have this here?
     pub matched_arm: Option<u32>,
 }
 
-impl<S> SpanMap<S>
-where
-    SpanData<S>: Copy,
-{
+impl SpanMap {
     /// Creates a new empty [`SpanMap`].
     pub fn empty() -> Self {
         Self { spans: Vec::new(), matched_arm: None }
@@ -33,21 +30,21 @@ where
     /// in order.
     pub fn finish(&mut self) {
         always!(
-            self.spans.iter().tuple_windows().all(|(a, b)| a.0 < b.0),
+            self.spans.iter().array_windows().all(|[a, b]| a.0 < b.0),
             "spans are not in order"
         );
         self.spans.shrink_to_fit();
     }
 
     /// Pushes a new span onto the [`SpanMap`].
-    pub fn push(&mut self, offset: TextSize, span: SpanData<S>) {
-        if cfg!(debug_assertions) {
-            if let Some(&(last_offset, _)) = self.spans.last() {
-                assert!(
-                    last_offset < offset,
-                    "last_offset({last_offset:?}) must be smaller than offset({offset:?})"
-                );
-            }
+    pub fn push(&mut self, offset: TextSize, span: Span) {
+        if cfg!(debug_assertions)
+            && let Some(&(last_offset, _)) = self.spans.last()
+        {
+            assert!(
+                last_offset < offset,
+                "last_offset({last_offset:?}) must be smaller than offset({offset:?})"
+            );
         }
         self.spans.push((offset, span));
     }
@@ -57,11 +54,8 @@ where
     /// Note this does a linear search through the entire backing vector.
     pub fn ranges_with_span_exact(
         &self,
-        span: SpanData<S>,
-    ) -> impl Iterator<Item = (TextRange, S)> + '_
-    where
-        S: Copy,
-    {
+        span: Span,
+    ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
         self.spans.iter().enumerate().filter_map(move |(idx, &(end, s))| {
             if !s.eq_ignoring_ctx(span) {
                 return None;
@@ -74,10 +68,10 @@ where
     /// Returns all [`TextRange`]s whose spans contain the given span.
     ///
     /// Note this does a linear search through the entire backing vector.
-    pub fn ranges_with_span(&self, span: SpanData<S>) -> impl Iterator<Item = (TextRange, S)> + '_
-    where
-        S: Copy,
-    {
+    pub fn ranges_with_span(
+        &self,
+        span: Span,
+    ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
         self.spans.iter().enumerate().filter_map(move |(idx, &(end, s))| {
             if s.anchor != span.anchor {
                 return None;
@@ -91,28 +85,28 @@ where
     }
 
     /// Returns the span at the given position.
-    pub fn span_at(&self, offset: TextSize) -> SpanData<S> {
+    pub fn span_at(&self, offset: TextSize) -> Span {
         let entry = self.spans.partition_point(|&(it, _)| it <= offset);
         self.spans[entry].1
     }
 
     /// Returns the spans associated with the given range.
     /// In other words, this will return all spans that correspond to all offsets within the given range.
-    pub fn spans_for_range(&self, range: TextRange) -> impl Iterator<Item = SpanData<S>> + '_ {
+    pub fn spans_for_range(&self, range: TextRange) -> impl Iterator<Item = Span> + '_ {
         let (start, end) = (range.start(), range.end());
         let start_entry = self.spans.partition_point(|&(it, _)| it <= start);
         let end_entry = self.spans[start_entry..].partition_point(|&(it, _)| it <= end); // FIXME: this might be wrong?
         self.spans[start_entry..][..end_entry].iter().map(|&(_, s)| s)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (TextSize, SpanData<S>)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (TextSize, Span)> + '_ {
         self.spans.iter().copied()
     }
 
     /// Merges this span map with another span map, where `other` is inserted at (and replaces) `other_range`.
     ///
     /// The length of the replacement node needs to be `other_size`.
-    pub fn merge(&mut self, other_range: TextRange, other_size: TextSize, other: &SpanMap<S>) {
+    pub fn merge(&mut self, other_range: TextRange, other_size: TextSize, other: &SpanMap) {
         // I find the following diagram helpful to illustrate the bounds and why we use `<` or `<=`:
         // --------------------------------------------------------------------
         //   1   3   5   6   7   10    11          <-- offsets we store
@@ -156,6 +150,39 @@ where
     }
 }
 
+#[cfg(not(no_salsa_async_drops))]
+impl Drop for SpanMap {
+    fn drop(&mut self) {
+        let spans = std::mem::take(&mut self.spans);
+        static SPAN_MAP_DROP_THREAD: std::sync::OnceLock<
+            std::sync::mpsc::Sender<Vec<(TextSize, Span)>>,
+        > = std::sync::OnceLock::new();
+
+        SPAN_MAP_DROP_THREAD
+            .get_or_init(|| {
+                let (sender, receiver) = std::sync::mpsc::channel::<Vec<(TextSize, Span)>>();
+                std::thread::Builder::new()
+                    .name("SpanMapDropper".to_owned())
+                    .spawn(move || {
+                        loop {
+                            // block on a receive
+                            _ = receiver.recv();
+                            // then drain the entire channel
+                            while receiver.try_recv().is_ok() {}
+                            // and sleep for a bit
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
+                        // otherwise this thread will constantly wake up and sleep again.
+                    })
+                    .unwrap();
+                sender
+            })
+            .send(spans)
+            .unwrap();
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub struct RealSpanMap {
     file_id: EditionedFileId,
@@ -169,7 +196,7 @@ impl fmt::Display for RealSpanMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "RealSpanMap({:?}):", self.file_id)?;
         for span in self.pairs.iter() {
-            writeln!(f, "{}: {}", u32::from(span.0), span.1.into_raw())?;
+            writeln!(f, "{}: {:#?}", u32::from(span.0), span.1)?;
         }
         Ok(())
     }
@@ -193,6 +220,7 @@ impl RealSpanMap {
         Self { file_id, pairs, end }
     }
 
+    #[cfg(feature = "salsa")]
     pub fn span_for_range(&self, range: TextRange) -> Span {
         assert!(
             range.end() <= self.end,
@@ -207,8 +235,8 @@ impl RealSpanMap {
         let (offset, ast_id) = self.pairs[idx - 1];
         Span {
             range: range - offset,
-            anchor: SpanAnchor { file_id: self.file_id, ast_id },
-            ctx: SyntaxContextId::root(self.file_id.edition()),
+            anchor: crate::SpanAnchor { file_id: self.file_id, ast_id },
+            ctx: SyntaxContext::root(self.file_id.edition()),
         }
     }
 }

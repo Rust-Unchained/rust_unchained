@@ -61,6 +61,7 @@ fn main() {
 }
 
 // FIXME: bunch of patterns that should be linted
+#[expect(clippy::needless_late_init)]
 fn fixme() {
     let a: usize = 5;
     let b: usize = 3;
@@ -113,4 +114,13 @@ fn non_primitive_ty() {
 
     let (a, b) = (S(10), S(20));
     let _ = if a < b { b - a } else { a - b };
+}
+
+fn issue15254(a: &usize, b: &usize) -> usize {
+    if a < b {
+        //~^ manual_abs_diff
+        b - a
+    } else {
+        a - b
+    }
 }

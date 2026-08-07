@@ -4,11 +4,11 @@
 use crate::source::{snippet, snippet_opt, snippet_with_applicability, snippet_with_context};
 use crate::ty::expr_sig;
 use crate::{get_parent_expr_for_hir, higher};
-use rustc_ast::ast;
 use rustc_ast::util::parser::AssocOp;
+use rustc_ast::{UnOp, ast};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
-use rustc_hir as hir;
-use rustc_hir::{Closure, ExprKind, HirId, MutTy, TyKind};
+use rustc_hir::{self as hir, Closure, ExprKind, HirId, MatchSource, MutTy, Node, TyKind};
 use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 use rustc_lint::{EarlyContext, LateContext, LintContext};
 use rustc_middle::hir::place::ProjectionKind;
@@ -29,6 +29,11 @@ pub enum Sugg<'a> {
     /// A binary operator expression, including `as`-casts and explicit type
     /// coercion.
     BinOp(AssocOp, Cow<'a, str>, Cow<'a, str>),
+    /// A unary operator expression. This is used to sometimes represent `!`
+    /// or `-`, but only if the type with and without the operator is kept identical.
+    /// It means that doubling the operator can be used to remove it instead, in
+    /// order to provide better suggestions.
+    UnOp(UnOp, Box<Self>),
 }
 
 /// Literal constant `0`, for convenience.
@@ -40,9 +45,10 @@ pub const EMPTY: Sugg<'static> = Sugg::NonParen(Cow::Borrowed(""));
 
 impl Display for Sugg<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        match *self {
-            Sugg::NonParen(ref s) | Sugg::MaybeParen(ref s) => s.fmt(f),
-            Sugg::BinOp(op, ref lhs, ref rhs) => binop_to_string(op, lhs, rhs).fmt(f),
+        match self {
+            Sugg::NonParen(s) | Sugg::MaybeParen(s) => s.fmt(f),
+            Sugg::BinOp(op, lhs, rhs) => binop_to_string(*op, lhs, rhs).fmt(f),
+            Sugg::UnOp(op, inner) => write!(f, "{}{}", op.as_str(), inner.clone().maybe_inner_paren()),
         }
     }
 }
@@ -53,7 +59,7 @@ impl<'a> Sugg<'a> {
     pub fn hir_opt(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Self> {
         let ctxt = expr.span.ctxt();
         let get_snippet = |span| snippet_with_context(cx, span, ctxt, "", &mut Applicability::Unspecified).0;
-        snippet_opt(cx, expr.span).map(|_| Self::hir_from_snippet(expr, get_snippet))
+        snippet_opt(cx, expr.span).map(|_| Self::hir_from_snippet(cx, expr, get_snippet))
     }
 
     /// Convenience function around `hir_opt` for suggestions with a default
@@ -100,9 +106,19 @@ impl<'a> Sugg<'a> {
         applicability: &mut Applicability,
     ) -> Self {
         if expr.span.ctxt() == ctxt {
-            Self::hir_from_snippet(expr, |span| {
-                snippet_with_context(cx, span, ctxt, default, applicability).0
-            })
+            if let ExprKind::Unary(op, inner) = expr.kind
+                && matches!(op, UnOp::Neg | UnOp::Not)
+                && cx.typeck_results().expr_ty(expr) == cx.typeck_results().expr_ty(inner)
+            {
+                Sugg::UnOp(
+                    op,
+                    Box::new(Self::hir_with_context(cx, inner, ctxt, default, applicability)),
+                )
+            } else {
+                Self::hir_from_snippet(cx, expr, |span| {
+                    snippet_with_context(cx, span, ctxt, default, applicability).0
+                })
+            }
         } else {
             let (snip, _) = snippet_with_context(cx, expr.span, ctxt, default, applicability);
             Sugg::NonParen(snip)
@@ -111,9 +127,13 @@ impl<'a> Sugg<'a> {
 
     /// Generate a suggestion for an expression with the given snippet. This is used by the `hir_*`
     /// function variants of `Sugg`, since these use different snippet functions.
-    fn hir_from_snippet(expr: &hir::Expr<'_>, mut get_snippet: impl FnMut(Span) -> Cow<'a, str>) -> Self {
-        if let Some(range) = higher::Range::hir(expr) {
-            let op = AssocOp::Range(range.limits);
+    pub fn hir_from_snippet(
+        cx: &LateContext<'_>,
+        expr: &hir::Expr<'_>,
+        mut get_snippet: impl FnMut(Span) -> Cow<'a, str>,
+    ) -> Self {
+        if let Some(range) = higher::Range::hir(cx, expr) {
+            let op = AssocOp::Range(range.ty.limits());
             let start = range.start.map_or("".into(), |expr| get_snippet(expr.span));
             let end = range.end.map_or("".into(), |expr| get_snippet(expr.span));
 
@@ -126,7 +146,9 @@ impl<'a> Sugg<'a> {
             | ExprKind::Let(..)
             | ExprKind::Closure { .. }
             | ExprKind::Unary(..)
-            | ExprKind::Match(..) => Sugg::MaybeParen(get_snippet(expr.span)),
+            | ExprKind::Match(_, _,
+                MatchSource::Normal | MatchSource::Postfix | MatchSource::ForLoopDesugar
+            ) => Sugg::MaybeParen(get_snippet(expr.span)),
             ExprKind::Continue(..)
             | ExprKind::Yield(..)
             | ExprKind::Array(..)
@@ -149,8 +171,11 @@ impl<'a> Sugg<'a> {
             | ExprKind::Tup(..)
             | ExprKind::Use(..)
             | ExprKind::Err(_)
-            | ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(get_snippet(expr.span)),
-            ExprKind::DropTemps(inner) => Self::hir_from_snippet(inner, get_snippet),
+            | ExprKind::UnsafeBinderCast(..)
+            | ExprKind::Match(_, _,
+                MatchSource::AwaitDesugar | MatchSource::TryDesugar(_) | MatchSource::FormatArgs
+            ) => Sugg::NonParen(get_snippet(expr.span)),
+            ExprKind::DropTemps(inner) => Self::hir_from_snippet(cx, inner, get_snippet),
             ExprKind::Assign(lhs, rhs, _) => {
                 Sugg::BinOp(AssocOp::Assign, get_snippet(lhs.span), get_snippet(rhs.span))
             },
@@ -206,6 +231,7 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::Loop(..)
             | ast::ExprKind::MacCall(..)
             | ast::ExprKind::MethodCall(..)
+            | ast::ExprKind::Move(..)
             | ast::ExprKind::Paren(..)
             | ast::ExprKind::Underscore
             | ast::ExprKind::Path(..)
@@ -222,6 +248,7 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::Array(..)
             | ast::ExprKind::While(..)
             | ast::ExprKind::Await(..)
+            | ast::ExprKind::DirectConstArg(..)
             | ast::ExprKind::Err(_)
             | ast::ExprKind::Dummy
             | ast::ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(snippet(expr.span)),
@@ -310,6 +337,11 @@ impl<'a> Sugg<'a> {
         Sugg::NonParen(Cow::Owned(format!("{{ {self} }}")))
     }
 
+    /// Convenience method to wrap the expression in an `unsafe` block.
+    pub fn unsafeify(self) -> Sugg<'static> {
+        Sugg::NonParen(Cow::Owned(format!("unsafe {{ {self} }}")))
+    }
+
     /// Convenience method to prefix the expression with the `async` keyword.
     /// Can be used after `blockify` to create an async block.
     pub fn asyncify(self) -> Sugg<'static> {
@@ -341,6 +373,21 @@ impl<'a> Sugg<'a> {
                 let sugg = binop_to_string(op, &lhs, &rhs);
                 Sugg::NonParen(format!("({sugg})").into())
             },
+            Sugg::UnOp(op, inner) => Sugg::NonParen(format!("({}{})", op.as_str(), inner.maybe_inner_paren()).into()),
+        }
+    }
+
+    /// Strip enclosing parentheses if present. This method must be called when
+    /// it is known that removing those will not change the meaning. For example,
+    /// if `self` is known to represent a reference and the suggestion will be
+    /// used as the argument of a function call, it is safe to remove the enclosing
+    /// parentheses. It would not be safe to do so for an expression that might
+    /// represent a tuple.
+    #[must_use]
+    pub fn strip_paren(self) -> Self {
+        match self {
+            Sugg::NonParen(s) | Sugg::MaybeParen(s) => Sugg::NonParen(strip_enclosing_paren(s)),
+            sugg => sugg,
         }
     }
 
@@ -348,6 +395,26 @@ impl<'a> Sugg<'a> {
         match self {
             Sugg::NonParen(p) | Sugg::MaybeParen(p) => p.into_owned(),
             Sugg::BinOp(b, l, r) => binop_to_string(b, &l, &r),
+            Sugg::UnOp(op, inner) => format!("{}{}", op.as_str(), inner.maybe_inner_paren()),
+        }
+    }
+
+    /// Checks if `self` starts with a unary operator.
+    fn starts_with_unary_op(&self) -> bool {
+        match self {
+            Sugg::UnOp(..) => true,
+            Sugg::BinOp(..) => false,
+            Sugg::MaybeParen(s) | Sugg::NonParen(s) => s.starts_with(['*', '!', '-', '&']),
+        }
+    }
+
+    /// Call `maybe_paren` on `self` if it doesn't start with a unary operator,
+    /// don't touch it otherwise.
+    fn maybe_inner_paren(self) -> Self {
+        if self.starts_with_unary_op() {
+            self
+        } else {
+            self.maybe_paren()
         }
     }
 }
@@ -381,6 +448,22 @@ pub fn has_enclosing_paren(sugg: impl AsRef<str>) -> bool {
         chars.next().is_none()
     } else {
         false
+    }
+}
+
+/// Strip enclosing parentheses from a snippet if present.
+fn strip_enclosing_paren(snippet: Cow<'_, str>) -> Cow<'_, str> {
+    if has_enclosing_paren(&snippet) {
+        match snippet {
+            Cow::Borrowed(s) => Cow::Borrowed(&s[1..s.len() - 1]),
+            Cow::Owned(mut s) => {
+                s.pop();
+                s.remove(0);
+                Cow::Owned(s)
+            },
+        }
+    } else {
+        snippet
     }
 }
 
@@ -430,10 +513,11 @@ impl Sub for &Sugg<'_> {
 forward_binop_impls_to_ref!(impl Add, add for Sugg<'_>, type Output = Sugg<'static>);
 forward_binop_impls_to_ref!(impl Sub, sub for Sugg<'_>, type Output = Sugg<'static>);
 
-impl Neg for Sugg<'_> {
-    type Output = Sugg<'static>;
-    fn neg(self) -> Sugg<'static> {
-        match &self {
+impl<'a> Neg for Sugg<'a> {
+    type Output = Sugg<'a>;
+    fn neg(self) -> Self::Output {
+        match self {
+            Self::UnOp(UnOp::Neg, sugg) => *sugg,
             Self::BinOp(AssocOp::Cast, ..) => Sugg::MaybeParen(format!("-({self})").into()),
             _ => make_unop("-", self),
         }
@@ -446,19 +530,21 @@ impl<'a> Not for Sugg<'a> {
         use AssocOp::Binary;
         use ast::BinOpKind::{Eq, Ge, Gt, Le, Lt, Ne};
 
-        if let Sugg::BinOp(op, lhs, rhs) = self {
-            let to_op = match op {
-                Binary(Eq) => Binary(Ne),
-                Binary(Ne) => Binary(Eq),
-                Binary(Lt) => Binary(Ge),
-                Binary(Ge) => Binary(Lt),
-                Binary(Gt) => Binary(Le),
-                Binary(Le) => Binary(Gt),
-                _ => return make_unop("!", Sugg::BinOp(op, lhs, rhs)),
-            };
-            Sugg::BinOp(to_op, lhs, rhs)
-        } else {
-            make_unop("!", self)
+        match self {
+            Sugg::BinOp(op, lhs, rhs) => {
+                let to_op = match op {
+                    Binary(Eq) => Binary(Ne),
+                    Binary(Ne) => Binary(Eq),
+                    Binary(Lt) => Binary(Ge),
+                    Binary(Ge) => Binary(Lt),
+                    Binary(Gt) => Binary(Le),
+                    Binary(Le) => Binary(Gt),
+                    _ => return make_unop("!", Sugg::BinOp(op, lhs, rhs)),
+                };
+                Sugg::BinOp(to_op, lhs, rhs)
+            },
+            Sugg::UnOp(UnOp::Not, expr) => *expr,
+            _ => make_unop("!", self),
         }
     }
 }
@@ -491,10 +577,11 @@ impl<T: Display> Display for ParenHelper<T> {
 /// Builds the string for `<op><expr>` adding parenthesis when necessary.
 ///
 /// For convenience, the operator is taken as a string because all unary
-/// operators have the same
-/// precedence.
+/// operators have the same precedence.
 pub fn make_unop(op: &str, expr: Sugg<'_>) -> Sugg<'static> {
-    Sugg::MaybeParen(format!("{op}{}", expr.maybe_paren()).into())
+    // If the `expr` starts with a unary operator already, do not wrap it in
+    // parentheses.
+    Sugg::MaybeParen(format!("{op}{}", expr.maybe_inner_paren()).into())
 }
 
 /// Builds the string for `<lhs> <op> <rhs>` adding parenthesis when necessary.
@@ -629,19 +716,19 @@ pub trait DiagExt<T: LintContext> {
         applicability: Applicability,
     );
 
-    /// Suggest to add an item before another.
+    /// Suggest to add an item after another.
     ///
     /// The item should not be indented (except for inner indentation).
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// diag.suggest_prepend_item(cx, item,
+    /// diag.suggest_append_item(cx, item,
     /// "fn foo() {
     ///     bar();
     /// }");
     /// ```
-    fn suggest_prepend_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability);
+    fn suggest_append_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability);
 
     /// Suggest to completely remove an item.
     ///
@@ -673,24 +760,19 @@ impl<T: LintContext> DiagExt<T> for rustc_errors::Diag<'_, ()> {
         }
     }
 
-    fn suggest_prepend_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability) {
+    fn suggest_append_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability) {
         if let Some(indent) = indentation(cx, item) {
-            let span = item.with_hi(item.lo());
-
-            let mut first = true;
-            let new_item = new_item
-                .lines()
-                .map(|l| {
-                    if first {
-                        first = false;
-                        format!("{l}\n")
-                    } else {
-                        format!("{indent}{l}\n")
-                    }
-                })
-                .collect::<String>();
-
-            self.span_suggestion(span, msg.to_string(), format!("{new_item}\n{indent}"), applicability);
+            let span = item.shrink_to_hi();
+            let mut new_item_code = String::new();
+            for l in new_item.lines() {
+                writeln!(new_item_code, "{indent}{l}").unwrap();
+            }
+            self.span_suggestion(
+                span,
+                msg.to_string(),
+                format!("\n\n{}", new_item_code.strip_suffix('\n').unwrap()),
+                applicability,
+            );
         }
     }
 
@@ -724,7 +806,7 @@ pub struct DerefClosure {
 /// such as explicit deref and borrowing cases.
 /// Returns `None` if no such use cases have been triggered in closure body
 ///
-/// note: this only works on single line immutable closures with exactly one input parameter.
+/// note: This only works on immutable closures with exactly one input parameter.
 pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Option<DerefClosure> {
     if let ExprKind::Closure(&Closure {
         fn_decl, def_id, body, ..
@@ -743,8 +825,10 @@ pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Opti
         let mut visitor = DerefDelegate {
             cx,
             closure_span: closure.span,
+            closure_arg_id: closure_body.params[0].pat.hir_id,
             closure_arg_is_type_annotated_double_ref,
             next_pos: closure.span.lo(),
+            checked_borrows: FxHashSet::default(),
             suggestion_start: String::new(),
             applicability: Applicability::MachineApplicable,
         };
@@ -770,10 +854,15 @@ struct DerefDelegate<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     /// The span of the input closure to adapt
     closure_span: Span,
+    /// The `hir_id` of the closure argument being checked
+    closure_arg_id: HirId,
     /// Indicates if the arg of the closure is a type annotated double reference
     closure_arg_is_type_annotated_double_ref: bool,
     /// last position of the span to gradually build the suggestion
     next_pos: BytePos,
+    /// `hir_id`s that has been checked. This is used to avoid checking the same `hir_id` multiple
+    /// times when inside macro expansions.
+    checked_borrows: FxHashSet<HirId>,
     /// starting part of the gradually built suggestion
     suggestion_start: String,
     /// confidence on the built suggestion
@@ -804,7 +893,14 @@ impl<'tcx> DerefDelegate<'_, 'tcx> {
                     .cx
                     .typeck_results()
                     .type_dependent_def_id(parent_expr.hir_id)
-                    .map(|did| self.cx.tcx.fn_sig(did).instantiate_identity().skip_binder())
+                    .map(|did| {
+                        self.cx
+                            .tcx
+                            .fn_sig(did)
+                            .instantiate_identity()
+                            .skip_norm_wip()
+                            .skip_binder()
+                    })
                 {
                     std::iter::once(receiver)
                         .chain(call_args.iter())
@@ -837,9 +933,15 @@ impl<'tcx> Delegate<'tcx> for DerefDelegate<'_, 'tcx> {
 
     fn use_cloned(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId) {}
 
+    #[expect(clippy::too_many_lines)]
     fn borrow(&mut self, cmt: &PlaceWithHirId<'tcx>, _: HirId, _: ty::BorrowKind) {
         if let PlaceBase::Local(id) = cmt.place.base {
             let span = self.cx.tcx.hir_span(cmt.hir_id);
+            if !self.checked_borrows.insert(cmt.hir_id) {
+                // already checked this span and hir_id, skip
+                return;
+            }
+
             let start_span = Span::new(self.next_pos, span.lo(), span.ctxt(), None);
             let mut start_snip = snippet_with_applicability(self.cx, start_span, "..", &mut self.applicability);
 
@@ -848,7 +950,12 @@ impl<'tcx> Delegate<'tcx> for DerefDelegate<'_, 'tcx> {
             // full identifier that includes projection (i.e.: `fp.field`)
             let ident_str_with_proj = snippet(self.cx, span, "..").to_string();
 
-            if cmt.place.projections.is_empty() {
+            // Make sure to get in all projections if we're on a `matches!`
+            if let Node::Pat(pat) = self.cx.tcx.hir_node(id)
+                && pat.hir_id != self.closure_arg_id
+            {
+                let _ = write!(self.suggestion_start, "{start_snip}{ident_str_with_proj}");
+            } else if cmt.place.projections.is_empty() {
                 // handle item without any projection, that needs an explicit borrowing
                 // i.e.: suggest `&x` instead of `x`
                 let _: fmt::Result = write!(self.suggestion_start, "{start_snip}&{ident_str}");
@@ -940,7 +1047,9 @@ impl<'tcx> Delegate<'tcx> for DerefDelegate<'_, 'tcx> {
                         // note: unable to trigger `Subslice` kind in tests
                         ProjectionKind::Subslice |
                         // Doesn't have surface syntax. Only occurs in patterns.
-                        ProjectionKind::OpaqueCast => (),
+                        ProjectionKind::OpaqueCast |
+                        // Only occurs in closure captures.
+                        ProjectionKind::UnwrapUnsafeBinder => (),
                         ProjectionKind::Deref => {
                             // Explicit derefs are typically handled later on, but
                             // some items do not need explicit deref, such as array accesses,
@@ -1014,6 +1123,16 @@ mod test {
         let sugg = Sugg::BinOp(AssocOp::Binary(ast::BinOpKind::Add), "(1 + 1)".into(), "(1 + 1)".into());
         assert_eq!("((1 + 1) + (1 + 1))", sugg.maybe_paren().to_string());
     }
+
+    #[test]
+    fn unop_parenthesize() {
+        let sugg = Sugg::NonParen("x".into()).mut_addr();
+        assert_eq!("&mut x", sugg.to_string());
+        let sugg = sugg.mut_addr();
+        assert_eq!("&mut &mut x", sugg.to_string());
+        assert_eq!("(&mut &mut x)", sugg.maybe_paren().to_string());
+    }
+
     #[test]
     fn not_op() {
         use ast::BinOpKind::{Add, And, Eq, Ge, Gt, Le, Lt, Ne, Or};

@@ -1,5 +1,4 @@
 #![feature(fn_delegation)]
-#![allow(incomplete_features)]
 
 trait Trait {
     const C: u32 = 0;
@@ -26,7 +25,7 @@ impl Trait for S {
     //~| ERROR expected function, found associated constant `Trait::C`
     reuse <F as Trait>::Type;
     //~^ ERROR item `Type` is an associated method, which doesn't match its trait `Trait`
-    //~| ERROR expected method or associated constant, found associated type `Trait::Type`
+    //~| ERROR cannot find method or associated constant `Type` in trait `Trait`
     reuse <F as Trait>::baz;
     //~^ ERROR method `baz` is not a member of trait `Trait`
     //~| ERROR cannot find method or associated constant `baz` in trait `Trait`
@@ -34,13 +33,15 @@ impl Trait for S {
 
     reuse foo { &self.0 }
     //~^ ERROR cannot find function `foo` in this scope
+    //~| ERROR: method `foo` has a `&self` declaration in the trait, but not in the impl
     reuse Trait::foo2 { self.0 }
     //~^ ERROR cannot find function `foo2` in trait `Trait`
     //~| ERROR method `foo2` is not a member of trait `Trait`
 }
 
 mod prefix {}
-reuse unresolved_prefix::{a, b, c}; //~ ERROR use of unresolved module or unlinked crate
+reuse unresolved_prefix::{a, b, c}; //~ ERROR cannot find module or crate `unresolved_prefix`
 reuse prefix::{self, super, crate}; //~ ERROR `crate` in paths can only be used in start position
+//~^ ERROR cannot find function `self` in module `prefix`
 
 fn main() {}

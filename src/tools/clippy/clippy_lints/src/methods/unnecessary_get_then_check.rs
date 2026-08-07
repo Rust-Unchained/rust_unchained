@@ -1,21 +1,22 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::source::SpanRangeExt;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::SpanExt;
+use clippy_utils::sym;
 
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 
 use super::UNNECESSARY_GET_THEN_CHECK;
 
 fn is_a_std_set_type(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
-    is_type_diagnostic_item(cx, ty, sym::HashSet) || is_type_diagnostic_item(cx, ty, sym::BTreeSet)
+    matches!(ty.opt_diag_name(cx), Some(sym::HashSet | sym::BTreeSet))
 }
 
 fn is_a_std_map_type(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
-    is_type_diagnostic_item(cx, ty, sym::HashMap) || is_type_diagnostic_item(cx, ty, sym::BTreeMap)
+    matches!(ty.opt_diag_name(cx), Some(sym::HashMap | sym::BTreeMap))
 }
 
 pub(super) fn check(
@@ -38,11 +39,11 @@ pub(super) fn check(
         return;
     };
     let both_calls_span = get_call_span.with_hi(call_span.hi());
-    if let Some(snippet) = both_calls_span.get_source_text(cx)
-        && let Some(arg_snippet) = arg.span.get_source_text(cx)
+    if let Some(snippet) = both_calls_span.get_text(cx)
+        && let Some(arg_snippet) = arg.span.get_text(cx)
     {
         let generics_snippet = if let Some(generics) = path.args
-            && let Some(generics_snippet) = generics.span_ext.get_source_text(cx)
+            && let Some(generics_snippet) = generics.span_ext.get_text(cx)
         {
             format!("::{generics_snippet}")
         } else {
@@ -63,7 +64,7 @@ pub(super) fn check(
                 suggestion,
                 Applicability::MaybeIncorrect,
             );
-        } else if let Some(caller_snippet) = get_caller.span.get_source_text(cx) {
+        } else if let Some(caller_snippet) = get_caller.span.get_text(cx) {
             let full_span = get_caller.span.with_hi(call_span.hi());
 
             span_lint_and_then(

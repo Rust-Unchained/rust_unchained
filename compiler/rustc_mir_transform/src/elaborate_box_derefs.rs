@@ -3,41 +3,31 @@
 //! Box is not actually a pointer so it is incorrect to dereference it directly.
 
 use rustc_abi::FieldIdx;
-use rustc_hir::def_id::DefId;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::span_bug;
-use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::ty::{self, PatternKind, Ty, TyCtxt};
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 /// Constructs the types used when accessing a Box's pointer
 fn build_ptr_tys<'tcx>(
     tcx: TyCtxt<'tcx>,
     pointee: Ty<'tcx>,
-    unique_did: DefId,
-    nonnull_did: DefId,
+    unique_def: ty::AdtDef<'tcx>,
+    nonnull_def: ty::AdtDef<'tcx>,
 ) -> (Ty<'tcx>, Ty<'tcx>, Ty<'tcx>) {
     let args = tcx.mk_args(&[pointee.into()]);
-    let unique_ty = tcx.type_of(unique_did).instantiate(tcx, args);
-    let nonnull_ty = tcx.type_of(nonnull_did).instantiate(tcx, args);
+    let unique_ty = Ty::new_adt(tcx, unique_def, args);
+    let nonnull_ty = Ty::new_adt(tcx, nonnull_def, args);
     let ptr_ty = Ty::new_imm_ptr(tcx, pointee);
 
     (unique_ty, nonnull_ty, ptr_ty)
 }
 
-/// Constructs the projection needed to access a Box's pointer
-pub(super) fn build_projection<'tcx>(
-    unique_ty: Ty<'tcx>,
-    nonnull_ty: Ty<'tcx>,
-) -> [PlaceElem<'tcx>; 2] {
-    [PlaceElem::Field(FieldIdx::ZERO, unique_ty), PlaceElem::Field(FieldIdx::ZERO, nonnull_ty)]
-}
-
 struct ElaborateBoxDerefVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    unique_did: DefId,
-    nonnull_did: DefId,
     local_decls: &'a mut LocalDecls<'tcx>,
     patch: MirPatch<'tcx>,
 }
@@ -63,22 +53,18 @@ impl<'a, 'tcx> MutVisitor<'tcx> for ElaborateBoxDerefVisitor<'a, 'tcx> {
         {
             let source_info = self.local_decls[place.local].source_info;
 
-            let (unique_ty, nonnull_ty, ptr_ty) =
-                build_ptr_tys(tcx, boxed_ty, self.unique_did, self.nonnull_did);
+            let ptr_ty = Ty::new_imm_ptr(tcx, boxed_ty);
 
             let ptr_local = self.patch.new_temp(ptr_ty, source_info.span);
 
+            // Project to the first field (a `Unique`), then transmute that. We could project one
+            // further but in the end we'd hit a pattern type so we'd always have to transmute.
+            let field_place =
+                Place::from(place.local).project_to_field(FieldIdx::ZERO, &*self.local_decls, tcx);
             self.patch.add_assign(
                 location,
                 Place::from(ptr_local),
-                Rvalue::Cast(
-                    CastKind::Transmute,
-                    Operand::Copy(
-                        Place::from(place.local)
-                            .project_deeper(&build_projection(unique_ty, nonnull_ty), tcx),
-                    ),
-                    ptr_ty,
-                ),
+                Rvalue::Cast(CastKind::BoxDerefTransmute, Operand::Copy(field_place), ptr_ty),
             );
 
             place.local = ptr_local;
@@ -97,18 +83,25 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateBoxDerefs {
 
         let unique_did = tcx.adt_def(def_id).non_enum_variant().fields[FieldIdx::ZERO].did;
 
-        let Some(nonnull_def) = tcx.type_of(unique_did).instantiate_identity().ty_adt_def() else {
+        let Some(unique_def) =
+            tcx.type_of(unique_did).instantiate_identity().skip_norm_wip().ty_adt_def()
+        else {
             span_bug!(tcx.def_span(unique_did), "expected Box to contain Unique")
         };
 
-        let nonnull_did = nonnull_def.non_enum_variant().fields[FieldIdx::ZERO].did;
+        let nonnull_did = unique_def.non_enum_variant().fields[FieldIdx::ZERO].did;
+
+        let Some(nonnull_def) =
+            tcx.type_of(nonnull_did).instantiate_identity().skip_norm_wip().ty_adt_def()
+        else {
+            span_bug!(tcx.def_span(nonnull_did), "expected Unique to contain Nonnull")
+        };
 
         let patch = MirPatch::new(body);
 
         let local_decls = &mut body.local_decls;
 
-        let mut visitor =
-            ElaborateBoxDerefVisitor { tcx, unique_did, nonnull_did, local_decls, patch };
+        let mut visitor = ElaborateBoxDerefVisitor { tcx, local_decls, patch };
 
         for (block, data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated_mut() {
             visitor.visit_basic_block_data(block, data);
@@ -131,11 +124,16 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateBoxDerefs {
                             new_projections.get_or_insert_with(|| base.projection.to_vec());
 
                         let (unique_ty, nonnull_ty, ptr_ty) =
-                            build_ptr_tys(tcx, boxed_ty, unique_did, nonnull_did);
+                            build_ptr_tys(tcx, boxed_ty, unique_def, nonnull_def);
 
-                        new_projections.extend_from_slice(&build_projection(unique_ty, nonnull_ty));
-                        // While we can't project into `NonNull<_>` in a basic block
-                        // due to MCP#807, this is debug info where it's fine.
+                        new_projections.extend_from_slice(&[
+                            PlaceElem::Field(FieldIdx::ZERO, unique_ty),
+                            PlaceElem::Field(FieldIdx::ZERO, nonnull_ty),
+                        ]);
+                        // While we can't project into a pattern type in a basic block,
+                        // this is debug info where it's fine.
+                        let pat_ty = Ty::new_pat(tcx, ptr_ty, tcx.mk_pat(PatternKind::NotNull));
+                        new_projections.push(PlaceElem::Field(FieldIdx::ZERO, pat_ty));
                         new_projections.push(PlaceElem::Field(FieldIdx::ZERO, ptr_ty));
                         new_projections.push(PlaceElem::Deref);
                     } else if let Some(new_projections) = new_projections.as_mut() {
@@ -152,7 +150,8 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateBoxDerefs {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        // Implements Box dereference semantics so backends and Miri do not have to handle them.
+        PassPolicy::Required
     }
 }

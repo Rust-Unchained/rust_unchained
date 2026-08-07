@@ -11,20 +11,18 @@
 //@ compile-flags: -Z print-type-sizes --crate-type lib
 //@ ignore-std-debug-assertions (debug assertions will print more types)
 //@ build-pass
-//@ ignore-pass
+//@ no-pass-override (codegen affects -Zprint-type-sizes)
 //  ^-- needed because `--pass check` does not emit the output needed.
 //      FIXME: consider using an attribute instead of side-effects.
 #![allow(dead_code)]
-#![feature(rustc_attrs)]
+#![feature(rustc_attrs, pattern_types, pattern_type_macro)]
 
 use std::num::NonZero;
 
 pub enum MyOption<T> { None, Some(T) }
 
-#[rustc_layout_scalar_valid_range_start(0)]
-#[rustc_layout_scalar_valid_range_end(0xFF_FF_FF_FE)]
 pub struct MyNotNegativeOne {
-  _i: i32,
+  _i: std::pat::pattern_type!(i32 is 0..=i32::MAX | i32::MIN..=-2),
 }
 
 impl<T> Default for MyOption<T> {
@@ -55,7 +53,14 @@ pub struct NestedNonZero {
 
 impl Default for NestedNonZero {
     fn default() -> Self {
-        NestedNonZero { pre: 0, val: unsafe { NonZero::new_unchecked(1) }, post: 0 }
+        // Ideally we'd call NonZero::new_unchecked, but this test is supposed
+        // to be target-independent and NonZero::new_unchecked is #[track_caller]
+        // (see #129658) so mentioning that function pulls in std::panic::Location
+        // which contains a &str, whose layout is target-dependent.
+        const ONE: NonZero<u32> = const {
+            unsafe { std::mem::transmute(1u32) }
+        };
+        NestedNonZero { pre: 0, val: ONE, post: 0 }
     }
 }
 

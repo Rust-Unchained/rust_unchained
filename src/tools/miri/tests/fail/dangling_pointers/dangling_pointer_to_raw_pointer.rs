@@ -6,9 +6,9 @@ fn direct_raw(x: *const (i32, i32)) -> *const i32 {
 
 // Ensure that if a raw pointer is created via an intermediate
 // reference, we catch that. (Just in case someone decides to
-// desugar this differenly or so.)
+// desugar this differently or so.)
 fn via_ref(x: *const (i32, i32)) -> *const i32 {
-    unsafe { &(*x).0 as *const i32 } //~ERROR: dangling pointer
+    unsafe { &(*x).0 as *const i32 } //~ERROR: dangling reference
 }
 
 fn main() {

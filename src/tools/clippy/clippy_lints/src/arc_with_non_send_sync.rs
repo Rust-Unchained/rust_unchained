@@ -1,6 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_from_proc_macro;
-use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
+use clippy_utils::res::MaybeDef;
+use clippy_utils::ty::implements_trait;
 use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
@@ -38,6 +39,7 @@ declare_clippy_lint! {
     suspicious,
     "using `Arc` with a type that does not implement `Send` and `Sync`"
 }
+
 declare_lint_pass!(ArcWithNonSendSync => [ARC_WITH_NON_SEND_SYNC]);
 
 impl<'tcx> LateLintPass<'tcx> for ArcWithNonSendSync {
@@ -46,11 +48,11 @@ impl<'tcx> LateLintPass<'tcx> for ArcWithNonSendSync {
             && let ExprKind::Path(QPath::TypeRelative(func_ty, func_name)) = func.kind
             && func_name.ident.name == sym::new
             && !expr.span.from_expansion()
-            && is_type_diagnostic_item(cx, cx.typeck_results().node_type(func_ty.hir_id), sym::Arc)
+            && cx.typeck_results().node_type(func_ty.hir_id).is_diag_item(cx, sym::Arc)
             && let arg_ty = cx.typeck_results().expr_ty(arg)
             // make sure that the type is not and does not contain any type parameters
             && arg_ty.walk().all(|arg| {
-                !matches!(arg.unpack(), GenericArgKind::Type(ty) if matches!(ty.kind(), ty::Param(_)))
+                !matches!(arg.kind(), GenericArgKind::Type(ty) if matches!(ty.kind(), ty::Param(_)))
             })
             && let Some(send) = cx.tcx.get_diagnostic_item(sym::Send)
             && let Some(sync) = cx.tcx.lang_items().sync_trait()
@@ -73,7 +75,7 @@ impl<'tcx> LateLintPass<'tcx> for ArcWithNonSendSync {
                         diag.note(format!(
                             "`Arc<{arg_ty}>` is not `Send` and `Sync` as `{arg_ty}` is {reason}"
                         ));
-                        diag.help("if the `Arc` will not used be across threads replace it with an `Rc`");
+                        diag.help("if the `Arc` will not be used across threads replace it with an `Rc`");
                         diag.help(format!(
                             "otherwise make `{arg_ty}` `Send` and `Sync` or consider a wrapper type such as `Mutex`"
                         ));

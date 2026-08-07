@@ -1,4 +1,4 @@
-#![feature(no_core, rustc_attrs, lang_items)]
+#![feature(no_core, rustc_attrs)]
 #![allow(dead_code)]
 #![crate_type = "lib"]
 #![no_std]
@@ -9,7 +9,7 @@ use minicore::*;
 
 // See also: repr-c-int-dead-variants.rs
 
-//@ add-core-stubs
+//@ add-minicore
 //@ normalize-stderr: "pref: Align\([1-8] bytes\)" -> "pref: $$SOME_ALIGN"
 //@ normalize-stderr: "randomization_seed: \d+" -> "randomization_seed: $$SEED"
 
@@ -33,20 +33,21 @@ use minicore::*;
 //@ revisions: armebv7r-none-eabi
 //@[armebv7r-none-eabi] compile-flags: --target armebv7r-none-eabi
 //@[armebv7r-none-eabi] needs-llvm-components: arm
+//@ ignore-backends: gcc
 
 // A simple uninhabited type.
 enum Void {}
 
 // Compiler must not remove dead variants of `#[repr(C, int)]` ADTs.
 #[repr(C)]
-#[rustc_layout(debug)]
+#[rustc_dump_layout(debug)]
 enum Univariant { //~ ERROR layout_of
     Variant(Void),
 }
 
 // ADTs with variants that have fields must have space allocated for those fields.
 #[repr(C)]
-#[rustc_layout(debug)]
+#[rustc_dump_layout(debug)]
 enum TwoVariants { //~ ERROR layout_of
     Variant1(Void),
     Variant2(u8),
@@ -58,7 +59,7 @@ struct Align8U64(u64);
 
 // This one is 2 x u64: we reserve space for fields in a dead branch.
 #[repr(C)]
-#[rustc_layout(debug)]
+#[rustc_dump_layout(debug)]
 enum DeadBranchHasOtherField { //~ ERROR layout_of
     Variant1(Void, Align8U64),
     Variant2(u8),

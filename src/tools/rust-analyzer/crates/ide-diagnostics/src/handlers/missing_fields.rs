@@ -1,20 +1,25 @@
 use either::Either;
 use hir::{
-    db::{ExpandDatabase, HirDatabase},
-    sym, AssocItem, HirDisplay, HirFileIdExt, ImportPathConfig, InFile, Type,
+    AssocItem, FindPathConfig, HasVisibility, HirDisplay, InFile, Type, db::HirDatabase, sym,
 };
 use ide_db::{
-    assists::Assist, famous_defs::FamousDefs, imports::import_assets::item_for_path_search,
-    source_change::SourceChange, syntax_helpers::tree_diff::diff, text_edit::TextEdit,
-    use_trivial_constructor::use_trivial_constructor, FxHashMap,
+    FxHashMap,
+    assists::{Assist, ExprFillDefaultMode},
+    famous_defs::FamousDefs,
+    imports::import_assets::item_for_path_search,
+    source_change::SourceChange,
+    syntax_helpers::tree_diff::diff,
+    text_edit::TextEdit,
+    use_trivial_constructor::use_trivial_constructor,
 };
 use stdx::format_to;
 use syntax::{
-    ast::{self, make},
     AstNode, Edition, SyntaxNode, SyntaxNodePtr, ToSmolStr,
+    ast::{self, make},
+    syntax_editor::SyntaxEditor,
 };
 
-use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 
 // Diagnostic: missing-fields
 //
@@ -27,9 +32,12 @@ use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
 //
 // let a = A { a: 10 };
 // ```
-pub(crate) fn missing_fields(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Diagnostic {
+pub(crate) fn missing_fields(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::MissingFields,
+) -> Diagnostic {
     let mut message = String::from("missing structure fields:\n");
-    for field in &d.missed_fields {
+    for (field, _) in &d.missed_fields {
         format_to!(message, "- {}\n", field.display(ctx.sema.db, ctx.edition));
     }
 
@@ -41,25 +49,32 @@ pub(crate) fn missing_fields(ctx: &DiagnosticsContext<'_>, d: &hir::MissingField
     );
 
     Diagnostic::new_with_syntax_node_ptr(ctx, DiagnosticCode::RustcHardError("E0063"), message, ptr)
+        .stable()
         .with_fixes(fixes(ctx, d))
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::MissingFields) -> Option<Vec<Assist>> {
     // Note that although we could add a diagnostics to
     // fill the missing tuple field, e.g :
     // `struct A(usize);`
     // `let a = A { 0: () }`
     // but it is uncommon usage and it should not be encouraged.
-    if d.missed_fields.iter().any(|it| it.as_tuple_index().is_some()) {
+    if d.missed_fields.iter().any(|(name, _)| name.as_tuple_index().is_some()) {
         return None;
     }
 
-    let root = ctx.sema.db.parse_or_expand(d.file);
+    let root = d.file.parse_or_expand(ctx.sema.db);
 
     let current_module =
         ctx.sema.scope(d.field_list_parent.to_node(&root).syntax()).map(|it| it.module());
     let range = InFile::new(d.file, d.field_list_parent.text_range())
-        .original_node_file_range_rooted(ctx.sema.db);
+        .original_node_file_range_rooted_opt(ctx.sema.db)?;
+
+    if let Some(current_module) = current_module
+        && d.missed_fields.iter().any(|(_, field)| !field.is_visible_from(ctx.db(), current_module))
+    {
+        return None;
+    }
 
     let build_text_edit = |new_syntax: &SyntaxNode, old_syntax| {
         let edit = {
@@ -83,7 +98,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
         Some(vec![fix(
             "fill_missing_fields",
             "Fill struct fields",
-            SourceChange::from_text_edit(range.file_id, edit),
+            SourceChange::from_text_edit(range.file_id.file_id(ctx.sema.db), edit),
             range.range,
         )])
     };
@@ -99,20 +114,25 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                 }
             });
 
-            let generate_fill_expr = |ty: &Type| match ctx.config.expr_fill_default {
-                crate::ExprFillDefaultMode::Todo => make::ext::expr_todo(),
-                crate::ExprFillDefaultMode::Default => {
-                    get_default_constructor(ctx, d, ty).unwrap_or_else(make::ext::expr_todo)
+            let old_field_list = field_list_parent.record_expr_field_list()?;
+            let root = old_field_list.syntax().tree_top();
+            let (editor, _) = SyntaxEditor::new(root);
+            let make = editor.make();
+
+            let generate_fill_expr = |ty: &Type<'_>| match ctx.config.expr_fill_default {
+                ExprFillDefaultMode::Todo => make.expr_todo(),
+                ExprFillDefaultMode::Underscore => make.expr_underscore().into(),
+                ExprFillDefaultMode::Default => {
+                    get_default_constructor(ctx, d, ty).unwrap_or_else(|| make.expr_todo())
                 }
             };
 
-            let old_field_list = field_list_parent.record_expr_field_list()?;
-            let new_field_list = old_field_list.clone_for_update();
+            let mut new_fields = Vec::new();
             for (f, ty) in missing_fields.iter() {
                 let field_expr = if let Some(local_candidate) = locals.get(&f.name(ctx.sema.db)) {
                     cov_mark::hit!(field_shorthand);
                     let candidate_ty = local_candidate.ty(ctx.sema.db);
-                    if ty.could_unify_with(ctx.sema.db, &candidate_ty) {
+                    if candidate_ty.could_coerce_to(ctx.sema.db, ty) {
                         None
                     } else {
                         Some(generate_fill_expr(ty))
@@ -124,7 +144,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                         let type_path = current_module?.find_path(
                             ctx.sema.db,
                             item_for_path_search(ctx.sema.db, item_in_ns)?,
-                            ImportPathConfig {
+                            FindPathConfig {
                                 prefer_no_std: ctx.config.prefer_no_std,
                                 prefer_prelude: ctx.config.prefer_prelude,
                                 prefer_absolute: ctx.config.prefer_absolute,
@@ -140,44 +160,53 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                         )
                     })();
 
-                    if expr.is_some() {
-                        expr
-                    } else {
-                        Some(generate_fill_expr(ty))
-                    }
+                    if expr.is_some() { expr } else { Some(generate_fill_expr(ty)) }
                 };
-                let field = make::record_expr_field(
-                    make::name_ref(&f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr()),
+                let field = make.record_expr_field(
+                    make.name_ref(&f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr()),
                     field_expr,
                 );
-                new_field_list.add_field(field.clone_for_update());
+                new_fields.push(field);
             }
-            build_text_edit(new_field_list.syntax(), old_field_list.syntax())
+            old_field_list.add_fields(&editor, new_fields);
+            let new_field_list = editor.finish().find_element(old_field_list.syntax())?;
+            build_text_edit(&new_field_list, old_field_list.syntax())
         }
         Either::Right(field_list_parent) => {
             let missing_fields = ctx.sema.record_pattern_missing_fields(field_list_parent);
 
             let old_field_list = field_list_parent.record_pat_field_list()?;
-            let new_field_list = old_field_list.clone_for_update();
+            let root = old_field_list.syntax().tree_top();
+            let (editor, _) = SyntaxEditor::new(root);
+            let make = editor.make();
+
+            let mut new_fields = Vec::new();
             for (f, _) in missing_fields.iter() {
-                let field = make::record_pat_field_shorthand(make::name_ref(
-                    &f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr(),
-                ));
-                new_field_list.add_field(field.clone_for_update());
+                let field = make.record_pat_field_shorthand(
+                    make.ident_pat(
+                        false,
+                        false,
+                        make.name(&f.name(ctx.sema.db).display_no_db(ctx.edition).to_smolstr()),
+                    )
+                    .into(),
+                );
+                new_fields.push(field);
             }
-            build_text_edit(new_field_list.syntax(), old_field_list.syntax())
+            old_field_list.add_fields(&editor, new_fields);
+            let new_field_list = editor.finish().find_element(old_field_list.syntax())?;
+            build_text_edit(&new_field_list, old_field_list.syntax())
         }
     }
 }
 
 fn make_ty(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     module: hir::Module,
     edition: Edition,
 ) -> ast::Type {
     let ty_str = match ty.as_adt() {
-        Some(adt) => adt.name(db).display(db.upcast(), edition).to_string(),
+        Some(adt) => adt.name(db).display(db, edition).to_string(),
         None => {
             ty.display_source_code(db, module.into(), false).ok().unwrap_or_else(|| "_".to_owned())
         }
@@ -187,9 +216,9 @@ fn make_ty(
 }
 
 fn get_default_constructor(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::MissingFields,
-    ty: &Type,
+    ty: &Type<'_>,
 ) -> Option<ast::Expr> {
     if let Some(builtin_ty) = ty.as_builtin() {
         if builtin_ty.is_int() || builtin_ty.is_uint() {
@@ -209,18 +238,20 @@ fn get_default_constructor(
         }
     }
 
-    let krate = ctx.sema.file_to_module_def(d.file.original_file(ctx.sema.db))?.krate();
-    let module = krate.root_module();
+    let krate = ctx
+        .sema
+        .file_to_module_def(d.file.original_file(ctx.sema.db).file_id(ctx.sema.db))?
+        .krate(ctx.sema.db);
+    let module = krate.root_module(ctx.sema.db);
 
     // Look for a ::new() associated function
     let has_new_func = ty
-        .iterate_assoc_items(ctx.sema.db, krate, |assoc_item| {
-            if let AssocItem::Function(func) = assoc_item {
-                if func.name(ctx.sema.db) == sym::new.clone()
-                    && func.assoc_fn_params(ctx.sema.db).is_empty()
-                {
-                    return Some(());
-                }
+        .iterate_assoc_items(ctx.sema.db, |assoc_item| {
+            if let AssocItem::Function(func) = assoc_item
+                && func.name(ctx.sema.db) == sym::new
+                && func.assoc_fn_params(ctx.sema.db).is_empty()
+            {
+                return Some(());
             }
 
             None
@@ -243,7 +274,7 @@ fn get_default_constructor(
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_fix, check_has_fix, check_no_fix};
 
     #[test]
     fn missing_record_pat_field_diagnostic() {
@@ -276,12 +307,15 @@ fn baz(s: S) -> i32 {
     #[test]
     fn missing_record_pat_field_box() {
         check_diagnostics(
-            r"
+            r#"
+#![feature(lang_items)]
+#[lang = "owned_box"]
+struct Box<T>(T);
 struct S { s: Box<u32> }
 fn x(a: S) {
     let S { box s } = a;
 }
-",
+"#,
         )
     }
 
@@ -577,14 +611,14 @@ fn test_fn() {
     fn test_fill_struct_fields_default() {
         check_fix(
             r#"
-//- minicore: default, option
+//- minicore: default, option, slice
 struct TestWithDefault(usize);
 impl Default for TestWithDefault {
     pub fn default() -> Self {
         Self(0)
     }
 }
-struct TestStruct { one: i32, two: TestWithDefault }
+struct TestStruct { one: i32, two: TestWithDefault, r: &'static [i32] }
 
 fn test_fn() {
     let s = TestStruct{ $0 };
@@ -597,10 +631,10 @@ impl Default for TestWithDefault {
         Self(0)
     }
 }
-struct TestStruct { one: i32, two: TestWithDefault }
+struct TestStruct { one: i32, two: TestWithDefault, r: &'static [i32] }
 
 fn test_fn() {
-    let s = TestStruct{ one: 0, two: TestWithDefault::default()  };
+    let s = TestStruct{ one: 0, two: TestWithDefault::default(), r: <&'static [i32]>::default()  };
 }
 ",
         );
@@ -795,7 +829,7 @@ fn f() {
 
     #[test]
     fn test_fill_struct_pat_fields_partial() {
-        check_fix(
+        check_has_fix(
             r#"
 struct S { a: &'static str, b: i32 }
 
@@ -842,6 +876,124 @@ pub mod jwt  {
 //- /jwt/lib.rs crate:jwt
 pub struct Claims {
     field: u8,
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn test_default_field_values_basic() {
+        // This should work without errors - only field 'b' is required
+        check_diagnostics(
+            r#"
+#![feature(default_field_values)]
+struct Struct {
+    a: usize = 0,
+    b: usize,
+}
+
+fn main() {
+    Struct { b: 1, .. };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_default_field_values_missing_field_error() {
+        // This should report a missing field error because email is required
+        check_diagnostics(
+            r#"
+#![feature(default_field_values)]
+struct UserInfo {
+    id: i32,
+    age: f32 = 1.0,
+    email: String,
+}
+
+fn main() {
+    UserInfo { id: 20, .. };
+//  ^^^^^^^^💡 error: missing structure fields:
+//         |- email
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_default_field_values_requires_spread_syntax() {
+        // without `..` should report missing fields
+        check_diagnostics(
+            r#"
+#![feature(default_field_values)]
+struct Point {
+    x: i32 = 0,
+    y: i32 = 0,
+}
+
+fn main() {
+    Point { x: 0 };
+//  ^^^^^💡 error: missing structure fields:
+//      |- y
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_default_field_values_pattern_matching() {
+        check_diagnostics(
+            r#"
+#![feature(default_field_values)]
+struct Point {
+    x: i32 = 0,
+    y: i32 = 0,
+    z: i32,
+}
+
+fn main() {
+    let Point { x, .. } = Point { z: 5, .. };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn coerce_existing_local() {
+        check_fix(
+            r#"
+struct A {
+    v: f64,
+}
+
+fn f() -> A {
+    let v = loop {};
+    A {$0}
+}
+        "#,
+            r#"
+struct A {
+    v: f64,
+}
+
+fn f() -> A {
+    let v = loop {};
+    A { v }
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn inaccessible_fields() {
+        check_no_fix(
+            r#"
+mod foo {
+    pub struct Bar { baz: i32 }
+}
+
+fn qux() {
+    foo::Bar {$0};
 }
         "#,
         );

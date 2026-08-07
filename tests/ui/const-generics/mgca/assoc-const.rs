@@ -1,11 +1,10 @@
 //@ check-pass
 
-#![feature(min_generic_const_args)]
+#![feature(min_generic_const_args, macroless_generic_const_args)]
 #![allow(incomplete_features)]
 
 pub trait Tr<X> {
-    #[type_const]
-    const SIZE: usize;
+    type const SIZE: usize;
 }
 
 fn mk_array<T: Tr<bool>>(_x: T) -> [(); <T as Tr<bool>>::SIZE] {

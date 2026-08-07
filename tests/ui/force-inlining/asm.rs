@@ -1,7 +1,8 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ build-fail
 //@ compile-flags: --crate-type=lib --target thumbv4t-none-eabi
 //@ needs-llvm-components: arm
+//@ ignore-backends: gcc
 
 // Checks that forced inlining won't mix asm with incompatible instruction sets.
 

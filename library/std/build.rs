@@ -13,6 +13,9 @@ fn main() {
         println!("cargo:rustc-cfg=netbsd10");
     }
 
+    // Needed for `#![doc(auto_cfg(hide(no_global_oom_handling)))]` attribute.
+    println!("cargo::rustc-check-cfg=cfg(no_global_oom_handling)");
+
     println!("cargo:rustc-check-cfg=cfg(restricted_std)");
     if target_os == "linux"
         || target_os == "android"
@@ -30,6 +33,7 @@ fn main() {
         || target_os == "windows"
         || target_os == "fuchsia"
         || (target_vendor == "fortanix" && target_env == "sgx")
+        || target_os == "motor"
         || target_os == "hermit"
         || target_os == "trusty"
         || target_os == "l4re"
@@ -44,6 +48,7 @@ fn main() {
         || target_os == "vita"
         || target_os == "aix"
         || target_os == "nto"
+        || target_os == "qnx"
         || target_os == "xous"
         || target_os == "hurd"
         || target_os == "uefi"
@@ -52,6 +57,7 @@ fn main() {
         || target_os == "rtems"
         || target_os == "nuttx"
         || target_os == "cygwin"
+        || target_os == "vexos"
 
         // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
         || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
@@ -74,4 +80,28 @@ fn main() {
     println!("cargo:rustc-cfg=backtrace_in_libstd");
 
     println!("cargo:rustc-env=STD_ENV_ARCH={}", env::var("CARGO_CFG_TARGET_ARCH").unwrap());
+
+    println!("cargo:rustc-check-cfg=cfg(vxworks_lt_25_09)");
+
+    if target_os == "vxworks" {
+        match vxworks_version_code() {
+            Some((major, minor)) if (major, minor) < (25, 9) => {
+                println!("cargo:rustc-cfg=vxworks_lt_25_09");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Retrieve the VxWorks release version from the environment variable set by the VxWorks build
+/// environment, in `(minor, patch)` form.
+fn vxworks_version_code() -> Option<(u32, u32)> {
+    let version = env::var("WIND_RELEASE_ID").ok()?;
+
+    let mut pieces = version.trim().split(['.']);
+
+    let major: u32 = pieces.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let minor: u32 = pieces.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+
+    Some((major, minor))
 }

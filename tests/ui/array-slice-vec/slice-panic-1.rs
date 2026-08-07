@@ -1,10 +1,11 @@
 //@ run-pass
 //@ needs-unwind
 //@ needs-threads
+//@ ignore-backends: gcc
 
 // Test that if a slicing expr[..] fails, the correct cleanups happen.
 
-// FIXME(static_mut_refs): this could use an atomic
+// FIXME(static_mut_refs): use raw pointers instead of references
 #![allow(static_mut_refs)]
 
 use std::thread;

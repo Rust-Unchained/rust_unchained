@@ -1,27 +1,28 @@
 use std::cell::RefCell;
 
+use libc::c_uint;
 use rustc_abi::{Align, Size, VariantIdx};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_macros::HashStable;
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_macros::StableHash;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, ExistentialTraitRef, Ty, TyCtxt};
 
 use super::{DefinitionLocation, SmallVec, UNKNOWN_LINE_NUMBER, unknown_file_metadata};
-use crate::common::{AsCCharPtr, CodegenCx};
+use crate::common::CodegenCx;
 use crate::debuginfo::utils::{DIB, create_DIArray, debug_context};
+use crate::llvm;
 use crate::llvm::debuginfo::{DIFlags, DIScope, DIType};
-use crate::llvm::{self};
 
 mod private {
-    use rustc_macros::HashStable;
+    use rustc_macros::StableHash;
 
     // This type cannot be constructed outside of this module because
     // it has a private field. We make use of this in order to prevent
     // `UniqueTypeId` from being constructed directly, without asserting
     // the preconditions.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, HashStable)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
     pub(crate) struct HiddenZst;
 }
 
@@ -32,7 +33,7 @@ mod private {
 /// Note that there are some things that only show up in debuginfo, like
 /// the separate type descriptions for each enum variant. These get an ID
 /// too because they have their own debuginfo node in LLVM IR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, HashStable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableHash)]
 pub(super) enum UniqueTypeId<'tcx> {
     /// The ID of a regular type as it shows up at the language level.
     Ty(Ty<'tcx>, private::HiddenZst),
@@ -49,15 +50,12 @@ pub(super) enum UniqueTypeId<'tcx> {
 
 impl<'tcx> UniqueTypeId<'tcx> {
     pub(crate) fn for_ty(tcx: TyCtxt<'tcx>, t: Ty<'tcx>) -> Self {
-        assert_eq!(t, tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), t));
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), t);
         UniqueTypeId::Ty(t, private::HiddenZst)
     }
 
     pub(crate) fn for_enum_variant_part(tcx: TyCtxt<'tcx>, enum_ty: Ty<'tcx>) -> Self {
-        assert_eq!(
-            enum_ty,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), enum_ty)
-        );
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), enum_ty);
         UniqueTypeId::VariantPart(enum_ty, private::HiddenZst)
     }
 
@@ -66,10 +64,7 @@ impl<'tcx> UniqueTypeId<'tcx> {
         enum_ty: Ty<'tcx>,
         variant_idx: VariantIdx,
     ) -> Self {
-        assert_eq!(
-            enum_ty,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), enum_ty)
-        );
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), enum_ty);
         UniqueTypeId::VariantStructType(enum_ty, variant_idx, private::HiddenZst)
     }
 
@@ -78,10 +73,7 @@ impl<'tcx> UniqueTypeId<'tcx> {
         enum_ty: Ty<'tcx>,
         variant_idx: VariantIdx,
     ) -> Self {
-        assert_eq!(
-            enum_ty,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), enum_ty)
-        );
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), enum_ty);
         UniqueTypeId::VariantStructTypeCppLikeWrapper(enum_ty, variant_idx, private::HiddenZst)
     }
 
@@ -90,14 +82,8 @@ impl<'tcx> UniqueTypeId<'tcx> {
         self_type: Ty<'tcx>,
         implemented_trait: Option<ExistentialTraitRef<'tcx>>,
     ) -> Self {
-        assert_eq!(
-            self_type,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), self_type)
-        );
-        assert_eq!(
-            implemented_trait,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), implemented_trait)
-        );
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), self_type);
+        tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), implemented_trait);
         UniqueTypeId::VTableTy(self_type, implemented_trait, private::HiddenZst)
     }
 
@@ -108,7 +94,7 @@ impl<'tcx> UniqueTypeId<'tcx> {
     fn generate_unique_id_string(self, tcx: TyCtxt<'tcx>) -> String {
         let mut hasher = StableHasher::new();
         tcx.with_stable_hashing_context(|mut hcx| {
-            hcx.while_hashing_spans(false, |hcx| self.hash_stable(hcx, &mut hasher))
+            hcx.while_hashing_spans(false, |hcx| self.stable_hash(hcx, &mut hasher))
         });
         hasher.finish::<Fingerprint>().to_hex()
     }
@@ -191,7 +177,7 @@ pub(super) fn stub<'ll, 'tcx>(
     containing_scope: Option<&'ll DIScope>,
     flags: DIFlags,
 ) -> StubInfo<'ll, 'tcx> {
-    let empty_array = create_DIArray(DIB(cx), &[]);
+    let no_elements: &[Option<&llvm::Metadata>] = &[];
     let unique_type_id_str = unique_type_id.generate_unique_id_string(cx.tcx);
 
     let (file_metadata, line_number) = if let Some(def_location) = def_location {
@@ -207,10 +193,10 @@ pub(super) fn stub<'ll, 'tcx>(
                 _ => None,
             };
             unsafe {
-                llvm::LLVMRustDIBuilderCreateStructType(
+                llvm::LLVMDIBuilderCreateStructType(
                     DIB(cx),
                     containing_scope,
-                    name.as_c_char_ptr(),
+                    name.as_ptr(),
                     name.len(),
                     file_metadata,
                     line_number,
@@ -218,28 +204,30 @@ pub(super) fn stub<'ll, 'tcx>(
                     align.bits() as u32,
                     flags,
                     None,
-                    empty_array,
-                    0,
+                    no_elements.as_ptr(),
+                    no_elements.len() as c_uint,
+                    0u32, // (Objective-C runtime version; default is 0)
                     vtable_holder,
-                    unique_type_id_str.as_c_char_ptr(),
+                    unique_type_id_str.as_ptr(),
                     unique_type_id_str.len(),
                 )
             }
         }
         Stub::Union => unsafe {
-            llvm::LLVMRustDIBuilderCreateUnionType(
+            llvm::LLVMDIBuilderCreateUnionType(
                 DIB(cx),
                 containing_scope,
-                name.as_c_char_ptr(),
+                name.as_ptr(),
                 name.len(),
                 file_metadata,
                 line_number,
                 size.bits(),
                 align.bits() as u32,
                 flags,
-                Some(empty_array),
-                0,
-                unique_type_id_str.as_c_char_ptr(),
+                no_elements.as_ptr(),
+                no_elements.len() as c_uint,
+                0u32, // (Objective-C runtime version; default is 0)
+                unique_type_id_str.as_ptr(),
                 unique_type_id_str.len(),
             )
         },
@@ -276,7 +264,7 @@ pub(super) fn build_type_with_children<'ll, 'tcx>(
         && let ty::Adt(adt_def, args) = ty.kind()
     {
         let def_id = adt_def.did();
-        // If any sub type reference the original type definition and the sub type has a type
+        // If any child type references the original type definition and the child type has a type
         // parameter that strictly contains the original parameter, the original type is a recursive
         // type that can expanding indefinitely. Example,
         // ```
@@ -285,21 +273,43 @@ pub(super) fn build_type_with_children<'ll, 'tcx>(
         //     Item(T),
         // }
         // ```
-        let is_expanding_recursive =
-            debug_context(cx).adt_stack.borrow().iter().any(|(parent_def_id, parent_args)| {
-                if def_id == *parent_def_id {
-                    args.iter().zip(parent_args.iter()).any(|(arg, parent_arg)| {
-                        if let (Some(arg), Some(parent_arg)) = (arg.as_type(), parent_arg.as_type())
-                        {
-                            arg != parent_arg && arg.contains(parent_arg)
-                        } else {
-                            false
-                        }
-                    })
-                } else {
-                    false
-                }
-            });
+        let is_expanding_recursive = {
+            let stack = debug_context(cx).adt_stack.borrow();
+            stack
+                .iter()
+                .enumerate()
+                .rev()
+                .skip(1)
+                .filter(|(_, (ancestor_def_id, _))| def_id == *ancestor_def_id)
+                .any(|(ancestor_index, (_, ancestor_args))| {
+                    args.iter()
+                        .zip(ancestor_args.iter())
+                        .filter_map(|(arg, ancestor_arg)| arg.as_type().zip(ancestor_arg.as_type()))
+                        .any(|(arg, ancestor_arg)|
+                            // Strictly contains.
+                            (arg != ancestor_arg && arg.contains(ancestor_arg))
+                            // Check all types between current and ancestor use the
+                            // ancestor_arg.
+                            // Otherwise, duplicate wrappers in normal recursive type may be
+                            // regarded as expanding.
+                            // ```
+                            // struct Recursive {
+                            //     a: Box<Box<Recursive>>,
+                            // }
+                            // ```
+                            // It can produce an ADT stack like this,
+                            // - Box<Recursive>
+                            // - Recursive
+                            // - Box<Box<Recursive>>
+                            && stack[ancestor_index + 1..stack.len()].iter().all(
+                                |(_, intermediate_args)|
+                                    intermediate_args
+                                        .iter()
+                                        .filter_map(|arg| arg.as_type())
+                                        .any(|mid_arg| mid_arg.contains(ancestor_arg))
+                            ))
+                })
+        };
         if is_expanding_recursive {
             // FIXME: indicate that this is an expanding recursive type in stub metadata?
             return DINodeCreationResult::new(stub_info.metadata, false);

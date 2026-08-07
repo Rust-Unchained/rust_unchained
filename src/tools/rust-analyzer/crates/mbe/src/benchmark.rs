@@ -2,21 +2,21 @@
 
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use span::{Edition, Span};
 use stdx::itertools::Itertools;
 use syntax::{
-    ast::{self, HasName},
     AstNode,
+    ast::{self, HasName},
 };
 use syntax_bridge::{
-    dummy_test_span_utils::{DummyTestSpanMap, DUMMY},
-    syntax_node_to_token_tree, DocCommentDesugarMode,
+    DocCommentDesugarMode,
+    dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
+    syntax_node_to_token_tree,
 };
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
 use crate::{
+    DeclarativeMacro, MacroCallStyle,
     parser::{MetaVarKind, Op, RepeatKind, Separator},
-    DeclarativeMacro,
 };
 
 #[test]
@@ -43,17 +43,18 @@ fn benchmark_expand_macro_rules() {
     if skip_slow_tests() {
         return;
     }
+    let db = salsa::DatabaseImpl::default();
     let rules = macro_rules_fixtures();
-    let invocations = invocation_fixtures(&rules);
+    let invocations = invocation_fixtures(&db, &rules);
 
     let hash: usize = {
         let _pt = bench("mbe expand macro rules");
         invocations
             .into_iter()
             .map(|(id, tt)| {
-                let res = rules[&id].expand(&tt, |_| (), DUMMY, Edition::CURRENT);
+                let res = rules[&id].expand(&db, &tt, |_| (), MacroCallStyle::FnLike, DUMMY);
                 assert!(res.err.is_none());
-                res.value.0 .0.len()
+                res.value.0.as_token_trees().len()
             })
             .sum()
     };
@@ -68,7 +69,7 @@ fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
         .collect()
 }
 
-fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree<Span>> {
+fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
     let fixture = bench_fixture::numerous_macro_rules();
     let source_file = ast::SourceFile::parse(&fixture, span::Edition::CURRENT).ok().unwrap();
 
@@ -91,8 +92,9 @@ fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree<Span>> {
 
 /// Generate random invocation fixtures from rules
 fn invocation_fixtures(
+    db: &dyn salsa::Database,
     rules: &FxHashMap<String, DeclarativeMacro>,
-) -> Vec<(String, tt::TopSubtree<Span>)> {
+) -> Vec<(String, tt::TopSubtree)> {
     let mut seed = 123456789;
     let mut res = Vec::new();
 
@@ -122,7 +124,8 @@ fn invocation_fixtures(
                     }
                     let subtree = builder.build();
 
-                    if it.expand(&subtree, |_| (), DUMMY, Edition::CURRENT).err.is_none() {
+                    if it.expand(db, &subtree, |_| (), MacroCallStyle::FnLike, DUMMY).err.is_none()
+                    {
                         res.push((name.clone(), subtree));
                         break;
                     }
@@ -136,7 +139,7 @@ fn invocation_fixtures(
     }
     return res;
 
-    fn collect_from_op(op: &Op, builder: &mut tt::TopSubtreeBuilder<Span>, seed: &mut usize) {
+    fn collect_from_op(op: &Op, builder: &mut tt::TopSubtreeBuilder, seed: &mut usize) {
         return match op {
             Op::Var { kind, .. } => match kind.as_ref() {
                 Some(MetaVarKind::Ident) => builder.push(make_ident("foo")),
@@ -184,20 +187,22 @@ fn invocation_fixtures(
                     for it in tokens.iter() {
                         collect_from_op(it, builder, seed);
                     }
-                    if i + 1 != cnt {
-                        if let Some(sep) = separator {
-                            match &**sep {
-                                Separator::Literal(it) => {
-                                    builder.push(tt::Leaf::Literal(it.clone()))
+                    if i + 1 != cnt
+                        && let Some(sep) = separator
+                    {
+                        match &**sep {
+                            Separator::Literal(it) => builder.push(tt::Leaf::Literal(it.clone())),
+                            Separator::Ident(it) => builder.push(tt::Leaf::Ident(it.clone())),
+                            Separator::Puncts(puncts) => {
+                                for it in puncts {
+                                    builder.push(tt::Leaf::Punct(*it))
                                 }
-                                Separator::Ident(it) => builder.push(tt::Leaf::Ident(it.clone())),
-                                Separator::Puncts(puncts) => {
-                                    for it in puncts {
-                                        builder.push(tt::Leaf::Punct(*it))
-                                    }
-                                }
-                            };
-                        }
+                            }
+                            Separator::Lifetime(punct, ident) => {
+                                builder.push(tt::Leaf::Punct(*punct));
+                                builder.push(tt::Leaf::Ident(ident.clone()));
+                            }
+                        };
                     }
                 }
             }
@@ -220,25 +225,20 @@ fn invocation_fixtures(
             *seed = usize::wrapping_add(usize::wrapping_mul(*seed, a), c);
             *seed
         }
-        fn make_ident(ident: &str) -> tt::Leaf<Span> {
+        fn make_ident(ident: &str) -> tt::Leaf {
             tt::Leaf::Ident(tt::Ident {
                 span: DUMMY,
                 sym: Symbol::intern(ident),
                 is_raw: tt::IdentIsRaw::No,
             })
         }
-        fn make_punct(char: char) -> tt::Leaf<Span> {
+        fn make_punct(char: char) -> tt::Leaf {
             tt::Leaf::Punct(tt::Punct { span: DUMMY, char, spacing: tt::Spacing::Alone })
         }
-        fn make_literal(lit: &str) -> tt::Leaf<Span> {
-            tt::Leaf::Literal(tt::Literal {
-                span: DUMMY,
-                symbol: Symbol::intern(lit),
-                kind: tt::LitKind::Str,
-                suffix: None,
-            })
+        fn make_literal(lit: &str) -> tt::Leaf {
+            tt::Leaf::Literal(tt::Literal::new_no_suffix(lit, DUMMY, tt::LitKind::Str))
         }
-        fn make_subtree(kind: tt::DelimiterKind, builder: &mut tt::TopSubtreeBuilder<Span>) {
+        fn make_subtree(kind: tt::DelimiterKind, builder: &mut tt::TopSubtreeBuilder) {
             builder.open(kind, DUMMY);
             builder.close(DUMMY);
         }

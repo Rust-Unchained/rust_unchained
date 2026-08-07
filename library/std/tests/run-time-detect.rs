@@ -9,10 +9,6 @@
     feature(stdarch_aarch64_feature_detection)
 )]
 #![cfg_attr(
-    all(target_arch = "s390x", target_os = "linux"),
-    feature(stdarch_s390x_feature_detection)
-)]
-#![cfg_attr(
     all(target_arch = "powerpc", target_os = "linux"),
     feature(stdarch_powerpc_feature_detection)
 )]
@@ -20,6 +16,7 @@
     all(target_arch = "powerpc64", target_os = "linux"),
     feature(stdarch_powerpc_feature_detection)
 )]
+#![cfg_attr(all(target_arch = "s390x", target_os = "linux"), feature(s390x_target_feature))]
 
 #[test]
 #[cfg(all(target_arch = "arm", any(target_os = "linux", target_os = "android")))]
@@ -57,18 +54,18 @@ fn aarch64_linux() {
     println!("fhm: {}", is_aarch64_feature_detected!("fhm"));
     println!("flagm2: {}", is_aarch64_feature_detected!("flagm2"));
     println!("flagm: {}", is_aarch64_feature_detected!("flagm"));
-    println!("fp16: {}", is_aarch64_feature_detected!("fp16"));
     println!("fp8: {}", is_aarch64_feature_detected!("fp8"));
     println!("fp8dot2: {}", is_aarch64_feature_detected!("fp8dot2"));
     println!("fp8dot4: {}", is_aarch64_feature_detected!("fp8dot4"));
     println!("fp8fma: {}", is_aarch64_feature_detected!("fp8fma"));
+    println!("fp16: {}", is_aarch64_feature_detected!("fp16"));
     println!("fpmr: {}", is_aarch64_feature_detected!("fpmr"));
     println!("frintts: {}", is_aarch64_feature_detected!("frintts"));
     println!("hbc: {}", is_aarch64_feature_detected!("hbc"));
     println!("i8mm: {}", is_aarch64_feature_detected!("i8mm"));
     println!("jsconv: {}", is_aarch64_feature_detected!("jsconv"));
-    println!("lse128: {}", is_aarch64_feature_detected!("lse128"));
     println!("lse2: {}", is_aarch64_feature_detected!("lse2"));
+    println!("lse128: {}", is_aarch64_feature_detected!("lse128"));
     println!("lse: {}", is_aarch64_feature_detected!("lse"));
     println!("lut: {}", is_aarch64_feature_detected!("lut"));
     println!("mops: {}", is_aarch64_feature_detected!("mops"));
@@ -87,10 +84,10 @@ fn aarch64_linux() {
     println!("sha3: {}", is_aarch64_feature_detected!("sha3"));
     println!("sm4: {}", is_aarch64_feature_detected!("sm4"));
     println!("sme-b16b16: {}", is_aarch64_feature_detected!("sme-b16b16"));
-    println!("sme-f16f16: {}", is_aarch64_feature_detected!("sme-f16f16"));
-    println!("sme-f64f64: {}", is_aarch64_feature_detected!("sme-f64f64"));
     println!("sme-f8f16: {}", is_aarch64_feature_detected!("sme-f8f16"));
     println!("sme-f8f32: {}", is_aarch64_feature_detected!("sme-f8f32"));
+    println!("sme-f16f16: {}", is_aarch64_feature_detected!("sme-f16f16"));
+    println!("sme-f64f64: {}", is_aarch64_feature_detected!("sme-f64f64"));
     println!("sme-fa64: {}", is_aarch64_feature_detected!("sme-fa64"));
     println!("sme-i16i64: {}", is_aarch64_feature_detected!("sme-i16i64"));
     println!("sme-lutv2: {}", is_aarch64_feature_detected!("sme-lutv2"));
@@ -109,7 +106,6 @@ fn aarch64_linux() {
     println!("sve2: {}", is_aarch64_feature_detected!("sve2"));
     println!("sve2p1: {}", is_aarch64_feature_detected!("sve2p1"));
     println!("sve: {}", is_aarch64_feature_detected!("sve"));
-    println!("tme: {}", is_aarch64_feature_detected!("tme"));
     println!("wfxt: {}", is_aarch64_feature_detected!("wfxt"));
     // tidy-alphabetical-end
 }

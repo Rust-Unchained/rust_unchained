@@ -1,6 +1,6 @@
 //@ run-pass
 #![allow(non_upper_case_globals)]
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+// FIXME(static_mut_refs): use raw pointers instead of references
 #![allow(static_mut_refs)]
 
 // Issue 23611: this test is ensuring that, for an instance `X` of the
@@ -256,7 +256,7 @@ pub mod d {
             };
             self.log.borrow_mut().push(self.uid);
             indent_println(self.trail, &format!("+-- Drop {}", self));
-            indent_println(::PREF_INDENT, "");
+            indent_println(super::PREF_INDENT, "");
         }
     }
 }

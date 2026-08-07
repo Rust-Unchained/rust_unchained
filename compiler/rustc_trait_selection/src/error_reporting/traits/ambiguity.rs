@@ -4,14 +4,16 @@ use rustc_errors::{Applicability, Diag, E0283, E0284, E0790, MultiSpan, struct_s
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
 use rustc_hir::intravisit::Visitor as _;
 use rustc_infer::infer::{BoundRegionConversionTime, InferCtxt};
 use rustc_infer::traits::util::elaborate;
 use rustc_infer::traits::{
     Obligation, ObligationCause, ObligationCauseCode, PolyTraitObligation, PredicateObligation,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable as _, TypeVisitableExt as _};
+use rustc_middle::ty::print::PrintPolyTraitPredicateExt;
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable as _, TypeVisitableExt as _, Unnormalized};
+use rustc_session::diagnostics::feature_err_unstable_feature_bound;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 use tracing::{debug, instrument};
 
@@ -30,6 +32,7 @@ pub enum CandidateSource {
 pub fn compute_applicable_impls_for_diagnostics<'tcx>(
     infcx: &InferCtxt<'tcx>,
     obligation: &PolyTraitObligation<'tcx>,
+    ignore_predicates_of_impls: bool,
 ) -> Vec<CandidateSource> {
     let tcx = infcx.tcx;
     let param_env = obligation.param_env;
@@ -42,14 +45,17 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
             let obligation_trait_ref = ocx.normalize(
                 &ObligationCause::dummy(),
                 param_env,
-                placeholder_obligation.trait_ref,
+                Unnormalized::new_wip(placeholder_obligation.trait_ref),
             );
 
             let impl_args = infcx.fresh_args_for_item(DUMMY_SP, impl_def_id);
             let impl_trait_ref =
-                tcx.impl_trait_ref(impl_def_id).unwrap().instantiate(tcx, impl_args);
-            let impl_trait_ref =
-                ocx.normalize(&ObligationCause::dummy(), param_env, impl_trait_ref);
+                tcx.impl_trait_ref(impl_def_id).instantiate(tcx, impl_args).skip_norm_wip();
+            let impl_trait_ref = ocx.normalize(
+                &ObligationCause::dummy(),
+                param_env,
+                Unnormalized::new_wip(impl_trait_ref),
+            );
 
             if let Err(_) =
                 ocx.eq(&ObligationCause::dummy(), param_env, obligation_trait_ref, impl_trait_ref)
@@ -57,7 +63,7 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
                 return false;
             }
 
-            let impl_trait_header = tcx.impl_trait_header(impl_def_id).unwrap();
+            let impl_trait_header = tcx.impl_trait_header(impl_def_id);
             let impl_polarity = impl_trait_header.polarity;
 
             match (impl_polarity, predicate_polarity) {
@@ -66,23 +72,30 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
                 _ => return false,
             }
 
-            let obligations = tcx
-                .predicates_of(impl_def_id)
-                .instantiate(tcx, impl_args)
-                .into_iter()
-                .map(|(predicate, _)| {
-                    Obligation::new(tcx, ObligationCause::dummy(), param_env, predicate)
-                })
-                // Kinda hacky, but let's just throw away obligations that overflow.
-                // This may reduce the accuracy of this check (if the obligation guides
-                // inference or it actually resulted in error after others are processed)
-                // ... but this is diagnostics code.
-                .filter(|obligation| {
-                    infcx.next_trait_solver() || infcx.evaluate_obligation(obligation).is_ok()
-                });
-            ocx.register_obligations(obligations);
+            if !ignore_predicates_of_impls {
+                let obligations = tcx
+                    .clauses_of(impl_def_id)
+                    .instantiate(tcx, impl_args)
+                    .into_iter()
+                    .map(|(clause, _)| {
+                        Obligation::new(
+                            tcx,
+                            ObligationCause::dummy(),
+                            param_env,
+                            clause.skip_norm_wip(),
+                        )
+                    })
+                    // Kinda hacky, but let's just throw away obligations that overflow.
+                    // This may reduce the accuracy of this check (if the obligation guides
+                    // inference or it actually resulted in error after others are processed)
+                    // ... but this is diagnostics code.
+                    .filter(|obligation| {
+                        infcx.next_trait_solver() || infcx.evaluate_obligation(obligation).is_ok()
+                    });
+                ocx.register_obligations(obligations);
+            }
 
-            ocx.select_where_possible().is_empty()
+            ocx.try_evaluate_obligations().is_empty()
         })
     };
 
@@ -92,7 +105,7 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
             let obligation_trait_ref = ocx.normalize(
                 &ObligationCause::dummy(),
                 param_env,
-                placeholder_obligation.trait_ref,
+                Unnormalized::new_wip(placeholder_obligation.trait_ref),
             );
 
             let param_env_predicate = infcx.instantiate_binder_with_fresh_vars(
@@ -100,8 +113,11 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
                 BoundRegionConversionTime::HigherRankedType,
                 poly_trait_predicate,
             );
-            let param_env_trait_ref =
-                ocx.normalize(&ObligationCause::dummy(), param_env, param_env_predicate.trait_ref);
+            let param_env_trait_ref = ocx.normalize(
+                &ObligationCause::dummy(),
+                param_env,
+                Unnormalized::new_wip(param_env_predicate.trait_ref),
+            );
 
             if let Err(_) = ocx.eq(
                 &ObligationCause::dummy(),
@@ -112,7 +128,7 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
                 return false;
             }
 
-            ocx.select_where_possible().is_empty()
+            ocx.try_evaluate_obligations().is_empty()
         })
     };
 
@@ -128,19 +144,28 @@ pub fn compute_applicable_impls_for_diagnostics<'tcx>(
         },
     );
 
-    let predicates =
-        tcx.predicates_of(obligation.cause.body_id.to_def_id()).instantiate_identity(tcx);
-    for (pred, span) in elaborate(tcx, predicates.into_iter()) {
-        let kind = pred.kind();
-        if let ty::ClauseKind::Trait(trait_pred) = kind.skip_binder()
-            && param_env_candidate_may_apply(kind.rebind(trait_pred))
+    // If our `body_def_id` has been set (and isn't just from a dummy obligation cause),
+    // then try to look for a param-env clause that would apply. The way we compute
+    // this is somewhat manual, since we need the spans, so we elaborate this directly
+    // from `clauses_of` rather than actually looking at the param-env which
+    // otherwise would be more appropriate.
+    let body_def_id = obligation.cause.body_def_id;
+    if body_def_id != CRATE_DEF_ID {
+        let clauses = tcx.clauses_of(body_def_id.to_def_id()).instantiate_identity(tcx);
+        for (clause, span) in
+            elaborate(tcx, clauses.into_iter().map(|(c, s)| (c.skip_norm_wip(), s)))
         {
-            if kind.rebind(trait_pred.trait_ref)
-                == ty::Binder::dummy(ty::TraitRef::identity(tcx, trait_pred.def_id()))
+            let kind = clause.kind();
+            if let ty::ClauseKind::Trait(trait_pred) = kind.skip_binder()
+                && param_env_candidate_may_apply(kind.rebind(trait_pred))
             {
-                ambiguities.push(CandidateSource::ParamEnv(tcx.def_span(trait_pred.def_id())))
-            } else {
-                ambiguities.push(CandidateSource::ParamEnv(span))
+                if kind.rebind(trait_pred.trait_ref)
+                    == ty::Binder::dummy(ty::TraitRef::identity(tcx, trait_pred.def_id()))
+                {
+                    ambiguities.push(CandidateSource::ParamEnv(tcx.def_span(trait_pred.def_id())))
+                } else {
+                    ambiguities.push(CandidateSource::ParamEnv(span))
+                }
             }
         }
     }
@@ -161,7 +186,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
         let predicate = self.resolve_vars_if_possible(obligation.predicate);
         let span = obligation.cause.span;
-        let mut file = None;
+        let mut long_ty_path = None;
 
         debug!(?predicate, obligation.cause.code = ?obligation.cause.code());
 
@@ -178,9 +203,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     return e;
                 }
 
-                if let Err(guar) = self.tcx.ensure_ok().coherent_trait(trait_pred.def_id()) {
-                    // Avoid bogus "type annotations needed `Foo: Bar`" errors on `impl Bar for Foo` in case
-                    // other `Foo` impls are incoherent.
+                if let Err(guar) = self.tcx.ensure_result().coherent_trait(trait_pred.def_id()) {
+                    // Avoid bogus "type annotations needed `Foo: Bar`" errors on `impl Bar for
+                    // Foo` in case other `Foo` impls are incoherent.
                     return guar;
                 }
 
@@ -199,20 +224,22 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 // avoid inundating the user with unnecessary errors, but we now
                 // check upstream for type errors and don't add the obligations to
                 // begin with in those cases.
-                if self.tcx.is_lang_item(trait_pred.def_id(), LangItem::Sized) {
-                    match self.tainted_by_errors() {
-                        None => {
-                            let err = self.emit_inference_failure_err(
-                                obligation.cause.body_id,
+                if matches!(
+                    self.tcx.as_lang_item(trait_pred.def_id()),
+                    Some(LangItem::Sized | LangItem::MetaSized)
+                ) {
+                    return match self.tainted_by_errors() {
+                        None => self
+                            .emit_inference_failure_err(
+                                obligation.cause.body_def_id,
                                 span,
                                 trait_pred.self_ty().skip_binder().into(),
                                 TypeAnnotationNeeded::E0282,
                                 false,
-                            );
-                            return err.emit();
-                        }
-                        Some(e) => return e,
-                    }
+                            )
+                            .emit(),
+                        Some(e) => e,
+                    };
                 }
 
                 // Typically, this ambiguity should only happen if
@@ -236,12 +263,37 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     .find(|s| s.has_non_region_infer());
 
                 let mut err = if let Some(term) = term {
-                    self.emit_inference_failure_err(
-                        obligation.cause.body_id,
+                    let candidates: Vec<_> = self
+                        .tcx
+                        .all_impls(trait_pred.def_id())
+                        .filter_map(|def_id| {
+                            let imp = self.tcx.impl_trait_header(def_id);
+                            if imp.polarity != ty::ImplPolarity::Positive
+                                || !self.tcx.is_user_visible_dep(def_id.krate)
+                            {
+                                return None;
+                            }
+                            let imp = imp.trait_ref.skip_binder();
+                            if imp
+                                .with_replaced_self_ty(self.tcx, trait_pred.skip_binder().self_ty())
+                                == trait_pred.skip_binder().trait_ref
+                            {
+                                Some(imp.self_ty())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    self.emit_inference_failure_err_with_type_hint(
+                        obligation.cause.body_def_id,
                         span,
                         term,
                         TypeAnnotationNeeded::E0283,
                         true,
+                        match &candidates[..] {
+                            [candidate] => Some(*candidate),
+                            _ => None,
+                        },
                     )
                 } else {
                     struct_span_code_err!(
@@ -249,13 +301,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         span,
                         E0283,
                         "type annotations needed: cannot satisfy `{}`",
-                        self.tcx.short_string(predicate, &mut file),
+                        self.tcx.short_string(predicate, &mut long_ty_path),
                     )
+                    .with_long_ty_path(long_ty_path)
                 };
 
                 let mut ambiguities = compute_applicable_impls_for_diagnostics(
                     self.infcx,
                     &obligation.with(self.tcx, trait_pred),
+                    false,
                 );
                 let has_non_region_infer = trait_pred
                     .skip_binder()
@@ -296,15 +350,26 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         err.cancel();
                         return e;
                     }
-                    let pred = self.tcx.short_string(predicate, &mut file);
-                    err.note(format!("cannot satisfy `{pred}`"));
+                    if let Some(clause) = predicate.as_trait_clause()
+                        && let ty::Infer(_) = clause.self_ty().skip_binder().kind()
+                    {
+                        let tr = self.tcx.short_string(
+                            clause.print_modifiers_and_trait_path(),
+                            &mut err.long_ty_path(),
+                        );
+                        err.note(format!("the type must implement `{tr}`"));
+                    } else {
+                        let pred = self.tcx.short_string(predicate, &mut err.long_ty_path());
+                        err.note(format!("cannot satisfy `{pred}`"));
+                    }
                     let impl_candidates =
                         self.find_similar_impl_candidates(predicate.as_trait_clause().unwrap());
                     if impl_candidates.len() < 40 {
                         self.report_similar_impl_candidates(
                             impl_candidates.as_slice(),
+                            obligation,
                             trait_pred,
-                            obligation.cause.body_id,
+                            obligation.cause.body_def_id,
                             &mut err,
                             false,
                             obligation.param_env,
@@ -319,7 +384,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
 
                 if term.is_some_and(|term| term.as_type().is_some())
-                    && let Some(body) = self.tcx.hir_maybe_body_owned_by(obligation.cause.body_id)
+                    && let Some(body) =
+                        self.tcx.hir_maybe_body_owned_by(obligation.cause.body_def_id)
                 {
                     let mut expr_finder = FindExprBySpan::new(span, self.tcx);
                     expr_finder.visit_expr(&body.value);
@@ -349,10 +415,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             },
                         ] = path.segments
                         && data.trait_ref.def_id == *trait_id
-                        && self.tcx.trait_of_item(*item_id) == Some(*trait_id)
+                        && self.tcx.trait_of_assoc(*item_id) == Some(*trait_id)
                         && let None = self.tainted_by_errors()
                     {
-                        let (verb, noun) = match self.tcx.associated_item(item_id).kind {
+                        let assoc_item = self.tcx.associated_item(*item_id);
+                        let (verb, noun) = match assoc_item.kind {
                             ty::AssocKind::Const { .. } => ("refer to the", "constant"),
                             ty::AssocKind::Fn { .. } => ("call", "function"),
                             // This is already covered by E0223, but this following single match
@@ -371,17 +438,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         );
                         err.code(E0790);
 
-                        if let Some(local_def_id) = data.trait_ref.def_id.as_local()
-                            && let hir::Node::Item(hir::Item {
-                                kind: hir::ItemKind::Trait(_, _, trait_ident, _, _, trait_item_refs),
-                                ..
-                            }) = self.tcx.hir_node_by_def_id(local_def_id)
-                            && let Some(method_ref) = trait_item_refs
-                                .iter()
-                                .find(|item_ref| item_ref.ident == *assoc_item_ident)
-                        {
+                        if item_id.is_local() {
+                            let trait_ident = self.tcx.item_name(*trait_id);
                             err.span_label(
-                                method_ref.span,
+                                self.tcx.def_span(*item_id),
                                 format!("`{trait_ident}::{assoc_item_ident}` defined here"),
                             );
                         }
@@ -390,7 +450,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
                         let trait_impls = self.tcx.trait_impls_of(data.trait_ref.def_id);
 
-                        if let Some(impl_def_id) =
+                        if let Some(&impl_def_id) =
                             trait_impls.non_blanket_impls().values().flatten().next()
                         {
                             let non_blanket_impl_count =
@@ -403,7 +463,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                      implementation",
                                     vec![format!(
                                         "{}",
-                                        self.tcx.type_of(impl_def_id).instantiate_identity()
+                                        self.tcx
+                                            .type_of(impl_def_id)
+                                            .instantiate_identity()
+                                            .skip_norm_wip()
                                     )],
                                 )
                             } else if non_blanket_impl_count < 20 {
@@ -414,10 +477,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                         .non_blanket_impls()
                                         .values()
                                         .flatten()
-                                        .map(|id| {
+                                        .map(|&id| {
                                             format!(
                                                 "{}",
-                                                self.tcx.type_of(id).instantiate_identity()
+                                                self.tcx
+                                                    .type_of(id)
+                                                    .instantiate_identity()
+                                                    .skip_norm_wip()
                                             )
                                         })
                                         .collect::<Vec<String>>(),
@@ -481,7 +547,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
 
                 self.emit_inference_failure_err(
-                    obligation.cause.body_id,
+                    obligation.cause.body_def_id,
                     span,
                     term,
                     TypeAnnotationNeeded::E0282,
@@ -500,13 +566,14 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 // both must be type variables, or the other would've been instantiated
                 assert!(a.is_ty_var() && b.is_ty_var());
                 self.emit_inference_failure_err(
-                    obligation.cause.body_id,
+                    obligation.cause.body_def_id,
                     span,
                     a.into(),
                     TypeAnnotationNeeded::E0282,
                     true,
                 )
             }
+
             ty::PredicateKind::Clause(ty::ClauseKind::Projection(data)) => {
                 if let Err(e) = predicate.error_reported() {
                     return e;
@@ -515,10 +582,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     return e;
                 }
 
-                if let Err(guar) = self
-                    .tcx
-                    .ensure_ok()
-                    .coherent_trait(self.tcx.parent(data.projection_term.def_id))
+                if data.projection_term.kind.is_trait_projection()
+                    && let Err(guar) =
+                        self.tcx.ensure_result().coherent_trait(self.tcx.parent(data.def_id()))
                 {
                     // Avoid bogus "type annotations needed `Foo: Bar`" errors on `impl Bar for Foo` in case
                     // other `Foo` impls are incoherent.
@@ -531,16 +597,17 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     .filter_map(ty::GenericArg::as_term)
                     .chain([data.term])
                     .find(|g| g.has_non_region_infer());
-                let predicate = self.tcx.short_string(predicate, &mut file);
+                let predicate = self.tcx.short_string(predicate, &mut long_ty_path);
                 if let Some(term) = term {
                     self.emit_inference_failure_err(
-                        obligation.cause.body_id,
+                        obligation.cause.body_def_id,
                         span,
                         term,
                         TypeAnnotationNeeded::E0284,
                         true,
                     )
                     .with_note(format!("cannot satisfy `{predicate}`"))
+                    .with_long_ty_path(long_ty_path)
                 } else {
                     // If we can't find a generic parameter, just print a generic error
                     struct_span_code_err!(
@@ -550,6 +617,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         "type annotations needed: cannot satisfy `{predicate}`",
                     )
                     .with_span_label(span, format!("cannot satisfy `{predicate}`"))
+                    .with_long_ty_path(long_ty_path)
                 }
             }
 
@@ -563,17 +631,16 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 let term =
                     data.walk().filter_map(ty::GenericArg::as_term).find(|term| term.is_infer());
                 if let Some(term) = term {
-                    let err = self.emit_inference_failure_err(
-                        obligation.cause.body_id,
+                    self.emit_inference_failure_err(
+                        obligation.cause.body_def_id,
                         span,
                         term,
                         TypeAnnotationNeeded::E0284,
                         true,
-                    );
-                    err
+                    )
                 } else {
                     // If we can't find a generic parameter, just print a generic error
-                    let predicate = self.tcx.short_string(predicate, &mut file);
+                    let predicate = self.tcx.short_string(predicate, &mut long_ty_path);
                     struct_span_code_err!(
                         self.dcx(),
                         span,
@@ -581,24 +648,26 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         "type annotations needed: cannot satisfy `{predicate}`",
                     )
                     .with_span_label(span, format!("cannot satisfy `{predicate}`"))
+                    .with_long_ty_path(long_ty_path)
                 }
             }
 
             ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, ..)) => self
                 .emit_inference_failure_err(
-                    obligation.cause.body_id,
+                    obligation.cause.body_def_id,
                     span,
                     ct.into(),
                     TypeAnnotationNeeded::E0284,
                     true,
                 ),
+
             ty::PredicateKind::NormalizesTo(ty::NormalizesTo { alias, term })
                 if term.is_infer() =>
             {
                 if let Some(e) = self.tainted_by_errors() {
                     return e;
                 }
-                let alias = self.tcx.short_string(alias, &mut file);
+                let alias = self.tcx.short_string(alias, &mut long_ty_path);
                 struct_span_code_err!(
                     self.dcx(),
                     span,
@@ -606,13 +675,34 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     "type annotations needed: cannot normalize `{alias}`",
                 )
                 .with_span_label(span, format!("cannot normalize `{alias}`"))
+                .with_long_ty_path(long_ty_path)
+            }
+
+            ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(sym)) => {
+                if let Some(e) = self.tainted_by_errors() {
+                    return e;
+                }
+
+                if self.tcx.features().staged_api() {
+                    self.dcx().struct_span_err(
+                        span,
+                        format!("unstable feature `{sym}` is used without being enabled."),
+                    ).with_help(format!("The feature can be enabled by marking the current item with `#[unstable_feature_bound({sym})]`"))
+                } else {
+                    feature_err_unstable_feature_bound(
+                        &self.tcx.sess,
+                        sym,
+                        span,
+                        format!("use of unstable library feature `{sym}`"),
+                    )
+                }
             }
 
             _ => {
                 if let Some(e) = self.tainted_by_errors() {
                     return e;
                 }
-                let predicate = self.tcx.short_string(predicate, &mut file);
+                let predicate = self.tcx.short_string(predicate, &mut long_ty_path);
                 struct_span_code_err!(
                     self.dcx(),
                     span,
@@ -620,9 +710,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     "type annotations needed: cannot satisfy `{predicate}`",
                 )
                 .with_span_label(span, format!("cannot satisfy `{predicate}`"))
+                .with_long_ty_path(long_ty_path)
             }
         };
-        *err.long_ty_path() = file;
         self.note_obligation_cause(&mut err, obligation);
         err.emit()
     }
@@ -681,7 +771,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             predicate
         );
         let post = if post.len() > 1 || (post.len() == 1 && post[0].contains('\n')) {
-            format!(":\n{}", post.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"),)
+            format!(":\n{}", post.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"))
         } else if post.len() == 1 {
             format!(": `{}`", post[0])
         } else {
@@ -693,7 +783,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 err.note(format!("cannot satisfy `{predicate}`"));
             }
             (0, _, 1) => {
-                err.note(format!("{} in the `{}` crate{}", msg, crates[0], post,));
+                err.note(format!("{msg} in the `{}` crate{post}", crates[0]));
             }
             (0, _, _) => {
                 err.note(format!(
@@ -710,7 +800,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             (_, 1, 1) => {
                 let span: MultiSpan = spans.into();
                 err.span_note(span, msg);
-                err.note(format!("and another `impl` found in the `{}` crate{}", crates[0], post,));
+                err.note(format!("and another `impl` found in the `{}` crate{post}", crates[0]));
             }
             _ => {
                 let span: MultiSpan = spans.into();

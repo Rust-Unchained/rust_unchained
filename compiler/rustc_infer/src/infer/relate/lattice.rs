@@ -17,14 +17,15 @@
 //!
 //! [lattices]: https://en.wikipedia.org/wiki/Lattice_(order)
 
+use rustc_hir::def_id::DefId;
+use rustc_middle::span_bug;
 use rustc_middle::traits::solve::Goal;
-use rustc_middle::ty::relate::combine::{super_combine_consts, super_combine_tys};
+use rustc_middle::ty::relate::combine::{combine_ty_args, super_combine_consts, super_combine_tys};
 use rustc_middle::ty::relate::{Relate, RelateResult, TypeRelation};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyVar, TypeVisitableExt};
 use rustc_span::Span;
 use tracing::{debug, instrument};
 
-use super::StructurallyRelateAliases;
 use super::combine::PredicateEmittingRelation;
 use crate::infer::{DefineOpaqueTypes, InferCtxt, SubregionOrigin, TypeTrace};
 use crate::traits::{Obligation, PredicateObligations};
@@ -73,6 +74,19 @@ impl<'infcx, 'tcx> LatticeOp<'infcx, 'tcx> {
 impl<'tcx> TypeRelation<TyCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
     fn cx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
+    }
+
+    fn relate_ty_args(
+        &mut self,
+        a_ty: Ty<'tcx>,
+        b_ty: Ty<'tcx>,
+        def_id: DefId,
+        a_args: ty::GenericArgsRef<'tcx>,
+        b_args: ty::GenericArgsRef<'tcx>,
+        mk: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+    ) -> RelateResult<'tcx, Ty<'tcx>> {
+        let variances = self.cx().variances_of(def_id);
+        combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, |args| mk(args))
     }
 
     fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
@@ -146,13 +160,26 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
                 Ok(v)
             }
 
+            (&ty::Alias(ty::IsRigid::No, _), _) | (_, &ty::Alias(ty::IsRigid::No, _))
+                if infcx.next_trait_solver() =>
+            {
+                // NOTE(khyperia): If this turns out to be possible, either the caller should
+                // normalize the alias, or we should normalize the alias here. See the PR that
+                // introduced this comment for how to do so, which normalizes aliases in other
+                // relations.
+                span_bug!(
+                    self.span(),
+                    "it should not be possible to encounter unnormalized aliases in lattice relation"
+                );
+            }
+
             (
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
+                &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: a_def_id }, .. }),
+                &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id => super_combine_tys(infcx, self, a, b),
 
-            (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
-            | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
+            (&ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }), _)
+            | (_, &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }))
                 if def_id.is_local() && !infcx.next_trait_solver() =>
             {
                 self.register_goals(infcx.handle_opaque_type(
@@ -249,10 +276,6 @@ impl<'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
         self.trace.span()
     }
 
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
-        StructurallyRelateAliases::No
-    }
-
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.param_env
     }
@@ -275,14 +298,5 @@ impl<'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
                 goal.predicate,
             )
         }))
-    }
-
-    fn register_alias_relate_predicate(&mut self, a: Ty<'tcx>, b: Ty<'tcx>) {
-        self.register_predicates([ty::Binder::dummy(ty::PredicateKind::AliasRelate(
-            a.into(),
-            b.into(),
-            // FIXME(deferred_projection_equality): This isn't right, I think?
-            ty::AliasRelationDirection::Equate,
-        ))]);
     }
 }

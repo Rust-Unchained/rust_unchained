@@ -1,11 +1,13 @@
+use std::iter;
+
 use tracing::debug;
 
 use super::{
-    ExpectedFound, RelateResult, StructurallyRelateAliases, TypeRelation,
-    structurally_relate_consts, structurally_relate_tys,
+    ExpectedFound, RelateResult, TypeRelation, structurally_relate_consts, structurally_relate_tys,
 };
 use crate::error::TypeError;
 use crate::inherent::*;
+use crate::relate::VarianceDiagInfo;
 use crate::solve::Goal;
 use crate::visit::TypeVisitableExt as _;
 use crate::{self as ty, InferCtxtLike, Interner, TypingMode, Upcast};
@@ -20,11 +22,6 @@ where
 
     fn param_env(&self) -> I::ParamEnv;
 
-    /// Whether aliases should be related structurally. This is pretty much
-    /// always `No` unless you're equating in some specific locations of the
-    /// new solver. See the comments in these use-cases for more details.
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases;
-
     /// Register obligations that must hold in order for this relation to hold
     fn register_goals(&mut self, obligations: impl IntoIterator<Item = Goal<I, I::Predicate>>);
 
@@ -34,9 +31,6 @@ where
         &mut self,
         obligations: impl IntoIterator<Item: Upcast<I, I::Predicate>>,
     );
-
-    /// Register `AliasRelate` obligation(s) that both types must be related to each other.
-    fn register_alias_relate_predicate(&mut self, a: I::Ty, b: I::Ty);
 }
 
 pub fn super_combine_tys<Infcx, I, R>(
@@ -111,23 +105,20 @@ where
         {
             panic!("We do not expect to encounter `Fresh` variables in the new solver")
         }
-
-        (_, ty::Alias(..)) | (ty::Alias(..), _) if infcx.next_trait_solver() => {
-            match relation.structurally_relate_aliases() {
-                StructurallyRelateAliases::Yes => structurally_relate_tys(relation, a, b),
-                StructurallyRelateAliases::No => {
-                    relation.register_alias_relate_predicate(a, b);
-                    Ok(a)
-                }
-            }
+        (ty::Alias(ty::IsRigid::No, _), _) | (_, ty::Alias(ty::IsRigid::No, _))
+            if infcx.next_trait_solver() =>
+        {
+            panic!("non-rigid aliases should be handled in the caller of super_combine_tys")
         }
 
         // All other cases of inference are errors
         (ty::Infer(_), _) | (_, ty::Infer(_)) => Err(TypeError::Sorts(ExpectedFound::new(a, b))),
 
-        (ty::Alias(ty::Opaque, _), _) | (_, ty::Alias(ty::Opaque, _)) => {
-            assert!(!infcx.next_trait_solver());
-            match infcx.typing_mode() {
+        (ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }), _)
+        | (_, ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }))
+            if !infcx.next_trait_solver() =>
+        {
+            match infcx.typing_mode_raw().assert_not_erased() {
                 // During coherence, opaque types should be treated as *possibly*
                 // equal to any other type. This is an
                 // extremely heavy hammer, but can be relaxed in a forwards-compatible
@@ -136,10 +127,12 @@ where
                     relation.register_predicates([ty::Binder::dummy(ty::PredicateKind::Ambiguous)]);
                     Ok(a)
                 }
-                TypingMode::Analysis { .. }
-                | TypingMode::Borrowck { .. }
-                | TypingMode::PostBorrowckAnalysis { .. }
-                | TypingMode::PostAnalysis => structurally_relate_tys(relation, a, b),
+                TypingMode::Typeck { .. }
+                | TypingMode::Reflection
+                | TypingMode::PostTypeckUntilBorrowck { .. }
+                | TypingMode::PostBorrowck { .. }
+                | TypingMode::PostAnalysis
+                | TypingMode::Codegen => structurally_relate_tys(relation, a, b),
             }
         }
 
@@ -186,36 +179,111 @@ where
             )
         }
 
+        (ty::ConstKind::Alias(ty::IsRigid::No, alias), _) if infcx.next_trait_solver() => {
+            relation.register_predicates([ty::ProjectionPredicate {
+                projection_term: alias.into(),
+                term: b.into(),
+            }]);
+            Ok(b)
+        }
+        (_, ty::ConstKind::Alias(ty::IsRigid::No, alias)) if infcx.next_trait_solver() => {
+            relation.register_predicates([ty::ProjectionPredicate {
+                projection_term: alias.into(),
+                term: a.into(),
+            }]);
+            Ok(b)
+        }
+
         (ty::ConstKind::Infer(ty::InferConst::Var(vid)), _) => {
-            infcx.instantiate_const_var_raw(relation, true, vid, b)?;
+            infcx.instantiate_const_var(relation, true, vid, b)?;
             Ok(b)
         }
 
         (_, ty::ConstKind::Infer(ty::InferConst::Var(vid))) => {
-            infcx.instantiate_const_var_raw(relation, false, vid, a)?;
+            infcx.instantiate_const_var(relation, false, vid, a)?;
             Ok(a)
         }
 
-        (ty::ConstKind::Unevaluated(..), _) | (_, ty::ConstKind::Unevaluated(..))
-            if infcx.cx().features().generic_const_exprs() || infcx.next_trait_solver() =>
+        (ty::ConstKind::Alias(ty::IsRigid::No, _), _)
+        | (_, ty::ConstKind::Alias(ty::IsRigid::No, _))
+            if infcx.cx().features().generic_const_exprs() =>
         {
-            match relation.structurally_relate_aliases() {
-                StructurallyRelateAliases::No => {
-                    relation.register_predicates([if infcx.next_trait_solver() {
-                        ty::PredicateKind::AliasRelate(
-                            a.into(),
-                            b.into(),
-                            ty::AliasRelationDirection::Equate,
-                        )
-                    } else {
-                        ty::PredicateKind::ConstEquate(a, b)
-                    }]);
-
-                    Ok(b)
-                }
-                StructurallyRelateAliases::Yes => structurally_relate_consts(relation, a, b),
-            }
+            relation.register_predicates([ty::PredicateKind::ConstEquate(a, b)]);
+            Ok(b)
         }
+
         _ => structurally_relate_consts(relation, a, b),
     }
+}
+
+pub fn combine_ty_args<Infcx, I, R>(
+    infcx: &Infcx,
+    relation: &mut R,
+    a_ty: I::Ty,
+    b_ty: I::Ty,
+    variances: I::VariancesOf,
+    a_args: I::GenericArgs,
+    b_args: I::GenericArgs,
+    mk: impl FnOnce(I::GenericArgs) -> I::Ty,
+) -> RelateResult<I, I::Ty>
+where
+    Infcx: InferCtxtLike<Interner = I>,
+    I: Interner,
+    R: PredicateEmittingRelation<Infcx>,
+{
+    let cx = infcx.cx();
+    let mut has_unconstrained_bivariant_arg = false;
+    let args = iter::zip(a_args.iter(), b_args.iter()).enumerate().map(|(i, (a, b))| {
+        let variance = variances.get(i).unwrap();
+        let variance_info = match variance {
+            ty::Invariant => {
+                VarianceDiagInfo::Invariant { ty: a_ty, param_index: i.try_into().unwrap() }
+            }
+            ty::Covariant | ty::Contravariant => VarianceDiagInfo::default(),
+            ty::Bivariant => {
+                let has_non_region_infer = |arg: I::GenericArg| {
+                    arg.has_non_region_infer()
+                        && infcx.resolve_vars_if_possible(arg).has_non_region_infer()
+                };
+                if has_non_region_infer(a) || has_non_region_infer(b) {
+                    has_unconstrained_bivariant_arg = true;
+                }
+                VarianceDiagInfo::default()
+            }
+        };
+        relation.relate_with_variance(variance, variance_info, a, b)
+    });
+    let args = cx.mk_args_from_iter(args)?;
+
+    // In general, we do not check whether all types which occur during
+    // type checking are well-formed. We only check wf of user-provided types
+    // and when actually using a type, e.g. for method calls.
+    //
+    // This means that when subtyping, we may end up with unconstrained
+    // inference variables if a generalized type has bivariant parameters.
+    // A parameter may only be bivariant if it is constrained by a projection
+    // bound in a where-clause. As an example, imagine a type:
+    //
+    //     struct Foo<A, B> where A: Iterator<Item = B> {
+    //         data: A
+    //     }
+    //
+    // here, `A` will be covariant, but `B` is unconstrained. However, whatever it is,
+    // for `Foo` to be WF, it must be equal to `A::Item`.
+    //
+    // If we have an input `Foo<?A, ?B>`, then after generalization we will wind
+    // up with a type like `Foo<?C, ?D>`. When we enforce `Foo<?A, ?B> <: Foo<?C, ?D>`,
+    // we will wind up with the requirement that `?A <: ?C`, but no particular
+    // relationship between `?B` and `?D` (after all, these types may be completely
+    // different). If we do nothing else, this may mean that `?D` goes unconstrained
+    // (as in #41677). To avoid this we emit a `WellFormed` when relating types with
+    // bivariant arguments.
+    if has_unconstrained_bivariant_arg {
+        relation.register_predicates([
+            ty::ClauseKind::WellFormed(a_ty.into()),
+            ty::ClauseKind::WellFormed(b_ty.into()),
+        ]);
+    }
+
+    if a_args == args { Ok(a_ty) } else { Ok(mk(args)) }
 }

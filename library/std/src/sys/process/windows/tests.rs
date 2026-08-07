@@ -1,7 +1,10 @@
+use super::child_pipe::{Pipes, child_pipe};
 use super::{Arg, make_command_line};
-use crate::env;
 use crate::ffi::{OsStr, OsString};
-use crate::process::Command;
+use crate::os::windows::io::AsHandle;
+use crate::process::{Command, Stdio};
+use crate::time::Duration;
+use crate::{env, thread};
 
 #[test]
 fn test_raw_args() {
@@ -29,18 +32,29 @@ fn test_thread_handle() {
     use crate::os::windows::process::{ChildExt, CommandExt};
     const CREATE_SUSPENDED: u32 = 0x00000004;
 
-    let p = Command::new("cmd").args(&["/C", "exit 0"]).creation_flags(CREATE_SUSPENDED).spawn();
+    let p = Command::new("whoami").stdout(Stdio::null()).creation_flags(CREATE_SUSPENDED).spawn();
     assert!(p.is_ok());
-    let mut p = p.unwrap();
+
+    // Ensure the process is killed in the event something goes wrong.
+    struct DropGuard(crate::process::Child);
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+    let mut p = DropGuard(p.unwrap());
+    let p = &mut p.0;
 
     unsafe extern "system" {
-        fn ResumeThread(_: BorrowedHandle<'_>) -> u32;
+        unsafe fn ResumeThread(hHandle: BorrowedHandle<'_>) -> u32;
+        unsafe fn WaitForSingleObject(hHandle: BorrowedHandle<'_>, dwMilliseconds: u32) -> u32;
     }
     unsafe {
         ResumeThread(p.main_thread_handle());
+        // Wait until the process exits or 1 minute passes.
+        // We don't bother checking the result here as that's done below using `try_wait`.
+        WaitForSingleObject(p.as_handle(), 1000 * 60);
     }
-
-    crate::thread::sleep(crate::time::Duration::from_millis(100));
 
     let res = p.try_wait();
     assert!(res.is_ok());
@@ -220,4 +234,27 @@ fn windows_exe_resolver() {
             resolve_exe(OsStr::new("exists.exe"), empty_paths, Some(temp.path().as_ref())).is_ok()
         );
     }
+}
+
+/// Test the synchronous fallback for overlapped I/O.
+///
+/// While technically testing `Handle` functionality, this is situated in this
+/// module to allow easier access to `ChildPipe`.
+#[test]
+fn overlapped_handle_fallback() {
+    // Create some pipes. `ours` will be asynchronous.
+    let Pipes { ours, theirs } = child_pipe(true, false).unwrap();
+
+    let async_readable = ours.into_handle();
+    let sync_writeable = theirs.into_handle();
+
+    thread::scope(|_| {
+        thread::sleep(Duration::from_millis(100));
+        sync_writeable.write(b"hello world!").unwrap();
+    });
+
+    // The pipe buffer starts empty so reading won't complete synchronously unless
+    // our fallback path works.
+    let mut buffer = [0u8; 1024];
+    async_readable.read(&mut buffer).unwrap();
 }

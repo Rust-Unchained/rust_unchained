@@ -4,7 +4,7 @@ use either::{Either, Left, Right};
 use rustc_abi::{HasDataLayout, Size};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 
 use super::{
     AllocId, CtfeProvenance, InterpResult, Pointer, PointerArithmetic, Provenance,
@@ -20,7 +20,7 @@ use crate::ty::ScalarInt;
 /// These variants would be private if there was a convenient way to achieve that in Rust.
 /// Do *not* match on a `Scalar`! Use the various `to_*` methods instead.
 #[derive(Clone, Copy, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub enum Scalar<Prov = CtfeProvenance> {
     /// The raw bytes of a simple value.
     Int(ScalarInt),
@@ -109,7 +109,7 @@ impl<Prov> Scalar<Prov> {
     /// Create a Scalar from a pointer with an `Option<_>` provenance (where `None` represents a
     /// plain integer / "invalid" pointer).
     pub fn from_maybe_pointer(ptr: Pointer<Option<Prov>>, cx: &impl HasDataLayout) -> Self {
-        match ptr.into_parts() {
+        match ptr.into_raw_parts() {
             (Some(prov), offset) => Scalar::from_pointer(Pointer::new(prov, offset), cx),
             (None, offset) => {
                 Scalar::Int(ScalarInt::try_from_uint(offset.bytes(), cx.pointer_size()).unwrap())
@@ -167,7 +167,7 @@ impl<Prov> Scalar<Prov> {
 
     #[inline]
     pub fn from_target_usize(i: u64, cx: &impl HasDataLayout) -> Self {
-        Self::from_uint(i, cx.data_layout().pointer_size)
+        Self::from_uint(i, cx.data_layout().pointer_offset())
     }
 
     #[inline]
@@ -180,32 +180,32 @@ impl<Prov> Scalar<Prov> {
 
     #[inline]
     pub fn from_i8(i: i8) -> Self {
-        Self::from_int(i, Size::from_bits(8))
+        Self::Int(i.into())
     }
 
     #[inline]
     pub fn from_i16(i: i16) -> Self {
-        Self::from_int(i, Size::from_bits(16))
+        Self::Int(i.into())
     }
 
     #[inline]
     pub fn from_i32(i: i32) -> Self {
-        Self::from_int(i, Size::from_bits(32))
+        Self::Int(i.into())
     }
 
     #[inline]
     pub fn from_i64(i: i64) -> Self {
-        Self::from_int(i, Size::from_bits(64))
+        Self::Int(i.into())
     }
 
     #[inline]
     pub fn from_i128(i: i128) -> Self {
-        Self::from_int(i, Size::from_bits(128))
+        Self::Int(i.into())
     }
 
     #[inline]
     pub fn from_target_isize(i: i64, cx: &impl HasDataLayout) -> Self {
-        Self::from_int(i, cx.data_layout().pointer_size)
+        Self::from_int(i, cx.data_layout().pointer_offset())
     }
 
     #[inline]
@@ -276,7 +276,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
             Right(ptr) => interp_ok(ptr.into()),
             Left(bits) => {
                 let addr = u64::try_from(bits).unwrap();
-                interp_ok(Pointer::from_addr_invalid(addr))
+                interp_ok(Pointer::without_provenance(addr))
             }
         }
     }
@@ -299,7 +299,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
                     Ok(ScalarInt::try_from_uint(ptr.offset.bytes(), Size::from_bytes(sz)).unwrap())
                 } else {
                     // We know `offset` is relative, since `OFFSET_IS_ADDR == false`.
-                    let (prov, offset) = ptr.into_parts();
+                    let (prov, offset) = ptr.into_raw_parts();
                     // Because `OFFSET_IS_ADDR == false`, this unwrap can never fail.
                     Err(Scalar::Ptr(Pointer::new(prov.get_alloc_id().unwrap(), offset), sz))
                 }
@@ -393,7 +393,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
     /// Converts the scalar to produce a machine-pointer-sized unsigned integer.
     /// Fails if the scalar is a pointer.
     pub fn to_target_usize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
-        let b = self.to_uint(cx.data_layout().pointer_size)?;
+        let b = self.to_uint(cx.data_layout().pointer_size())?;
         interp_ok(u64::try_from(b).unwrap())
     }
 
@@ -433,7 +433,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
     /// Converts the scalar to produce a machine-pointer-sized signed integer.
     /// Fails if the scalar is a pointer.
     pub fn to_target_isize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, i64> {
-        let b = self.to_int(cx.data_layout().pointer_size)?;
+        let b = self.to_int(cx.data_layout().pointer_size())?;
         interp_ok(i64::try_from(b).unwrap())
     }
 

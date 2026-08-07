@@ -1,5 +1,8 @@
 # Troubleshooting
 
+First, search the [troubleshooting FAQ](faq.html). If your problem appears
+there (and the proposed solution works for you), great! Otherwise, read on.
+
 Start with looking at the rust-analyzer version. Try **rust-analyzer:
 Show RA Version** in VS Code (using **Command Palette** feature
 typically activated by Ctrl+Shift+P) or `rust-analyzer --version` in the
@@ -34,17 +37,16 @@ bypassing LSP machinery.
 When filing issues, it is useful (but not necessary) to try to minimize
 examples. An ideal bug reproduction looks like this:
 
-```shell
-$ git clone https://github.com/username/repo.git && cd repo && git switch --detach commit-hash
-$ rust-analyzer --version
+```bash
+git clone https://github.com/username/repo.git && cd repo && git switch --detach commit-hash
+rust-analyzer --version
 rust-analyzer dd12184e4 2021-05-08 dev
-$ rust-analyzer analysis-stats .
-💀 💀 💀
+rust-analyzer analysis-stats .
 ```
+💀 💀 💀
 
 It is especially useful when the `repo` doesn’t use external crates or
 the standard library.
 
 If you want to go as far as to modify the source code to debug the
-problem, be sure to take a look at the [dev
-docs](https://github.com/rust-lang/rust-analyzer/tree/master/docs/dev)!
+problem, be sure to take a look at the [contribution guide](contributing/index.html)!

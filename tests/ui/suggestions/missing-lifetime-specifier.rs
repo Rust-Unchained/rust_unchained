@@ -4,10 +4,10 @@
 //@ ignore-emscripten globals are used instead of thread locals
 //@ ignore-android does not use #[thread_local]
 //@ ignore-nto does not use #[thread_local]
+//@ ignore-qnx does not use #[thread_local]
 // Different number of duplicated diagnostics on different targets
 //@ compile-flags: -Zdeduplicate-diagnostics=yes
 
-#![allow(bare_trait_objects)]
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ thread_local! {
     //~^ ERROR missing lifetime specifiers
 }
 thread_local! {
-    static b: RefCell<HashMap<i32, Vec<Vec<&Bar>>>> = RefCell::new(HashMap::new());
+    static b: RefCell<HashMap<i32, Vec<Vec<&dyn Bar>>>> = RefCell::new(HashMap::new());
     //~^ ERROR missing lifetime specifiers
 }
 thread_local! {
@@ -36,7 +36,7 @@ thread_local! {
     //~^ ERROR missing lifetime specifiers
 }
 thread_local! {
-    static d: RefCell<HashMap<i32, Vec<Vec<&Tar<i32>>>>> = RefCell::new(HashMap::new());
+    static d: RefCell<HashMap<i32, Vec<Vec<&dyn Tar<i32>>>>> = RefCell::new(HashMap::new());
     //~^ ERROR missing lifetime specifiers
 }
 
@@ -45,8 +45,9 @@ thread_local! {
     //~^ ERROR union takes 2 lifetime arguments but 1 lifetime argument
 }
 thread_local! {
-    static f: RefCell<HashMap<i32, Vec<Vec<&Tar<'static, i32>>>>> = RefCell::new(HashMap::new());
-    //~^ ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
+    static f: RefCell<HashMap<i32, Vec<Vec<&dyn Tar<'static, i32>>>>> =
+        RefCell::new(HashMap::new());
+    //~^^ ERROR trait takes 2 lifetime arguments but 1 lifetime argument was supplied
     //~| ERROR missing lifetime specifier
 }
 

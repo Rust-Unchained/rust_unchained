@@ -4,6 +4,11 @@
 // See comments in build_native_lib()
 #define EXPORT __attribute__((visibility("default")))
 
+enum cenum {
+  cenum_a,
+  cenum_b,
+};
+
 EXPORT int32_t add_one_int(int32_t x) {
   return 2 + x;
 }
@@ -22,12 +27,24 @@ EXPORT uint32_t get_unsigned_int(void) {
   return -10;
 }
 
-EXPORT short add_int16(int16_t x) {
+EXPORT int16_t add_int16(int16_t x) {
   return x + 3;
 }
 
-EXPORT long add_short_to_long(int16_t x, int64_t y) {
+EXPORT int64_t add_short_to_long(int16_t x, int64_t y) {
   return x + y;
+}
+
+EXPORT float add_float(float x) {
+  return x + 1.5f;
+}
+
+EXPORT uint8_t u8_id(uint8_t x) {
+  return x;
+}
+
+EXPORT uint8_t scalar_enum(enum cenum e) {
+  return (uint8_t)e;
 }
 
 // To test that functions not marked with EXPORT cannot be called by Miri.

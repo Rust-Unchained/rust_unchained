@@ -84,13 +84,13 @@ pub(super) fn check<'tcx>(
         if !prefix.is_empty()
             && (
                 // Precedence of internal expression is less than or equal to precedence of `&expr`.
-                arg_expression.precedence() <= ExprPrecedence::Prefix || is_range_literal(arg_expression)
+                cx.precedence(arg_expression) <= ExprPrecedence::Prefix || is_range_literal(arg_expression)
             )
         {
             arg_snip = format!("({arg_snip})").into();
         }
 
-        if clippy_utils::higher::Range::hir(arg_expression).is_some() {
+        if clippy_utils::higher::Range::hir(cx, arg_expression).is_some() {
             let range_expr = snippet(cx, arg_expression.span, "?").to_string();
 
             let sugg = snippet(cx, arg_expression.span, "..");

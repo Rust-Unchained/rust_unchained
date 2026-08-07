@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use crate::spec::{
-    CodeModel, SanitizerSet, SplitDebuginfo, Target, TargetMetadata, TargetOptions, base,
+    Arch, CodeModel, LlvmAbi, SanitizerSet, SplitDebuginfo, Target, TargetMetadata, TargetOptions,
+    base,
 };
 
 pub(crate) fn target() -> Target {
@@ -15,12 +16,12 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 64,
         data_layout: "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128".into(),
-        arch: "riscv64".into(),
+        arch: Arch::RiscV64,
         options: TargetOptions {
             code_model: Some(CodeModel::Medium),
             cpu: "generic-rv64".into(),
             features: "+m,+a,+f,+d,+c,+b,+v,+zicsr,+zifencei".into(),
-            llvm_abiname: "lp64d".into(),
+            llvm_abiname: LlvmAbi::Lp64d,
             supported_sanitizers: SanitizerSet::ADDRESS,
             max_atomic_width: Some(64),
             supported_split_debuginfo: Cow::Borrowed(&[SplitDebuginfo::Off]),

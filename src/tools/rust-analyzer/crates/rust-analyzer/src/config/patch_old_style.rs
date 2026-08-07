@@ -1,9 +1,9 @@
 //! See [`patch_json_for_outdated_configs`]
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// This function patches the json config to the new expected keys.
 /// That is we try to load old known config keys here and convert them to the new ones.
-/// See https://github.com/rust-lang/rust-analyzer/pull/12010
+/// See <https://github.com/rust-lang/rust-analyzer/pull/12010>
 ///
 /// We already have an alias system for simple cases, but if we make structural changes
 /// the alias infra fails down.
@@ -73,19 +73,19 @@ pub(super) fn patch_json_for_outdated_configs(json: &mut Value) {
     }
 
     // completion.snippets -> completion.snippets.custom;
-    if let Some(Value::Object(obj)) = copy.pointer("/completion/snippets").cloned() {
-        if obj.len() != 1 || obj.get("custom").is_none() {
-            merge(
-                json,
-                json! {{
-                    "completion": {
-                        "snippets": {
-                            "custom": obj
-                        },
+    if let Some(Value::Object(obj)) = copy.pointer("/completion/snippets").cloned()
+        && (obj.len() != 1 || obj.get("custom").is_none())
+    {
+        merge(
+            json,
+            json! {{
+                "completion": {
+                    "snippets": {
+                        "custom": obj
                     },
-                }},
-            );
-        }
+                },
+            }},
+        );
     }
 
     // callInfo_full -> signatureInfo_detail, signatureInfo_documentation_enable

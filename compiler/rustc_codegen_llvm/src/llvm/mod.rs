@@ -1,24 +1,26 @@
 #![allow(non_snake_case)]
 
 use std::ffi::{CStr, CString};
+use std::num::NonZero;
 use std::ptr;
-use std::str::FromStr;
 use std::string::FromUtf8Error;
 
 use libc::c_uint;
-use rustc_abi::{Align, Size, WrappingRange};
+use rustc_abi::{AddressSpace, Align, Size, WrappingRange};
 use rustc_llvm::RustString;
 
 pub(crate) use self::CallConv::*;
 pub(crate) use self::CodeGenOptSize::*;
-pub(crate) use self::MetadataType::*;
+pub(crate) use self::conversions::*;
 pub(crate) use self::ffi::*;
+pub(crate) use self::metadata_kind::*;
 use crate::common::AsCCharPtr;
 
-pub(crate) mod archive_ro;
+mod conversions;
 pub(crate) mod diagnostic;
 pub(crate) mod enzyme_ffi;
 mod ffi;
+mod metadata_kind;
 
 pub(crate) use self::enzyme_ffi::*;
 
@@ -41,30 +43,12 @@ pub(crate) fn AddFunctionAttributes<'ll>(
     }
 }
 
-pub(crate) fn HasAttributeAtIndex<'ll>(
-    llfn: &'ll Value,
-    idx: AttributePlace,
-    kind: AttributeKind,
-) -> bool {
-    unsafe { LLVMRustHasAttributeAtIndex(llfn, idx.as_uint(), kind) }
-}
-
 pub(crate) fn HasStringAttribute<'ll>(llfn: &'ll Value, name: &str) -> bool {
     unsafe { LLVMRustHasFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
 }
 
 pub(crate) fn RemoveStringAttrFromFn<'ll>(llfn: &'ll Value, name: &str) {
     unsafe { LLVMRustRemoveFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
-}
-
-pub(crate) fn RemoveRustEnumAttributeAtIndex(
-    llfn: &Value,
-    place: AttributePlace,
-    kind: AttributeKind,
-) {
-    unsafe {
-        LLVMRustRemoveEnumAttributeAtIndex(llfn, place.as_uint(), kind);
-    }
 }
 
 pub(crate) fn AddCallSiteAttributes<'ll>(
@@ -89,6 +73,21 @@ pub(crate) fn CreateAttrStringValue<'ll>(
             attr.len().try_into().unwrap(),
             value.as_c_char_ptr(),
             value.len().try_into().unwrap(),
+        )
+    }
+}
+pub(crate) fn CreateAttrStringValueFromCStr<'ll>(
+    llcx: &'ll Context,
+    attr: &std::ffi::CStr,
+    value: &std::ffi::CStr,
+) -> &'ll Attribute {
+    unsafe {
+        LLVMCreateStringAttribute(
+            llcx,
+            (*attr).as_ptr(),
+            (*attr).to_bytes().len() as c_uint,
+            (*value).as_ptr(),
+            (*value).to_bytes().len() as c_uint,
         )
     }
 }
@@ -139,16 +138,26 @@ pub(crate) fn CreateAllocKindAttr(llcx: &Context, kind_arg: AllocKindFlags) -> &
 
 pub(crate) fn CreateRangeAttr(llcx: &Context, size: Size, range: WrappingRange) -> &Attribute {
     let lower = range.start;
+    // LLVM treats the upper bound as exclusive, but allows wrapping.
     let upper = range.end.wrapping_add(1);
-    let lower_words = [lower as u64, (lower >> 64) as u64];
-    let upper_words = [upper as u64, (upper >> 64) as u64];
+
+    // Pass each `u128` endpoint value as a `[u64; 2]` array, least-significant part first.
+    let as_u64_array = |x: u128| [x as u64, (x >> 64) as u64];
+    let lower_words: [u64; 2] = as_u64_array(lower);
+    let upper_words: [u64; 2] = as_u64_array(upper);
+
+    // To ensure that LLVM doesn't try to read beyond the `[u64; 2]` arrays,
+    // we must explicitly check that `size_bits` does not exceed 128.
+    let size_bits = size.bits();
+    assert!(size_bits <= 128);
+    // More robust assertions that are redundant with `size_bits <= 128` and
+    // should be optimized away.
+    assert!(size_bits.div_ceil(64) <= u64::try_from(lower_words.len()).unwrap());
+    assert!(size_bits.div_ceil(64) <= u64::try_from(upper_words.len()).unwrap());
+    let size_bits = c_uint::try_from(size_bits).unwrap();
+
     unsafe {
-        LLVMRustCreateRangeAttribute(
-            llcx,
-            size.bits().try_into().unwrap(),
-            lower_words.as_ptr(),
-            upper_words.as_ptr(),
-        )
+        LLVMRustCreateRangeAttribute(llcx, size_bits, lower_words.as_ptr(), upper_words.as_ptr())
     }
 }
 
@@ -177,21 +186,6 @@ pub(crate) enum CodeGenOptSize {
     CodeGenOptSizeAggressive = 2,
 }
 
-impl FromStr for ArchiveKind {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "gnu" => Ok(ArchiveKind::K_GNU),
-            "bsd" => Ok(ArchiveKind::K_BSD),
-            "darwin" => Ok(ArchiveKind::K_DARWIN),
-            "coff" => Ok(ArchiveKind::K_COFF),
-            "aix_big" => Ok(ArchiveKind::K_AIXBIG),
-            _ => Err(()),
-        }
-    }
-}
-
 pub(crate) fn SetInstructionCallConv(instr: &Value, cc: CallConv) {
     unsafe {
         LLVMSetInstructionCallConv(instr, cc as c_uint);
@@ -210,16 +204,14 @@ pub(crate) fn SetFunctionCallConv(fn_: &Value, cc: CallConv) {
 // function.
 // For more details on COMDAT sections see e.g., https://www.airs.com/blog/archives/52
 pub(crate) fn SetUniqueComdat(llmod: &Module, val: &Value) {
-    let name_buf = get_value_name(val).to_vec();
+    let name_buf = get_value_name(val);
     let name =
         CString::from_vec_with_nul(name_buf).or_else(|buf| CString::new(buf.into_bytes())).unwrap();
     set_comdat(llmod, val, &name);
 }
 
-pub(crate) fn SetUnnamedAddress(global: &Value, unnamed: UnnamedAddr) {
-    unsafe {
-        LLVMSetUnnamedAddress(global, unnamed);
-    }
+pub(crate) fn set_unnamed_address(global: &Value, unnamed: UnnamedAddr) {
+    LLVMSetUnnamedAddress(global, unnamed);
 }
 
 pub(crate) fn set_thread_local_mode(global: &Value, mode: ThreadLocalMode) {
@@ -259,9 +251,7 @@ pub(crate) fn set_initializer(llglobal: &Value, constant_val: &Value) {
 }
 
 pub(crate) fn set_global_constant(llglobal: &Value, is_constant: bool) {
-    unsafe {
-        LLVMSetGlobalConstant(llglobal, if is_constant { ffi::True } else { ffi::False });
-    }
+    LLVMSetGlobalConstant(llglobal, is_constant.to_llvm_bool());
 }
 
 pub(crate) fn get_linkage(llglobal: &Value) -> Linkage {
@@ -275,7 +265,7 @@ pub(crate) fn set_linkage(llglobal: &Value, linkage: Linkage) {
 }
 
 pub(crate) fn is_declaration(llglobal: &Value) -> bool {
-    unsafe { LLVMIsDeclaration(llglobal) == ffi::True }
+    unsafe { LLVMIsDeclaration(llglobal) }.is_true()
 }
 
 pub(crate) fn get_visibility(llglobal: &Value) -> Visibility {
@@ -294,6 +284,10 @@ pub(crate) fn set_alignment(llglobal: &Value, align: Align) {
     }
 }
 
+pub(crate) fn set_externally_initialized(llglobal: &Value, is_ext_init: bool) {
+    LLVMSetExternallyInitialized(llglobal, is_ext_init.to_llvm_bool());
+}
+
 /// Get the `name`d comdat from `llmod` and assign it to `llglobal`.
 ///
 /// Inserts the comdat into `llmod` if it does not exist.
@@ -303,6 +297,10 @@ pub(crate) fn set_comdat(llmod: &Module, llglobal: &Value, name: &CStr) {
         let comdat = LLVMGetOrInsertComdat(llmod, name.as_ptr());
         LLVMSetComdat(llglobal, comdat);
     }
+}
+
+pub(crate) fn count_params(llfn: &Value) -> c_uint {
+    LLVMCountParams(llfn)
 }
 
 /// Safe wrapper around `LLVMGetParam`, because segfaults are no fun.
@@ -318,12 +316,44 @@ pub(crate) fn get_param(llfn: &Value, index: c_uint) -> &Value {
     }
 }
 
-/// Safe wrapper for `LLVMGetValueName2` into a byte slice
-pub(crate) fn get_value_name(value: &Value) -> &[u8] {
+/// Safe wrapper for `LLVMGetValueName2`
+/// Needs to allocate the value, because `set_value_name` will invalidate
+/// the pointer.
+pub(crate) fn get_value_name(value: &Value) -> Vec<u8> {
     unsafe {
         let mut len = 0;
         let data = LLVMGetValueName2(value, &mut len);
-        std::slice::from_raw_parts(data.cast(), len)
+        std::slice::from_raw_parts(data.cast(), len).to_vec()
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct Intrinsic {
+    id: NonZero<c_uint>,
+}
+
+impl Intrinsic {
+    pub(crate) fn lookup(name: &[u8]) -> Option<Self> {
+        let id = unsafe { LLVMLookupIntrinsicID(name.as_c_char_ptr(), name.len()) };
+        NonZero::new(id).map(|id| Self { id })
+    }
+
+    pub(crate) fn is_overloaded(self) -> bool {
+        unsafe { LLVMIntrinsicIsOverloaded(self.id).is_true() }
+    }
+
+    pub(crate) fn is_target_specific(self) -> bool {
+        unsafe { LLVMRustIsTargetIntrinsic(self.id) }
+    }
+
+    pub(crate) fn get_declaration<'ll>(
+        self,
+        llmod: &'ll Module,
+        type_params: &[&'ll Type],
+    ) -> &'ll Value {
+        unsafe {
+            LLVMGetIntrinsicDeclaration(llmod, self.id, type_params.as_ptr(), type_params.len())
+        }
     }
 }
 
@@ -363,12 +393,13 @@ pub(crate) fn last_error() -> Option<String> {
     }
 }
 
-/// Owns an [`OperandBundle`], and will dispose of it when dropped.
-pub(crate) struct OperandBundleOwned<'a> {
+/// Owning pointer to an [`OperandBundle`] that will dispose of the bundle
+/// when dropped.
+pub(crate) struct OperandBundleBox<'a> {
     raw: ptr::NonNull<OperandBundle<'a>>,
 }
 
-impl<'a> OperandBundleOwned<'a> {
+impl<'a> OperandBundleBox<'a> {
     pub(crate) fn new(name: &str, vals: &[&'a Value]) -> Self {
         let raw = unsafe {
             LLVMCreateOperandBundle(
@@ -378,21 +409,21 @@ impl<'a> OperandBundleOwned<'a> {
                 vals.len() as c_uint,
             )
         };
-        OperandBundleOwned { raw: ptr::NonNull::new(raw).unwrap() }
+        Self { raw: ptr::NonNull::new(raw).unwrap() }
     }
 
-    /// Returns inner `OperandBundle` type.
+    /// Dereferences to the underlying `&OperandBundle`.
     ///
-    /// This could be a `Deref` implementation, but `OperandBundle` contains an extern type and
-    /// `Deref::Target: ?Sized`.
-    pub(crate) fn raw(&self) -> &OperandBundle<'a> {
+    /// This can't be a `Deref` implementation because `OperandBundle` transitively
+    /// contains an extern type, which is incompatible with `Deref::Target: ?Sized`.
+    pub(crate) fn as_ref(&self) -> &OperandBundle<'a> {
         // SAFETY: The returned reference is opaque and can only used for FFI.
         // It is valid for as long as `&self` is.
         unsafe { self.raw.as_ref() }
     }
 }
 
-impl Drop for OperandBundleOwned<'_> {
+impl Drop for OperandBundleBox<'_> {
     fn drop(&mut self) {
         unsafe {
             LLVMDisposeOperandBundle(self.raw);
@@ -438,5 +469,40 @@ pub(crate) fn set_dllimport_storage_class<'ll>(v: &'ll Value) {
 pub(crate) fn set_dso_local<'ll>(v: &'ll Value) {
     unsafe {
         LLVMRustSetDSOLocal(v, true);
+    }
+}
+
+/// Safe wrapper for `LLVMAppendModuleInlineAsm`, which delegates to
+/// `Module::appendModuleInlineAsm`.
+pub(crate) fn append_module_inline_asm<'ll>(llmod: &'ll Module, asm: &[u8]) {
+    unsafe {
+        LLVMAppendModuleInlineAsm(llmod, asm.as_ptr(), asm.len());
+    }
+}
+
+/// Safe wrapper for `LLVMAddAlias2`
+pub(crate) fn add_alias<'ll>(
+    module: &'ll Module,
+    ty: &Type,
+    address_space: AddressSpace,
+    aliasee: &Value,
+    name: &CStr,
+) -> &'ll Value {
+    unsafe { LLVMAddAlias2(module, ty, address_space.0, aliasee, name.as_ptr()) }
+}
+
+/// Safe wrapper for `LLVMRustConstPtrAuth`.
+pub(crate) fn const_ptr_auth<'ll>(
+    ptr: &'ll Value,
+    key: u32,
+    disc: u64,
+    addr_diversity: Option<&'ll Value>,
+) -> &'ll Value {
+    unsafe {
+        let addr_div_ptr = addr_diversity.map_or(std::ptr::null(), |v| v as *const Value);
+        let deactivation_symbol = std::ptr::null();
+        let result =
+            LLVMRustConstPtrAuth(ptr as *const Value, key, disc, addr_div_ptr, deactivation_symbol);
+        &*result
     }
 }

@@ -2,11 +2,8 @@
 //@[edition2018] edition:2018
 //@[edition2021] edition:2021
 
-//@no-rustfix: need to change the suggestion to a multipart suggestion
-
 #![warn(clippy::manual_assert)]
-#![allow(dead_code, unused_doc_comments)]
-#![allow(clippy::nonminimal_bool, clippy::uninlined_format_args, clippy::useless_vec)]
+#![expect(clippy::useless_vec)]
 
 macro_rules! one {
     () => {
@@ -104,4 +101,18 @@ fn issue12505() {
             panic!()
         };
     }
+}
+
+fn issue15227(left: u64, right: u64) -> u64 {
+    macro_rules! is_x86_feature_detected {
+        ($feature:literal) => {
+            $feature.len() > 0 && $feature.starts_with("ss")
+        };
+    }
+
+    if !is_x86_feature_detected!("ssse3") {
+        //~^ manual_assert
+        panic!("SSSE3 is not supported");
+    }
+    unsafe { todo!() }
 }

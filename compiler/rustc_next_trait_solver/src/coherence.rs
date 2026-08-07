@@ -3,8 +3,9 @@ use std::ops::ControlFlow;
 
 use derive_where::derive_where;
 use rustc_type_ir::inherent::*;
+use rustc_type_ir::lang_items::SolverAdtLangItem;
 use rustc_type_ir::{
-    self as ty, InferCtxtLike, Interner, TrivialTypeTraversalImpls, TypeVisitable,
+    self as ty, InferCtxtLike, Interner, Region, TrivialTypeTraversalImpls, TypeVisitable,
     TypeVisitableExt, TypeVisitor,
 };
 use tracing::instrument;
@@ -247,7 +248,7 @@ where
         ControlFlow::Continue(())
     }
 
-    fn def_id_is_local(&mut self, def_id: I::DefId) -> bool {
+    fn def_id_is_local(&mut self, def_id: impl DefId<I>) -> bool {
         match self.in_crate {
             InCrate::Local { .. } => def_id.is_local(),
             InCrate::Remote => false,
@@ -270,7 +271,7 @@ where
 {
     type Result = ControlFlow<OrphanCheckEarlyExit<I, E>>;
 
-    fn visit_region(&mut self, _r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, _r: Region<I>) -> Self::Result {
         ControlFlow::Continue(())
     }
 
@@ -289,7 +290,6 @@ where
             | ty::Uint(..)
             | ty::Float(..)
             | ty::Str
-            | ty::FnDef(..)
             | ty::Pat(..)
             | ty::FnPtr(..)
             | ty::RawPtr(..)
@@ -342,18 +342,22 @@ where
                     // implement, so we don't use this behavior.
                     // Addendum: Moreover, revealing the underlying type is likely to cause cycle
                     // errors as we rely on coherence / the specialization graph during typeck.
-
                     self.found_non_local_ty(ty)
                 }
             }
 
             // For fundamental types, we just look inside of them.
+            // Certain lang items (currently, `Box`) have special behaviour here
+            // and so are special cased.
             ty::Ref(_, ty, _) => ty.visit_with(self),
             ty::Adt(def, args) => {
                 if self.def_id_is_local(def.def_id()) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
                 } else {
-                    args.visit_with(self)
+                    match self.infcx.cx().as_adt_lang_item(def.def_id()) {
+                        Some(SolverAdtLangItem::OwnedBox) => args.type_at(0).visit_with(self),
+                        Some(..) | None => args.visit_with(self)
+                    }
                 }
             }
             ty::Foreign(def_id) => {
@@ -364,7 +368,7 @@ where
                 }
             }
             ty::Dynamic(tt, ..) => {
-                let principal = tt.principal().map(|p| p.def_id());
+                let principal = tt.principal_def_id();
                 if principal.is_some_and(|p| self.def_id_is_local(p)) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
                 } else {
@@ -372,13 +376,14 @@ where
                 }
             }
             ty::Error(_) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
-            ty::Closure(_, ..) | ty::CoroutineClosure(_, ..) | ty::Coroutine(_, ..) => {
-                ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
+
+            ty::FnDef(..)
+            | ty::Closure(..)
+            | ty::CoroutineClosure(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..) => {
+                unreachable!("unnameable type in coherence: {ty:?}");
             }
-            // This should only be created when checking whether we have to check whether some
-            // auto trait impl applies. There will never be multiple impls, so we can just
-            // act as if it were a local type here.
-            ty::CoroutineWitness(..) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
         };
         // A bit of a hack, the `OrphanChecker` is only used to visit a `TraitRef`, so
         // the first type we visit is always the self type.

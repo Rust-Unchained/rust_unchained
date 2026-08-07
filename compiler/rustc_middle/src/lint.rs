@@ -1,20 +1,23 @@
-use std::cmp;
+use std::cmp::min;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_errors::{Diag, MultiSpan};
+use rustc_errors::{Diag, DiagLocation, Diagnostic, MultiSpan};
 use rustc_hir::{HirId, ItemLocalId};
-use rustc_macros::{Decodable, Encodable, HashStable};
+use rustc_lint_defs::EditionFcw;
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_session::Session;
-use rustc_session::lint::builtin::{self, FORBIDDEN_LINT_GROUPS};
-use rustc_session::lint::{FutureIncompatibilityReason, Level, Lint, LintExpectationId, LintId};
-use rustc_span::{DUMMY_SP, Span, Symbol, kw};
+use rustc_session::lint::{
+    FutureIncompatibilityReason, Level, Lint, LintExpectationId, LintId, StableLintExpectationId,
+    UnstableLintExpectationId, builtin,
+};
+use rustc_span::{DUMMY_SP, ExpnKind, Span, Symbol, kw};
 use tracing::instrument;
 
 use crate::ty::TyCtxt;
 
 /// How a lint level was set.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, HashStable, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, StableHash, Debug)]
 pub enum LintLevelSource {
     /// Lint is at the default level as declared in rustc.
     Default,
@@ -51,91 +54,161 @@ impl LintLevelSource {
     }
 }
 
-/// Convenience helper for moving things around together that frequently are paired
-#[derive(Copy, Clone, Debug, HashStable, Encodable, Decodable)]
-pub struct LevelAndSource {
-    pub level: Level,
-    pub lint_id: Option<LintExpectationId>,
+/// Convenience helper for things that are frequently used together.
+#[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable)]
+pub struct LevelSpec<Id = LintExpectationId> {
+    // This field *must* be private. It must be set in tandem with `lint_id`, only in
+    // `LevelSpec::new`, because only certain `level`/`lint_id` combinations are valid. See
+    // `LevelSpec::new` for those combinations.
+    //
+    // If you are thinking right now that `level` and `lint_id` should be combined into a single
+    // type that excludes the invalid combinations, that's a reasonable thought, but in practice
+    // it's painful because `level` needs to be used by itself, without `lint_id`, in many places.
+    // Making the fields private prevents invalid combinations while retaining the flexibility of
+    // two separate fields.
+    level: Level,
+
+    // This field *must* be private. See the comment on `level`.
+    lint_id: Option<Id>,
+
     pub src: LintLevelSource,
+}
+
+pub type UnstableLevelSpec = LevelSpec<UnstableLintExpectationId>;
+pub type StableLevelSpec = LevelSpec<StableLintExpectationId>;
+
+impl<Id: Copy> LevelSpec<Id> {
+    // Panics if an invalid `level`/`lint_id` combination is given.
+    pub fn new(level: Level, lint_id: Option<Id>, src: LintLevelSource) -> LevelSpec<Id> {
+        match (level, lint_id) {
+            (Level::Allow | Level::Warn | Level::Deny | Level::Forbid, None) => {}
+            (Level::Expect, Some(_)) => {}
+            (Level::ForceWarn, _) => {}
+            _ => panic!("invalid level/lint_id combination"),
+        }
+        LevelSpec { level, lint_id, src }
+    }
+
+    pub fn level(self) -> Level {
+        self.level
+    }
+
+    pub fn is_allow(self) -> bool {
+        self.level == Level::Allow
+    }
+
+    pub fn is_expect(self) -> bool {
+        self.level == Level::Expect
+    }
+
+    pub fn lint_id(self) -> Option<Id> {
+        self.lint_id
+    }
+}
+
+impl From<UnstableLevelSpec> for LevelSpec {
+    fn from(level: UnstableLevelSpec) -> LevelSpec {
+        let LevelSpec { level, lint_id, src } = level;
+        let lint_id = lint_id.map(LintExpectationId::Unstable);
+        LevelSpec { level, lint_id, src }
+    }
+}
+
+impl From<StableLevelSpec> for LevelSpec {
+    fn from(level: StableLevelSpec) -> LevelSpec {
+        let LevelSpec { level, lint_id, src } = level;
+        let lint_id = lint_id.map(LintExpectationId::Stable);
+        LevelSpec { level, lint_id, src }
+    }
 }
 
 /// Return type for the `shallow_lint_levels_on` query.
 ///
-/// This map represents the set of allowed lints and allowance levels given
-/// by the attributes for *a single HirId*.
-#[derive(Default, Debug, HashStable)]
+/// This map represents lints levels given by the attributes for *a single HirId*.
+#[derive(Default, Debug, StableHash)]
 pub struct ShallowLintLevelMap {
-    pub expectations: Vec<(LintExpectationId, LintExpectation)>,
-    pub specs: SortedMap<ItemLocalId, FxIndexMap<LintId, LevelAndSource>>,
+    // All the specs for this HirId. This is accessed frequently, e.g. for every lint emitted.
+    pub specs: SortedMap<ItemLocalId, FxIndexMap<LintId, StableLevelSpec>>,
+
+    // Additional information about the `expect` specs for this HirId. This is consulted only once
+    // per compilation session, in `check_expectations`/`lint_expectations`.
+    pub expectations: Vec<(StableLintExpectationId, LintExpectation)>,
 }
 
-/// From an initial level and source, verify the effect of special annotations:
-/// `warnings` lint level and lint caps.
+/// Verify the effect of special annotations: `warnings` lint level and lint caps.
 ///
 /// The return of this function is suitable for diagnostics.
-pub fn reveal_actual_level(
-    level: Option<(Level, Option<LintExpectationId>)>,
-    src: &mut LintLevelSource,
+pub fn reveal_actual_level_spec<Id: Copy>(
     sess: &Session,
     lint: LintId,
-    probe_for_lint_level: impl FnOnce(
-        LintId,
-    )
-        -> (Option<(Level, Option<LintExpectationId>)>, LintLevelSource),
-) -> (Level, Option<LintExpectationId>) {
+    probe_for_lint_level_spec: impl Fn(LintId) -> Option<LevelSpec<Id>>,
+) -> LevelSpec<Id> {
+    let level_spec = probe_for_lint_level_spec(lint);
+
     // If `level` is none then we actually assume the default level for this lint.
-    let (mut level, mut lint_id) =
-        level.unwrap_or_else(|| (lint.lint.default_level(sess.edition()), None));
+    let mut level_spec = level_spec.unwrap_or_else(|| {
+        LevelSpec::new(lint.lint.default_level(sess.edition()), None, LintLevelSource::Default)
+    });
 
     // If we're about to issue a warning, check at the last minute for any
-    // directives against the warnings "lint". If, for example, there's an
+    // directives against the `warnings` lint group. If, for example, there's an
     // `allow(warnings)` in scope then we want to respect that instead.
-    //
-    // We exempt `FORBIDDEN_LINT_GROUPS` from this because it specifically
-    // triggers in cases (like #80988) where you have `forbid(warnings)`,
-    // and so if we turned that into an error, it'd defeat the purpose of the
-    // future compatibility warning.
-    if level == Level::Warn && lint != LintId::of(FORBIDDEN_LINT_GROUPS) {
-        let (warnings_level, warnings_src) = probe_for_lint_level(LintId::of(builtin::WARNINGS));
-        if let Some((configured_warning_level, configured_lint_id)) = warnings_level {
-            if configured_warning_level != Level::Warn {
-                level = configured_warning_level;
-                lint_id = configured_lint_id;
-                *src = warnings_src;
+    if level_spec.level == Level::Warn {
+        if let Some(configured_level_spec) =
+            probe_for_lint_level_spec(LintId::of(builtin::WARNINGS))
+        {
+            let respect_warnings_lint_group = match configured_level_spec.level {
+                // -Wwarnings is a no-op.
+                Level::Warn => false,
+                // Some warnings cannot be denied from the `warnings` lint group, only individually.
+                Level::Deny | Level::Forbid => !lint.lint.ignore_deny_warnings,
+                // All warnings respect -Awarnings.
+                Level::Allow => true,
+                // Not sure what the right behavior is here, but, sure, why not.
+                // See tests/ui/lint/rfc-2383-lint-reason/expect_warnings.rs.
+                Level::Expect => true,
+                Level::ForceWarn => {
+                    sess.dcx().span_delayed_bug(
+                        configured_level_spec.src.span(),
+                        "cannot --force-warn the `warnings` lint group",
+                    );
+                    false
+                }
+            };
+            if respect_warnings_lint_group {
+                level_spec = configured_level_spec;
             }
         }
     }
 
     // Ensure that we never exceed the `--cap-lints` argument unless the source is a --force-warn
-    level = if let LintLevelSource::CommandLine(_, Level::ForceWarn) = src {
-        level
-    } else {
-        cmp::min(level, sess.opts.lint_cap.unwrap_or(Level::Forbid))
+    if !matches!(level_spec.src, LintLevelSource::CommandLine(_, Level::ForceWarn)) {
+        level_spec.level = min(level_spec.level, sess.opts.lint_cap.unwrap_or(Level::Forbid));
     };
 
+    // Ensure that we never exceed driver level.
     if let Some(driver_level) = sess.driver_lint_caps.get(&lint) {
-        // Ensure that we never exceed driver level.
-        level = cmp::min(*driver_level, level);
+        level_spec.level = min(level_spec.level, *driver_level);
     }
 
-    (level, lint_id)
+    level_spec
 }
 
 impl ShallowLintLevelMap {
-    /// Perform a deep probe in the HIR tree looking for the actual level for the lint.
-    /// This lint level is not usable for diagnostics, it needs to be corrected by
+    /// Perform a deep probe in the HIR tree looking for the actual level spec for the lint.
+    /// This lint level spec is not usable for diagnostics, it needs to be corrected by
     /// `reveal_actual_level` beforehand.
     #[instrument(level = "trace", skip(self, tcx), ret)]
-    fn probe_for_lint_level(
+    fn probe_for_lint_level_spec(
         &self,
         tcx: TyCtxt<'_>,
         id: LintId,
         start: HirId,
-    ) -> (Option<(Level, Option<LintExpectationId>)>, LintLevelSource) {
+    ) -> Option<StableLevelSpec> {
         if let Some(map) = self.specs.get(&start.local_id)
-            && let Some(&LevelAndSource { level, lint_id, src }) = map.get(&id)
+            && let Some(level_spec) = map.get(&id)
         {
-            return (Some((level, lint_id)), src);
+            return Some(*level_spec);
         }
 
         let mut owner = start.owner;
@@ -147,42 +220,40 @@ impl ShallowLintLevelMap {
                 specs = &tcx.shallow_lint_levels_on(owner).specs;
             }
             if let Some(map) = specs.get(&parent.local_id)
-                && let Some(&LevelAndSource { level, lint_id, src }) = map.get(&id)
+                && let Some(level_spec) = map.get(&id)
             {
-                return (Some((level, lint_id)), src);
+                return Some(*level_spec);
             }
         }
 
-        (None, LintLevelSource::Default)
+        None
     }
 
-    /// Fetch and return the user-visible lint level for the given lint at the given HirId.
+    /// Fetch and return the user-visible lint level spec for the given lint at the given HirId.
     #[instrument(level = "trace", skip(self, tcx), ret)]
-    pub fn lint_level_id_at_node(
+    pub fn lint_level_spec_at_node(
         &self,
         tcx: TyCtxt<'_>,
         lint: LintId,
         cur: HirId,
-    ) -> LevelAndSource {
-        let (level, mut src) = self.probe_for_lint_level(tcx, lint, cur);
-        let (level, lint_id) = reveal_actual_level(level, &mut src, tcx.sess, lint, |lint| {
-            self.probe_for_lint_level(tcx, lint, cur)
-        });
-        LevelAndSource { level, lint_id, src }
+    ) -> StableLevelSpec {
+        reveal_actual_level_spec(tcx.sess, lint, |lint| {
+            self.probe_for_lint_level_spec(tcx, lint, cur)
+        })
     }
 }
 
 impl TyCtxt<'_> {
-    /// Fetch and return the user-visible lint level for the given lint at the given HirId.
-    pub fn lint_level_at_node(self, lint: &'static Lint, id: HirId) -> LevelAndSource {
-        self.shallow_lint_levels_on(id.owner).lint_level_id_at_node(self, LintId::of(lint), id)
+    /// Fetch and return the user-visible lint level spec for the given lint at the given HirId.
+    pub fn lint_level_spec_at_node(self, lint: &'static Lint, id: HirId) -> StableLevelSpec {
+        self.shallow_lint_levels_on(id.owner).lint_level_spec_at_node(self, LintId::of(lint), id)
     }
 }
 
 /// This struct represents a lint expectation and holds all required information
 /// to emit the `unfulfilled_lint_expectations` lint if it is unfulfilled after
 /// the `LateLintPass` has completed.
-#[derive(Clone, Debug, Encodable, Decodable, HashStable)]
+#[derive(Clone, Debug, Encodable, Decodable, StableHash)]
 pub struct LintExpectation {
     /// The reason for this expectation that can optionally be added as part of
     /// the attribute. It will be displayed as part of the lint message.
@@ -211,11 +282,28 @@ impl LintExpectation {
 }
 
 fn explain_lint_level_source(
+    sess: &Session,
     lint: &'static Lint,
     level: Level,
     src: LintLevelSource,
     err: &mut Diag<'_, ()>,
 ) {
+    // Find the name of the lint group that contains the given lint.
+    // Assumes the lint only belongs to one group.
+    let lint_group_name = |lint| {
+        let lint_groups_iter = sess.lint_groups_iter();
+        let lint_id = LintId::of(lint);
+        lint_groups_iter
+            .filter(|lint_group| !lint_group.is_externally_loaded)
+            .find(|lint_group| {
+                lint_group
+                    .lints
+                    .iter()
+                    .find(|lint_group_lint| **lint_group_lint == lint_id)
+                    .is_some()
+            })
+            .map(|lint_group| lint_group.name)
+    };
     let name = lint.name_lower();
     if let Level::Allow = level {
         // Do not point at `#[allow(compat_lint)]` as the reason for a compatibility lint
@@ -224,7 +312,15 @@ fn explain_lint_level_source(
     }
     match src {
         LintLevelSource::Default => {
-            err.note_once(format!("`#[{}({})]` on by default", level.as_str(), name));
+            let level_str = level.as_str();
+            match lint_group_name(lint) {
+                Some(group_name) => {
+                    err.note_once(format!("`#[{level_str}({name})]` (part of `#[{level_str}({group_name})]`) on by default"));
+                }
+                None => {
+                    err.note_once(format!("`#[{level_str}({name})]` on by default"));
+                }
+            }
         }
         LintLevelSource::CommandLine(lint_flag_val, orig_level) => {
             let flag = orig_level.to_cmd_flag();
@@ -239,9 +335,16 @@ fn explain_lint_level_source(
                     "`{flag} {hyphen_case_lint_name}` implied by `{flag} {hyphen_case_flag_val}`"
                 ));
                 if matches!(orig_level, Level::Warn | Level::Deny) {
-                    err.help_once(format!(
-                        "to override `{flag} {hyphen_case_flag_val}` add `#[allow({name})]`"
-                    ));
+                    let help = if name == "dead_code" {
+                        format!(
+                            "to override `{flag} {hyphen_case_flag_val}` add `#[expect({name})]` or `#[allow({name})]`"
+                        )
+                    } else {
+                        format!(
+                            "to override `{flag} {hyphen_case_flag_val}` add `#[allow({name})]`"
+                        )
+                    };
+                    err.help_once(help);
                 }
             }
         }
@@ -258,40 +361,48 @@ fn explain_lint_level_source(
             }
         }
     }
+
+    if let Some(warnings_group) = sess
+        .opts
+        .lint_opts
+        .iter()
+        .find_map(|(opt, level)| (opt == "warnings").then_some(level))
+        .copied()
+        && warnings_group >= Level::Deny
+        && level < warnings_group
+    {
+        err.note_once(format!("the `{name}` lint ignores `-D warnings`"));
+    }
 }
 
-/// The innermost function for emitting lints.
+/// The innermost function for emitting lints implementing the [`trait@Diagnostic`] trait.
 ///
 /// If you are looking to implement a lint, look for higher level functions,
 /// for example:
+///
 /// - [`TyCtxt::emit_node_span_lint`]
-/// - [`TyCtxt::node_span_lint`]
-/// - [`TyCtxt::emit_node_lint`]
-/// - [`TyCtxt::node_lint`]
 /// - `LintContext::opt_span_lint`
-///
-/// ## `decorate`
-///
-/// It is not intended to call `emit`/`cancel` on the `Diag` passed in the `decorate` callback.
 #[track_caller]
-pub fn lint_level(
-    sess: &Session,
+pub fn emit_lint_base<'a, D: Diagnostic<'a, ()> + 'a>(
+    sess: &'a Session,
     lint: &'static Lint,
-    level: LevelAndSource,
+    level_spec: impl Into<LevelSpec>,
     span: Option<MultiSpan>,
-    decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
+    decorate: D,
 ) {
     // Avoid codegen bloat from monomorphization by immediately doing dyn dispatch of `decorate` to
     // the "real" work.
     #[track_caller]
-    fn lint_level_impl(
-        sess: &Session,
+    fn emit_lint_base_impl<'a>(
+        sess: &'a Session,
         lint: &'static Lint,
-        level: LevelAndSource,
+        level_spec: LevelSpec,
         span: Option<MultiSpan>,
-        decorate: Box<dyn '_ + for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>)>,
+        decorate: Box<
+            dyn FnOnce(rustc_errors::DiagCtxtHandle<'a>, rustc_errors::Level) -> Diag<'a, ()> + 'a,
+        >,
     ) {
-        let LevelAndSource { level, lint_id, src } = level;
+        let LevelSpec { level, lint_id, src } = level_spec;
 
         // Check for future incompatibility lints and issue a stronger warning.
         let future_incompatible = lint.future_incompatible;
@@ -299,7 +410,7 @@ pub fn lint_level(
         let has_future_breakage = future_incompatible.map_or(
             // Default allow lints trigger too often for testing.
             sess.opts.unstable_opts.future_incompat_test && lint.default_level != Level::Allow,
-            |incompat| incompat.reason.has_future_breakage(),
+            |incompat| incompat.report_in_deps,
         );
 
         // Convert lint level to error level.
@@ -325,93 +436,43 @@ pub fn lint_level(
             Level::Warn => rustc_errors::Level::Warning,
             Level::Deny | Level::Forbid => rustc_errors::Level::Error,
         };
-        let mut err = Diag::new(sess.dcx(), err_level, "");
-        if let Some(span) = span {
-            err.span(span);
-        }
-        if let Some(lint_id) = lint_id {
-            err.lint_id(lint_id);
-        }
 
-        // If this code originates in a foreign macro, aka something that this crate
-        // did not itself author, then it's likely that there's nothing this crate
-        // can do about it. We probably want to skip the lint entirely.
-        if err.span.primary_spans().iter().any(|s| s.in_external_macro(sess.source_map())) {
-            // Any suggestions made here are likely to be incorrect, so anything we
-            // emit shouldn't be automatically fixed by rustfix.
-            err.disable_suggestions();
+        let disable_suggestions = if let Some(ref span) = span
+            // If this code originates in a foreign macro, aka something that this crate
+            // did not itself author, then it's likely that there's nothing this crate
+            // can do about it. We probably want to skip the lint entirely.
+            && span.primary_spans().iter().any(|s| s.in_external_macro(sess.source_map()))
+        {
+            true
+        } else {
+            false
+        };
 
+        if disable_suggestions {
             // If this is a future incompatible that is not an edition fixing lint
             // it'll become a hard error, so we have to emit *something*. Also,
             // if this lint occurs in the expansion of a macro from an external crate,
             // allow individual lints to opt-out from being reported.
             let incompatible = future_incompatible.is_some_and(|f| f.reason.edition().is_none());
 
-            if !incompatible && !lint.report_in_external_macro {
-                err.cancel();
+            // In rustc, for the find_attr macro, we want to always emit this.
+            // This completely circumvents normal lint checking, which usually doesn't happen for macros from other crates.
+            // However, we kind of want that when using find_attr from another rustc crate. So we cheat a little.
+            let is_in_find_attr = sess.enable_internal_lints()
+                && span.as_ref().is_some_and(|span| {
+                    span.primary_spans().iter().any(|s| {
+                        s.source_callee().is_some_and(|i| {
+                            matches!(i.kind, ExpnKind::Macro(_, name) if name.as_str() == "find_attr")
+                        })
+                    })
+                });
 
+            if !incompatible && !lint.report_in_external_macro && !is_in_find_attr {
                 // Don't continue further, since we don't want to have
                 // `diag_span_note_once` called for a diagnostic that isn't emitted.
                 return;
             }
         }
-
-        err.is_lint(lint.name_lower(), has_future_breakage);
-
-        // Lint diagnostics that are covered by the expect level will not be emitted outside
-        // the compiler. It is therefore not necessary to add any information for the user.
-        // This will therefore directly call the decorate function which will in turn emit
-        // the diagnostic.
-        if let Level::Expect = level {
-            decorate(&mut err);
-            err.emit();
-            return;
-        }
-
-        if let Some(future_incompatible) = future_incompatible {
-            let explanation = match future_incompatible.reason {
-                FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps
-                | FutureIncompatibilityReason::FutureReleaseErrorReportInDeps => {
-                    "this was previously accepted by the compiler but is being phased out; \
-                         it will become a hard error in a future release!"
-                        .to_owned()
-                }
-                FutureIncompatibilityReason::FutureReleaseSemanticsChange => {
-                    "this will change its meaning in a future release!".to_owned()
-                }
-                FutureIncompatibilityReason::EditionError(edition) => {
-                    let current_edition = sess.edition();
-                    format!(
-                        "this is accepted in the current edition (Rust {current_edition}) but is a hard error in Rust {edition}!"
-                    )
-                }
-                FutureIncompatibilityReason::EditionSemanticsChange(edition) => {
-                    format!("this changes meaning in Rust {edition}")
-                }
-                FutureIncompatibilityReason::EditionAndFutureReleaseError(edition) => {
-                    format!(
-                        "this was previously accepted by the compiler but is being phased out; \
-                         it will become a hard error in Rust {edition} and in a future release in all editions!"
-                    )
-                }
-                FutureIncompatibilityReason::EditionAndFutureReleaseSemanticsChange(edition) => {
-                    format!(
-                        "this changes meaning in Rust {edition} and in a future release in all editions!"
-                    )
-                }
-                FutureIncompatibilityReason::Custom(reason) => reason.to_owned(),
-            };
-
-            if future_incompatible.explain_reason {
-                err.warn(explanation);
-            }
-            if !future_incompatible.reference.is_empty() {
-                let citation =
-                    format!("for more information, see {}", future_incompatible.reference);
-                err.note(citation);
-            }
-        }
-
         // Finally, run `decorate`. `decorate` can call `trimmed_path_str` (directly or indirectly),
         // so we need to make sure when we do call `decorate` that the diagnostic is eventually
         // emitted or we'll get a `must_produce_diag` ICE.
@@ -424,12 +485,103 @@ pub fn lint_level(
         //    will be emitted if `can_emit_warnings` is true.
         let skip = err_level == rustc_errors::Level::Warning && !sess.dcx().can_emit_warnings();
 
-        if !skip {
-            decorate(&mut err);
+        let mut err: Diag<'_, ()> = if !skip {
+            decorate(sess.dcx(), err_level)
+        } else {
+            Diag::new(sess.dcx(), err_level, "")
+        };
+        // FIXME: Find a nicer way to expose the `DiagLocation`
+        err.emitted_at = DiagLocation::caller();
+
+        if let Some(span) = span
+            && err.span.primary_span().is_none()
+        {
+            // We can't use `err.span()` because it overwrites the labels, so we need to do it manually.
+            for primary in span.primary_spans() {
+                err.span.push_primary_span(*primary);
+            }
+            for (label_span, label) in span.span_labels_raw() {
+                err.span.push_span_diag(*label_span, label.clone());
+            }
+        }
+        if let Some(lint_id) = lint_id {
+            err.lint_id(lint_id);
         }
 
-        explain_lint_level_source(lint, level, src, &mut err);
-        err.emit()
+        if disable_suggestions {
+            // Any suggestions made here are likely to be incorrect, so anything we
+            // emit shouldn't be automatically fixed by rustfix.
+            err.disable_suggestions();
+        }
+
+        err.is_lint(lint.name_lower(), has_future_breakage, lint.rust_version);
+        // Lint diagnostics that are covered by the expect level will not be emitted outside
+        // the compiler. It is therefore not necessary to add any information for the user.
+        // This will therefore directly call the decorate function which will in turn emit
+        // the diagnostic.
+        if let Level::Expect = level {
+            err.emit();
+            return;
+        }
+
+        if let Some(future_incompatible) = future_incompatible {
+            let explanation = match future_incompatible.reason {
+                FutureIncompatibilityReason::FutureReleaseError(_) => {
+                    "this was previously accepted by the compiler but is being phased out; \
+                         it will become a hard error in a future release!"
+                        .to_owned()
+                }
+                FutureIncompatibilityReason::FutureReleaseSemanticsChange(_) => {
+                    "this will change its meaning in a future release!".to_owned()
+                }
+                FutureIncompatibilityReason::EditionError(EditionFcw { edition, .. }) => {
+                    let current_edition = sess.edition();
+                    format!(
+                        "this is accepted in the current edition (Rust {current_edition}) but is a hard error in Rust {edition}!"
+                    )
+                }
+                FutureIncompatibilityReason::EditionSemanticsChange(EditionFcw {
+                    edition, ..
+                }) => {
+                    format!("this changes meaning in Rust {edition}")
+                }
+                FutureIncompatibilityReason::EditionAndFutureReleaseError(EditionFcw {
+                    edition,
+                    ..
+                }) => {
+                    format!(
+                        "this was previously accepted by the compiler but is being phased out; \
+                         it will become a hard error in Rust {edition} and in a future release in all editions!"
+                    )
+                }
+                FutureIncompatibilityReason::EditionAndFutureReleaseSemanticsChange(
+                    EditionFcw { edition, .. },
+                ) => {
+                    format!(
+                        "this changes meaning in Rust {edition} and in a future release in all editions!"
+                    )
+                }
+                FutureIncompatibilityReason::Custom(reason, _) => reason.to_owned(),
+                FutureIncompatibilityReason::Unreachable => unreachable!(),
+            };
+
+            if future_incompatible.explain_reason {
+                err.warn(explanation);
+            }
+
+            let citation =
+                format!("for more information, see {}", future_incompatible.reason.reference());
+            err.note(citation);
+        }
+
+        explain_lint_level_source(sess, lint, level, src, &mut err);
+        err.emit();
     }
-    lint_level_impl(sess, lint, level, span, Box::new(decorate))
+    emit_lint_base_impl(
+        sess,
+        lint,
+        level_spec.into(),
+        span,
+        Box::new(move |dcx, level| decorate.into_diag(dcx, level)),
+    );
 }

@@ -909,7 +909,8 @@ fn test_split_iterators_size_hint() {
             // become maximally long, so the size_hint upper bounds are tight
             ((|_| true) as fn(&_) -> _, Bounds::Upper),
         ] {
-            use {assert_tight_size_hints as a, format_args as f};
+            use assert_tight_size_hints as a;
+            use format_args as f;
 
             a(v.split(p), b, "split");
             a(v.split_mut(p), b, "split_mut");
@@ -1636,6 +1637,19 @@ fn test_chunk_by() {
     assert_eq!(iter.next_back(), Some(&[1][..]));
     assert_eq!(iter.next(), Some(&[2, 2, 2][..]));
     assert_eq!(iter.next_back(), None);
+
+    let mut iter = slice.chunk_by(|a, b| a == b);
+    assert_eq!(iter.next(), Some(&[1, 1, 1][..]));
+    assert_eq!(iter.next(), Some(&[3, 3][..]));
+    let mut iter_clone = iter.clone();
+    assert_eq!(iter.next(), Some(&[2, 2, 2][..]));
+    assert_eq!(iter.next(), Some(&[1][..]));
+    assert_eq!(iter.next(), Some(&[0][..]));
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter_clone.next(), Some(&[2, 2, 2][..]));
+    assert_eq!(iter_clone.next(), Some(&[1][..]));
+    assert_eq!(iter_clone.next(), Some(&[0][..]));
+    assert_eq!(iter_clone.next(), None);
 }
 
 #[test]

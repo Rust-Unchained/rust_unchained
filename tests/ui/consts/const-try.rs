@@ -1,26 +1,27 @@
-//@ compile-flags: -Znext-solver
+//@ check-pass
+//@ revisions: current next
+//@[next] compile-flags: -Znext-solver
 
 // Demonstrates what's needed to make use of `?` in const contexts.
 
 #![crate_type = "lib"]
 #![feature(try_trait_v2)]
+#![feature(try_trait_v2_residual)]
 #![feature(const_trait_impl)]
 #![feature(const_try)]
 
-use std::ops::{ControlFlow, FromResidual, Try};
+use std::ops::{ControlFlow, FromResidual, Residual, Try};
 
 struct TryMe;
 struct Error;
 
-impl const FromResidual<Error> for TryMe {
-    //~^ ERROR const `impl` for trait `FromResidual` which is not marked with `#[const_trait]`
+const impl FromResidual<Error> for TryMe {
     fn from_residual(residual: Error) -> Self {
         TryMe
     }
 }
 
-impl const Try for TryMe {
-    //~^ ERROR const `impl` for trait `Try` which is not marked with `#[const_trait]`
+const impl Try for TryMe {
     type Output = ();
     type Residual = Error;
     fn from_output(output: Self::Output) -> Self {
@@ -31,10 +32,12 @@ impl const Try for TryMe {
     }
 }
 
+impl Residual<()> for Error {
+    type TryType = TryMe;
+}
+
 const fn t() -> TryMe {
     TryMe?;
-    //~^ ERROR `?` is not allowed on
-    //~| ERROR `?` is not allowed on
     TryMe
 }
 

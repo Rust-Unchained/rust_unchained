@@ -1,50 +1,48 @@
 use std::any::Any;
-use std::ops::{Div, Mul};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::{env, fmt, io};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::{env, io};
 
-use rand::{RngCore, rng};
-use rustc_data_structures::base_n::{CASE_INSENSITIVE, ToBaseN};
-use rustc_data_structures::flock;
-use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
 use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
-use rustc_data_structures::sync::{DynSend, DynSync, Lock, MappedReadGuard, ReadGuard, RwLock};
+use rustc_data_structures::sync::{AppendOnlyVec, DynSend, DynSync, Lock};
+use rustc_data_structures::{Limit, flock};
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::codes::*;
-use rustc_errors::emitter::{
-    DynEmitter, HumanEmitter, HumanReadableErrorType, OutputTheme, stderr_destination,
-};
+use rustc_errors::emitter::{DynEmitter, HumanReadableErrorType, OutputTheme, stderr_destination};
 use rustc_errors::json::JsonEmitter;
+use rustc_errors::timings::TimingSectionHandler;
 use rustc_errors::{
     Diag, DiagCtxt, DiagCtxtHandle, DiagMessage, Diagnostic, ErrorGuaranteed, FatalAbort,
-    FluentBundle, LazyFallbackBundle, TerminalUrl, fallback_fluent_bundle,
+    TerminalUrl,
 };
-use rustc_macros::HashStable_Generic;
+use rustc_feature::UnstableFeatures;
+use rustc_macros::StableHash;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{FileNameDisplayPreference, RealFileName, Span, Symbol};
+use rustc_span::{RealFileName, Span, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{
-    CodeModel, DebuginfoKind, PanicStrategy, RelocModel, RelroLevel, SanitizerSet,
-    SmallDataThresholdSupport, SplitDebuginfo, StackProtector, SymbolVisibility, Target,
-    TargetTuple, TlsModel, apple,
+    Arch, CfgAbi, CodeModel, DebuginfoKind, Os, PanicStrategy, RelocModel, RelroLevel,
+    SanitizerSet, SmallDataThresholdSupport, SplitDebuginfo, StackProtector, SymbolVisibility,
+    Target, TargetTuple, TlsModel, apple,
 };
 
 use crate::code_stats::CodeStats;
 pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
 use crate::config::{
-    self, CoverageLevel, CrateType, DebugInfo, ErrorOutputType, FunctionReturn, Input,
-    InstrumentCoverage, OptLevel, OutFileName, OutputType, RemapPathScopeComponents,
-    SwitchWithOptPath,
+    self, BranchProtection, Cfg, CheckCfg, CoverageLevel, CoverageOptions, CrateType, DebugInfo,
+    ErrorOutputType, FunctionReturn, Input, InstrumentCoverage, InstrumentMcount, NATIVE_CPU,
+    OptLevel, OutFileName, OutputType, PAuthKey, PointerAuthOption, SwitchWithOptPath,
 };
 use crate::filesearch::FileSearch;
-use crate::parse::{ParseSess, add_feature_diagnostics};
+use crate::lint::LintId;
+use crate::parse::ParseSess;
 use crate::search_paths::SearchPath;
-use crate::{errors, filesearch, lint};
+use crate::{diagnostics, filesearch, lint};
 
 /// The behavior of the CTFE engine when an error occurs with regards to backtraces.
 #[derive(Clone, Copy)]
@@ -58,65 +56,7 @@ pub enum CtfeBacktrace {
     Immediate,
 }
 
-/// New-type wrapper around `usize` for representing limits. Ensures that comparisons against
-/// limits are consistent throughout the compiler.
-#[derive(Clone, Copy, Debug, HashStable_Generic)]
-pub struct Limit(pub usize);
-
-impl Limit {
-    /// Create a new limit from a `usize`.
-    pub fn new(value: usize) -> Self {
-        Limit(value)
-    }
-
-    /// Create a new unlimited limit.
-    pub fn unlimited() -> Self {
-        Limit(usize::MAX)
-    }
-
-    /// Check that `value` is within the limit. Ensures that the same comparisons are used
-    /// throughout the compiler, as mismatches can cause ICEs, see #72540.
-    #[inline]
-    pub fn value_within_limit(&self, value: usize) -> bool {
-        value <= self.0
-    }
-}
-
-impl From<usize> for Limit {
-    fn from(value: usize) -> Self {
-        Self::new(value)
-    }
-}
-
-impl fmt::Display for Limit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Div<usize> for Limit {
-    type Output = Limit;
-
-    fn div(self, rhs: usize) -> Self::Output {
-        Limit::new(self.0 / rhs)
-    }
-}
-
-impl Mul<usize> for Limit {
-    type Output = Limit;
-
-    fn mul(self, rhs: usize) -> Self::Output {
-        Limit::new(self.0 * rhs)
-    }
-}
-
-impl rustc_errors::IntoDiagArg for Limit {
-    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
-        self.to_string().into_diag_arg(&mut None)
-    }
-}
-
-#[derive(Clone, Copy, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, StableHash)]
 pub struct Limits {
     /// The maximum recursion limit for potentially infinitely recursive
     /// operations such as auto-dereference and monomorphization.
@@ -137,7 +77,249 @@ pub struct CompilerIO {
     pub temps_dir: Option<PathBuf>,
 }
 
-pub trait LintStoreMarker: Any + DynSync + DynSend {}
+pub trait DynLintStore: Any + DynSync + DynSend {
+    /// Provides a way to access lint groups without depending on `rustc_lint`
+    fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = LintGroup> + '_>;
+}
+
+/// Hardware pointer-signing keys in ARM8.3.
+/// These values are the same as used in ptrauth.h.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAuthARM8_3Key {
+    ASIA = 0,
+    ASIB = 1,
+    ASDA = 2,
+    ASDB = 3,
+}
+
+/// Forms of extra discrimination.
+pub enum PointerAuthDiscrimination {
+    /// No additional discrimination.
+    None,
+    /// Include a hash of the entity's type.
+    Type,
+    /// Include a hash of the entity's identity.
+    Decl,
+    /// Discriminate using a constant value.
+    Constant,
+}
+
+/// Types of address discrimination.
+pub enum PointerAuthAddressDiscriminator {
+    /// Enable/disable hardware address discrimination.
+    HardwareAddress(bool),
+    /// Use a synthetic value. For instance init/fini entries can not the address of the arrays,
+    /// they must use a synthetic value of `1`.
+    Synthetic(u64),
+}
+
+pub struct PointerAuthSchema {
+    pub is_address_discriminated: PointerAuthAddressDiscriminator,
+    pub discrimination_kind: PointerAuthDiscrimination,
+    pub key: PointerAuthARM8_3Key,
+    pub constant_discriminator: u16,
+}
+impl PointerAuthSchema {
+    pub fn function_pointers_default(target: &Target) -> Self {
+        assert!(target.cfg_abi == CfgAbi::Pauthtest);
+        return Self {
+            is_address_discriminated: PointerAuthAddressDiscriminator::HardwareAddress(false),
+            discrimination_kind: PointerAuthDiscrimination::None,
+            key: PointerAuthARM8_3Key::ASIA,
+            constant_discriminator: 0,
+        };
+    }
+    pub fn init_fini_default(target: &Target) -> Self {
+        assert!(target.cfg_abi == CfgAbi::Pauthtest);
+        return Self {
+            is_address_discriminated: PointerAuthAddressDiscriminator::Synthetic(1),
+            discrimination_kind: PointerAuthDiscrimination::None,
+            key: PointerAuthARM8_3Key::ASIA,
+            // ptrauth_string_discriminator("init_fini")
+            constant_discriminator: 0xd9d4,
+        };
+    }
+}
+
+pub struct PointerAuthConfig {
+    /// Should return addresses be authenticated?
+    pub return_addresses: bool,
+    /// Do authentication failures cause a trap?
+    pub auth_traps: bool,
+    /// Do indirect goto label addresses need to be authenticated?
+    pub indirect_gotos: bool,
+    /// Should ELF GOT entries be signed?
+    pub elf_got: bool,
+    /// Use hardened lowering for jump-table dispatch?
+    pub aarch64_jump_table_hardening: bool,
+    /// The ABI for C function pointers.
+    pub function_pointers: Option<PointerAuthSchema>,
+    /// The ABI for function addresses in .init_array and .fini_array
+    pub init_fini: Option<PointerAuthSchema>,
+    /// Use of pointer authentication intrinsics.
+    pub intrinsics: bool,
+    /// The following are used only for compatibility with C++ and control over generated abi
+    /// version. They do not control Rust code generation.
+    pub typeinfo_vt_ptr_discrimination: bool,
+    pub vt_ptr_addr_discrimination: bool,
+    pub vt_ptr_type_discrimination: bool,
+}
+impl PointerAuthConfig {
+    fn default(target: &Target) -> Self {
+        assert!(target.cfg_abi == CfgAbi::Pauthtest);
+        return Self {
+            return_addresses: true,
+            auth_traps: true,
+            indirect_gotos: true,
+            elf_got: false,
+            aarch64_jump_table_hardening: true,
+            function_pointers: Some(PointerAuthSchema::function_pointers_default(target)),
+            init_fini: Some(PointerAuthSchema::init_fini_default(target)),
+            intrinsics: true,
+            typeinfo_vt_ptr_discrimination: true,
+            vt_ptr_addr_discrimination: true,
+            vt_ptr_type_discrimination: true,
+        };
+    }
+    pub fn calculate_pauth_abi_version(&self, target: &Target) -> u32 {
+        assert!(target.cfg_abi == CfgAbi::Pauthtest);
+        // Bit positions of version flags for AARCH64_PAUTH_PLATFORM_LLVM_LINUX.
+        // NOTE: The enum values must stay in sync with clang, see:
+        // <llvm_root>/llvm/include/llvm/BinaryFormat/ELF.h
+        //
+        // We do not expect to use C++ virtual dispatch, but enable these flags
+        // for compatibility with C++ code. Intrinsics are also always enabled.
+        //
+        // Link to PAuth core info documentation:
+        // <https://github.com/ARM-software/abi-aa/blob/2025Q4/pauthabielf64/pauthabielf64.rst#core-information>
+        const INTRINSICS: u32 = 0;
+        const CALLS: u32 = 1;
+        const RETURNS: u32 = 2;
+        const AUTHTRAPS: u32 = 3;
+        const VT_PTR_ADDR_DISCR: u32 = 4;
+        const VT_PTR_TYPE_DISCR: u32 = 5;
+        const INIT_FINI: u32 = 6;
+        const INIT_FINI_ADDR_DISC: u32 = 7;
+        const GOT: u32 = 8;
+        const GOTOS: u32 = 9;
+        const TYPEINFO_VT_PTR_DISCR: u32 = 10;
+        // FIXME(jchlanda) We don't yet support function pointer type discrimination.
+        // const FPTR_TYPE_DISCR: u32 = 11;
+
+        let pauth_abi_version: u32 = (u32::from(self.intrinsics) << INTRINSICS)
+            | (u32::from(self.function_pointers.is_some()) << CALLS)
+            | (u32::from(self.return_addresses) << RETURNS)
+            | (u32::from(self.auth_traps) << AUTHTRAPS)
+            | (u32::from(self.vt_ptr_addr_discrimination) << VT_PTR_ADDR_DISCR)
+            | (u32::from(self.vt_ptr_type_discrimination) << VT_PTR_TYPE_DISCR)
+            | (u32::from(self.init_fini.is_some()) << INIT_FINI)
+            | (u32::from(self.init_fini.as_ref().is_some_and(|schema| {
+                matches!(
+                    schema.is_address_discriminated,
+                    PointerAuthAddressDiscriminator::HardwareAddress(true)
+                        | PointerAuthAddressDiscriminator::Synthetic(_)
+                )
+            })) << INIT_FINI_ADDR_DISC)
+            | (u32::from(self.elf_got) << GOT)
+            | (u32::from(self.indirect_gotos) << GOTOS)
+            | (u32::from(self.typeinfo_vt_ptr_discrimination) << TYPEINFO_VT_PTR_DISCR);
+
+        pauth_abi_version
+    }
+    pub fn from_raw(raw: &[(PointerAuthOption, bool)], target: &Target) -> Option<Self> {
+        if target.cfg_abi != CfgAbi::Pauthtest {
+            return None;
+        }
+
+        let mut cfg = Self::default(target);
+        if raw.is_empty() {
+            return Some(cfg);
+        }
+
+        for (opt, enabled) in raw {
+            match opt {
+                PointerAuthOption::Calls => {
+                    if *enabled {
+                        cfg.function_pointers.get_or_insert_with(|| {
+                            PointerAuthSchema::function_pointers_default(target)
+                        });
+                    } else {
+                        cfg.function_pointers = None;
+                    }
+                }
+                PointerAuthOption::FunctionPointerTypeDiscrimination => {
+                    if *enabled {
+                        let schema = cfg.function_pointers.get_or_insert_with(|| {
+                            PointerAuthSchema::function_pointers_default(target)
+                        });
+                        schema.discrimination_kind = PointerAuthDiscrimination::Type;
+                    } else if let Some(schema) = &mut cfg.function_pointers {
+                        schema.discrimination_kind = PointerAuthDiscrimination::None;
+                    }
+                }
+                PointerAuthOption::ReturnAddresses => cfg.return_addresses = *enabled,
+                PointerAuthOption::AuthTraps => cfg.auth_traps = *enabled,
+                PointerAuthOption::IndirectGotos => cfg.indirect_gotos = *enabled,
+                PointerAuthOption::ElfGot => cfg.elf_got = *enabled,
+                PointerAuthOption::Aarch64JumpTableHardening => {
+                    cfg.aarch64_jump_table_hardening = *enabled
+                }
+                PointerAuthOption::InitFini => {
+                    if *enabled {
+                        cfg.init_fini
+                            .get_or_insert_with(|| PointerAuthSchema::init_fini_default(target));
+                    } else {
+                        cfg.init_fini = None;
+                    }
+                }
+                PointerAuthOption::InitFiniAddressDiscrimination => {
+                    if *enabled {
+                        let schema = cfg
+                            .init_fini
+                            .get_or_insert_with(|| PointerAuthSchema::init_fini_default(target));
+                        schema.is_address_discriminated =
+                            PointerAuthAddressDiscriminator::HardwareAddress(true);
+                    } else if let Some(schema) = &mut cfg.init_fini {
+                        schema.is_address_discriminated =
+                            PointerAuthAddressDiscriminator::Synthetic(1);
+                    }
+                }
+
+                PointerAuthOption::Intrinsics => cfg.intrinsics = *enabled,
+                PointerAuthOption::TypeInfoVTPtrDisc => {
+                    cfg.typeinfo_vt_ptr_discrimination = *enabled
+                }
+                PointerAuthOption::VTPtrAddrDisc => cfg.vt_ptr_addr_discrimination = *enabled,
+                PointerAuthOption::VTPtrTypeDisc => cfg.vt_ptr_type_discrimination = *enabled,
+            }
+        }
+
+        Some(cfg)
+    }
+    pub fn fn_attrs(&self) -> Vec<&'static str> {
+        // FIXME(jchlanda) This is not an exhaustive list of all `ptrauth`-related attributes, but only
+        // those currently supported. The list is expected to grow as additional functionality is
+        // implemented, particularly for C++ interoperability.
+        let mut attrs = vec![];
+        if self.aarch64_jump_table_hardening {
+            attrs.push("aarch64-jump-table-hardening");
+        }
+        if self.auth_traps {
+            attrs.push("ptrauth-auth-traps");
+        }
+        if self.function_pointers.is_some() {
+            attrs.push("ptrauth-calls");
+        }
+        if self.indirect_gotos {
+            attrs.push("ptrauth-indirect-gotos");
+        }
+        if self.return_addresses {
+            attrs.push("ptrauth-returns");
+        }
+
+        attrs
+    }
+}
 
 /// Represents the data associated with a compilation
 /// session for a single crate.
@@ -145,22 +327,29 @@ pub struct Session {
     pub target: Target,
     pub host: Target,
     pub opts: config::Options,
-    pub target_tlib_path: Arc<SearchPath>,
+    pub target_tlib_path: SearchPath,
     pub psess: ParseSess,
-    pub sysroot: PathBuf,
+    pub unstable_features: UnstableFeatures,
+    pub config: Cfg,
+    pub check_config: CheckCfg,
+    /// Spans passed to `proc_macro::quote_span`. Each span has a numerical
+    /// identifier represented by its position in the vector.
+    proc_macro_quoted_spans: AppendOnlyVec<Span>,
+
     /// Input, input file path and output file path to this compilation process.
     pub io: CompilerIO,
 
-    incr_comp_session: RwLock<IncrCompSession>,
-
     /// Used by `-Z self-profile`.
     pub prof: SelfProfilerRef,
+
+    /// Used to emit section timings events (enabled by `--json=timings`).
+    pub timings: TimingSectionHandler,
 
     /// Data about code being compiled, gathered during compilation.
     pub code_stats: CodeStats,
 
     /// This only ever stores a `LintStore` but we don't want a dependency on that type here.
-    pub lint_store: Option<Arc<dyn LintStoreMarker>>,
+    pub lint_store: Option<Arc<dyn DynLintStore>>,
 
     /// Cap lint level specified by a driver specifically.
     pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
@@ -197,29 +386,42 @@ pub struct Session {
     /// None signifies that this is not tracked.
     pub using_internal_features: &'static AtomicBool,
 
-    /// All commandline args used to invoke the compiler, with @file args fully expanded.
-    /// This will only be used within debug info, e.g. in the pdb file on windows
-    /// This is mainly useful for other tools that reads that debuginfo to figure out
-    /// how to call the compiler with the same arguments.
-    pub expanded_args: Vec<String>,
+    /// Environment variables accessed during the build and their values when they exist.
+    pub env_depinfo: Lock<FxIndexSet<(Symbol, Option<Symbol>)>>,
 
-    target_filesearch: FileSearch,
-    host_filesearch: FileSearch,
+    /// File paths accessed during the build.
+    pub file_depinfo: Lock<FxIndexSet<Symbol>>,
 
-    /// A random string generated per invocation of rustc.
+    target_filesearch: Arc<FileSearch>,
+    host_filesearch: Arc<FileSearch>,
+
+    /// The names of intrinsics that the current codegen backend replaces
+    /// with its own implementations.
+    pub replaced_intrinsics: FxHashSet<Symbol>,
+    /// The names of intrinsics that the current codegen backend does *not* replace
+    /// with its own implementations.
+    pub fallback_intrinsics: FxHashSet<Symbol>,
+
+    /// Does the codegen backend support ThinLTO?
+    pub thin_lto_supported: bool,
+
+    /// Global per-session counter for MIR optimization pass applications.
     ///
-    /// This is prepended to all temporary files so that they do not collide
-    /// during concurrent invocations of rustc, or past invocations that were
-    /// preserved with a flag like `-C save-temps`, since these files may be
-    /// hard linked.
-    pub invocation_temp: Option<String>,
-}
+    /// Used by `-Zmir-opt-bisect-limit` to assign an index to each
+    /// optimization-pass execution candidate during this compilation.
+    pub mir_opt_bisect_eval_count: AtomicUsize,
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub enum MetadataKind {
-    None,
-    Uncompressed,
-    Compressed,
+    /// Enabled features that are used in the current compilation.
+    ///
+    /// The value is the `DepNodeIndex` of the node encodes the used feature.
+    pub used_features: Lock<FxHashMap<Symbol, u32>>,
+
+    /// Whether the test harness removed a user-written `#[rustc_main]` attribute
+    /// while generating the synthetic test entry point.
+    pub removed_rustc_main_attr: AtomicBool,
+
+    /// Config specifying targets' pointer authentication preference.
+    pub pointer_auth_config: Option<PointerAuthConfig>,
 }
 
 #[derive(Clone, Copy)]
@@ -243,13 +445,23 @@ impl CodegenUnits {
     }
 }
 
+pub struct LintGroup {
+    pub name: &'static str,
+    pub lints: Vec<LintId>,
+    pub is_externally_loaded: bool,
+}
+
 impl Session {
     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
         self.miri_unleashed_features.lock().push((span, feature_gate));
     }
 
     pub fn local_crate_source_file(&self) -> Option<RealFileName> {
-        Some(self.source_map().path_mapping().to_real_filename(self.io.input.opt_path()?))
+        Some(
+            self.source_map()
+                .path_mapping()
+                .to_real_filename(self.source_map().working_dir(), self.io.input.opt_path()?),
+        )
     }
 
     fn check_miri_unleashed_features(&self) -> Option<ErrorGuaranteed> {
@@ -258,15 +470,15 @@ impl Session {
         if !unleashed_features.is_empty() {
             let mut must_err = false;
             // Create a diagnostic pointing at where things got unleashed.
-            self.dcx().emit_warn(errors::SkippingConstChecks {
+            self.dcx().emit_warn(diagnostics::SkippingConstChecks {
                 unleashed_features: unleashed_features
                     .iter()
                     .map(|(span, gate)| {
                         gate.map(|gate| {
                             must_err = true;
-                            errors::UnleashedFeatureHelp::Named { span: *span, gate }
+                            diagnostics::UnleashedFeatureHelp::Named { span: *span, gate }
                         })
-                        .unwrap_or(errors::UnleashedFeatureHelp::Unnamed { span: *span })
+                        .unwrap_or(diagnostics::UnleashedFeatureHelp::Unnamed { span: *span })
                     })
                     .collect(),
             });
@@ -274,7 +486,7 @@ impl Session {
             // If we should err, make sure we did.
             if must_err && self.dcx().has_errors().is_none() {
                 // We have skipped a feature gate, and not run into other errors... reject.
-                guar = Some(self.dcx().emit_err(errors::NotCircumventFeature));
+                guar = Some(self.dcx().emit_err(diagnostics::NotCircumventFeature));
             }
         }
         guar
@@ -302,10 +514,9 @@ impl Session {
     pub fn create_feature_err<'a>(&'a self, err: impl Diagnostic<'a>, feature: Symbol) -> Diag<'a> {
         let mut err = self.dcx().create_err(err);
         if err.code.is_none() {
-            #[allow(rustc::diagnostic_outside_of_impl)]
             err.code(E0658);
         }
-        add_feature_diagnostics(&mut err, self, feature);
+        diagnostics::add_feature_diagnostics(&mut err, self, feature);
         err
     }
 
@@ -316,6 +527,7 @@ impl Session {
             || self.opts.unstable_opts.query_dep_graph
             || self.opts.unstable_opts.dump_mir.is_some()
             || self.opts.unstable_opts.unpretty.is_some()
+            || self.prof.is_args_recording_enabled()
             || self.opts.output_types.contains_key(&OutputType::Mir)
             || std::env::var_os("RUSTC_LOG").is_some()
         {
@@ -333,6 +545,16 @@ impl Session {
     #[inline]
     pub fn source_map(&self) -> &SourceMap {
         self.psess.source_map()
+    }
+
+    pub fn proc_macro_quoted_spans(&self) -> impl Iterator<Item = (usize, Span)> {
+        // This is equivalent to `.iter().copied().enumerate()`, but that isn't possible for
+        // AppendOnlyVec, so we resort to this scheme.
+        self.proc_macro_quoted_spans.iter_enumerated()
+    }
+
+    pub fn save_proc_macro_span(&self, span: Span) -> usize {
+        self.proc_macro_quoted_spans.push(span)
     }
 
     /// Returns `true` if internal lints should be added to the lint store - i.e. if
@@ -356,23 +578,15 @@ impl Session {
             && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Condition
     }
 
-    pub fn instrument_coverage_mcdc(&self) -> bool {
-        self.instrument_coverage()
-            && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Mcdc
-    }
-
-    /// True if `-Zcoverage-options=no-mir-spans` was passed.
-    pub fn coverage_no_mir_spans(&self) -> bool {
-        self.opts.unstable_opts.coverage_options.no_mir_spans
-    }
-
-    /// True if `-Zcoverage-options=discard-all-spans-in-codegen` was passed.
-    pub fn coverage_discard_all_spans_in_codegen(&self) -> bool {
-        self.opts.unstable_opts.coverage_options.discard_all_spans_in_codegen
+    /// Provides direct access to the `CoverageOptions` struct, so that
+    /// individual flags for debugging/testing coverage instrumetation don't
+    /// need separate accessors.
+    pub fn coverage_options(&self) -> &CoverageOptions {
+        &self.opts.unstable_opts.coverage_options
     }
 
     pub fn is_sanitizer_cfi_enabled(&self) -> bool {
-        self.opts.unstable_opts.sanitizer.contains(SanitizerSet::CFI)
+        self.sanitizers().contains(SanitizerSet::CFI)
     }
 
     pub fn is_sanitizer_cfi_canonical_jump_tables_disabled(&self) -> bool {
@@ -396,7 +610,7 @@ impl Session {
     }
 
     pub fn is_sanitizer_kcfi_enabled(&self) -> bool {
-        self.opts.unstable_opts.sanitizer.contains(SanitizerSet::KCFI)
+        self.sanitizers().contains(SanitizerSet::KCFI)
     }
 
     pub fn is_split_lto_unit_enabled(&self) -> bool {
@@ -431,7 +645,7 @@ impl Session {
     }
 
     pub fn is_wasi_reactor(&self) -> bool {
-        self.target.options.os == "wasi"
+        self.target.options.os == Os::Wasi
             && matches!(
                 self.opts.unstable_opts.wasi_exec_model,
                 Some(config::WasiExecModel::Reactor)
@@ -441,10 +655,6 @@ impl Session {
     /// Returns `true` if the target can use the current split debuginfo configuration.
     pub fn target_can_use_split_dwarf(&self) -> bool {
         self.target.debuginfo_kind == DebuginfoKind::Dwarf
-    }
-
-    pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
-        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())
     }
 
     pub fn target_filesearch(&self) -> &filesearch::FileSearch {
@@ -458,13 +668,11 @@ impl Session {
     /// directories are also returned, for example if `--sysroot` is used but tools are missing
     /// (#125246): we also add the bin directories to the sysroot where rustc is located.
     pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
-        let bin_path = filesearch::make_target_bin_path(&self.sysroot, config::host_tuple());
-        let fallback_sysroot_paths = filesearch::sysroot_candidates()
-            .into_iter()
-            // Ignore sysroot candidate if it was the same as the sysroot path we just used.
-            .filter(|sysroot| *sysroot != self.sysroot)
+        let search_paths = self
+            .opts
+            .sysroot
+            .all_paths()
             .map(|sysroot| filesearch::make_target_bin_path(&sysroot, config::host_tuple()));
-        let search_paths = std::iter::once(bin_path).chain(fallback_sysroot_paths);
 
         if self_contained {
             // The self-contained tools are expected to be e.g. in `bin/self-contained` in the
@@ -474,62 +682,6 @@ impl Session {
         } else {
             search_paths.collect()
         }
-    }
-
-    pub fn init_incr_comp_session(&self, session_dir: PathBuf, lock_file: flock::Lock) {
-        let mut incr_comp_session = self.incr_comp_session.borrow_mut();
-
-        if let IncrCompSession::NotInitialized = *incr_comp_session {
-        } else {
-            panic!("Trying to initialize IncrCompSession `{:?}`", *incr_comp_session)
-        }
-
-        *incr_comp_session =
-            IncrCompSession::Active { session_directory: session_dir, _lock_file: lock_file };
-    }
-
-    pub fn finalize_incr_comp_session(&self, new_directory_path: PathBuf) {
-        let mut incr_comp_session = self.incr_comp_session.borrow_mut();
-
-        if let IncrCompSession::Active { .. } = *incr_comp_session {
-        } else {
-            panic!("trying to finalize `IncrCompSession` `{:?}`", *incr_comp_session);
-        }
-
-        // Note: this will also drop the lock file, thus unlocking the directory.
-        *incr_comp_session = IncrCompSession::Finalized { session_directory: new_directory_path };
-    }
-
-    pub fn mark_incr_comp_session_as_invalid(&self) {
-        let mut incr_comp_session = self.incr_comp_session.borrow_mut();
-
-        let session_directory = match *incr_comp_session {
-            IncrCompSession::Active { ref session_directory, .. } => session_directory.clone(),
-            IncrCompSession::InvalidBecauseOfErrors { .. } => return,
-            _ => panic!("trying to invalidate `IncrCompSession` `{:?}`", *incr_comp_session),
-        };
-
-        // Note: this will also drop the lock file, thus unlocking the directory.
-        *incr_comp_session = IncrCompSession::InvalidBecauseOfErrors { session_directory };
-    }
-
-    pub fn incr_comp_session_dir(&self) -> MappedReadGuard<'_, PathBuf> {
-        let incr_comp_session = self.incr_comp_session.borrow();
-        ReadGuard::map(incr_comp_session, |incr_comp_session| match *incr_comp_session {
-            IncrCompSession::NotInitialized => panic!(
-                "trying to get session directory from `IncrCompSession`: {:?}",
-                *incr_comp_session,
-            ),
-            IncrCompSession::Active { ref session_directory, .. }
-            | IncrCompSession::Finalized { ref session_directory }
-            | IncrCompSession::InvalidBecauseOfErrors { ref session_directory } => {
-                session_directory
-            }
-        })
-    }
-
-    pub fn incr_comp_session_dir_opt(&self) -> Option<MappedReadGuard<'_, PathBuf>> {
-        self.opts.incremental.as_ref().map(|_| self.incr_comp_session_dir())
     }
 
     /// Is this edition 2015?
@@ -576,9 +728,14 @@ impl Session {
     pub fn emit_lifetime_markers(&self) -> bool {
         self.opts.optimize != config::OptLevel::No
         // AddressSanitizer and KernelAddressSanitizer uses lifetimes to detect use after scope bugs.
+        //
         // MemorySanitizer uses lifetimes to detect use of uninitialized stack variables.
-        // HWAddressSanitizer will use lifetimes to detect use after scope bugs in the future.
-        || self.opts.unstable_opts.sanitizer.intersects(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS)
+        //
+        // HWAddressSanitizer and KernelHWAddressSanitizer will use lifetimes to detect use after
+        // scope bugs in the future.
+        || self.sanitizers().intersects(SanitizerSet::ADDRESS | SanitizerSet::KERNELADDRESS | SanitizerSet::MEMORY | SanitizerSet::HWADDRESS | SanitizerSet::KERNELHWADDRESS)
+        // Lifetimes are necessary for retagging semantics.
+        || self.opts.unstable_opts.codegen_emit_retag.is_some()
     }
 
     pub fn diagnostic_width(&self) -> usize {
@@ -608,6 +765,13 @@ impl Session {
             (&*self.target.staticlib_prefix, &*self.target.staticlib_suffix)
         }
     }
+
+    pub fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = LintGroup> + '_> {
+        match self.lint_store {
+            Some(ref lint_store) => lint_store.lint_groups_iter(),
+            None => Box::new(std::iter::empty()),
+        }
+    }
 }
 
 // JUSTIFICATION: defn of the suggested wrapper fns
@@ -619,6 +783,10 @@ impl Session {
 
     pub fn print_llvm_stats(&self) -> bool {
         self.opts.unstable_opts.print_codegen_stats
+    }
+
+    pub fn print_llvm_stats_json(&self) -> Option<&String> {
+        self.opts.unstable_opts.print_codegen_stats_json.as_ref()
     }
 
     pub fn verify_llvm_ir(&self) -> bool {
@@ -661,8 +829,17 @@ impl Session {
             }
             config::LtoCli::Thin => {
                 // The user explicitly asked for ThinLTO
+                if !self.thin_lto_supported {
+                    // Backend doesn't support ThinLTO, fallback to fat LTO.
+                    self.dcx().emit_warn(diagnostics::ThinLtoNotSupportedByBackend);
+                    return config::Lto::Fat;
+                }
                 return config::Lto::Thin;
             }
+        }
+
+        if !self.thin_lto_supported {
+            return config::Lto::No;
         }
 
         // Ok at this point the target doesn't require anything and the user
@@ -779,10 +956,42 @@ impl Session {
         }
     }
 
+    /// Returns the `-Zbranch-protection` info. Note that it is adjusted to the current target, e.g.
+    /// some targets only support certain Pointer Authentication Code keys.
+    ///
+    /// Accessing the session's unstable `branch_protection` option fields directly is linted
+    /// against.
+    pub fn branch_protection(&self) -> Option<BranchProtection> {
+        let mut bp = self.opts.unstable_opts.branch_protection;
+
+        if let Some(bp) = bp.as_mut() {
+            // Windows on Arm only supports PAC Key B for return address signing, as shown in
+            // https://github.com/llvm/llvm-project/pull/203989. We parse the CLI flags for branch
+            // protection and target separately though, so we adjust this possible discrepancy here.
+            if self.target.os == Os::Windows && self.target.arch == Arch::AArch64 {
+                if let Some(pac_ret) = bp.pac_ret.as_mut()
+                    && pac_ret.key == PAuthKey::A
+                {
+                    pac_ret.key = PAuthKey::B;
+                }
+            }
+        }
+
+        bp
+    }
+
     pub fn must_emit_unwind_tables(&self) -> bool {
         // This is used to control the emission of the `uwtable` attribute on
-        // LLVM functions.
+        // LLVM functions. The `uwtable` attribute according to LLVM is:
         //
+        //     This attribute indicates that the ABI being targeted requires that an
+        //     unwind table entry be produced for this function even if we can show
+        //     that no exceptions passes by it. This is normally the case for the
+        //     ELF x86-64 abi, but it can be disabled for some compilation units.
+        //
+        // Typically when we're compiling with `-C panic=abort` we don't need
+        // `uwtable` because we can't generate any exceptions! But note that
+        // some targets require unwind tables to generate backtraces.
         // Unwind tables are needed when compiling with `-C panic=unwind`, but
         // LLVM won't omit unwind tables unless the function is also marked as
         // `nounwind`, so users are allowed to disable `uwtable` emission.
@@ -801,16 +1010,11 @@ impl Session {
         // Otherwise, we can defer to the `-C force-unwind-tables=<yes/no>`
         // value, if it is provided, or disable them, if not.
         self.target.requires_uwtable
-            || self.opts.cg.force_unwind_tables.unwrap_or(
-                self.panic_strategy() == PanicStrategy::Unwind || self.target.default_uwtable,
-            )
-    }
-
-    /// Returns the number of query threads that should be used for this
-    /// compilation
-    #[inline]
-    pub fn threads(&self) -> usize {
-        self.opts.unstable_opts.threads
+            || self
+                .opts
+                .cg
+                .force_unwind_tables
+                .unwrap_or(self.panic_strategy().unwinds() || self.target.default_uwtable)
     }
 
     /// Returns the number of codegen units that should be used for this
@@ -895,21 +1099,6 @@ impl Session {
         self.opts.cg.link_dead_code.unwrap_or(false)
     }
 
-    pub fn filename_display_preference(
-        &self,
-        scope: RemapPathScopeComponents,
-    ) -> FileNameDisplayPreference {
-        assert!(
-            scope.bits().count_ones() == 1,
-            "one and only one scope should be passed to `Session::filename_display_preference`"
-        );
-        if self.opts.unstable_opts.remap_path_scope.contains(scope) {
-            FileNameDisplayPreference::Remapped
-        } else {
-            FileNameDisplayPreference::Local
-        }
-    }
-
     /// Get the deployment target on Apple platforms based on the standard environment variables,
     /// or fall back to the minimum version supported by `rustc`.
     ///
@@ -928,7 +1117,7 @@ impl Session {
                     // is lower than the minimum OS supported by rustc, not when the variable is lower
                     // than the minimum for a specific target.
                     if version < os_min {
-                        self.dcx().emit_warn(errors::AppleDeploymentTarget::TooLow {
+                        self.dcx().emit_warn(diagnostics::AppleDeploymentTarget::TooLow {
                             env_var,
                             version: version.fmt_pretty().to_string(),
                             os_min: os_min.fmt_pretty().to_string(),
@@ -939,7 +1128,8 @@ impl Session {
                     version.max(min)
                 }
                 Err(error) => {
-                    self.dcx().emit_err(errors::AppleDeploymentTarget::Invalid { env_var, error });
+                    self.dcx()
+                        .emit_err(diagnostics::AppleDeploymentTarget::Invalid { env_var, error });
                     min
                 }
             }
@@ -948,16 +1138,27 @@ impl Session {
             min
         }
     }
+
+    pub fn sanitizers(&self) -> SanitizerSet {
+        return self.opts.unstable_opts.sanitizer | self.target.options.default_sanitizers;
+    }
+
+    pub fn pointer_authentication(&self) -> bool {
+        self.pointer_auth_config.is_some()
+    }
+
+    pub fn pointer_authentication_functions(&self) -> Option<&PointerAuthSchema> {
+        self.pointer_auth_config.as_ref().and_then(|cfg| cfg.function_pointers.as_ref())
+    }
+
+    pub fn pointer_authentication_init_fini(&self) -> Option<&PointerAuthSchema> {
+        self.pointer_auth_config.as_ref().and_then(|cfg| cfg.init_fini.as_ref())
+    }
 }
 
 // JUSTIFICATION: part of session construction
 #[allow(rustc::bad_opt_access)]
-fn default_emitter(
-    sopts: &config::Options,
-    source_map: Arc<SourceMap>,
-    bundle: Option<Arc<FluentBundle>>,
-    fallback_bundle: LazyFallbackBundle,
-) -> Box<DynEmitter> {
+fn default_emitter(sopts: &config::Options, source_map: Arc<SourceMap>) -> Box<DynEmitter> {
     let macro_backtrace = sopts.unstable_opts.macro_backtrace;
     let track_diagnostics = sopts.unstable_opts.track_diagnostics;
     let terminal_url = match sopts.unstable_opts.terminal_urls {
@@ -977,48 +1178,30 @@ fn default_emitter(
     let source_map = if sopts.unstable_opts.link_only { None } else { Some(source_map) };
 
     match sopts.error_format {
-        config::ErrorOutputType::HumanReadable { kind, color_config } => {
-            let short = kind.short();
-
-            if let HumanReadableErrorType::AnnotateSnippet = kind {
-                let emitter = AnnotateSnippetEmitter::new(
-                    source_map,
-                    bundle,
-                    fallback_bundle,
-                    short,
-                    macro_backtrace,
-                );
-                Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
-            } else {
-                let emitter = HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
-                    .fluent_bundle(bundle)
+        config::ErrorOutputType::HumanReadable { kind, color_config } => match kind {
+            HumanReadableErrorType { short, unicode } => {
+                let emitter = AnnotateSnippetEmitter::new(stderr_destination(color_config))
                     .sm(source_map)
                     .short_message(short)
                     .diagnostic_width(sopts.diagnostic_width)
                     .macro_backtrace(macro_backtrace)
                     .track_diagnostics(track_diagnostics)
                     .terminal_url(terminal_url)
-                    .theme(if let HumanReadableErrorType::Unicode = kind {
-                        OutputTheme::Unicode
-                    } else {
-                        OutputTheme::Ascii
-                    })
+                    .theme(if unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
                     .ignored_directories_in_source_blocks(
                         sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
                     );
                 Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             }
-        }
+        },
         config::ErrorOutputType::Json { pretty, json_rendered, color_config } => Box::new(
             JsonEmitter::new(
                 Box::new(io::BufWriter::new(io::stderr())),
                 source_map,
-                fallback_bundle,
                 pretty,
                 json_rendered,
                 color_config,
             )
-            .fluent_bundle(bundle)
             .ui_testing(sopts.unstable_opts.ui_testing)
             .ignored_directories_in_source_blocks(
                 sopts.unstable_opts.ignore_directory_in_diagnostics_source_blocks.clone(),
@@ -1033,20 +1216,14 @@ fn default_emitter(
 
 // JUSTIFICATION: literally session construction
 #[allow(rustc::bad_opt_access)]
-#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn build_session(
     sopts: config::Options,
     io: CompilerIO,
-    bundle: Option<Arc<rustc_errors::FluentBundle>>,
-    registry: rustc_errors::registry::Registry,
-    fluent_resources: Vec<&'static str>,
     driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
     target: Target,
-    sysroot: PathBuf,
     cfg_version: &'static str,
     ice_file: Option<PathBuf>,
     using_internal_features: &'static AtomicBool,
-    expanded_args: Vec<String>,
 ) -> Session {
     // FIXME: This is not general enough to make the warning lint completely override
     // normal diagnostic warnings, since the warning lint can also be denied and changed
@@ -1059,23 +1236,25 @@ pub fn build_session(
     let cap_lints_allow = sopts.lint_cap.is_some_and(|cap| cap == lint::Allow);
     let can_emit_warnings = !(warnings_allow || cap_lints_allow);
 
-    let fallback_bundle = fallback_fluent_bundle(
-        fluent_resources,
-        sopts.unstable_opts.translate_directionality_markers,
-    );
     let source_map = rustc_span::source_map::get_source_map().unwrap();
-    let emitter = default_emitter(&sopts, Arc::clone(&source_map), bundle, fallback_bundle);
+    let emitter = default_emitter(&sopts, Arc::clone(&source_map));
 
-    let mut dcx = DiagCtxt::new(emitter)
-        .with_flags(sopts.unstable_opts.dcx_flags(can_emit_warnings))
-        .with_registry(registry);
+    let mut dcx =
+        DiagCtxt::new(emitter).with_flags(sopts.unstable_opts.dcx_flags(can_emit_warnings));
     if let Some(ice_file) = ice_file {
         dcx = dcx.with_ice_file(ice_file);
     }
 
+    if let Some(msrv) = sopts.unstable_opts.hint_msrv {
+        dcx = dcx.with_msrv(msrv);
+    }
+
     let host_triple = TargetTuple::from_tuple(config::host_tuple());
-    let (host, target_warnings) = Target::search(&host_triple, &sysroot)
-        .unwrap_or_else(|e| dcx.handle().fatal(format!("Error loading host specification: {e}")));
+    let (host, target_warnings) =
+        Target::search(&host_triple, sopts.sysroot.path(), sopts.unstable_opts.unstable_options)
+            .unwrap_or_else(|e| {
+                dcx.handle().fatal(format!("Error loading host specification: {e}"))
+            });
     for warning in target_warnings.warning_messages() {
         dcx.handle().warn(warning)
     }
@@ -1093,7 +1272,7 @@ pub fn build_session(
         match profiler {
             Ok(profiler) => Some(Arc::new(profiler)),
             Err(e) => {
-                dcx.handle().emit_warn(errors::FailedToCreateProfiler { err: e.to_string() });
+                dcx.handle().emit_warn(diagnostics::FailedToCreateProfiler { err: e.to_string() });
                 None
             }
         }
@@ -1101,20 +1280,13 @@ pub fn build_session(
         None
     };
 
-    let mut psess = ParseSess::with_dcx(dcx, source_map);
-    psess.assume_incomplete_release = sopts.unstable_opts.assume_incomplete_release;
+    let psess = ParseSess::with_dcx(dcx, source_map);
 
     let host_triple = config::host_tuple();
     let target_triple = sopts.target_triple.tuple();
     // FIXME use host sysroot?
-    let host_tlib_path = Arc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
-    let target_tlib_path = if host_triple == target_triple {
-        // Use the same `SearchPath` if host and target triple are identical to avoid unnecessary
-        // rescanning of the target lib path and an unnecessary allocation.
-        Arc::clone(&host_tlib_path)
-    } else {
-        Arc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
-    };
+    let host_tlib_path = SearchPath::from_sysroot_and_triple(sopts.sysroot.path(), host_triple);
+    let target_tlib_path = SearchPath::from_sysroot_and_triple(sopts.sysroot.path(), target_triple);
 
     let prof = SelfProfilerRef::new(
         self_profiler,
@@ -1127,15 +1299,28 @@ pub fn build_session(
         _ => CtfeBacktrace::Disabled,
     });
 
-    let asm_arch = if target.allow_asm { InlineAsmArch::from_str(&target.arch).ok() } else { None };
-    let target_filesearch =
-        filesearch::FileSearch::new(&sopts.search_paths, &target_tlib_path, &target);
-    let host_filesearch = filesearch::FileSearch::new(&sopts.search_paths, &host_tlib_path, &host);
+    let asm_arch = if target.allow_asm { InlineAsmArch::from_arch(&target.arch) } else { None };
+    let target_filesearch = Arc::new(filesearch::FileSearch::new(
+        &sopts.search_paths,
+        &target_tlib_path,
+        &target,
+        sopts.unstable_opts.implicit_sysroot_deps,
+    ));
+    let host_filesearch = if target == host {
+        Arc::clone(&target_filesearch)
+    } else {
+        Arc::new(filesearch::FileSearch::new(
+            &sopts.search_paths,
+            &host_tlib_path,
+            &host,
+            sopts.unstable_opts.implicit_sysroot_deps,
+        ))
+    };
 
-    let invocation_temp = sopts
-        .incremental
-        .as_ref()
-        .map(|_| rng().next_u32().to_base_fixed_len(CASE_INSENSITIVE).to_string());
+    let timings = TimingSectionHandler::new(sopts.json_timings);
+
+    let pointer_auth_config: Option<PointerAuthConfig> =
+        PointerAuthConfig::from_raw(&sopts.unstable_opts.pointer_authentication, &target);
 
     let sess = Session {
         target,
@@ -1143,10 +1328,13 @@ pub fn build_session(
         opts: sopts,
         target_tlib_path,
         psess,
-        sysroot,
+        unstable_features: UnstableFeatures::from_environment(None),
+        config: Cfg::default(),
+        check_config: CheckCfg::default(),
+        proc_macro_quoted_spans: Default::default(),
         io,
-        incr_comp_session: RwLock::new(IncrCompSession::NotInitialized),
         prof,
+        timings,
         code_stats: Default::default(),
         lint_store: None,
         driver_lint_caps,
@@ -1157,15 +1345,26 @@ pub fn build_session(
         unstable_target_features: Default::default(),
         cfg_version,
         using_internal_features,
-        expanded_args,
+        env_depinfo: Default::default(),
+        file_depinfo: Default::default(),
         target_filesearch,
         host_filesearch,
-        invocation_temp,
+        replaced_intrinsics: FxHashSet::default(), // filled by `run_compiler`
+        fallback_intrinsics: FxHashSet::default(), // filled by `run_compiler`
+        thin_lto_supported: true,                  // filled by `run_compiler`
+        mir_opt_bisect_eval_count: AtomicUsize::new(0),
+        used_features: Lock::default(),
+        removed_rustc_main_attr: AtomicBool::new(false),
+        pointer_auth_config,
     };
 
     validate_commandline_args_with_session_available(&sess);
 
     sess
+}
+
+pub fn generate_proc_macro_decls_symbol(stable_crate_id: StableCrateId) -> String {
+    format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())
 }
 
 /// Validate command line arguments with a `Session`.
@@ -1186,28 +1385,49 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         && sess.opts.cg.prefer_dynamic
         && sess.target.is_like_windows
     {
-        sess.dcx().emit_err(errors::LinkerPluginToWindowsNotSupported);
+        sess.dcx().emit_err(diagnostics::LinkerPluginToWindowsNotSupported);
+    }
+
+    if sess
+        .pointer_auth_config
+        .as_ref()
+        .and_then(|cfg| cfg.function_pointers.as_ref())
+        .is_some_and(|schema| matches!(schema.discrimination_kind, PointerAuthDiscrimination::Type))
+    {
+        sess.dcx().emit_err(
+            diagnostics::PointerAuthenticationTypeDiscriminationNotSupportedForTarget {
+                target_triple: &sess.opts.target_triple,
+            },
+        );
+    }
+
+    if sess.target.cfg_abi != CfgAbi::Pauthtest
+        && !sess.opts.unstable_opts.pointer_authentication.is_empty()
+    {
+        sess.dcx().emit_warn(diagnostics::PointerAuthenticationNotSupportedForTarget {
+            target_triple: &sess.opts.target_triple,
+        });
     }
 
     // Make sure that any given profiling data actually exists so LLVM can't
     // decide to silently skip PGO.
     if let Some(ref path) = sess.opts.cg.profile_use {
         if !path.exists() {
-            sess.dcx().emit_err(errors::ProfileUseFileDoesNotExist { path });
+            sess.dcx().emit_err(diagnostics::ProfileUseFileDoesNotExist { path });
         }
     }
 
     // Do the same for sample profile data.
     if let Some(ref path) = sess.opts.unstable_opts.profile_sample_use {
         if !path.exists() {
-            sess.dcx().emit_err(errors::ProfileSampleUseFileDoesNotExist { path });
+            sess.dcx().emit_err(diagnostics::ProfileSampleUseFileDoesNotExist { path });
         }
     }
 
     // Unwind tables cannot be disabled if the target requires them.
     if let Some(include_uwtables) = sess.opts.cg.force_unwind_tables {
         if sess.target.requires_uwtable && !include_uwtables {
-            sess.dcx().emit_err(errors::TargetRequiresUnwindTables);
+            sess.dcx().emit_err(diagnostics::TargetRequiresUnwindTables);
         }
     }
 
@@ -1216,17 +1436,18 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     let mut unsupported_sanitizers = sess.opts.unstable_opts.sanitizer - supported_sanitizers;
     // Niche: if `fixed-x18`, or effectively switching on `reserved-x18` flag, is enabled
     // we should allow Shadow Call Stack sanitizer.
-    if sess.opts.unstable_opts.fixed_x18 && sess.target.arch == "aarch64" {
+    if sess.opts.unstable_opts.fixed_x18 && sess.target.arch == Arch::AArch64 {
         unsupported_sanitizers -= SanitizerSet::SHADOWCALLSTACK;
     }
     match unsupported_sanitizers.into_iter().count() {
         0 => {}
         1 => {
-            sess.dcx()
-                .emit_err(errors::SanitizerNotSupported { us: unsupported_sanitizers.to_string() });
+            sess.dcx().emit_err(diagnostics::SanitizerNotSupported {
+                us: unsupported_sanitizers.to_string(),
+            });
         }
         _ => {
-            sess.dcx().emit_err(errors::SanitizersNotSupported {
+            sess.dcx().emit_err(diagnostics::SanitizersNotSupported {
                 us: unsupported_sanitizers.to_string(),
             });
         }
@@ -1234,7 +1455,7 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
 
     // Cannot mix and match mutually-exclusive sanitizers.
     if let Some((first, second)) = sess.opts.unstable_opts.sanitizer.mutually_exclusive() {
-        sess.dcx().emit_err(errors::CannotMixAndMatchSanitizers {
+        sess.dcx().emit_err(diagnostics::CannotMixAndMatchSanitizers {
             first: first.to_string(),
             second: second.to_string(),
         });
@@ -1245,19 +1466,26 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         && !sess.opts.unstable_opts.sanitizer.is_empty()
         && !sess.target.is_like_msvc
     {
-        sess.dcx().emit_err(errors::CannotEnableCrtStaticLinux);
+        sess.dcx().emit_err(diagnostics::CannotEnableCrtStaticLinux);
+    }
+
+    // FIXME(jchlanda) Pauthtest does not support static linking. It must be dynamically linked,
+    // with a dynamic linker acting as the ELF interpreter that can resolve pauth relocations and
+    // enforce pointer authentication constraints.
+    if sess.crt_static(None) && sess.target.cfg_abi == CfgAbi::Pauthtest {
+        sess.dcx().emit_err(diagnostics::CannotEnableCrtStaticPointerAuth);
     }
 
     // LLVM CFI requires LTO.
     if sess.is_sanitizer_cfi_enabled()
         && !(sess.lto() == config::Lto::Fat || sess.opts.cg.linker_plugin_lto.enabled())
     {
-        sess.dcx().emit_err(errors::SanitizerCfiRequiresLto);
+        sess.dcx().emit_err(diagnostics::SanitizerCfiRequiresLto);
     }
 
     // KCFI requires panic=abort
-    if sess.is_sanitizer_kcfi_enabled() && sess.panic_strategy() != PanicStrategy::Abort {
-        sess.dcx().emit_err(errors::SanitizerKcfiRequiresPanicAbort);
+    if sess.is_sanitizer_kcfi_enabled() && sess.panic_strategy().unwinds() {
+        sess.dcx().emit_err(diagnostics::SanitizerKcfiRequiresPanicAbort);
     }
 
     // LLVM CFI using rustc LTO requires a single codegen unit.
@@ -1265,32 +1493,32 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         && sess.lto() == config::Lto::Fat
         && (sess.codegen_units().as_usize() != 1)
     {
-        sess.dcx().emit_err(errors::SanitizerCfiRequiresSingleCodegenUnit);
+        sess.dcx().emit_err(diagnostics::SanitizerCfiRequiresSingleCodegenUnit);
     }
 
     // Canonical jump tables requires CFI.
     if sess.is_sanitizer_cfi_canonical_jump_tables_disabled() {
         if !sess.is_sanitizer_cfi_enabled() {
-            sess.dcx().emit_err(errors::SanitizerCfiCanonicalJumpTablesRequiresCfi);
+            sess.dcx().emit_err(diagnostics::SanitizerCfiCanonicalJumpTablesRequiresCfi);
         }
     }
 
     // KCFI arity indicator requires KCFI.
     if sess.is_sanitizer_kcfi_arity_enabled() && !sess.is_sanitizer_kcfi_enabled() {
-        sess.dcx().emit_err(errors::SanitizerKcfiArityRequiresKcfi);
+        sess.dcx().emit_err(diagnostics::SanitizerKcfiArityRequiresKcfi);
     }
 
     // LLVM CFI pointer generalization requires CFI or KCFI.
     if sess.is_sanitizer_cfi_generalize_pointers_enabled() {
         if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
-            sess.dcx().emit_err(errors::SanitizerCfiGeneralizePointersRequiresCfi);
+            sess.dcx().emit_err(diagnostics::SanitizerCfiGeneralizePointersRequiresCfi);
         }
     }
 
     // LLVM CFI integer normalization requires CFI or KCFI.
     if sess.is_sanitizer_cfi_normalize_integers_enabled() {
         if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
-            sess.dcx().emit_err(errors::SanitizerCfiNormalizeIntegersRequiresCfi);
+            sess.dcx().emit_err(diagnostics::SanitizerCfiNormalizeIntegersRequiresCfi);
         }
     }
 
@@ -1300,19 +1528,19 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
             || sess.lto() == config::Lto::Thin
             || sess.opts.cg.linker_plugin_lto.enabled())
     {
-        sess.dcx().emit_err(errors::SplitLtoUnitRequiresLto);
+        sess.dcx().emit_err(diagnostics::SplitLtoUnitRequiresLto);
     }
 
     // VFE requires LTO.
     if sess.lto() != config::Lto::Fat {
         if sess.opts.unstable_opts.virtual_function_elimination {
-            sess.dcx().emit_err(errors::UnstableVirtualFunctionElimination);
+            sess.dcx().emit_err(diagnostics::UnstableVirtualFunctionElimination);
         }
     }
 
     if sess.opts.unstable_opts.stack_protector != StackProtector::None {
         if !sess.target.options.supports_stack_protector {
-            sess.dcx().emit_warn(errors::StackProtectorNotSupportedForTarget {
+            sess.dcx().emit_warn(diagnostics::StackProtectorNotSupportedForTarget {
                 stack_protector: sess.opts.unstable_opts.stack_protector,
                 target_triple: &sess.opts.target_triple,
             });
@@ -1321,14 +1549,14 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
 
     if sess.opts.unstable_opts.small_data_threshold.is_some() {
         if sess.target.small_data_threshold_support() == SmallDataThresholdSupport::None {
-            sess.dcx().emit_warn(errors::SmallDataThresholdNotSupportedForTarget {
+            sess.dcx().emit_warn(diagnostics::SmallDataThresholdNotSupportedForTarget {
                 target_triple: &sess.opts.target_triple,
             })
         }
     }
 
-    if sess.opts.unstable_opts.branch_protection.is_some() && sess.target.arch != "aarch64" {
-        sess.dcx().emit_err(errors::BranchProtectionRequiresAArch64);
+    if sess.opts.unstable_opts.branch_protection.is_some() && sess.target.arch != Arch::AArch64 {
+        sess.dcx().emit_err(diagnostics::BranchProtectionRequiresAArch64);
     }
 
     if let Some(dwarf_version) =
@@ -1336,57 +1564,76 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     {
         // DWARF 1 is not supported by LLVM and DWARF 6 is not yet finalized.
         if dwarf_version < 2 || dwarf_version > 5 {
-            sess.dcx().emit_err(errors::UnsupportedDwarfVersion { dwarf_version });
+            sess.dcx().emit_err(diagnostics::UnsupportedDwarfVersion { dwarf_version });
         }
     }
 
     if !sess.target.options.supported_split_debuginfo.contains(&sess.split_debuginfo())
         && !sess.opts.unstable_opts.unstable_options
     {
-        sess.dcx()
-            .emit_err(errors::SplitDebugInfoUnstablePlatform { debuginfo: sess.split_debuginfo() });
+        sess.dcx().emit_err(diagnostics::SplitDebugInfoUnstablePlatform {
+            debuginfo: sess.split_debuginfo(),
+        });
     }
 
     if sess.opts.unstable_opts.embed_source {
         let dwarf_version = sess.dwarf_version();
 
         if dwarf_version < 5 {
-            sess.dcx().emit_warn(errors::EmbedSourceInsufficientDwarfVersion { dwarf_version });
+            sess.dcx()
+                .emit_warn(diagnostics::EmbedSourceInsufficientDwarfVersion { dwarf_version });
         }
 
         if sess.opts.debuginfo == DebugInfo::None {
-            sess.dcx().emit_warn(errors::EmbedSourceRequiresDebugInfo);
+            sess.dcx().emit_warn(diagnostics::EmbedSourceRequiresDebugInfo);
+        }
+    }
+
+    if let InstrumentMcount::Fentry(opts) = sess.opts.unstable_opts.instrument_mcount {
+        if !sess.target.options.supports_fentry {
+            sess.dcx()
+                .emit_err(diagnostics::InstrumentationNotSupported { us: "fentry".to_string() });
+        }
+        if (opts.no_call || opts.record) && sess.target.arch != Arch::S390x {
+            sess.dcx()
+                .emit_err(diagnostics::InstrumentationNotSupported { us: "fentry-*".to_string() });
         }
     }
 
     if sess.opts.unstable_opts.instrument_xray.is_some() && !sess.target.options.supports_xray {
-        sess.dcx().emit_err(errors::InstrumentationNotSupported { us: "XRay".to_string() });
+        sess.dcx().emit_err(diagnostics::InstrumentationNotSupported { us: "XRay".to_string() });
     }
 
-    if let Some(flavor) = sess.opts.cg.linker_flavor {
-        if let Some(compatible_list) = sess.target.linker_flavor.check_compatibility(flavor) {
-            let flavor = flavor.desc();
-            sess.dcx().emit_err(errors::IncompatibleLinkerFlavor { flavor, compatible_list });
-        }
+    if let Some(flavor) = sess.opts.cg.linker_flavor
+        && let Some(compatible_list) = sess.target.linker_flavor.check_compatibility(flavor)
+    {
+        let flavor = flavor.desc();
+        sess.dcx().emit_err(diagnostics::IncompatibleLinkerFlavor { flavor, compatible_list });
     }
 
     if sess.opts.unstable_opts.function_return != FunctionReturn::default() {
-        if sess.target.arch != "x86" && sess.target.arch != "x86_64" {
-            sess.dcx().emit_err(errors::FunctionReturnRequiresX86OrX8664);
+        if !matches!(sess.target.arch, Arch::X86 | Arch::X86_64) {
+            sess.dcx().emit_err(diagnostics::FunctionReturnRequiresX86OrX8664);
+        }
+    }
+
+    if sess.opts.unstable_opts.indirect_branch_cs_prefix {
+        if !matches!(sess.target.arch, Arch::X86 | Arch::X86_64) {
+            sess.dcx().emit_err(diagnostics::IndirectBranchCsPrefixRequiresX86OrX8664);
         }
     }
 
     if let Some(regparm) = sess.opts.unstable_opts.regparm {
         if regparm > 3 {
-            sess.dcx().emit_err(errors::UnsupportedRegparm { regparm });
+            sess.dcx().emit_err(diagnostics::UnsupportedRegparm { regparm });
         }
-        if sess.target.arch != "x86" {
-            sess.dcx().emit_err(errors::UnsupportedRegparmArch);
+        if sess.target.arch != Arch::X86 {
+            sess.dcx().emit_err(diagnostics::UnsupportedRegparmArch);
         }
     }
     if sess.opts.unstable_opts.reg_struct_return {
-        if sess.target.arch != "x86" {
-            sess.dcx().emit_err(errors::UnsupportedRegStructReturnArch);
+        if sess.target.arch != Arch::X86 {
+            sess.dcx().emit_err(diagnostics::UnsupportedRegStructReturnArch);
         }
     }
 
@@ -1401,40 +1648,38 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
             if let Some(code_model) = sess.code_model()
                 && code_model == CodeModel::Large
             {
-                sess.dcx().emit_err(errors::FunctionReturnThunkExternRequiresNonLargeCodeModel);
+                sess.dcx()
+                    .emit_err(diagnostics::FunctionReturnThunkExternRequiresNonLargeCodeModel);
             }
         }
     }
 
-    if sess.opts.cg.soft_float {
-        if sess.target.arch == "arm" {
-            sess.dcx().emit_warn(errors::SoftFloatDeprecated);
-        } else {
-            // All `use_softfp` does is the equivalent of `-mfloat-abi` in GCC/clang, which only exists on ARM targets.
-            // We document this flag to only affect `*eabihf` targets, so let's show a warning for all other targets.
-            sess.dcx().emit_warn(errors::SoftFloatIgnored);
+    if sess.opts.unstable_opts.packed_stack {
+        if sess.target.arch != Arch::S390x {
+            sess.dcx().emit_err(diagnostics::UnsupportedPackedStack);
+        }
+    }
+
+    if let Some(ref cpu_name) = sess.opts.cg.target_cpu {
+        if cpu_name == NATIVE_CPU && sess.target.requires_consistent_cpu {
+            sess.dcx().emit_fatal(diagnostics::NativeTargetCpuNotAllowed {
+                target_triple: &sess.opts.target_triple,
+                need_explicit_cpu: sess.target.need_explicit_cpu,
+            });
         }
     }
 }
 
 /// Holds data on the current incremental compilation session, if there is one.
-#[derive(Debug)]
-enum IncrCompSession {
-    /// This is the state the session will be in until the incr. comp. dir is
-    /// needed.
-    NotInitialized,
-    /// This is the state during which the session directory is private and can
-    /// be modified. `_lock_file` is never directly used, but its presence
+pub struct IncrCompSession {
+    /// The directory containing all cached data. Cached data from a previous
+    /// session can be read out of it and new data for the current session will
+    /// be written into it.
+    pub session_directory: PathBuf,
+    /// `_lock_file` is never directly used, but its presence
     /// alone has an effect, because the file will unlock when the session is
     /// dropped.
-    Active { session_directory: PathBuf, _lock_file: flock::Lock },
-    /// This is the state after the session directory has been finalized. In this
-    /// state, the contents of the directory must not be modified any more.
-    Finalized { session_directory: PathBuf },
-    /// This is an error state that is reached when some compilation error has
-    /// occurred. It indicates that the contents of the session directory must
-    /// not be used, since they might be invalid.
-    InvalidBecauseOfErrors { session_directory: PathBuf },
+    pub _lock_file: flock::Lock,
 }
 
 /// A wrapper around an [`DiagCtxt`] that is used for early error emissions.
@@ -1457,73 +1702,49 @@ impl EarlyDiagCtxt {
         self.dcx = DiagCtxt::new(emitter);
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_note(&self, msg: impl Into<DiagMessage>) {
         self.dcx.handle().note(msg)
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_help(&self, msg: impl Into<DiagMessage>) {
         self.dcx.handle().struct_help(msg).emit()
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     #[must_use = "raise_fatal must be called on the returned ErrorGuaranteed in order to exit with a non-zero status code"]
     pub fn early_err(&self, msg: impl Into<DiagMessage>) -> ErrorGuaranteed {
         self.dcx.handle().err(msg)
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_fatal(&self, msg: impl Into<DiagMessage>) -> ! {
         self.dcx.handle().fatal(msg)
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_struct_fatal(&self, msg: impl Into<DiagMessage>) -> Diag<'_, FatalAbort> {
         self.dcx.handle().struct_fatal(msg)
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_warn(&self, msg: impl Into<DiagMessage>) {
         self.dcx.handle().warn(msg)
     }
 
-    #[allow(rustc::untranslatable_diagnostic)]
-    #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_struct_warn(&self, msg: impl Into<DiagMessage>) -> Diag<'_, ()> {
         self.dcx.handle().struct_warn(msg)
     }
 }
 
 fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
-    // FIXME(#100717): early errors aren't translated at the moment, so this is fine, but it will
-    // need to reference every crate that might emit an early error for translation to work.
-    let fallback_bundle =
-        fallback_fluent_bundle(vec![rustc_errors::DEFAULT_LOCALE_RESOURCE], false);
     let emitter: Box<DynEmitter> = match output {
-        config::ErrorOutputType::HumanReadable { kind, color_config } => {
-            let short = kind.short();
-            Box::new(
-                HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
-                    .theme(if let HumanReadableErrorType::Unicode = kind {
-                        OutputTheme::Unicode
-                    } else {
-                        OutputTheme::Ascii
-                    })
+        config::ErrorOutputType::HumanReadable { kind, color_config } => match kind {
+            HumanReadableErrorType { short, unicode } => Box::new(
+                AnnotateSnippetEmitter::new(stderr_destination(color_config))
+                    .theme(if unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
                     .short_message(short),
-            )
-        }
+            ),
+        },
         config::ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             Box::new(JsonEmitter::new(
                 Box::new(io::BufWriter::new(io::stderr())),
                 Some(Arc::new(SourceMap::new(FilePathMapping::empty()))),
-                fallback_bundle,
                 pretty,
                 json_rendered,
                 color_config,
@@ -1531,47 +1752,4 @@ fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
         }
     };
     emitter
-}
-
-pub trait RemapFileNameExt {
-    type Output<'a>
-    where
-        Self: 'a;
-
-    /// Returns a possibly remapped filename based on the passed scope and remap cli options.
-    ///
-    /// One and only one scope should be passed to this method, it will panic otherwise.
-    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_>;
-}
-
-impl RemapFileNameExt for rustc_span::FileName {
-    type Output<'a> = rustc_span::FileNameDisplay<'a>;
-
-    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_> {
-        assert!(
-            scope.bits().count_ones() == 1,
-            "one and only one scope should be passed to for_scope"
-        );
-        if sess.opts.unstable_opts.remap_path_scope.contains(scope) {
-            self.prefer_remapped_unconditionaly()
-        } else {
-            self.prefer_local()
-        }
-    }
-}
-
-impl RemapFileNameExt for rustc_span::RealFileName {
-    type Output<'a> = &'a Path;
-
-    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_> {
-        assert!(
-            scope.bits().count_ones() == 1,
-            "one and only one scope should be passed to for_scope"
-        );
-        if sess.opts.unstable_opts.remap_path_scope.contains(scope) {
-            self.remapped_path_if_available()
-        } else {
-            self.local_path_if_available()
-        }
-    }
 }

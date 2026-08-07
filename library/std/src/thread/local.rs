@@ -8,8 +8,8 @@ use crate::fmt;
 
 /// A thread local storage (TLS) key which owns its contents.
 ///
-/// This key uses the fastest possible implementation available to it for the
-/// target platform. It is instantiated with the [`thread_local!`] macro and the
+/// This key uses the fastest implementation available on the target platform.
+/// It is instantiated with the [`thread_local!`] macro and the
 /// primary method is the [`with`] method, though there are helpers to make
 /// working with [`Cell`] types easier.
 ///
@@ -24,12 +24,17 @@ use crate::fmt;
 /// [`with`]) within a thread, and values that implement [`Drop`] get
 /// destructed when a thread exits. Some platform-specific caveats apply, which
 /// are explained below.
-/// Note that, should the destructor panics, the whole process will be [aborted].
+/// Note that, should the destructor panic, the whole process will be [aborted].
+/// On platforms where initialization requires memory allocation, this is
+/// performed directly through [`System`], allowing the [global allocator]
+/// to make use of thread local storage.
 ///
 /// A `LocalKey`'s initializer cannot recursively depend on itself. Using a
-/// `LocalKey` in this way may cause panics, aborts or infinite recursion on
+/// `LocalKey` in this way may cause panics, aborts, or infinite recursion on
 /// the first call to `with`.
 ///
+/// [`System`]: crate::alloc::System
+/// [global allocator]: crate::alloc
 /// [aborted]: crate::process::abort
 ///
 /// # Single-thread Synchronization
@@ -93,17 +98,18 @@ use crate::fmt;
 ///    run on the thread that causes the process to exit. This is because the
 ///    other threads may be forcibly terminated.
 ///
-/// ## Synchronization in thread-local destructors
+///    If a thread is [converted into a fiber], destructors will not be run unless
+///    the fiber is [converted back into a thread] before the underlying thread exits.
 ///
-/// On Windows, synchronization operations (such as [`JoinHandle::join`]) in
-/// thread local destructors are prone to deadlocks and so should be avoided.
-/// This is because the [loader lock] is held while a destructor is run. The
-/// lock is acquired whenever a thread starts or exits or when a DLL is loaded
-/// or unloaded. Therefore these events are blocked for as long as a thread
-/// local destructor is running.
+///    If a process loads a Rust `cdylib`, it must not cause the Rust TLS destructor support
+//     to be initialized for the first time during process shutdown.
 ///
+///    When dynamically unloading a Rust `cdylib`, pending TLS destructors may run
+//     during the unload or may be leaked.
+///
+/// [converted into a fiber]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-convertthreadtofiber
+/// [converted back into a thread]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-convertfibertothread
 /// [loader lock]: https://docs.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices
-/// [`JoinHandle::join`]: crate::thread::JoinHandle::join
 /// [`with`]: LocalKey::with
 #[cfg_attr(not(test), rustc_diagnostic_item = "LocalKey")]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -130,6 +136,165 @@ impl<T: 'static> fmt::Debug for LocalKey<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalKey").finish_non_exhaustive()
     }
+}
+
+#[doc(hidden)]
+#[allow_internal_unstable(thread_local_internals)]
+#[unstable(feature = "thread_local_internals", issue = "none")]
+#[rustc_macro_transparency = "semiopaque"]
+pub macro thread_local_process_attrs {
+
+    // Parse `cfg_attr` to figure out whether it's a `rustc_align_static`.
+    // Each `cfg_attr` can have zero or more attributes on the RHS, and can be nested.
+
+    // finished parsing the `cfg_attr`, it had no `rustc_align_static`
+    (
+        [] [$(#[$($prev_other_attrs:tt)*])*];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [] };
+        [$($prev_align_attrs_ret:tt)*] [$($prev_other_attrs_ret:tt)*];
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs_ret)*] [$($prev_other_attrs_ret)* #[cfg_attr($($predicate)*, $($($prev_other_attrs)*),*)]];
+            $($rest)*
+        );
+    ),
+
+    // finished parsing the `cfg_attr`, it had nothing but `rustc_align_static`
+    (
+        [$(#[$($prev_align_attrs:tt)*])+] [];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [] };
+        [$($prev_align_attrs_ret:tt)*] [$($prev_other_attrs_ret:tt)*];
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs_ret)*  #[cfg_attr($($predicate)*, $($($prev_align_attrs)*),+)]] [$($prev_other_attrs_ret)*];
+            $($rest)*
+        );
+    ),
+
+    // finished parsing the `cfg_attr`, it had a mix of `rustc_align_static` and other attrs
+    (
+        [$(#[$($prev_align_attrs:tt)*])+] [$(#[$($prev_other_attrs:tt)*])+];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [] };
+        [$($prev_align_attrs_ret:tt)*] [$($prev_other_attrs_ret:tt)*];
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs_ret)*  #[cfg_attr($($predicate)*, $($($prev_align_attrs)*),+)]] [$($prev_other_attrs_ret)* #[cfg_attr($($predicate)*, $($($prev_other_attrs)*),+)]];
+            $($rest)*
+        );
+    ),
+
+    // it's a `rustc_align_static`
+    (
+        [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [rustc_align_static($($align_static_args:tt)*) $(, $($attr_rhs:tt)*)?] };
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)* #[rustc_align_static($($align_static_args)*)]] [$($prev_other_attrs)*];
+            @processing_cfg_attr { pred: ($($predicate)*), rhs: [$($($attr_rhs)*)?] };
+            $($rest)*
+        );
+    ),
+
+    // it's a nested `cfg_attr(..., ...)`; recurse into RHS
+    (
+        [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [cfg_attr($cfg_lhs:expr, $($cfg_rhs:tt)*) $(, $($attr_rhs:tt)*)?] };
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [] [];
+            @processing_cfg_attr { pred: ($cfg_lhs), rhs: [$($cfg_rhs)*] };
+            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
+            @processing_cfg_attr { pred: ($($predicate)*), rhs: [$($($attr_rhs)*)?] };
+            $($rest)*
+        );
+    ),
+
+    // it's some other attribute
+    (
+        [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [$meta:meta $(, $($attr_rhs:tt)*)?] };
+        $($rest:tt)*
+    ) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)*] [$($prev_other_attrs)* #[$meta]];
+            @processing_cfg_attr { pred: ($($predicate)*), rhs: [$($($attr_rhs)*)?] };
+            $($rest)*
+        );
+    ),
+
+
+    // Separate attributes into `rustc_align_static` and everything else:
+
+    // `rustc_align_static` attribute
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[rustc_align_static $($attr_rest:tt)*] $($rest:tt)*) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)* #[rustc_align_static $($attr_rest)*]] [$($prev_other_attrs)*];
+            $($rest)*
+        );
+    ),
+
+    // `cfg_attr(..., ...)` attribute; parse it
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[cfg_attr($cfg_pred:expr, $($cfg_rhs:tt)*)] $($rest:tt)*) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [] [];
+            @processing_cfg_attr { pred: ($cfg_pred), rhs: [$($cfg_rhs)*] };
+            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
+            $($rest)*
+        );
+    ),
+
+    // doc comment not followed by any other attributes; process it all at once to avoid blowing recursion limit
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; $(#[doc $($doc_rhs:tt)*])+ $vis:vis static $($rest:tt)*) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)*] [$($prev_other_attrs)* $(#[doc $($doc_rhs)*])+];
+            $vis static $($rest)*
+        );
+    ),
+
+    // 8 lines of doc comment; process them all at once to avoid blowing recursion limit
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
+     #[doc $($doc_rhs_1:tt)*] #[doc $($doc_rhs_2:tt)*] #[doc $($doc_rhs_3:tt)*] #[doc $($doc_rhs_4:tt)*]
+     #[doc $($doc_rhs_5:tt)*] #[doc $($doc_rhs_6:tt)*] #[doc $($doc_rhs_7:tt)*] #[doc $($doc_rhs_8:tt)*]
+     $($rest:tt)*) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)*] [$($prev_other_attrs)*
+            #[doc $($doc_rhs_1)*] #[doc $($doc_rhs_2)*] #[doc $($doc_rhs_3)*] #[doc $($doc_rhs_4)*]
+            #[doc $($doc_rhs_5)*] #[doc $($doc_rhs_6)*] #[doc $($doc_rhs_7)*] #[doc $($doc_rhs_8)*]];
+            $($rest)*
+        );
+    ),
+
+    // other attribute
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[$($attr:tt)*] $($rest:tt)*) => (
+        $crate::thread::local_impl::thread_local_process_attrs!(
+            [$($prev_align_attrs)*] [$($prev_other_attrs)* #[$($attr)*]];
+            $($rest)*
+        );
+    ),
+
+
+    // Delegate to `thread_local_inner` once attributes are fully categorized:
+
+    // process `const` declaration and recurse
+    ([$($align_attrs:tt)*] [$($other_attrs:tt)*]; $vis:vis static $name:ident: $t:ty = const $init:block $(; $($($rest:tt)+)?)?) => (
+        $($other_attrs)* $vis const $name: $crate::thread::LocalKey<$t> =
+            $crate::thread::local_impl::thread_local_inner!(@key $t, $($align_attrs)*, const $init);
+
+        $($($crate::thread::local_impl::thread_local_process_attrs!([] []; $($rest)+);)?)?
+    ),
+
+    // process non-`const` declaration and recurse
+    ([$($align_attrs:tt)*] [$($other_attrs:tt)*]; $vis:vis static $name:ident: $t:ty = $init:expr $(; $($($rest:tt)+)?)?) => (
+        $($other_attrs)* $vis const $name: $crate::thread::LocalKey<$t> =
+            $crate::thread::local_impl::thread_local_inner!(@key $t, $($align_attrs)*, $init);
+
+        $($($crate::thread::local_impl::thread_local_process_attrs!([] []; $($rest)+);)?)?
+    ),
 }
 
 /// Declare a new thread local storage key of type [`std::thread::LocalKey`].
@@ -181,29 +346,13 @@ impl<T: 'static> fmt::Debug for LocalKey<T> {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "thread_local_macro")]
 #[allow_internal_unstable(thread_local_internals)]
+#[rustc_diagnostic_opaque]
 macro_rules! thread_local {
-    // empty (base case for the recursion)
     () => {};
 
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = const $init:block; $($rest:tt)*) => (
-        $crate::thread::local_impl::thread_local_inner!($(#[$attr])* $vis $name, $t, const $init);
-        $crate::thread_local!($($rest)*);
-    );
-
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = const $init:block) => (
-        $crate::thread::local_impl::thread_local_inner!($(#[$attr])* $vis $name, $t, const $init);
-    );
-
-    // process multiple declarations
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr; $($rest:tt)*) => (
-        $crate::thread::local_impl::thread_local_inner!($(#[$attr])* $vis $name, $t, $init);
-        $crate::thread_local!($($rest)*);
-    );
-
-    // handle a single declaration
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr) => (
-        $crate::thread::local_impl::thread_local_inner!($(#[$attr])* $vis $name, $t, $init);
-    );
+    ($($tt:tt)+) => {
+        $crate::thread::local_impl::thread_local_process_attrs!([] []; $($tt)+);
+    };
 }
 
 /// An error returned by [`LocalKey::try_with`](struct.LocalKey.html#method.try_with).
@@ -230,7 +379,7 @@ impl fmt::Display for AccessError {
 impl Error for AccessError {}
 
 // This ensures the panicking code is outlined from `with` for `LocalKey`.
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
+#[cfg_attr(not(panic = "immediate-abort"), inline(never))]
 #[track_caller]
 #[cold]
 fn panic_access_error(err: AccessError) -> ! {
@@ -286,7 +435,7 @@ impl<T: 'static> LocalKey<T> {
     ///
     /// This will lazily initialize the value if this thread has not referenced
     /// this key yet. If the key has been destroyed (which may happen if this is called
-    /// in a destructor), this function will return an [`AccessError`].
+    /// in a destructor), this function may return an [`AccessError`].
     ///
     /// # Panics
     ///
@@ -468,6 +617,36 @@ impl<T: 'static> LocalKey<Cell<T>> {
     #[rustc_confusables("swap")]
     pub fn replace(&'static self, value: T) -> T {
         self.with(|cell| cell.replace(value))
+    }
+
+    /// Updates the contained value using a function.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    ///
+    /// thread_local! {
+    ///     static X: Cell<i32> = const { Cell::new(5) };
+    /// }
+    ///
+    /// X.update(|x| x + 1);
+    /// assert_eq!(X.get(), 6);
+    /// ```
+    #[stable(feature = "local_key_cell_update", since = "CURRENT_RUSTC_VERSION")]
+    pub fn update(&'static self, f: impl FnOnce(T) -> T)
+    where
+        T: Copy,
+    {
+        self.with(|cell| cell.update(f))
     }
 }
 

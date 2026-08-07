@@ -6,13 +6,14 @@ use rustc_infer::traits::util::PredicateSet;
 use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
-    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Upcast, VtblEntry,
+    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
+    VtblEntry,
 };
 use rustc_span::DUMMY_SP;
 use smallvec::{SmallVec, smallvec};
 use tracing::debug;
 
-use crate::traits::{impossible_predicates, is_vtable_safe_method};
+use crate::traits::is_vtable_safe_method;
 
 #[derive(Clone, Debug)]
 pub enum VtblSegment<'tcx> {
@@ -121,10 +122,12 @@ fn prepare_vtable_segments_inner<'tcx, T>(
             let &(inner_most_trait_ref, _, _) = stack.last().unwrap();
 
             let mut direct_super_traits_iter = tcx
-                .explicit_super_predicates_of(inner_most_trait_ref.def_id)
+                .explicit_super_clauses_of(inner_most_trait_ref.def_id)
                 .iter_identity_copied()
-                .filter_map(move |(pred, _)| {
-                    pred.instantiate_supertrait(tcx, ty::Binder::dummy(inner_most_trait_ref))
+                .map(Unnormalized::skip_norm_wip)
+                .filter_map(move |(clause, _)| {
+                    clause
+                        .instantiate_supertrait(tcx, ty::Binder::dummy(inner_most_trait_ref))
                         .as_trait_clause()
                 })
                 .map(move |pred| {
@@ -153,7 +156,12 @@ fn prepare_vtable_segments_inner<'tcx, T>(
 
         // emit innermost item, move to next sibling and stop there if possible, otherwise jump to outer level.
         while let Some((inner_most_trait_ref, emit_vptr, mut siblings)) = stack.pop() {
-            let has_entries = has_own_existential_vtable_entries(tcx, inner_most_trait_ref.def_id);
+            // We don't need to emit a vptr for "truly-empty" supertraits, but we *do* need to emit a
+            // vptr for supertraits that have no methods, but that themselves have supertraits
+            // with methods, so we check if any transitive supertrait has entries here (this includes
+            // the trait itself).
+            let has_entries = ty::elaborate::supertrait_def_ids(tcx, inner_most_trait_ref.def_id)
+                .any(|def_id| has_own_existential_vtable_entries(tcx, def_id));
 
             segment_visitor(VtblSegment::TraitOwnEntries {
                 trait_ref: inner_most_trait_ref,
@@ -181,8 +189,7 @@ fn prepare_vtable_segments_inner<'tcx, T>(
 
 /// Turns option of iterator into an iterator (this is just flatten)
 fn maybe_iter<I: Iterator>(i: Option<I>) -> impl Iterator<Item = I::Item> {
-    // Flatten is bad perf-vise, we could probably implement a special case here that is better
-    i.into_iter().flatten()
+    i.into_flat_iter()
 }
 
 fn has_own_existential_vtable_entries(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
@@ -205,6 +212,11 @@ fn own_existential_vtable_entries_iter(
         debug!("own_existential_vtable_entry: trait_method={:?}", trait_method);
         let def_id = trait_method.def_id;
 
+        // Final methods should not be included in the vtable.
+        if trait_method.defaultness(tcx).is_final() {
+            return None;
+        }
+
         // Some methods cannot be called on an object; skip those.
         if !is_vtable_safe_method(tcx, trait_def_id, trait_method) {
             debug!("own_existential_vtable_entry: not vtable safe");
@@ -224,11 +236,7 @@ fn vtable_entries<'tcx>(
     trait_ref: ty::TraitRef<'tcx>,
 ) -> &'tcx [VtblEntry<'tcx>] {
     debug_assert!(!trait_ref.has_non_region_infer() && !trait_ref.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), trait_ref),
-        trait_ref,
-        "vtable trait ref should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), trait_ref);
 
     debug!("vtable_entries({:?})", trait_ref);
 
@@ -253,25 +261,23 @@ fn vtable_entries<'tcx>(
                     // FIXME: Is this normalize needed?
                     let args = tcx.normalize_erasing_regions(
                         ty::TypingEnv::fully_monomorphized(),
-                        GenericArgs::for_item(tcx, def_id, |param, _| match param.kind {
-                            GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
-                            GenericParamDefKind::Type { .. }
-                            | GenericParamDefKind::Const { .. } => {
-                                trait_ref.args[param.index as usize]
+                        Unnormalized::new_wip(GenericArgs::for_item(tcx, def_id, |param, _| {
+                            match param.kind {
+                                GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+                                GenericParamDefKind::Type { .. }
+                                | GenericParamDefKind::Const { .. } => {
+                                    trait_ref.args[param.index as usize]
+                                }
                             }
-                        }),
+                        })),
                     );
 
                     // It's possible that the method relies on where-clauses that
                     // do not hold for this particular set of type parameters.
                     // Note that this method could then never be called, so we
                     // do not want to try and codegen it, in that case (see #23435).
-                    let predicates = tcx.predicates_of(def_id).instantiate_own(tcx, args);
-                    if impossible_predicates(
-                        tcx,
-                        predicates.map(|(predicate, _)| predicate).collect(),
-                    ) {
-                        debug!("vtable_entries: predicates do not hold");
+                    if tcx.instantiate_and_check_impossible_clauses((def_id, args)) {
+                        debug!("vtable_entries: clauses do not hold");
                         return VtblEntry::Vacant;
                     }
 
@@ -306,13 +312,9 @@ fn vtable_entries<'tcx>(
 // for `Supertrait`'s methods in the vtable of `Subtrait`.
 pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRef<'tcx>) -> usize {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), key),
-        key,
-        "vtable trait ref should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
-    let ty::Dynamic(source, _, _) = *key.self_ty().kind() else {
+    let ty::Dynamic(source, _) = *key.self_ty().kind() else {
         bug!();
     };
     let source_principal = tcx.instantiate_bound_regions_with_erased(
@@ -320,10 +322,9 @@ pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRe
     );
 
     // We're monomorphizing a call to a dyn trait object that can never be constructed.
-    if tcx.instantiate_and_check_impossible_predicates((
-        source_principal.def_id,
-        source_principal.args,
-    )) {
+    if tcx
+        .instantiate_and_check_impossible_clauses((source_principal.def_id, source_principal.args))
+    {
         return 0;
     }
 
@@ -370,22 +371,18 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
     ),
 ) -> Option<usize> {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), key),
-        key,
-        "upcasting trait refs should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
     let (source, target) = key;
 
     // If the target principal is `None`, we can just return `None`.
-    let ty::Dynamic(target_data, _, _) = *target.kind() else {
+    let ty::Dynamic(target_data, _) = *target.kind() else {
         bug!();
     };
     let target_principal = tcx.instantiate_bound_regions_with_erased(target_data.principal()?);
 
     // Given that we have a target principal, it is a bug for there not to be a source principal.
-    let ty::Dynamic(source_data, _, _) = *source.kind() else {
+    let ty::Dynamic(source_data, _) = *source.kind() else {
         bug!();
     };
     let source_principal = tcx.instantiate_bound_regions_with_erased(
@@ -393,10 +390,9 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
     );
 
     // We're monomorphizing a dyn trait object upcast that can never be constructed.
-    if tcx.instantiate_and_check_impossible_predicates((
-        source_principal.def_id,
-        source_principal.args,
-    )) {
+    if tcx
+        .instantiate_and_check_impossible_clauses((source_principal.def_id, source_principal.args))
+    {
         return None;
     }
 
@@ -429,7 +425,16 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
         }
     };
 
-    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap()
+    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap_or_else(|| {
+        // This can happen if the trait hierarchy is malformed (e.g., due to
+        // missing generics on a supertrait bound). There should already be an error
+        // emitted for this, so we just delay the ICE.
+        tcx.dcx().delayed_bug(format!(
+            "could not find the supertrait vtable slot for `{}` -> `{}`",
+            source, target
+        ));
+        None
+    })
 }
 
 pub(super) fn provide(providers: &mut Providers) {

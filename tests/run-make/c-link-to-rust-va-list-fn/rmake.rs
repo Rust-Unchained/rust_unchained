@@ -3,12 +3,16 @@
 // prevent the creation of a functional binary.
 // See https://github.com/rust-lang/rust/pull/49878
 
-//@ ignore-cross-compile
+//@ needs-target-std
+//@ ignore-android: FIXME(#142855)
+//@ ignore-sgx: (x86 machine code cannot be directly executed)
+//@ ignore-pauthtest: (it requires non-trivial compilation of c sources, and only supports dynamic
+//  linking, ignore the test).
 
 use run_make_support::{cc, extra_c_flags, run, rustc, static_lib_name};
 
 fn main() {
-    rustc().input("checkrust.rs").run();
+    rustc().edition("2021").input("checkrust.rs").run();
     cc().input("test.c")
         .input(static_lib_name("checkrust"))
         .out_exe("test")

@@ -1,19 +1,25 @@
+use std::ops::RangeInclusive;
+
 use hir::{HirDisplay, TypeInfo};
 use ide_db::{
     assists::GroupLabel,
-    syntax_helpers::{suggest_name, LexedStr},
+    syntax_helpers::{LexedStr, suggest_name},
 };
 use syntax::{
-    algo::ancestors_at_offset,
+    Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, T, TextRange,
+    algo::{ancestors_at_offset, skip_trivia_token},
     ast::{
-        self, edit::IndentLevel, edit_in_place::Indent, make, syntax_factory::SyntaxFactory,
-        AstNode,
+        self, AstNode,
+        edit::{AstNodeEdit, IndentLevel},
     },
-    syntax_editor::Position,
-    NodeOrToken, SyntaxKind, SyntaxNode, T,
+    hacks::parse_expr_from_str,
+    syntax_editor::{Element, Position},
 };
 
-use crate::{utils::is_body_const, AssistContext, AssistId, AssistKind, Assists};
+use crate::{
+    AssistContext, AssistId, Assists,
+    utils::{cover_edit_range, is_body_const},
+};
 
 // Assist: extract_variable
 //
@@ -65,17 +71,15 @@ use crate::{utils::is_body_const, AssistContext, AssistId, AssistKind, Assists};
 //     VAR_NAME * 4;
 // }
 // ```
-pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let node = if ctx.has_empty_selection() {
         if let Some(t) = ctx.token_at_offset().find(|it| it.kind() == T![;]) {
             t.parent().and_then(ast::ExprStmt::cast)?.syntax().clone()
-        } else if let Some(expr) = ancestors_at_offset(ctx.source_file().syntax(), ctx.offset())
-            .next()
-            .and_then(ast::Expr::cast)
-        {
-            expr.syntax().ancestors().find_map(valid_target_expr)?.syntax().clone()
         } else {
-            return None;
+            let expr = ancestors_at_offset(ctx.source_file().syntax(), ctx.offset())
+                .next()
+                .and_then(ast::Expr::cast)?;
+            expr.syntax().ancestors().find_map(valid_target_expr(ctx))?.syntax().clone()
         }
     } else {
         match ctx.covering_element() {
@@ -91,27 +95,55 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
     let node = node.ancestors().take_while(|anc| anc.text_range() == node.text_range()).last()?;
     let range = node.text_range();
 
-    let to_extract = node
-        .descendants()
-        .take_while(|it| range.contains_range(it.text_range()))
-        .find_map(valid_target_expr)?;
+    let (to_replace, analysis, use_source_expr) = if node.kind() == SyntaxKind::TOKEN_TREE {
+        let (first, last) = extract_token_range_of(&node, ctx.selection_trimmed())?;
 
-    let ty = ctx.sema.type_of_expr(&to_extract).map(TypeInfo::adjusted);
+        let first_descend = ctx.sema.descend_into_macros_single_exact(first.clone());
+        let last_descend = ctx.sema.descend_into_macros_single_exact(last.clone());
+        let range = first_descend.text_range().cover(last_descend.text_range());
+
+        if first_descend.tree_top() != last_descend.tree_top() {
+            return None;
+        }
+
+        let expr = first_descend
+            .parent_ancestors()
+            .skip_while(|it| !it.text_range().contains_range(range))
+            .find_map(valid_target_expr(ctx))?;
+        let original_range = ctx.sema.original_range(expr.syntax());
+        if !node.text_range().contains_range(original_range.range) {
+            return None;
+        }
+        (cover_edit_range(&node, original_range.range), expr, true)
+    } else {
+        let expr = node
+            .descendants()
+            .take_while(|it| range.contains_range(it.text_range()))
+            .find_map(valid_target_expr(ctx))?;
+        let to_extract = expr.syntax().syntax_element();
+        (to_extract.clone()..=to_extract, expr, false)
+    };
+    let place = match to_replace.start() {
+        NodeOrToken::Node(node) => node.clone(),
+        NodeOrToken::Token(t) => t.parent()?,
+    };
+
+    let ty = ctx.sema.type_of_expr(&analysis).map(TypeInfo::adjusted);
     if matches!(&ty, Some(ty_info) if ty_info.is_unit()) {
         return None;
     }
 
-    let parent = to_extract.syntax().parent().and_then(ast::Expr::cast);
+    let parent = analysis.syntax().parent().and_then(ast::Expr::cast);
     // Any expression that autoderefs may need adjustment.
     let mut needs_adjust = parent.as_ref().is_some_and(|it| match it {
         ast::Expr::FieldExpr(_)
         | ast::Expr::MethodCallExpr(_)
         | ast::Expr::CallExpr(_)
         | ast::Expr::AwaitExpr(_) => true,
-        ast::Expr::IndexExpr(index) if index.base().as_ref() == Some(&to_extract) => true,
+        ast::Expr::IndexExpr(index) if index.base().as_ref() == Some(&analysis) => true,
         _ => false,
     });
-    let mut to_extract_no_ref = peel_parens(to_extract.clone());
+    let mut to_extract_no_ref = peel_parens(analysis.clone());
     let needs_ref = needs_adjust
         && match &to_extract_no_ref {
             ast::Expr::FieldExpr(_)
@@ -126,14 +158,14 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
             }
             _ => false,
         };
-    let module = ctx.sema.scope(to_extract.syntax())?.module();
-    let target = to_extract.syntax().text_range();
+    let module = ctx.sema.scope(analysis.syntax())?.module();
+    let target = to_replace.start().text_range().cover(to_replace.end().text_range());
     let needs_mut = match &parent {
         Some(ast::Expr::RefExpr(expr)) => expr.mut_token().is_some(),
         _ => needs_adjust && !needs_ref && ty.as_ref().is_some_and(|ty| ty.is_mutable_reference()),
     };
     for kind in ExtractionKind::ALL {
-        let Some(anchor) = Anchor::from(&to_extract, kind) else {
+        let Some(anchor) = Anchor::from(&place, kind) else {
             continue;
         };
 
@@ -168,19 +200,31 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
             kind.label(),
             target,
             |edit| {
-                let (var_name, expr_replace) = kind.get_name_and_expr(ctx, &to_extract);
+                let (var_name, expr_replace) = kind.get_name_and_expr(ctx, &analysis);
 
-                let make = SyntaxFactory::new();
-                let mut editor = edit.make_editor(&expr_replace);
+                let to_replace = if expr_replace.tree_top() == to_replace.start().tree_top() {
+                    let element = expr_replace.clone().syntax_element();
+                    element.clone()..=element
+                } else {
+                    to_replace.clone()
+                };
+
+                let editor = edit.make_editor(&place);
+                let make = editor.make();
 
                 let pat_name = make.name(&var_name);
-                let name_expr = make.expr_path(make::ext::ident_path(&var_name));
+                let name_expr = make.expr_path(make.ident_path(&var_name));
 
                 if let Some(cap) = ctx.config.snippet_cap {
                     let tabstop = edit.make_tabstop_before(cap);
                     editor.add_annotation(pat_name.syntax().clone(), tabstop);
                 }
 
+                let to_extract_no_ref = if use_source_expr {
+                    source_expr(ctx, to_replace.clone()).unwrap()
+                } else {
+                    to_extract_no_ref.clone()
+                };
                 let initializer = match ty.as_ref().filter(|_| needs_ref) {
                     Some(receiver_type) if receiver_type.is_mutable_reference() => {
                         make.expr_ref(to_extract_no_ref.clone(), true)
@@ -198,7 +242,7 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                     }
                     ExtractionKind::Constant => {
                         let ast_ty = make.ty(&ty_string);
-                        ast::Item::Const(make.item_const(None, pat_name, ast_ty, initializer))
+                        ast::Item::Const(make.item_const(None, None, pat_name, ast_ty, initializer))
                             .into()
                     }
                     ExtractionKind::Static => {
@@ -231,11 +275,11 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                             Position::before(place),
                             vec![
                                 new_stmt.syntax().clone().into(),
-                                make::tokens::whitespace(&trailing_ws).into(),
+                                make.whitespace(&trailing_ws).into(),
                             ],
                         );
 
-                        editor.replace(expr_replace, name_expr.syntax());
+                        editor.replace_all(to_replace, vec![name_expr.syntax().syntax_element()]);
                     }
                     Anchor::Replace(stmt) => {
                         cov_mark::hit!(test_extract_var_expr_stmt);
@@ -251,25 +295,40 @@ pub(crate) fn extract_variable(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                             make.block_expr([new_stmt], Some(name_expr))
                         } else {
                             // `expr_replace` is a descendant of `to_wrap`, so we just replace it with `name_expr`.
-                            editor.replace(expr_replace, name_expr.syntax());
+                            editor
+                                .replace_all(to_replace, vec![name_expr.syntax().syntax_element()]);
                             make.block_expr([new_stmt], Some(to_wrap.clone()))
-                        };
+                        }
+                        // fixup indentation of block
+                        .indent_with_mapping(indent_to, make);
 
                         editor.replace(to_wrap.syntax(), block.syntax());
-
-                        // fixup indentation of block
-                        block.indent(indent_to);
                     }
                 }
-
-                editor.add_mappings(make.finish_with_mappings());
-                edit.add_file_edits(ctx.file_id(), editor);
+                edit.add_file_edits(ctx.vfs_file_id(), editor);
                 edit.rename();
             },
         );
     }
 
     Some(())
+}
+
+fn extract_token_range_of(
+    node: &SyntaxNode,
+    range: TextRange,
+) -> Option<(SyntaxToken, SyntaxToken)> {
+    let first = node.token_at_offset(range.start()).right_biased()?;
+    let last = node.token_at_offset(range.end()).left_biased()?;
+
+    let first = skip_trivia_token(first, Direction::Next)?;
+    let last = skip_trivia_token(last, Direction::Next)?;
+
+    if first.text_range().ordering(last.text_range()).is_gt() {
+        return None;
+    }
+
+    Some((first, last))
 }
 
 fn peel_parens(mut expr: ast::Expr) -> ast::Expr {
@@ -280,15 +339,33 @@ fn peel_parens(mut expr: ast::Expr) -> ast::Expr {
     expr
 }
 
+fn source_expr(
+    ctx: &AssistContext<'_, '_>,
+    range: RangeInclusive<SyntaxElement>,
+) -> Option<ast::Expr> {
+    let range = range.start().text_range().cover(range.end().text_range());
+    let text = ctx.source_file().syntax().text().slice(range).to_string();
+    parse_expr_from_str(&text, ctx.edition())
+}
+
 /// Check whether the node is a valid expression which can be extracted to a variable.
 /// In general that's true for any expression, but in some cases that would produce invalid code.
-fn valid_target_expr(node: SyntaxNode) -> Option<ast::Expr> {
-    match node.kind() {
-        SyntaxKind::PATH_EXPR | SyntaxKind::LOOP_EXPR => None,
+fn valid_target_expr(ctx: &AssistContext<'_, '_>) -> impl Fn(SyntaxNode) -> Option<ast::Expr> {
+    let selection = ctx.selection_trimmed();
+    move |node| match node.kind() {
+        SyntaxKind::LOOP_EXPR | SyntaxKind::LET_EXPR => None,
         SyntaxKind::BREAK_EXPR => ast::BreakExpr::cast(node).and_then(|e| e.expr()),
         SyntaxKind::RETURN_EXPR => ast::ReturnExpr::cast(node).and_then(|e| e.expr()),
         SyntaxKind::BLOCK_EXPR => {
             ast::BlockExpr::cast(node).filter(|it| it.is_standalone()).map(ast::Expr::from)
+        }
+        SyntaxKind::ARG_LIST => ast::ArgList::cast(node)?
+            .args()
+            .find(|expr| crate::utils::is_selected(expr, selection, false)),
+        SyntaxKind::PATH_EXPR => {
+            let path_expr = ast::PathExpr::cast(node)?;
+            let path_resolution = ctx.sema.resolve_path(&path_expr.path()?)?;
+            like_const_value(ctx, path_resolution).then_some(path_expr.into())
         }
         _ => ast::Expr::cast(node),
     }
@@ -311,7 +388,7 @@ impl ExtractionKind {
             ExtractionKind::Static => "extract_static",
         };
 
-        AssistId(s, AssistKind::RefactorExtract)
+        AssistId::refactor_extract(s)
     }
 
     fn label(&self) -> &'static str {
@@ -324,7 +401,7 @@ impl ExtractionKind {
 
     fn get_name_and_expr(
         &self,
-        ctx: &AssistContext<'_>,
+        ctx: &AssistContext<'_, '_>,
         to_extract: &ast::Expr,
     ) -> (String, SyntaxNode) {
         // We only do this sort of extraction for fields because they should have lowercase names
@@ -357,7 +434,7 @@ impl ExtractionKind {
     }
 }
 
-fn get_literal_name(ctx: &AssistContext<'_>, expr: &ast::Expr) -> Option<String> {
+fn get_literal_name(ctx: &AssistContext<'_, '_>, expr: &ast::Expr) -> Option<String> {
     let ast::Expr::Literal(literal) = expr else {
         return None;
     };
@@ -378,7 +455,7 @@ fn get_literal_name(ctx: &AssistContext<'_>, expr: &ast::Expr) -> Option<String>
         return None;
     }
 
-    match LexedStr::single_token(ctx.file_id().edition(), &inner) {
+    match LexedStr::single_token(ctx.edition(), &inner) {
         Some((SyntaxKind::IDENT, None)) => Some(inner),
         _ => None,
     }
@@ -392,9 +469,8 @@ enum Anchor {
 }
 
 impl Anchor {
-    fn from(to_extract: &ast::Expr, kind: &ExtractionKind) -> Option<Anchor> {
-        let result = to_extract
-            .syntax()
+    fn from(place: &SyntaxNode, kind: &ExtractionKind) -> Option<Anchor> {
+        let result = place
             .ancestors()
             .take_while(|it| !ast::Item::can_cast(it.kind()) || ast::MacroCall::can_cast(it.kind()))
             .find_map(|node| {
@@ -403,11 +479,10 @@ impl Anchor {
                 }
                 if let Some(expr) =
                     node.parent().and_then(ast::StmtList::cast).and_then(|it| it.tail_expr())
+                    && expr.syntax() == &node
                 {
-                    if expr.syntax() == &node {
-                        cov_mark::hit!(test_extract_var_last_expr);
-                        return Some(Anchor::Before(node));
-                    }
+                    cov_mark::hit!(test_extract_var_last_expr);
+                    return Some(Anchor::Before(node));
                 }
 
                 if let Some(parent) = node.parent() {
@@ -426,10 +501,10 @@ impl Anchor {
                 }
 
                 if let Some(stmt) = ast::Stmt::cast(node.clone()) {
-                    if let ast::Stmt::ExprStmt(stmt) = stmt {
-                        if stmt.expr().as_ref() == Some(to_extract) {
-                            return Some(Anchor::Replace(stmt));
-                        }
+                    if let ast::Stmt::ExprStmt(stmt) = stmt
+                        && stmt.expr().is_some_and(|it| it.syntax() == place)
+                    {
+                        return Some(Anchor::Replace(stmt));
                     }
                     return Some(Anchor::Before(node));
                 }
@@ -438,7 +513,7 @@ impl Anchor {
 
         match kind {
             ExtractionKind::Constant | ExtractionKind::Static if result.is_none() => {
-                to_extract.syntax().ancestors().find_map(|node| {
+                place.ancestors().find_map(|node| {
                     let item = ast::Item::cast(node.clone())?;
                     let parent = item.syntax().parent()?;
                     match parent.kind() {
@@ -452,6 +527,31 @@ impl Anchor {
             }
             _ => result,
         }
+    }
+}
+
+fn like_const_value(ctx: &AssistContext<'_, '_>, path_resolution: hir::PathResolution<'_>) -> bool {
+    let db = ctx.db();
+    let adt_like_const_value = |adt: Option<hir::Adt>| matches!(adt, Some(hir::Adt::Struct(s)) if s.kind(db) == hir::StructKind::Unit);
+    match path_resolution {
+        hir::PathResolution::Def(def) => match def {
+            hir::ModuleDef::Adt(adt) => adt_like_const_value(Some(adt)),
+            hir::ModuleDef::EnumVariant(variant) => variant.kind(db) == hir::StructKind::Unit,
+            hir::ModuleDef::TypeAlias(ty) => adt_like_const_value(ty.ty(db).as_adt()),
+            hir::ModuleDef::Const(_) | hir::ModuleDef::Static(_) => true,
+            hir::ModuleDef::Trait(_)
+            | hir::ModuleDef::BuiltinType(_)
+            | hir::ModuleDef::Macro(_)
+            | hir::ModuleDef::Module(_) => false,
+            hir::ModuleDef::Function(_) => false, // no extract named function
+        },
+        hir::PathResolution::SelfType(ty) => adt_like_const_value(ty.self_ty(db).as_adt()),
+        hir::PathResolution::ConstParam(_) => true,
+        hir::PathResolution::Local(_)
+        | hir::PathResolution::TypeParam(_)
+        | hir::PathResolution::BuiltinAttr(_)
+        | hir::PathResolution::ToolModule(_)
+        | hir::PathResolution::DeriveHelper(_) => false,
     }
 }
 
@@ -631,7 +731,7 @@ fn main() {
 "#,
             r#"
 fn main() {
-    const $0HELLO: &str = "hello";
+    const $0HELLO: &'static str = "hello";
 }
 "#,
             "Extract into constant",
@@ -726,7 +826,7 @@ fn main() {
 "#,
             r#"
 fn main() {
-    static $0HELLO: &str = "hello";
+    static $0HELLO: &'static str = "hello";
 }
 "#,
             "Extract into static",
@@ -1257,6 +1357,33 @@ fn main() {
     }
 
     #[test]
+    fn extract_var_in_arglist_with_comma() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+fn main() {
+    let x = 2;
+    foo(
+        x + x,
+        $0x - x,$0
+    )
+}
+"#,
+            r#"
+fn main() {
+    let x = 2;
+    let $0var_name = x - x;
+    foo(
+        x + x,
+        var_name,
+    )
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
     fn extract_var_path_simple() {
         check_assist_by_label(
             extract_variable,
@@ -1397,6 +1524,25 @@ fn main() {
         let $0var_name = 2 + 2;
         break var_name;
     };
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
+    fn extract_var_let_expr() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+fn main() {
+    if $0let$0 Some(x) = Some(2+2) {}
+}
+"#,
+            r#"
+fn main() {
+    let $0var_name = Some(2+2);
+    if let Some(x) = var_name {}
 }
 "#,
             "Extract into variable",
@@ -1729,6 +1875,27 @@ fn main() {
     }
 
     #[test]
+    fn extract_non_local_path_expr() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+struct Foo;
+fn foo() -> Foo {
+    $0Foo$0
+}
+"#,
+            r#"
+struct Foo;
+fn foo() -> Foo {
+    let $0foo = Foo;
+    foo
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
     fn extract_var_for_return_not_applicable() {
         check_assist_not_applicable(extract_variable, "fn foo() { $0return$0; } ");
     }
@@ -1736,6 +1903,14 @@ fn main() {
     #[test]
     fn extract_var_for_break_not_applicable() {
         check_assist_not_applicable(extract_variable, "fn main() { loop { $0break$0; }; }");
+    }
+
+    #[test]
+    fn extract_var_for_let_expr_not_applicable() {
+        check_assist_not_applicable(
+            extract_variable,
+            "fn main() { if $0let Some(x) = Some(2+2) {} }",
+        );
     }
 
     #[test]
@@ -2162,7 +2337,7 @@ fn foo(s: &S) {
 //- minicore: index
 struct X;
 
-impl std::ops::Index<usize> for X {
+impl core::ops::Index<usize> for X {
     type Output = i32;
     fn index(&self) -> &Self::Output { 0 }
 }
@@ -2177,7 +2352,7 @@ fn foo(s: &S) {
             r#"
 struct X;
 
-impl std::ops::Index<usize> for X {
+impl core::ops::Index<usize> for X {
     type Output = i32;
     fn index(&self) -> &Self::Output { 0 }
 }
@@ -2187,8 +2362,8 @@ struct S {
 }
 
 fn foo(s: &S) {
-    let $0sub = &s.sub;
-    sub[0];
+    let $0x = &s.sub;
+    x[0];
 }"#,
             "Extract into variable",
         );
@@ -2528,13 +2703,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     let entry = Entry($0"Hello"$0);
 }
 "#,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     let $0hello = "Hello";
     let entry = Entry(hello);
@@ -2546,13 +2721,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     let entry = Entry($0"Hello"$0);
 }
 "#,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     const $0HELLO: &str = "Hello";
     let entry = Entry(HELLO);
@@ -2564,13 +2739,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     let entry = Entry($0"Hello"$0);
 }
 "#,
             r#"
-struct Entry(&str);
+struct Entry<'a>(&'a str);
 fn foo() {
     static $0HELLO: &str = "Hello";
     let entry = Entry(HELLO);
@@ -2587,13 +2762,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     let entry = Entry { message: $0"Hello"$0 };
 }
 "#,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     let $0message = "Hello";
     let entry = Entry { message };
@@ -2605,13 +2780,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     let entry = Entry { message: $0"Hello"$0 };
 }
 "#,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     const $0HELLO: &str = "Hello";
     let entry = Entry { message: HELLO };
@@ -2623,13 +2798,13 @@ fn foo() {
         check_assist_by_label(
             extract_variable,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     let entry = Entry { message: $0"Hello"$0 };
 }
 "#,
             r#"
-struct Entry { message: &str }
+struct Entry<'a> { message: &'a str }
 fn foo() {
     static $0HELLO: &str = "Hello";
     let entry = Entry { message: HELLO };
@@ -2666,5 +2841,284 @@ fn main() {
 "#,
             "Extract into variable",
         );
+    }
+
+    #[test]
+    fn extract_variable_in_token_tree() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= $02 + 3$0 + 4);
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0var_name = 2 + 3;
+    let x = foo!(= var_name + 4);
+}
+"#,
+            "Extract into variable",
+        );
+
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= $02 +$0 3 + 4);
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0var_name = 2 + 3;
+    let x = foo!(= var_name + 4);
+}
+"#,
+            "Extract into variable",
+        );
+
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= $02 + 3 + 4$0);
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0var_name = 2 + 3 + 4;
+    let x = foo!(= var_name);
+}
+"#,
+            "Extract into variable",
+        );
+
+        // FIXME: Extract to inside the macro instead of outside the macro
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= {
+        $02 + 3 + 4$0
+    });
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0var_name = 2 + 3 + 4;
+    let x = foo!(= {
+        var_name
+    });
+}
+"#,
+            "Extract into variable",
+        );
+
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! identity {
+    ($e:expr) => {
+        $e
+    };
+}
+
+fn main() {
+    let x = identity!($0(1+2)$0);
+}
+"#,
+            r#"
+macro_rules! identity {
+    ($e:expr) => {
+        $e
+    };
+}
+
+fn main() {
+    let $0var_name = (1+2);
+    let x = identity!(var_name);
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
+    fn extract_variable_in_token_tree_record_expr() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= Foo { x: $02 + 3$0 });
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0x = 2 + 3;
+    let x = foo!(= Foo { x: x });
+}
+"#,
+            "Extract into variable",
+        );
+
+        check_assist_by_label(
+            extract_variable,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let x = foo!(= Foo { x: $02 + 3$0 + 4 });
+}
+"#,
+            r#"
+macro_rules! foo {
+    (= $($t:tt)*) => {
+        $($t)*
+    };
+}
+
+fn main() {
+    let $0var_name = 2 + 3;
+    let x = foo!(= Foo { x: var_name + 4 });
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
+    fn extract_variable_in_assert_macro_preserves_required_whitespace() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+//- minicore: assert
+fn check(value: &mut usize) -> bool {
+    false
+}
+
+fn foo(mut bar: usize) {
+    assert!(check($0&mut bar$0));
+}
+"#,
+            r#"
+fn check(value: &mut usize) -> bool {
+    false
+}
+
+fn foo(mut bar: usize) {
+    let $0value = &mut bar;
+    assert!(check(value));
+}
+"#,
+            "Extract into variable",
+        );
+
+        check_assist_by_label(
+            extract_variable,
+            r#"
+//- minicore: assert
+fn main() {
+    assert!($0if true {true} else {false}$0);
+}
+"#,
+            r#"
+fn main() {
+    let $0var_name = if true {true} else {false};
+    assert!(var_name);
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
+    fn regression_22441() {
+        check_assist_by_label(
+            extract_variable,
+            r#"
+//- minicore: option, write
+fn main() {
+    let maybe_str = Some("world");
+    write!((), "Hello, {}!", $0maybe_str.unwrap()$0);
+}
+"#,
+            r#"
+fn main() {
+    let maybe_str = Some("world");
+    let $0var_name = maybe_str.unwrap();
+    write!((), "Hello, {}!", var_name);
+}
+"#,
+            "Extract into variable",
+        );
+    }
+
+    #[test]
+    fn repro_bad_range_unresolved_macro_paren() {
+        check_assist_not_applicable(extract_variable, "fn f() { m!$0($0 }");
     }
 }

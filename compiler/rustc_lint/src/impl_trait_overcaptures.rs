@@ -1,34 +1,35 @@
-use std::assert_matches::debug_assert_matches;
 use std::cell::LazyCell;
+use std::debug_assert_matches;
 
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{LintDiagnostic, Subdiagnostic};
+use rustc_errors::{Diagnostic, Subdiagnostic, msg};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
-use rustc_macros::LintDiagnostic;
+use rustc_macros::Diagnostic;
 use rustc_middle::middle::resolve_bound_vars::ResolvedArg;
 use rustc_middle::ty::relate::{
-    Relate, RelateResult, TypeRelation, structurally_relate_consts, structurally_relate_tys,
+    Relate, RelateResult, TypeRelation, relate_args_with_variances, structurally_relate_consts,
+    structurally_relate_tys,
 };
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, RegionExt, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    Unnormalized,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_session::lint::FutureIncompatibilityReason;
+use rustc_session::lint::fcw;
 use rustc_session::{declare_lint, declare_lint_pass};
-use rustc_span::edition::Edition;
 use rustc_span::{Span, Symbol};
-use rustc_trait_selection::errors::{
+use rustc_trait_selection::diagnostics::{
     AddPreciseCapturingForOvercapture, impl_trait_overcapture_suggestion,
 };
 use rustc_trait_selection::regions::OutlivesEnvironmentBuildExt;
 use rustc_trait_selection::traits::ObligationCtxt;
 
-use crate::{LateContext, LateLintPass, fluent_generated as fluent};
+use crate::{LateContext, LateLintPass};
 
 declare_lint! {
     /// The `impl_trait_overcaptures` lint warns against cases where lifetime
@@ -70,8 +71,7 @@ declare_lint! {
     Allow,
     "`impl Trait` will capture more lifetimes than possibly intended in edition 2024",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionSemanticsChange(Edition::Edition2024),
-        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2024/rpit-lifetime-capture.html>",
+        reason: fcw!(EditionSemanticsChange 2024 "rpit-lifetime-capture"),
     };
 }
 
@@ -136,13 +136,13 @@ enum ParamKind {
     // Early-bound var.
     Early(Symbol, u32),
     // Late-bound var on function, not within a binder. We can capture these.
-    Free(DefId, Symbol),
+    Free(DefId),
     // Late-bound var in a binder. We can't capture these yet.
     Late,
 }
 
 fn check_fn(tcx: TyCtxt<'_>, parent_def_id: LocalDefId) {
-    let sig = tcx.fn_sig(parent_def_id).instantiate_identity();
+    let sig = tcx.fn_sig(parent_def_id).instantiate_identity().skip_norm_wip();
 
     let mut in_scope_parameters = FxIndexMap::default();
     // Populate the in_scope_parameters list first with all of the generics in scope
@@ -156,12 +156,11 @@ fn check_fn(tcx: TyCtxt<'_>, parent_def_id: LocalDefId) {
     }
 
     for bound_var in sig.bound_vars() {
-        let ty::BoundVariableKind::Region(ty::BoundRegionKind::Named(def_id, name)) = bound_var
-        else {
+        let ty::BoundVariableKind::Region(ty::BoundRegionKind::Named(def_id)) = bound_var else {
             span_bug!(tcx.def_span(parent_def_id), "unexpected non-lifetime binder on fn sig");
         };
 
-        in_scope_parameters.insert(def_id, ParamKind::Free(def_id, name));
+        in_scope_parameters.insert(def_id, ParamKind::Free(def_id));
     }
 
     let sig = tcx.liberate_late_bound_regions(parent_def_id.to_def_id(), sig);
@@ -213,13 +212,16 @@ where
         // When we get into a binder, we need to add its own bound vars to the scope.
         let mut added = vec![];
         for arg in t.bound_vars() {
-            let arg: ty::BoundVariableKind = arg;
+            let arg: ty::BoundVariableKind<'tcx> = arg;
             match arg {
-                ty::BoundVariableKind::Region(ty::BoundRegionKind::Named(def_id, ..))
-                | ty::BoundVariableKind::Ty(ty::BoundTyKind::Param(def_id, _)) => {
-                    added.push(def_id);
-                    let unique = self.in_scope_parameters.insert(def_id, ParamKind::Late);
-                    assert_eq!(unique, None);
+                ty::BoundVariableKind::Region(ty::BoundRegionKind::Named(def_id))
+                | ty::BoundVariableKind::Ty(ty::BoundTyKind::Param(def_id)) => {
+                    // Return type notation introduces a binder containing the referenced
+                    // function's own bound parameters. For self-referential RTN, these may
+                    // already be present as `Free` entries from the enclosing signature.
+                    // Temporarily shadow them as `Late` and restore them when leaving.
+                    let previous = self.in_scope_parameters.insert(def_id, ParamKind::Late);
+                    added.push((def_id, previous));
                 }
                 _ => {
                     self.tcx.dcx().span_delayed_bug(
@@ -232,10 +234,13 @@ where
 
         t.super_visit_with(self);
 
-        // And remove them. The `shift_remove` should be `O(1)` since we're popping
-        // them off from the end.
-        for arg in added.into_iter().rev() {
-            self.in_scope_parameters.shift_remove(&arg);
+        // Restore the previous scope entries, removing newly added parameters.
+        for (arg, previous) in added.into_iter().rev() {
+            if let Some(previous) = previous {
+                self.in_scope_parameters.insert(arg, previous);
+            } else {
+                self.in_scope_parameters.shift_remove(&arg);
+            }
         }
     }
 
@@ -244,16 +249,13 @@ where
             return;
         }
 
-        if let ty::Alias(ty::Projection, opaque_ty) = *t.kind()
-            && self.tcx.is_impl_trait_in_trait(opaque_ty.def_id)
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, args, .. }) = *t.kind()
+            && self.tcx.is_impl_trait_in_trait(def_id)
         {
             // visit the opaque of the RPITIT
-            self.tcx
-                .type_of(opaque_ty.def_id)
-                .instantiate(self.tcx, opaque_ty.args)
-                .visit_with(self)
-        } else if let ty::Alias(ty::Opaque, opaque_ty) = *t.kind()
-            && let Some(opaque_def_id) = opaque_ty.def_id.as_local()
+            self.tcx.type_of(def_id).instantiate(self.tcx, args).skip_norm_wip().visit_with(self)
+        } else if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args: opaque_ty_args, .. }) = *t.kind()
+            && let Some(opaque_def_id) = def_id.as_local()
             // Don't recurse infinitely on an opaque
             && self.seen.insert(opaque_def_id)
             // If it's owned by this function
@@ -284,7 +286,7 @@ where
                             continue;
                         }
 
-                        let arg = opaque_ty.args[param.index as usize];
+                        let arg = opaque_ty_args[param.index as usize];
                         // We need to turn all `ty::Param`/`ConstKind::Param` and
                         // `ReEarlyParam`/`ReBound` into def ids.
                         captured.insert(extract_def_id_from_arg(self.tcx, generics, arg));
@@ -310,16 +312,16 @@ where
                         return true;
                     };
                     // We only computed variance of lifetimes...
-                    debug_assert_matches!(self.tcx.def_kind(def_id), DefKind::LifetimeParam);
+                    debug_assert_matches!(self.tcx.def_kind(*def_id), DefKind::LifetimeParam);
                     let uncaptured = match *kind {
                         ParamKind::Early(name, index) => ty::Region::new_early_param(
                             self.tcx,
                             ty::EarlyParamRegion { name, index },
                         ),
-                        ParamKind::Free(def_id, name) => ty::Region::new_late_param(
+                        ParamKind::Free(def_id) => ty::Region::new_late_param(
                             self.tcx,
                             self.parent_def_id.to_def_id(),
-                            ty::LateParamRegionKind::Named(def_id, name),
+                            ty::LateParamRegionKind::Named(def_id),
                         ),
                         // Totally ignore late bound args from binders.
                         ParamKind::Late => return true,
@@ -344,7 +346,7 @@ where
 
                     let uncaptured_spans: Vec<_> = uncaptured_args
                         .into_iter()
-                        .map(|(def_id, _)| self.tcx.def_span(def_id))
+                        .map(|(&def_id, _)| self.tcx.def_span(def_id))
                         .collect();
 
                     self.tcx.emit_node_span_lint(
@@ -365,9 +367,9 @@ where
             // have no uncaptured args, then we should warn to the user that
             // it's redundant to capture all args explicitly.
             if new_capture_rules
-                && let Some((captured_args, capturing_span)) =
-                    opaque.bounds.iter().find_map(|bound| match *bound {
-                        hir::GenericBound::Use(a, s) => Some((a, s)),
+                && let Some((use_idx, captured_args, capturing_span)) =
+                    opaque.bounds.iter().enumerate().find_map(|(i, bound)| match *bound {
+                        hir::GenericBound::Use(a, s) => Some((i, a, s)),
                         _ => None,
                     })
             {
@@ -404,11 +406,25 @@ where
                     .iter()
                     .all(|(def_id, _)| explicitly_captured.contains(def_id))
                 {
+                    // Extend the removal span to include the `+` joiner adjacent
+                    // to `use<...>`, so applying the suggestion does not leave
+                    // behind a stray `+` that fails to parse.
+                    let suggestion_span = if let Some(next) = opaque.bounds.get(use_idx + 1) {
+                        capturing_span.with_hi(next.span().lo())
+                    } else if let Some(prev_idx) = use_idx.checked_sub(1) {
+                        let prev = opaque.bounds[prev_idx];
+                        capturing_span.with_lo(prev.span().hi())
+                    } else {
+                        // `impl use<...>` with no other bound is not valid
+                        // syntax, so this branch is unreachable in practice.
+                        capturing_span
+                    };
+
                     self.tcx.emit_node_span_lint(
                         IMPL_TRAIT_REDUNDANT_CAPTURES,
                         self.tcx.local_def_id_to_hir_id(opaque_def_id),
                         opaque_span,
-                        ImplTraitRedundantCapturesLint { capturing_span },
+                        ImplTraitRedundantCapturesLint { capturing_span: suggestion_span },
                     );
                 }
             }
@@ -417,8 +433,11 @@ where
             // in this lint as well. Interestingly, one place that I expect this lint to fire
             // is for `impl for<'a> Bound<Out = impl Other>`, since `impl Other` will begin
             // to capture `'a` in e2024 (even though late-bound vars in opaques are not allowed).
-            for clause in
-                self.tcx.item_bounds(opaque_ty.def_id).iter_instantiated(self.tcx, opaque_ty.args)
+            for clause in self
+                .tcx
+                .item_bounds(def_id)
+                .iter_instantiated(self.tcx, opaque_ty_args)
+                .map(Unnormalized::skip_norm_wip)
             {
                 clause.visit_with(self)
             }
@@ -435,23 +454,40 @@ struct ImplTraitOvercapturesLint<'tcx> {
     suggestion: Option<AddPreciseCapturingForOvercapture>,
 }
 
-impl<'a> LintDiagnostic<'a, ()> for ImplTraitOvercapturesLint<'_> {
-    fn decorate_lint<'b>(self, diag: &'b mut rustc_errors::Diag<'a, ()>) {
-        diag.primary_message(fluent::lint_impl_trait_overcaptures);
+impl<'a> Diagnostic<'a, ()> for ImplTraitOvercapturesLint<'_> {
+    fn into_diag(
+        self,
+        dcx: rustc_errors::DiagCtxtHandle<'a>,
+        level: rustc_errors::Level,
+    ) -> rustc_errors::Diag<'a, ()> {
+        let mut diag = rustc_errors::Diag::new(
+            dcx,
+            level,
+            msg!("`{$self_ty}` will capture more lifetimes than possibly intended in edition 2024"),
+        );
         diag.arg("self_ty", self.self_ty.to_string())
             .arg("num_captured", self.num_captured)
-            .span_note(self.uncaptured_spans, fluent::lint_note)
-            .note(fluent::lint_note2);
+            .span_note(
+                self.uncaptured_spans,
+                msg!(
+                    "specifically, {$num_captured ->
+                        [one] this lifetime is
+                        *[other] these lifetimes are
+                    } in scope but not mentioned in the type's bounds"
+                ),
+            )
+            .note(msg!("all lifetimes in scope will be captured by `impl Trait`s in edition 2024"));
         if let Some(suggestion) = self.suggestion {
-            suggestion.add_to_diag(diag);
+            suggestion.add_to_diag(&mut diag);
         }
+        diag
     }
 }
 
-#[derive(LintDiagnostic)]
-#[diag(lint_impl_trait_redundant_captures)]
+#[derive(Diagnostic)]
+#[diag("all possible in-scope parameters are already captured, so `use<...>` syntax is redundant")]
 struct ImplTraitRedundantCapturesLint {
-    #[suggestion(lint_suggestion, code = "", applicability = "machine-applicable")]
+    #[suggestion("remove the `use<...>` syntax", code = "", applicability = "machine-applicable")]
     capturing_span: Span,
 }
 
@@ -460,16 +496,13 @@ fn extract_def_id_from_arg<'tcx>(
     generics: &'tcx ty::Generics,
     arg: ty::GenericArg<'tcx>,
 ) -> DefId {
-    match arg.unpack() {
+    match arg.kind() {
         ty::GenericArgKind::Lifetime(re) => match re.kind() {
             ty::ReEarlyParam(ebr) => generics.region_param(ebr, tcx).def_id,
-            ty::ReBound(
-                _,
-                ty::BoundRegion { kind: ty::BoundRegionKind::Named(def_id, ..), .. },
-            )
+            ty::ReBound(_, ty::BoundRegion { kind: ty::BoundRegionKind::Named(def_id), .. })
             | ty::ReLateParam(ty::LateParamRegion {
                 scope: _,
-                kind: ty::LateParamRegionKind::Named(def_id, ..),
+                kind: ty::LateParamRegionKind::Named(def_id),
             }) => def_id,
             _ => unreachable!(),
         },
@@ -506,6 +539,20 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for FunctionalVariances<'tcx> {
         self.tcx
     }
 
+    fn relate_ty_args(
+        &mut self,
+        a_ty: Ty<'tcx>,
+        _: Ty<'tcx>,
+        def_id: DefId,
+        a_args: ty::GenericArgsRef<'tcx>,
+        b_args: ty::GenericArgsRef<'tcx>,
+        _: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+    ) -> RelateResult<'tcx, Ty<'tcx>> {
+        let variances = self.cx().variances_of(def_id);
+        relate_args_with_variances(self, variances, a_args, b_args)?;
+        Ok(a_ty)
+    }
+
     fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
         &mut self,
         variance: ty::Variance,
@@ -532,13 +579,10 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for FunctionalVariances<'tcx> {
     ) -> RelateResult<'tcx, ty::Region<'tcx>> {
         let def_id = match a.kind() {
             ty::ReEarlyParam(ebr) => self.generics.region_param(ebr, self.tcx).def_id,
-            ty::ReBound(
-                _,
-                ty::BoundRegion { kind: ty::BoundRegionKind::Named(def_id, ..), .. },
-            )
+            ty::ReBound(_, ty::BoundRegion { kind: ty::BoundRegionKind::Named(def_id), .. })
             | ty::ReLateParam(ty::LateParamRegion {
                 scope: _,
-                kind: ty::LateParamRegionKind::Named(def_id, ..),
+                kind: ty::LateParamRegionKind::Named(def_id),
             }) => def_id,
             _ => {
                 return Ok(a);

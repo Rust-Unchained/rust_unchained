@@ -1,7 +1,5 @@
 // We want to control preemption here. Stacked borrows interferes by having its own accesses.
-//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
-// Avoid accidental synchronization via address reuse inside `thread::spawn`.
-//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
 
 #![feature(rustc_attrs)]
 
@@ -17,7 +15,7 @@ extern "Rust" {
     #[rustc_std_internal_symbol]
     fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
 }
-pub fn main() {
+fn main() {
     // Shared atomic pointer
     let pointer: *mut usize = Box::into_raw(Box::new(0usize));
     let ptr = EvilSend(pointer);

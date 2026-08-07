@@ -1,10 +1,11 @@
 use rustc_ast::ast;
 use rustc_ast::visit::Visitor;
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use tracing::debug;
 
 use crate::attr::MetaVisitor;
 use crate::parse::macros::cfg_if::parse_cfg_if;
+use crate::parse::macros::cfg_select::parse_items_from_cfg_select;
 use crate::parse::session::ParseSess;
 
 pub(crate) struct ModItem {
@@ -71,6 +72,65 @@ impl<'a, 'ast: 'a> CfgIfVisitor<'a> {
     }
 }
 
+/// Traverse `cfg_select!` macro and fetch modules.
+pub(crate) struct CfgSelectVisitor<'a> {
+    psess: &'a ParseSess,
+    mods: Vec<ModItem>,
+}
+
+impl<'a> CfgSelectVisitor<'a> {
+    pub(crate) fn new(psess: &'a ParseSess) -> CfgSelectVisitor<'a> {
+        CfgSelectVisitor {
+            mods: vec![],
+            psess,
+        }
+    }
+
+    pub(crate) fn mods(self) -> Vec<ModItem> {
+        self.mods
+    }
+}
+
+impl<'a, 'ast: 'a> Visitor<'ast> for CfgSelectVisitor<'a> {
+    fn visit_mac_call(&mut self, mac: &'ast ast::MacCall) {
+        match self.visit_mac_inner(mac) {
+            Ok(()) => (),
+            Err(e) => debug!("{}", e),
+        }
+    }
+}
+
+impl<'a, 'ast: 'a> CfgSelectVisitor<'a> {
+    fn visit_mac_inner(&mut self, mac: &'ast ast::MacCall) -> Result<(), &'static str> {
+        // Support both:
+        // ```
+        // std::cfg_select! {..}
+        // core::cfg_select! {..}
+        // ```
+        // And:
+        // ```
+        // use std::cfg_select;
+        // cfg_select! {..}
+        // ```
+        match mac.path.segments.last() {
+            Some(last_segment) => {
+                if last_segment.ident.name != Symbol::intern("cfg_select") {
+                    return Err("Expected cfg_select");
+                }
+            }
+            None => {
+                return Err("Expected cfg_select");
+            }
+        };
+
+        let items = parse_items_from_cfg_select(self.psess, mac)?;
+        self.mods
+            .append(&mut items.into_iter().map(|item| ModItem { item }).collect());
+
+        Ok(())
+    }
+}
+
 /// Extracts `path = "foo.rs"` from attributes.
 #[derive(Default)]
 pub(crate) struct PathVisitor {
@@ -90,7 +150,7 @@ impl<'ast> MetaVisitor<'ast> for PathVisitor {
         meta_item: &'ast ast::MetaItem,
         lit: &'ast ast::MetaItemLit,
     ) {
-        if meta_item.has_name(Symbol::intern("path")) && lit.kind.is_str() {
+        if meta_item.has_name(sym::path) && lit.kind.is_str() {
             self.paths.push(meta_item_lit_to_str(lit));
         }
     }

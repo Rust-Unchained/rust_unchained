@@ -120,6 +120,10 @@ impl DocFolder for Stripper<'_, '_> {
 
             clean::ImplItem(..) => {}
 
+            // Since the `doc_cfg` propagation was handled before the current pass, we can (and
+            // should) remove all placeholder impl items.
+            clean::PlaceholderImplItem => return None,
+
             // tymethods etc. have no control over privacy
             clean::RequiredMethodItem(..)
             | clean::RequiredAssocConstItem(..)
@@ -133,6 +137,8 @@ impl DocFolder for Stripper<'_, '_> {
 
             // Keywords are never stripped
             clean::KeywordItem => {}
+            // Attributes are never stripped
+            clean::AttributeItem => {}
         }
 
         let fastreturn = match i.kind {
@@ -281,12 +287,14 @@ impl DocFolder for ImportStripper<'_> {
             clean::ImportItem(imp)
                 if !self.document_hidden && self.import_should_be_hidden(&i, imp) =>
             {
+                debug!("ImportStripper: stripping {:?}", i.name);
                 None
             }
             // clean::ImportItem(_) if !self.document_hidden && i.is_doc_hidden() => None,
             clean::ExternCrateItem { .. } | clean::ImportItem(..)
                 if i.visibility(self.tcx) != Some(Visibility::Public) =>
             {
+                debug!("ImportStripper: stripping {:?}", i.name);
                 None
             }
             _ => Some(self.fold_item_recur(i)),

@@ -1,6 +1,7 @@
 use clippy_config::Conf;
 use clippy_config::types::{DisallowedPath, create_disallowed_map};
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::paths::PathNS;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
@@ -34,6 +35,9 @@ declare_clippy_lint! {
     ///     { path = "std::net::Ipv4Addr", reason = "no IPv4 allowed" },
     ///     # Can also add a `replacement` that will be offered as a suggestion.
     ///     { path = "std::sync::Mutex", reason = "prefer faster & simpler non-poisonable mutex", replacement = "parking_lot::Mutex" },
+    ///     # This would normally error if the path is incorrect, but with `allow-invalid` = `true`,
+    ///     # it will be silently ignored
+    ///     { path = "std::invalid::Type", reason = "use alternative instead", allow-invalid = true }
     /// ]
     /// ```
     ///
@@ -53,6 +57,8 @@ declare_clippy_lint! {
     "use of disallowed types"
 }
 
+impl_lint_pass!(DisallowedTypes => [DISALLOWED_TYPES]);
+
 pub struct DisallowedTypes {
     def_ids: DefIdMap<(&'static str, &'static DisallowedPath)>,
     prim_tys: FxHashMap<PrimTy, (&'static str, &'static DisallowedPath)>,
@@ -60,7 +66,14 @@ pub struct DisallowedTypes {
 
 impl DisallowedTypes {
     pub fn new(tcx: TyCtxt<'_>, conf: &'static Conf) -> Self {
-        let (def_ids, prim_tys) = create_disallowed_map(tcx, &conf.disallowed_types, def_kind_predicate, "type", true);
+        let (def_ids, prim_tys) = create_disallowed_map(
+            tcx,
+            &conf.disallowed_types,
+            PathNS::Type,
+            def_kind_predicate,
+            "type",
+            true,
+        );
         Self { def_ids, prim_tys }
     }
 
@@ -93,14 +106,12 @@ pub fn def_kind_predicate(def_kind: DefKind) -> bool {
     )
 }
 
-impl_lint_pass!(DisallowedTypes => [DISALLOWED_TYPES]);
-
 impl<'tcx> LateLintPass<'tcx> for DisallowedTypes {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if let ItemKind::Use(path, UseKind::Single(_)) = &item.kind {
-            for res in &path.res {
-                self.check_res_emit(cx, res, item.span);
-            }
+        if let ItemKind::Use(path, UseKind::Single(_)) = &item.kind
+            && let Some(res) = path.res.type_ns
+        {
+            self.check_res_emit(cx, &res, item.span);
         }
     }
 

@@ -3,9 +3,9 @@ use std::{iter::once, mem};
 use hir::Semantics;
 use ide_db::syntax_helpers::tree_diff::diff;
 use ide_db::text_edit::{TextEdit, TextEditBuilder};
-use ide_db::{helpers::pick_best_token, FileRange, RootDatabase};
+use ide_db::{FileRange, RootDatabase, helpers::pick_best_token};
 use itertools::Itertools;
-use syntax::{ast, match_ast, AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange};
+use syntax::{AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast, match_ast};
 
 #[derive(Copy, Clone, Debug)]
 pub enum Direction {
@@ -72,7 +72,6 @@ fn find_ancestors(item: SyntaxElement, direction: Direction, range: TextRange) -
         SyntaxKind::MACRO_CALL,
         SyntaxKind::TYPE_ALIAS,
         SyntaxKind::TRAIT,
-        SyntaxKind::TRAIT_ALIAS,
         SyntaxKind::IMPL,
         SyntaxKind::MACRO_DEF,
         SyntaxKind::STRUCT,
@@ -120,12 +119,12 @@ fn swap_sibling_in_list<A: AstNode + Clone, I: Iterator<Item = A>>(
     range: TextRange,
     direction: Direction,
 ) -> Option<TextEdit> {
-    let list_lookup = list.tuple_windows().find(|(l, r)| match direction {
+    let list_lookup = list.array_windows().find(|[l, r]| match direction {
         Direction::Up => r.syntax().text_range().contains_range(range),
         Direction::Down => l.syntax().text_range().contains_range(range),
     });
 
-    if let Some((l, r)) = list_lookup {
+    if let Some([l, r]) = list_lookup {
         Some(replace_nodes(range, l.syntax(), r.syntax()))
     } else {
         // Cursor is beyond any movable list item (for example, on curly brace in enum).
@@ -174,7 +173,7 @@ fn replace_nodes<'a>(
 #[cfg(test)]
 mod tests {
     use crate::fixture;
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
 
     use crate::Direction;
 

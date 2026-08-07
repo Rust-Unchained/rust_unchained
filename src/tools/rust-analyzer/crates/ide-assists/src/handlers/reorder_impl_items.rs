@@ -2,11 +2,11 @@ use hir::{PathResolution, Semantics};
 use ide_db::{FxHashMap, RootDatabase};
 use itertools::Itertools;
 use syntax::{
-    ast::{self, HasName},
     AstNode, SyntaxElement,
+    ast::{self, HasName},
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: reorder_impl_items
 //
@@ -42,7 +42,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     fn c() {}
 // }
 // ```
-pub(crate) fn reorder_impl_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn reorder_impl_items(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let impl_ast = ctx.find_node_at_offset::<ast::Impl>()?;
     let items = impl_ast.assoc_item_list()?;
 
@@ -82,7 +82,7 @@ pub(crate) fn reorder_impl_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
                 ast::AssocItem::MacroCall(_) => None,
             };
 
-            name.and_then(|n| ranks.get(n.text().as_str().trim_start_matches("r#")).copied())
+            name.and_then(|n| ranks.get(n.text().trim_start_matches("r#")).copied())
                 .unwrap_or(usize::MAX)
         })
         .collect();
@@ -95,25 +95,25 @@ pub(crate) fn reorder_impl_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
 
     let target = items.syntax().text_range();
     acc.add(
-        AssistId("reorder_impl_items", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("reorder_impl_items"),
         "Sort items by trait definition",
         target,
         |builder| {
-            let mut editor = builder.make_editor(&parent_node);
+            let editor = builder.make_editor(&parent_node);
 
             assoc_items
                 .into_iter()
                 .zip(sorted)
                 .for_each(|(old, new)| editor.replace(old.syntax(), new.syntax()));
 
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
 fn compute_item_ranks(
     path: &ast::Path,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<FxHashMap<String, usize>> {
     let td = trait_definition(path, &ctx.sema)?;
 

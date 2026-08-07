@@ -1,14 +1,11 @@
 use std::marker::PhantomData;
-#[cfg(not(feature = "nightly"))]
-use std::mem;
-use std::ops::{BitAnd, BitAndAssign, BitOrAssign, Bound, Not, Range, RangeBounds, Shl};
+use std::ops::{Bound, Range, RangeBounds};
 use std::rc::Rc;
 use std::{fmt, iter, slice};
 
 use Chunk::*;
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable_NoContext, Encodable_NoContext};
-use smallvec::{SmallVec, smallvec};
 
 use crate::{Idx, IndexVec};
 
@@ -118,7 +115,7 @@ macro_rules! bit_relations_inherent_impls {
 #[derive(Eq, PartialEq, Hash)]
 pub struct DenseBitSet<T> {
     domain_size: usize,
-    words: SmallVec<[Word; 2]>,
+    words: Vec<Word>,
     marker: PhantomData<T>,
 }
 
@@ -134,7 +131,7 @@ impl<T: Idx> DenseBitSet<T> {
     #[inline]
     pub fn new_empty(domain_size: usize) -> DenseBitSet<T> {
         let num_words = num_words(domain_size);
-        DenseBitSet { domain_size, words: smallvec![0; num_words], marker: PhantomData }
+        DenseBitSet { domain_size, words: vec![0; num_words], marker: PhantomData }
     }
 
     /// Creates a new, filled bitset with a given `domain_size`.
@@ -142,7 +139,7 @@ impl<T: Idx> DenseBitSet<T> {
     pub fn new_filled(domain_size: usize) -> DenseBitSet<T> {
         let num_words = num_words(domain_size);
         let mut result =
-            DenseBitSet { domain_size, words: smallvec![!0; num_words], marker: PhantomData };
+            DenseBitSet { domain_size, words: vec![!0; num_words], marker: PhantomData };
         result.clear_excess_bits();
         result
     }
@@ -160,7 +157,7 @@ impl<T: Idx> DenseBitSet<T> {
 
     /// Count the number of set bits in the set.
     pub fn count(&self) -> usize {
-        self.words.iter().map(|e| e.count_ones() as usize).sum()
+        count_ones(&self.words)
     }
 
     /// Returns `true` if `self` contains `elem`.
@@ -234,6 +231,32 @@ impl<T: Idx> DenseBitSet<T> {
         self.clear_excess_bits();
     }
 
+    /// Checks whether any bit in the given range is a 1.
+    #[inline]
+    pub fn contains_any(&self, elems: impl RangeBounds<T>) -> bool {
+        let Some((start, end)) = inclusive_start_end(elems, self.domain_size) else {
+            return false;
+        };
+        let (start_word_index, start_mask) = word_index_and_mask(start);
+        let (end_word_index, end_mask) = word_index_and_mask(end);
+
+        if start_word_index == end_word_index {
+            self.words[start_word_index] & (end_mask | (end_mask - start_mask)) != 0
+        } else {
+            if self.words[start_word_index] & !(start_mask - 1) != 0 {
+                return true;
+            }
+
+            let remaining = start_word_index + 1..end_word_index;
+            if remaining.start <= remaining.end {
+                self.words[remaining].iter().any(|&w| w != 0)
+                    || self.words[end_word_index] & (end_mask | (end_mask - 1)) != 0
+            } else {
+                false
+            }
+        }
+    }
+
     /// Returns `true` if the set has changed.
     #[inline]
     pub fn remove(&mut self, elem: T) -> bool {
@@ -250,6 +273,21 @@ impl<T: Idx> DenseBitSet<T> {
     #[inline]
     pub fn iter(&self) -> BitIter<'_, T> {
         BitIter::new(&self.words)
+    }
+
+    /// Finds the first set bit at or after `elem`, if there is one.
+    pub fn first_set_at_or_after(&self, elem: T) -> Option<T> {
+        assert!(elem.index() < self.domain_size);
+        let (mut word_index, mask) = word_index_and_mask(elem);
+        // Mask out all bits below `elem`.
+        let mut word = self.words[word_index] & !(mask - 1);
+        loop {
+            if word != 0 {
+                return Some(T::new(WORD_BITS * word_index + word.trailing_zeros() as usize));
+            }
+            word_index += 1;
+            word = *self.words.get(word_index)?;
+        }
     }
 
     pub fn last_set_in(&self, range: impl RangeBounds<T>) -> Option<T> {
@@ -296,7 +334,7 @@ impl<T: Idx> DenseBitSet<T> {
         // quickly and accurately detect whether the update changed anything.
         // But that's only worth doing if there's an actual use-case.
 
-        bitwise(&mut self.words, &other.words, |a, b| a | !b);
+        update_words(&mut self.words, &other.words, |a, b| a | !b);
         // The bitwise update `a | !b` can result in the last word containing
         // out-of-domain bits, so we need to clear them.
         self.clear_excess_bits();
@@ -307,17 +345,17 @@ impl<T: Idx> DenseBitSet<T> {
 impl<T: Idx> BitRelations<DenseBitSet<T>> for DenseBitSet<T> {
     fn union(&mut self, other: &DenseBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        bitwise(&mut self.words, &other.words, |a, b| a | b)
+        update_words(&mut self.words, &other.words, |a, b| a | b)
     }
 
     fn subtract(&mut self, other: &DenseBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        bitwise(&mut self.words, &other.words, |a, b| a & !b)
+        update_words(&mut self.words, &other.words, |a, b| a & !b)
     }
 
     fn intersect(&mut self, other: &DenseBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        bitwise(&mut self.words, &other.words, |a, b| a & b)
+        update_words(&mut self.words, &other.words, |a, b| a & b)
     }
 }
 
@@ -465,19 +503,17 @@ pub struct ChunkedBitSet<T> {
     marker: PhantomData<T>,
 }
 
-// Note: the chunk domain size is duplicated in each variant. This is a bit
-// inconvenient, but it allows the type size to be smaller than if we had an
-// outer struct containing a chunk domain size plus the `Chunk`, because the
-// compiler can place the chunk domain size after the tag.
+// NOTE: The chunk domain size is stored in each variant because it keeps the
+// size of `Chunk` smaller than if it were stored outside the variants.
+// We have also tried computing it on the fly, but that was slightly more
+// complex and slower than storing it. See #145480 and #147802.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Chunk {
     /// A chunk that is all zeros; we don't represent the zeros explicitly.
-    /// The `ChunkSize` is always non-zero.
-    Zeros(ChunkSize),
+    Zeros { chunk_domain_size: ChunkSize },
 
     /// A chunk that is all ones; we don't represent the ones explicitly.
-    /// `ChunkSize` is always non-zero.
-    Ones(ChunkSize),
+    Ones { chunk_domain_size: ChunkSize },
 
     /// A chunk that has a mix of zeros and ones, which are represented
     /// explicitly and densely. It never has all zeros or all ones.
@@ -488,16 +524,21 @@ enum Chunk {
     /// to store the length, which would make this type larger. These excess
     /// words are always zero, as are any excess bits in the final in-use word.
     ///
-    /// The first `ChunkSize` field is always non-zero.
-    ///
-    /// The second `ChunkSize` field is the count of 1s set in the chunk, and
-    /// must satisfy `0 < count < chunk_domain_size`.
-    ///
     /// The words are within an `Rc` because it's surprisingly common to
     /// duplicate an entire chunk, e.g. in `ChunkedBitSet::clone_from()`, or
     /// when a `Mixed` chunk is union'd into a `Zeros` chunk. When we do need
     /// to modify a chunk we use `Rc::make_mut`.
-    Mixed(ChunkSize, ChunkSize, Rc<[Word; CHUNK_WORDS]>),
+    Mixed {
+        chunk_domain_size: ChunkSize,
+        /// Count of set bits (1s) in this chunk's words.
+        ///
+        /// Invariant: `0 < ones_count < chunk_domain_size`.
+        ///
+        /// Tracking this separately allows individual insert/remove calls to
+        /// know that the chunk has become all-zeroes or all-ones, in O(1) time.
+        ones_count: ChunkSize,
+        words: Rc<[Word; CHUNK_WORDS]>,
+    },
 }
 
 // This type is used a lot. Make sure it doesn't unintentionally get bigger.
@@ -530,15 +571,27 @@ impl<T: Idx> ChunkedBitSet<T> {
         let chunks = if domain_size == 0 {
             Box::new([])
         } else {
-            // All the chunks have a chunk_domain_size of `CHUNK_BITS` except
-            // the final one.
-            let final_chunk_domain_size = {
-                let n = domain_size % CHUNK_BITS;
-                if n == 0 { CHUNK_BITS } else { n }
+            let num_chunks = domain_size.index().div_ceil(CHUNK_BITS);
+            let mut last_chunk_domain_size = domain_size % CHUNK_BITS;
+            if last_chunk_domain_size == 0 {
+                last_chunk_domain_size = CHUNK_BITS;
             };
-            let mut chunks =
-                vec![Chunk::new(CHUNK_BITS, is_empty); num_chunks(domain_size)].into_boxed_slice();
-            *chunks.last_mut().unwrap() = Chunk::new(final_chunk_domain_size, is_empty);
+
+            // All the chunks are the same except the last one which might have a different
+            // `chunk_domain_size`.
+            let (normal_chunk, final_chunk) = if is_empty {
+                (
+                    Zeros { chunk_domain_size: CHUNK_BITS as ChunkSize },
+                    Zeros { chunk_domain_size: last_chunk_domain_size as ChunkSize },
+                )
+            } else {
+                (
+                    Ones { chunk_domain_size: CHUNK_BITS as ChunkSize },
+                    Ones { chunk_domain_size: last_chunk_domain_size as ChunkSize },
+                )
+            };
+            let mut chunks = vec![normal_chunk; num_chunks].into_boxed_slice();
+            *chunks.as_mut().last_mut().unwrap() = final_chunk;
             chunks
         };
         ChunkedBitSet { domain_size, chunks, marker: PhantomData }
@@ -557,8 +610,8 @@ impl<T: Idx> ChunkedBitSet<T> {
     }
 
     pub fn clear(&mut self) {
-        let domain_size = self.domain_size();
-        *self = ChunkedBitSet::new_empty(domain_size);
+        // Not the most efficient implementation, but this function isn't hot.
+        *self = ChunkedBitSet::new_empty(self.domain_size);
     }
 
     #[cfg(test)]
@@ -572,7 +625,7 @@ impl<T: Idx> ChunkedBitSet<T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chunks.iter().all(|chunk| matches!(chunk, Zeros(..)))
+        self.chunks.iter().all(|chunk| matches!(chunk, Zeros { .. }))
     }
 
     /// Returns `true` if `self` contains `elem`.
@@ -581,9 +634,9 @@ impl<T: Idx> ChunkedBitSet<T> {
         assert!(elem.index() < self.domain_size);
         let chunk = &self.chunks[chunk_index(elem)];
         match &chunk {
-            Zeros(_) => false,
-            Ones(_) => true,
-            Mixed(_, _, words) => {
+            Zeros { .. } => false,
+            Ones { .. } => true,
+            Mixed { words, .. } => {
                 let (word_index, mask) = chunk_word_index_and_mask(elem);
                 (words[word_index] & mask) != 0
             }
@@ -601,45 +654,35 @@ impl<T: Idx> ChunkedBitSet<T> {
         let chunk_index = chunk_index(elem);
         let chunk = &mut self.chunks[chunk_index];
         match *chunk {
-            Zeros(chunk_domain_size) => {
+            Zeros { chunk_domain_size } => {
                 if chunk_domain_size > 1 {
-                    #[cfg(feature = "nightly")]
                     let mut words = {
                         // We take some effort to avoid copying the words.
                         let words = Rc::<[Word; CHUNK_WORDS]>::new_zeroed();
                         // SAFETY: `words` can safely be all zeroes.
                         unsafe { words.assume_init() }
                     };
-                    #[cfg(not(feature = "nightly"))]
-                    let mut words = {
-                        // FIXME: unconditionally use `Rc::new_zeroed` once it is stable (#63291).
-                        let words = mem::MaybeUninit::<[Word; CHUNK_WORDS]>::zeroed();
-                        // SAFETY: `words` can safely be all zeroes.
-                        let words = unsafe { words.assume_init() };
-                        // Unfortunate possibly-large copy
-                        Rc::new(words)
-                    };
                     let words_ref = Rc::get_mut(&mut words).unwrap();
 
                     let (word_index, mask) = chunk_word_index_and_mask(elem);
                     words_ref[word_index] |= mask;
-                    *chunk = Mixed(chunk_domain_size, 1, words);
+                    *chunk = Mixed { chunk_domain_size, ones_count: 1, words };
                 } else {
-                    *chunk = Ones(chunk_domain_size);
+                    *chunk = Ones { chunk_domain_size };
                 }
                 true
             }
-            Ones(_) => false,
-            Mixed(chunk_domain_size, ref mut count, ref mut words) => {
+            Ones { .. } => false,
+            Mixed { chunk_domain_size, ref mut ones_count, ref mut words } => {
                 // We skip all the work if the bit is already set.
                 let (word_index, mask) = chunk_word_index_and_mask(elem);
                 if (words[word_index] & mask) == 0 {
-                    *count += 1;
-                    if *count < chunk_domain_size {
+                    *ones_count += 1;
+                    if *ones_count < chunk_domain_size {
                         let words = Rc::make_mut(words);
                         words[word_index] |= mask;
                     } else {
-                        *chunk = Ones(chunk_domain_size);
+                        *chunk = Ones { chunk_domain_size };
                     }
                     true
                 } else {
@@ -651,13 +694,8 @@ impl<T: Idx> ChunkedBitSet<T> {
 
     /// Sets all bits to true.
     pub fn insert_all(&mut self) {
-        for chunk in self.chunks.iter_mut() {
-            *chunk = match *chunk {
-                Zeros(chunk_domain_size)
-                | Ones(chunk_domain_size)
-                | Mixed(chunk_domain_size, ..) => Ones(chunk_domain_size),
-            }
-        }
+        // Not the most efficient implementation, but this function isn't hot.
+        *self = ChunkedBitSet::new_filled(self.domain_size);
     }
 
     /// Returns `true` if the set has changed.
@@ -666,24 +704,14 @@ impl<T: Idx> ChunkedBitSet<T> {
         let chunk_index = chunk_index(elem);
         let chunk = &mut self.chunks[chunk_index];
         match *chunk {
-            Zeros(_) => false,
-            Ones(chunk_domain_size) => {
+            Zeros { .. } => false,
+            Ones { chunk_domain_size } => {
                 if chunk_domain_size > 1 {
-                    #[cfg(feature = "nightly")]
                     let mut words = {
                         // We take some effort to avoid copying the words.
                         let words = Rc::<[Word; CHUNK_WORDS]>::new_zeroed();
                         // SAFETY: `words` can safely be all zeroes.
                         unsafe { words.assume_init() }
-                    };
-                    #[cfg(not(feature = "nightly"))]
-                    let mut words = {
-                        // FIXME: unconditionally use `Rc::new_zeroed` once it is stable (#63291).
-                        let words = mem::MaybeUninit::<[Word; CHUNK_WORDS]>::zeroed();
-                        // SAFETY: `words` can safely be all zeroes.
-                        let words = unsafe { words.assume_init() };
-                        // Unfortunate possibly-large copy
-                        Rc::new(words)
                     };
                     let words_ref = Rc::get_mut(&mut words).unwrap();
 
@@ -696,22 +724,22 @@ impl<T: Idx> ChunkedBitSet<T> {
                     );
                     let (word_index, mask) = chunk_word_index_and_mask(elem);
                     words_ref[word_index] &= !mask;
-                    *chunk = Mixed(chunk_domain_size, chunk_domain_size - 1, words);
+                    *chunk = Mixed { chunk_domain_size, ones_count: chunk_domain_size - 1, words };
                 } else {
-                    *chunk = Zeros(chunk_domain_size);
+                    *chunk = Zeros { chunk_domain_size };
                 }
                 true
             }
-            Mixed(chunk_domain_size, ref mut count, ref mut words) => {
+            Mixed { chunk_domain_size, ref mut ones_count, ref mut words } => {
                 // We skip all the work if the bit is already clear.
                 let (word_index, mask) = chunk_word_index_and_mask(elem);
                 if (words[word_index] & mask) != 0 {
-                    *count -= 1;
-                    if *count > 0 {
+                    *ones_count -= 1;
+                    if *ones_count > 0 {
                         let words = Rc::make_mut(words);
                         words[word_index] &= !mask;
                     } else {
-                        *chunk = Zeros(chunk_domain_size);
+                        *chunk = Zeros { chunk_domain_size }
                     }
                     true
                 } else {
@@ -723,9 +751,9 @@ impl<T: Idx> ChunkedBitSet<T> {
 
     fn chunk_iter(&self, chunk_index: usize) -> ChunkIter<'_> {
         match self.chunks.get(chunk_index) {
-            Some(Zeros(_chunk_domain_size)) => ChunkIter::Zeros,
-            Some(Ones(chunk_domain_size)) => ChunkIter::Ones(0..*chunk_domain_size as usize),
-            Some(Mixed(chunk_domain_size, _, words)) => {
+            Some(Zeros { .. }) => ChunkIter::Zeros,
+            Some(Ones { chunk_domain_size }) => ChunkIter::Ones(0..*chunk_domain_size as usize),
+            Some(Mixed { chunk_domain_size, words, .. }) => {
                 let num_words = num_words(*chunk_domain_size as usize);
                 ChunkIter::Mixed(BitIter::new(&words[0..num_words]))
             }
@@ -739,52 +767,63 @@ impl<T: Idx> ChunkedBitSet<T> {
 impl<T: Idx> BitRelations<ChunkedBitSet<T>> for ChunkedBitSet<T> {
     fn union(&mut self, other: &ChunkedBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        debug_assert_eq!(self.chunks.len(), other.chunks.len());
 
         let mut changed = false;
         for (mut self_chunk, other_chunk) in self.chunks.iter_mut().zip(other.chunks.iter()) {
             match (&mut self_chunk, &other_chunk) {
-                (_, Zeros(_)) | (Ones(_), _) => {}
-                (Zeros(self_chunk_domain_size), Ones(other_chunk_domain_size))
-                | (Mixed(self_chunk_domain_size, ..), Ones(other_chunk_domain_size))
-                | (Zeros(self_chunk_domain_size), Mixed(other_chunk_domain_size, ..)) => {
+                (_, Zeros { .. }) | (Ones { .. }, _) => {}
+                (Zeros { .. }, _) | (Mixed { .. }, Ones { .. }) => {
                     // `other_chunk` fully overwrites `self_chunk`
-                    debug_assert_eq!(self_chunk_domain_size, other_chunk_domain_size);
                     *self_chunk = other_chunk.clone();
                     changed = true;
                 }
                 (
-                    Mixed(self_chunk_domain_size, self_chunk_count, self_chunk_words),
-                    Mixed(_other_chunk_domain_size, _other_chunk_count, other_chunk_words),
+                    Mixed {
+                        chunk_domain_size,
+                        ones_count: self_chunk_ones_count,
+                        words: self_chunk_words,
+                    },
+                    Mixed { words: other_chunk_words, .. },
                 ) => {
                     // First check if the operation would change
                     // `self_chunk.words`. If not, we can avoid allocating some
                     // words, and this happens often enough that it's a
                     // performance win. Also, we only need to operate on the
                     // in-use words, hence the slicing.
+                    let num_words = num_words(*chunk_domain_size as usize);
+
+                    // If both sides are the same, nothing will change. This
+                    // case is very common and it's a pretty fast check, so
+                    // it's a performance win to do it.
+                    if self_chunk_words[0..num_words] == other_chunk_words[0..num_words] {
+                        continue;
+                    }
+
+                    // Do a more precise "will anything change?" test. Also a
+                    // performance win.
                     let op = |a, b| a | b;
-                    let num_words = num_words(*self_chunk_domain_size as usize);
-                    if bitwise_changes(
+                    if !would_modify_words(
                         &self_chunk_words[0..num_words],
                         &other_chunk_words[0..num_words],
                         op,
                     ) {
-                        let self_chunk_words = Rc::make_mut(self_chunk_words);
-                        let has_changed = bitwise(
-                            &mut self_chunk_words[0..num_words],
-                            &other_chunk_words[0..num_words],
-                            op,
-                        );
-                        debug_assert!(has_changed);
-                        *self_chunk_count = self_chunk_words[0..num_words]
-                            .iter()
-                            .map(|w| w.count_ones() as ChunkSize)
-                            .sum();
-                        if *self_chunk_count == *self_chunk_domain_size {
-                            *self_chunk = Ones(*self_chunk_domain_size);
-                        }
-                        changed = true;
+                        continue;
                     }
+
+                    // If we reach here, `self_chunk_words` is definitely changing.
+                    let self_chunk_words = Rc::make_mut(self_chunk_words);
+                    let has_changed = update_words(
+                        &mut self_chunk_words[0..num_words],
+                        &other_chunk_words[0..num_words],
+                        op,
+                    );
+                    debug_assert!(has_changed);
+                    *self_chunk_ones_count =
+                        count_ones(&self_chunk_words[0..num_words]) as ChunkSize;
+                    if *self_chunk_ones_count == *chunk_domain_size {
+                        *self_chunk = Ones { chunk_domain_size: *chunk_domain_size };
+                    }
+                    changed = true;
                 }
             }
         }
@@ -793,74 +832,75 @@ impl<T: Idx> BitRelations<ChunkedBitSet<T>> for ChunkedBitSet<T> {
 
     fn subtract(&mut self, other: &ChunkedBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        debug_assert_eq!(self.chunks.len(), other.chunks.len());
 
         let mut changed = false;
         for (mut self_chunk, other_chunk) in self.chunks.iter_mut().zip(other.chunks.iter()) {
             match (&mut self_chunk, &other_chunk) {
-                (Zeros(..), _) | (_, Zeros(..)) => {}
-                (
-                    Ones(self_chunk_domain_size) | Mixed(self_chunk_domain_size, _, _),
-                    Ones(other_chunk_domain_size),
-                ) => {
-                    debug_assert_eq!(self_chunk_domain_size, other_chunk_domain_size);
+                (Zeros { .. }, _) | (_, Zeros { .. }) => {}
+                (Ones { chunk_domain_size } | Mixed { chunk_domain_size, .. }, Ones { .. }) => {
                     changed = true;
-                    *self_chunk = Zeros(*self_chunk_domain_size);
+                    *self_chunk = Zeros { chunk_domain_size: *chunk_domain_size };
                 }
                 (
-                    Ones(self_chunk_domain_size),
-                    Mixed(other_chunk_domain_size, other_chunk_count, other_chunk_words),
+                    Ones { chunk_domain_size },
+                    Mixed { ones_count: other_chunk_ones_count, words: other_chunk_words, .. },
                 ) => {
-                    debug_assert_eq!(self_chunk_domain_size, other_chunk_domain_size);
                     changed = true;
-                    let num_words = num_words(*self_chunk_domain_size as usize);
+                    let num_words = num_words(*chunk_domain_size as usize);
                     debug_assert!(num_words > 0 && num_words <= CHUNK_WORDS);
-                    let mut tail_mask =
-                        1 << (*other_chunk_domain_size - ((num_words - 1) * WORD_BITS) as u16) - 1;
+                    // Set `self_chunk_words` to `other_chunk_words`, then invert all bits and
+                    // clear any excess bits in the final word.
                     let mut self_chunk_words = **other_chunk_words;
-                    for word in self_chunk_words[0..num_words].iter_mut().rev() {
-                        *word = !*word & tail_mask;
-                        tail_mask = u64::MAX;
+                    for word in self_chunk_words[0..num_words].iter_mut() {
+                        *word = !*word;
                     }
-                    let self_chunk_count = *self_chunk_domain_size - *other_chunk_count;
-                    debug_assert_eq!(
-                        self_chunk_count,
-                        self_chunk_words[0..num_words]
-                            .iter()
-                            .map(|w| w.count_ones() as ChunkSize)
-                            .sum()
+                    clear_excess_bits_in_final_word(
+                        *chunk_domain_size as usize,
+                        &mut self_chunk_words[..num_words],
                     );
-                    *self_chunk =
-                        Mixed(*self_chunk_domain_size, self_chunk_count, Rc::new(self_chunk_words));
+                    let self_chunk_ones_count = *chunk_domain_size - *other_chunk_ones_count;
+                    debug_assert_eq!(
+                        self_chunk_ones_count,
+                        count_ones(&self_chunk_words[0..num_words]) as ChunkSize
+                    );
+                    *self_chunk = Mixed {
+                        chunk_domain_size: *chunk_domain_size,
+                        ones_count: self_chunk_ones_count,
+                        words: Rc::new(self_chunk_words),
+                    };
                 }
                 (
-                    Mixed(self_chunk_domain_size, self_chunk_count, self_chunk_words),
-                    Mixed(_other_chunk_domain_size, _other_chunk_count, other_chunk_words),
+                    Mixed {
+                        chunk_domain_size,
+                        ones_count: self_chunk_ones_count,
+                        words: self_chunk_words,
+                    },
+                    Mixed { words: other_chunk_words, .. },
                 ) => {
-                    // See [`<Self as BitRelations<ChunkedBitSet<T>>>::union`] for the explanation
-                    let op = |a: u64, b: u64| a & !b;
-                    let num_words = num_words(*self_chunk_domain_size as usize);
-                    if bitwise_changes(
+                    // See `ChunkedBitSet::union` for details on what is happening here.
+                    let num_words = num_words(*chunk_domain_size as usize);
+                    let op = |a: Word, b: Word| a & !b;
+                    if !would_modify_words(
                         &self_chunk_words[0..num_words],
                         &other_chunk_words[0..num_words],
                         op,
                     ) {
-                        let self_chunk_words = Rc::make_mut(self_chunk_words);
-                        let has_changed = bitwise(
-                            &mut self_chunk_words[0..num_words],
-                            &other_chunk_words[0..num_words],
-                            op,
-                        );
-                        debug_assert!(has_changed);
-                        *self_chunk_count = self_chunk_words[0..num_words]
-                            .iter()
-                            .map(|w| w.count_ones() as ChunkSize)
-                            .sum();
-                        if *self_chunk_count == 0 {
-                            *self_chunk = Zeros(*self_chunk_domain_size);
-                        }
-                        changed = true;
+                        continue;
                     }
+
+                    let self_chunk_words = Rc::make_mut(self_chunk_words);
+                    let has_changed = update_words(
+                        &mut self_chunk_words[0..num_words],
+                        &other_chunk_words[0..num_words],
+                        op,
+                    );
+                    debug_assert!(has_changed);
+                    *self_chunk_ones_count =
+                        count_ones(&self_chunk_words[0..num_words]) as ChunkSize;
+                    if *self_chunk_ones_count == 0 {
+                        *self_chunk = Zeros { chunk_domain_size: *chunk_domain_size };
+                    }
+                    changed = true;
                 }
             }
         }
@@ -869,95 +909,51 @@ impl<T: Idx> BitRelations<ChunkedBitSet<T>> for ChunkedBitSet<T> {
 
     fn intersect(&mut self, other: &ChunkedBitSet<T>) -> bool {
         assert_eq!(self.domain_size, other.domain_size);
-        debug_assert_eq!(self.chunks.len(), other.chunks.len());
 
         let mut changed = false;
         for (mut self_chunk, other_chunk) in self.chunks.iter_mut().zip(other.chunks.iter()) {
             match (&mut self_chunk, &other_chunk) {
-                (Zeros(..), _) | (_, Ones(..)) => {}
-                (
-                    Ones(self_chunk_domain_size),
-                    Zeros(other_chunk_domain_size) | Mixed(other_chunk_domain_size, ..),
-                )
-                | (Mixed(self_chunk_domain_size, ..), Zeros(other_chunk_domain_size)) => {
-                    debug_assert_eq!(self_chunk_domain_size, other_chunk_domain_size);
+                (Zeros { .. }, _) | (_, Ones { .. }) => {}
+                (Ones { .. }, Zeros { .. } | Mixed { .. }) | (Mixed { .. }, Zeros { .. }) => {
                     changed = true;
                     *self_chunk = other_chunk.clone();
                 }
                 (
-                    Mixed(self_chunk_domain_size, self_chunk_count, self_chunk_words),
-                    Mixed(_other_chunk_domain_size, _other_chunk_count, other_chunk_words),
+                    Mixed {
+                        chunk_domain_size,
+                        ones_count: self_chunk_ones_count,
+                        words: self_chunk_words,
+                    },
+                    Mixed { words: other_chunk_words, .. },
                 ) => {
-                    // See [`<Self as BitRelations<ChunkedBitSet<T>>>::union`] for the explanation
+                    // See `ChunkedBitSet::union` for details on what is happening here.
+                    let num_words = num_words(*chunk_domain_size as usize);
                     let op = |a, b| a & b;
-                    let num_words = num_words(*self_chunk_domain_size as usize);
-                    if bitwise_changes(
+                    if !would_modify_words(
                         &self_chunk_words[0..num_words],
                         &other_chunk_words[0..num_words],
                         op,
                     ) {
-                        let self_chunk_words = Rc::make_mut(self_chunk_words);
-                        let has_changed = bitwise(
-                            &mut self_chunk_words[0..num_words],
-                            &other_chunk_words[0..num_words],
-                            op,
-                        );
-                        debug_assert!(has_changed);
-                        *self_chunk_count = self_chunk_words[0..num_words]
-                            .iter()
-                            .map(|w| w.count_ones() as ChunkSize)
-                            .sum();
-                        if *self_chunk_count == 0 {
-                            *self_chunk = Zeros(*self_chunk_domain_size);
-                        }
-                        changed = true;
+                        continue;
                     }
+
+                    let self_chunk_words = Rc::make_mut(self_chunk_words);
+                    let has_changed = update_words(
+                        &mut self_chunk_words[0..num_words],
+                        &other_chunk_words[0..num_words],
+                        op,
+                    );
+                    debug_assert!(has_changed);
+                    *self_chunk_ones_count =
+                        count_ones(&self_chunk_words[0..num_words]) as ChunkSize;
+                    if *self_chunk_ones_count == 0 {
+                        *self_chunk = Zeros { chunk_domain_size: *chunk_domain_size };
+                    }
+                    changed = true;
                 }
             }
         }
 
-        changed
-    }
-}
-
-impl<T: Idx> BitRelations<ChunkedBitSet<T>> for DenseBitSet<T> {
-    fn union(&mut self, other: &ChunkedBitSet<T>) -> bool {
-        sequential_update(|elem| self.insert(elem), other.iter())
-    }
-
-    fn subtract(&mut self, _other: &ChunkedBitSet<T>) -> bool {
-        unimplemented!("implement if/when necessary");
-    }
-
-    fn intersect(&mut self, other: &ChunkedBitSet<T>) -> bool {
-        assert_eq!(self.domain_size(), other.domain_size);
-        let mut changed = false;
-        for (i, chunk) in other.chunks.iter().enumerate() {
-            let mut words = &mut self.words[i * CHUNK_WORDS..];
-            if words.len() > CHUNK_WORDS {
-                words = &mut words[..CHUNK_WORDS];
-            }
-            match chunk {
-                Zeros(..) => {
-                    for word in words {
-                        if *word != 0 {
-                            changed = true;
-                            *word = 0;
-                        }
-                    }
-                }
-                Ones(..) => (),
-                Mixed(_, _, data) => {
-                    for (i, word) in words.iter_mut().enumerate() {
-                        let new_val = *word & data[i];
-                        if new_val != *word {
-                            changed = true;
-                            *word = new_val;
-                        }
-                    }
-                }
-            }
-        }
         changed
     }
 }
@@ -1029,46 +1025,31 @@ impl Chunk {
     #[cfg(test)]
     fn assert_valid(&self) {
         match *self {
-            Zeros(chunk_domain_size) | Ones(chunk_domain_size) => {
+            Zeros { chunk_domain_size } | Ones { chunk_domain_size } => {
                 assert!(chunk_domain_size as usize <= CHUNK_BITS);
             }
-            Mixed(chunk_domain_size, count, ref words) => {
+            Mixed { chunk_domain_size, ones_count, ref words } => {
                 assert!(chunk_domain_size as usize <= CHUNK_BITS);
-                assert!(0 < count && count < chunk_domain_size);
+                assert!(0 < ones_count && ones_count < chunk_domain_size);
 
                 // Check the number of set bits matches `count`.
-                assert_eq!(
-                    words.iter().map(|w| w.count_ones() as ChunkSize).sum::<ChunkSize>(),
-                    count
-                );
+                assert_eq!(count_ones(words.as_slice()) as ChunkSize, ones_count);
 
                 // Check the not-in-use words are all zeroed.
                 let num_words = num_words(chunk_domain_size as usize);
                 if num_words < CHUNK_WORDS {
-                    assert_eq!(
-                        words[num_words..]
-                            .iter()
-                            .map(|w| w.count_ones() as ChunkSize)
-                            .sum::<ChunkSize>(),
-                        0
-                    );
+                    assert_eq!(count_ones(&words[num_words..]) as ChunkSize, 0);
                 }
             }
         }
     }
 
-    fn new(chunk_domain_size: usize, is_empty: bool) -> Self {
-        debug_assert!(0 < chunk_domain_size && chunk_domain_size <= CHUNK_BITS);
-        let chunk_domain_size = chunk_domain_size as ChunkSize;
-        if is_empty { Zeros(chunk_domain_size) } else { Ones(chunk_domain_size) }
-    }
-
     /// Count the number of 1s in the chunk.
     fn count(&self) -> usize {
         match *self {
-            Zeros(_) => 0,
-            Ones(chunk_domain_size) => chunk_domain_size as usize,
-            Mixed(_, count, _) => count as usize,
+            Zeros { .. } => 0,
+            Ones { chunk_domain_size } => chunk_domain_size as usize,
+            Mixed { ones_count, .. } => usize::from(ones_count),
         }
     }
 }
@@ -1080,25 +1061,16 @@ enum ChunkIter<'a> {
     Finished,
 }
 
-// Applies a function to mutate a bitset, and returns true if any
-// of the applications return true
-fn sequential_update<T: Idx>(
-    mut self_update: impl FnMut(T) -> bool,
-    it: impl Iterator<Item = T>,
-) -> bool {
-    it.fold(false, |changed, elem| self_update(elem) | changed)
-}
-
 impl<T: Idx> fmt::Debug for ChunkedBitSet<T> {
     fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
         w.debug_list().entries(self.iter()).finish()
     }
 }
 
-/// Sets `out_vec[i] = op(out_vec[i], in_vec[i])` for each index `i` in both
+/// Sets `lhs[i] = op(lhs[i], rhs[i])` for each index `i` in both
 /// slices. The slices must have the same length.
 ///
-/// Returns true if at least one bit in `out_vec` was changed.
+/// Returns true if at least one bit in `lhs` was changed.
 ///
 /// ## Warning
 /// Some bitwise operations (e.g. union-not, xor) can set output bits that were
@@ -1108,16 +1080,16 @@ impl<T: Idx> fmt::Debug for ChunkedBitSet<T> {
 /// "changed" return value unreliable, because the change might have only
 /// affected excess bits.
 #[inline]
-fn bitwise<Op>(out_vec: &mut [Word], in_vec: &[Word], op: Op) -> bool
+fn update_words<Op>(lhs: &mut [Word], rhs: &[Word], op: Op) -> bool
 where
     Op: Fn(Word, Word) -> Word,
 {
-    assert_eq!(out_vec.len(), in_vec.len());
+    assert_eq!(lhs.len(), rhs.len());
     let mut changed = 0;
-    for (out_elem, in_elem) in iter::zip(out_vec, in_vec) {
-        let old_val = *out_elem;
-        let new_val = op(old_val, *in_elem);
-        *out_elem = new_val;
+    for (lhs_slot, &rhs_val) in iter::zip(lhs, rhs) {
+        let old_val = *lhs_slot;
+        let new_val = op(old_val, rhs_val);
+        *lhs_slot = new_val;
         // This is essentially equivalent to a != with changed being a bool, but
         // in practice this code gets auto-vectorized by the compiler for most
         // operators. Using != here causes us to generate quite poor code as the
@@ -1127,21 +1099,40 @@ where
     changed != 0
 }
 
-/// Does this bitwise operation change `out_vec`?
+/// Returns true if a call to [`update_words`] would modify `lhs`, i.e.
+/// `lhs[i] != op(lhs[i], rhs[i])` for some `i`.
 #[inline]
-fn bitwise_changes<Op>(out_vec: &[Word], in_vec: &[Word], op: Op) -> bool
+fn would_modify_words<Op>(lhs: &[Word], rhs: &[Word], op: Op) -> bool
 where
     Op: Fn(Word, Word) -> Word,
 {
-    assert_eq!(out_vec.len(), in_vec.len());
-    for (out_elem, in_elem) in iter::zip(out_vec, in_vec) {
-        let old_val = *out_elem;
-        let new_val = op(old_val, *in_elem);
-        if old_val != new_val {
+    assert_eq!(lhs.len(), rhs.len());
+
+    // To make codegen more vectorizer-friendly, we traverse each slice in larger
+    // "subchunks", and only consider an early return at subchunk boundaries.
+    // These subchunks are smaller than full `ChunkedBitSet` chunks, so that
+    // we still have some chance of stopping early.
+    const SUBCHUNK_LEN: usize = 64 / size_of::<Word>();
+    let (lhs_chunks, lhs_tail) = lhs.as_chunks::<SUBCHUNK_LEN>();
+    let (rhs_chunks, rhs_tail) = rhs.as_chunks::<SUBCHUNK_LEN>();
+
+    let would_modify_subchunk = |lhs_chunk: &[Word], rhs_chunk: &[Word]| {
+        let mut changed = 0;
+        for (&old_val, &rhs_val) in iter::zip(lhs_chunk, rhs_chunk) {
+            let new_val = op(old_val, rhs_val);
+            // Set `changed` to a non-zero value if any bits changed.
+            // This gives better SIMD codegen than using an actual boolean.
+            changed |= old_val ^ new_val;
+        }
+        changed != 0
+    };
+
+    for (lhs_chunk, rhs_chunk) in iter::zip(lhs_chunks, rhs_chunks) {
+        if would_modify_subchunk(lhs_chunk, rhs_chunk) {
             return true;
         }
     }
-    false
+    would_modify_subchunk(lhs_tail, rhs_tail)
 }
 
 /// A bitset with a mixed representation, using `DenseBitSet` for small and
@@ -1311,9 +1302,20 @@ impl<'a, T: Idx> Iterator for MixedBitIter<'a, T> {
 ///
 /// All operations that involve an element will panic if the element is equal
 /// to or greater than the domain size.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct GrowableBitSet<T: Idx> {
     bit_set: DenseBitSet<T>,
+}
+
+// Manually implemented to forward `clone_from`, and to avoid the `T: Clone` bound.
+impl<T: Idx> Clone for GrowableBitSet<T> {
+    fn clone(&self) -> Self {
+        Self { bit_set: self.bit_set.clone() }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.bit_set.clone_from(&source.bit_set);
+    }
 }
 
 impl<T: Idx> Default for GrowableBitSet<T> {
@@ -1350,11 +1352,27 @@ impl<T: Idx> GrowableBitSet<T> {
         self.bit_set.insert(elem)
     }
 
+    #[inline]
+    pub fn insert_range(&mut self, elems: Range<T>) {
+        self.ensure(elems.end.index());
+        self.bit_set.insert_range(elems);
+    }
+
     /// Returns `true` if the set has changed.
     #[inline]
     pub fn remove(&mut self, elem: T) -> bool {
         self.ensure(elem.index() + 1);
         self.bit_set.remove(elem)
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.bit_set.clear();
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.bit_set.count()
     }
 
     #[inline]
@@ -1366,6 +1384,14 @@ impl<T: Idx> GrowableBitSet<T> {
     pub fn contains(&self, elem: T) -> bool {
         let (word_index, mask) = word_index_and_mask(elem);
         self.bit_set.words.get(word_index).is_some_and(|word| (word & mask) != 0)
+    }
+
+    #[inline]
+    pub fn contains_any(&self, elems: Range<T>) -> bool {
+        elems.start.index() < self.bit_set.domain_size
+            && self
+                .bit_set
+                .contains_any(elems.start..T::new(elems.end.index().min(self.bit_set.domain_size)))
     }
 
     #[inline]
@@ -1397,7 +1423,7 @@ impl<T: Idx> From<DenseBitSet<T>> for GrowableBitSet<T> {
 pub struct BitMatrix<R: Idx, C: Idx> {
     num_rows: usize,
     num_columns: usize,
-    words: SmallVec<[Word; 2]>,
+    words: Vec<Word>,
     marker: PhantomData<(R, C)>,
 }
 
@@ -1410,7 +1436,7 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
         BitMatrix {
             num_rows,
             num_columns,
-            words: smallvec![0; num_rows * words_per_row],
+            words: vec![0; num_rows * words_per_row],
             marker: PhantomData,
         }
     }
@@ -1423,7 +1449,7 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
         BitMatrix {
             num_rows,
             num_columns,
-            words: iter::repeat(&row.words).take(num_rows).flatten().cloned().collect(),
+            words: iter::repeat_n(&row.words, num_rows).flatten().cloned().collect(),
             marker: PhantomData,
         }
     }
@@ -1518,7 +1544,7 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
         assert!(write.index() < self.num_rows);
         assert_eq!(with.domain_size(), self.num_columns);
         let (write_start, write_end) = self.range(write);
-        bitwise(&mut self.words[write_start..write_end], &with.words, |a, b| a | b)
+        update_words(&mut self.words[write_start..write_end], &with.words, |a, b| a | b)
     }
 
     /// Sets every cell in `row` to true.
@@ -1548,7 +1574,7 @@ impl<R: Idx, C: Idx> BitMatrix<R, C> {
     /// Returns the number of elements in `row`.
     pub fn count(&self, row: R) -> usize {
         let (start, end) = self.range(row);
-        self.words[start..end].iter().map(|e| e.count_ones() as usize).sum()
+        count_ones(&self.words[start..end])
     }
 }
 
@@ -1718,13 +1744,7 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
 
 #[inline]
 fn num_words<T: Idx>(domain_size: T) -> usize {
-    (domain_size.index() + WORD_BITS - 1) / WORD_BITS
-}
-
-#[inline]
-fn num_chunks<T: Idx>(domain_size: T) -> usize {
-    assert!(domain_size.index() > 0);
-    (domain_size.index() + CHUNK_BITS - 1) / CHUNK_BITS
+    domain_size.index().div_ceil(WORD_BITS)
 }
 
 #[inline]
@@ -1759,113 +1779,7 @@ fn max_bit(word: Word) -> usize {
     WORD_BITS - 1 - word.leading_zeros() as usize
 }
 
-/// Integral type used to represent the bit set.
-pub trait FiniteBitSetTy:
-    BitAnd<Output = Self>
-    + BitAndAssign
-    + BitOrAssign
-    + Clone
-    + Copy
-    + Shl
-    + Not<Output = Self>
-    + PartialEq
-    + Sized
-{
-    /// Size of the domain representable by this type, e.g. 64 for `u64`.
-    const DOMAIN_SIZE: u32;
-
-    /// Value which represents the `FiniteBitSet` having every bit set.
-    const FILLED: Self;
-    /// Value which represents the `FiniteBitSet` having no bits set.
-    const EMPTY: Self;
-
-    /// Value for one as the integral type.
-    const ONE: Self;
-    /// Value for zero as the integral type.
-    const ZERO: Self;
-
-    /// Perform a checked left shift on the integral type.
-    fn checked_shl(self, rhs: u32) -> Option<Self>;
-    /// Perform a checked right shift on the integral type.
-    fn checked_shr(self, rhs: u32) -> Option<Self>;
-}
-
-impl FiniteBitSetTy for u32 {
-    const DOMAIN_SIZE: u32 = 32;
-
-    const FILLED: Self = Self::MAX;
-    const EMPTY: Self = Self::MIN;
-
-    const ONE: Self = 1u32;
-    const ZERO: Self = 0u32;
-
-    fn checked_shl(self, rhs: u32) -> Option<Self> {
-        self.checked_shl(rhs)
-    }
-
-    fn checked_shr(self, rhs: u32) -> Option<Self> {
-        self.checked_shr(rhs)
-    }
-}
-
-impl std::fmt::Debug for FiniteBitSet<u32> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:032b}", self.0)
-    }
-}
-
-/// A fixed-sized bitset type represented by an integer type. Indices outwith than the range
-/// representable by `T` are considered set.
-#[cfg_attr(feature = "nightly", derive(Decodable_NoContext, Encodable_NoContext))]
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct FiniteBitSet<T: FiniteBitSetTy>(pub T);
-
-impl<T: FiniteBitSetTy> FiniteBitSet<T> {
-    /// Creates a new, empty bitset.
-    pub fn new_empty() -> Self {
-        Self(T::EMPTY)
-    }
-
-    /// Sets the `index`th bit.
-    pub fn set(&mut self, index: u32) {
-        self.0 |= T::ONE.checked_shl(index).unwrap_or(T::ZERO);
-    }
-
-    /// Unsets the `index`th bit.
-    pub fn clear(&mut self, index: u32) {
-        self.0 &= !T::ONE.checked_shl(index).unwrap_or(T::ZERO);
-    }
-
-    /// Sets the `i`th to `j`th bits.
-    pub fn set_range(&mut self, range: Range<u32>) {
-        let bits = T::FILLED
-            .checked_shl(range.end - range.start)
-            .unwrap_or(T::ZERO)
-            .not()
-            .checked_shl(range.start)
-            .unwrap_or(T::ZERO);
-        self.0 |= bits;
-    }
-
-    /// Is the set empty?
-    pub fn is_empty(&self) -> bool {
-        self.0 == T::EMPTY
-    }
-
-    /// Returns the domain size of the bitset.
-    pub fn within_domain(&self, index: u32) -> bool {
-        index < T::DOMAIN_SIZE
-    }
-
-    /// Returns if the `index`th bit is set.
-    pub fn contains(&self, index: u32) -> Option<bool> {
-        self.within_domain(index)
-            .then(|| ((self.0.checked_shr(index).unwrap_or(T::ONE)) & T::ONE) == T::ONE)
-    }
-}
-
-impl<T: FiniteBitSetTy> Default for FiniteBitSet<T> {
-    fn default() -> Self {
-        Self::new_empty()
-    }
+#[inline]
+fn count_ones(words: &[Word]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
 }

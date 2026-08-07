@@ -25,9 +25,8 @@ use std::collections::hash_map::Entry;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lock;
-use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TypeFoldable, TypeVisitable};
 pub use rustc_type_ir as ir;
-pub use rustc_type_ir::{CanonicalTyVarKind, CanonicalVarKind};
 use smallvec::SmallVec;
 
 use crate::mir::ConstraintCategory;
@@ -35,9 +34,9 @@ use crate::ty::{self, GenericArg, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt}
 
 pub type CanonicalQueryInput<'tcx, V> = ir::CanonicalQueryInput<TyCtxt<'tcx>, V>;
 pub type Canonical<'tcx, V> = ir::Canonical<TyCtxt<'tcx>, V>;
-pub type CanonicalVarInfo<'tcx> = ir::CanonicalVarInfo<TyCtxt<'tcx>>;
+pub type CanonicalVarKind<'tcx> = ir::CanonicalVarKind<TyCtxt<'tcx>>;
 pub type CanonicalVarValues<'tcx> = ir::CanonicalVarValues<TyCtxt<'tcx>>;
-pub type CanonicalVarInfos<'tcx> = &'tcx List<CanonicalVarInfo<'tcx>>;
+pub type CanonicalVarKinds<'tcx> = &'tcx List<CanonicalVarKind<'tcx>>;
 
 /// When we canonicalize a value to form a query, we wind up replacing
 /// various parts of it with canonical variables. This struct stores
@@ -68,7 +67,7 @@ impl<'tcx> Default for OriginalQueryValues<'tcx> {
 /// After we execute a query with a canonicalized key, we get back a
 /// `Canonical<QueryResponse<..>>`. You can use
 /// `instantiate_query_result` to access the data in this result.
-#[derive(Clone, Debug, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, Debug, StableHash, TypeFoldable, TypeVisitable)]
 pub struct QueryResponse<'tcx, R> {
     pub var_values: CanonicalVarValues<'tcx>,
     pub region_constraints: QueryRegionConstraints<'tcx>,
@@ -78,16 +77,22 @@ pub struct QueryResponse<'tcx, R> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-#[derive(HashStable, TypeFoldable, TypeVisitable)]
+#[derive(StableHash, TypeFoldable, TypeVisitable)]
 pub struct QueryRegionConstraints<'tcx> {
-    pub outlives: Vec<QueryOutlivesConstraint<'tcx>>,
+    pub constraints: Vec<QueryRegionConstraint<'tcx>>,
+    pub assumptions: Vec<ty::ArgOutlivesClause<'tcx>>,
 }
 
 impl QueryRegionConstraints<'_> {
-    /// Represents an empty (trivially true) set of region
-    /// constraints.
+    /// Represents an empty (trivially true) set of region constraints.
+    ///
+    /// FIXME(higher_ranked_auto): This could still just be true if there are only assumptions?
+    /// Because I don't expect for us to get cases where an assumption from one query would
+    /// discharge a requirement from another query, which is a potential problem if we did throw
+    /// away these assumptions because there were no constraints.
     pub fn is_empty(&self) -> bool {
-        self.outlives.is_empty()
+        let QueryRegionConstraints { constraints, assumptions } = self;
+        constraints.is_empty() && assumptions.is_empty()
     }
 }
 
@@ -95,7 +100,7 @@ pub type CanonicalQueryResponse<'tcx, T> = &'tcx Canonical<'tcx, QueryResponse<'
 
 /// Indicates whether or not we were able to prove the query to be
 /// true.
-#[derive(Copy, Clone, Debug, HashStable)]
+#[derive(Copy, Clone, Debug, StableHash)]
 pub enum Certainty {
     /// The query is known to be true, presuming that you apply the
     /// given `var_values` and the region-constraints are satisfied.
@@ -130,8 +135,12 @@ impl<'tcx, R> QueryResponse<'tcx, R> {
     }
 }
 
-pub type QueryOutlivesConstraint<'tcx> =
-    (ty::OutlivesPredicate<'tcx, GenericArg<'tcx>>, ConstraintCategory<'tcx>);
+#[derive(Debug, StableHash, Hash, Eq, PartialEq, TypeVisitable, Clone, TypeFoldable, Copy)]
+pub struct QueryRegionConstraint<'tcx> {
+    pub constraint: ty::RegionConstraint<'tcx>,
+    pub category: ConstraintCategory<'tcx>,
+    pub visible_for_leak_check: ty::VisibleForLeakCheck,
+}
 
 #[derive(Default)]
 pub struct CanonicalParamEnvCache<'tcx> {
@@ -166,7 +175,7 @@ impl<'tcx> CanonicalParamEnvCache<'tcx> {
         ) {
             return Canonical {
                 max_universe: ty::UniverseIndex::ROOT,
-                variables: List::empty(),
+                var_kinds: List::empty(),
                 value: key,
             };
         }

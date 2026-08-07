@@ -1,5 +1,5 @@
 error: all if blocks contain the same code at both the start and the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:17:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:15:5
    |
 LL | /     if x == 7 {
 LL | |
@@ -10,7 +10,7 @@ LL | |         let _overlap_end = 2 * t;
    | |_________________________________^
    |
 note: this code is shared at the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:31:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:29:5
    |
 LL | /         let _u = 9;
 LL | |     }
@@ -34,7 +34,7 @@ LL +     let _u = 9;
    |
 
 error: all if blocks contain the same code at both the start and the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:35:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:33:5
    |
 LL | /     if x == 99 {
 LL | |
@@ -45,7 +45,7 @@ LL | |         let _overlap_middle = r * r;
    | |____________________________________^
    |
 note: this code is shared at the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:48:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:46:5
    |
 LL | /         let _overlap_end = r * r * r;
 LL | |         let z = "end";
@@ -67,7 +67,7 @@ LL +     let z = "end";
    |
 
 error: all if blocks contain the same code at both the start and the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:66:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:64:5
    |
 LL | /     if (x > 7 && y < 13) || (x + y) % 2 == 1 {
 LL | |
@@ -78,7 +78,7 @@ LL | |         let e_id = gen_id(a, b);
    | |________________________________^
    |
 note: this code is shared at the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:88:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:86:5
    |
 LL | /         let pack = DataPack {
 LL | |             id: e_id,
@@ -108,7 +108,7 @@ LL +     process_data(pack);
    |
 
 error: all if blocks contain the same code at both the start and the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:101:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:99:5
    |
 LL | /     let _ = if x == 7 {
 ...  |
@@ -116,7 +116,7 @@ LL | |         let _ = 19;
    | |___________________^
    |
 note: this code is shared at the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:112:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:110:5
    |
 LL | /         x << 2
 LL | |     };
@@ -134,7 +134,7 @@ LL ~     x << 2;
    |
 
 error: all if blocks contain the same code at both the start and the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:115:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:113:5
    |
 LL | /     if x == 9 {
 ...  |
@@ -142,7 +142,7 @@ LL | |         let _ = 17;
    | |___________________^
    |
 note: this code is shared at the end
-  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:126:5
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:124:5
    |
 LL | /         x * 4
 LL | |     }
@@ -159,5 +159,31 @@ LL ~     }
 LL +     x * 4
    |
 
-error: aborting due to 5 previous errors
+error: all if blocks contain the same code at both the start and the end
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:156:9
+   |
+LL | /         if false {
+LL | |
+LL | |             let x = 1;
+   | |______________________^
+   |
+note: this code is shared at the end
+  --> tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs:164:9
+   |
+LL | /             let y = 1;
+LL | |         }
+   | |_________^
+   = warning: some moved values might need to be renamed to avoid wrong references
+help: consider moving these statements before the if
+   |
+LL ~         let x = 1;
+LL +         if false {
+   |
+help: consider moving these statements after the if
+   |
+LL ~         }
+LL +         let y = 1;
+   |
+
+error: aborting due to 6 previous errors
 

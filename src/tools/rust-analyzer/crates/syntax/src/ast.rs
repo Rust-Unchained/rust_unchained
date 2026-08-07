@@ -1,7 +1,6 @@
 //! Abstract Syntax Tree, layered on top of untyped `SyntaxNode`s
 
 pub mod edit;
-pub mod edit_in_place;
 mod expr_ext;
 mod generated;
 pub mod make;
@@ -17,23 +16,26 @@ use std::marker::PhantomData;
 use either::Either;
 
 use crate::{
-    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
     SyntaxKind,
+    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
 };
 
 pub use self::{
     expr_ext::{ArrayExprKind, BlockModifier, CallableExpr, ElseBranch, LiteralKind},
     generated::{nodes::*, tokens::*},
     node_ext::{
-        AttrKind, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind, SelfParamKind,
-        SlicePatComponents, StructKind, TraitOrAlias, TypeBoundKind, TypeOrConstParam,
-        VisibilityKind,
+        AttrKind, CfgAtomKey, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind,
+        SelfParamKind, SlicePatComponents, StructKind, TokenTreeChildren, TypeBoundKind,
+        TypeOrConstParam, VisibilityKind,
     },
     operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
-    token_ext::{CommentKind, CommentPlacement, CommentShape, IsString, QuoteOffsets, Radix},
+    token_ext::{
+        AnyString, CommentKind, CommentPlacement, CommentShape, IsString, QuoteOffsets, Radix,
+    },
     traits::{
         AttrDocCommentIter, DocCommentIter, HasArgList, HasAttrs, HasDocComments, HasGenericArgs,
         HasGenericParams, HasLoopBody, HasModuleItem, HasName, HasTypeBounds, HasVisibility,
+        attrs_including_inner,
     },
 };
 
@@ -59,12 +61,6 @@ pub trait AstNode {
         Self: Sized;
 
     fn syntax(&self) -> &SyntaxNode;
-    fn clone_for_update(&self) -> Self
-    where
-        Self: Sized,
-    {
-        Self::cast(self.syntax().clone_for_update()).unwrap()
-    }
     fn clone_subtree(&self) -> Self
     where
         Self: Sized,
@@ -393,8 +389,7 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_none());
-    assert!(pred.generic_param_list().is_none());
+    assert!(pred.for_binder().is_none());
     assert_eq!("T", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Clone", bounds.next());
     assert_bound("Copy", bounds.next());
@@ -432,8 +427,10 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_some());
-    assert_eq!("<'a>", pred.generic_param_list().unwrap().syntax().text().to_string());
+    assert_eq!(
+        "<'a>",
+        pred.for_binder().unwrap().generic_param_list().unwrap().syntax().text().to_string()
+    );
     assert_eq!("F", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Fn(&'a str)", bounds.next());
 }

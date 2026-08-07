@@ -3,17 +3,17 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait] trait Foo {
-    type Assoc<T>: ~const Bar
+const trait Foo {
+    type Assoc<T>: [const] Bar
     where
-        T: ~const Bar;
+        T: [const] Bar;
 }
 
-#[const_trait] trait Bar {}
+const trait Bar {}
 struct N<T>(T);
 impl<T> Bar for N<T> where T: Bar {}
 struct C<T>(T);
-impl<T> const Bar for C<T> where T: ~const Bar {}
+const impl<T> Bar for C<T> where T: [const] Bar {}
 
 impl Foo for u32 {
     type Assoc<T> = N<T>
@@ -21,10 +21,10 @@ impl Foo for u32 {
         T: Bar;
 }
 
-impl const Foo for i32 {
+const impl Foo for i32 {
     type Assoc<T> = C<T>
     where
-        T: ~const Bar;
+        T: [const] Bar;
 }
 
 fn main() {}

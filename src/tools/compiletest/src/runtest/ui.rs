@@ -5,27 +5,29 @@ use std::io::Write;
 use rustfix::{Filter, apply_suggestions, get_suggestions_from_json};
 use tracing::debug;
 
-use super::{
-    AllowUnused, Emit, ErrorKind, FailMode, LinkToAux, PassMode, TargetLocation, TestCx,
-    TestOutput, Truncated, UI_FIXED, WillExecute,
+use crate::common::PassFailMode;
+use crate::json;
+use crate::runtest::{
+    AllowUnused, Emit, LinkToAux, ProcRes, RunResult, TargetLocation, TestCx, TestOutput,
+    Truncated, UI_FIXED, WillExecute,
 };
-use crate::{errors, json};
 
 impl TestCx<'_> {
     pub(super) fn run_ui_test(&self) {
-        if let Some(FailMode::Build) = self.props.fail_mode {
+        let pass_fail =
+            self.effective_pass_fail_mode().expect("UI tests always have a pass/fail mode");
+
+        if pass_fail == PassFailMode::BuildFail {
             // Make sure a build-fail test cannot fail due to failing analysis (e.g. typeck).
-            let pm = Some(PassMode::Check);
-            let proc_res =
-                self.compile_test_general(WillExecute::No, Emit::Metadata, pm, Vec::new());
-            self.check_if_test_should_compile(self.props.fail_mode, pm, &proc_res);
+            let proc_res = self.compile_test(WillExecute::No, Emit::Metadata);
+            self.check_if_test_should_compile(PassFailMode::CheckPass, &proc_res);
         }
 
-        let pm = self.pass_mode();
-        let should_run = self.should_run(pm);
-        let emit_metadata = self.should_emit_metadata(pm);
-        let proc_res = self.compile_test(should_run, emit_metadata);
-        self.check_if_test_should_compile(self.props.fail_mode, pm, &proc_res);
+        let will_execute = if pass_fail.is_run() { self.run_if_enabled() } else { WillExecute::No };
+        let emit_metadata = if pass_fail.is_check() { Emit::Metadata } else { Emit::None };
+        let proc_res = self.compile_test(will_execute, emit_metadata);
+        self.check_if_test_should_compile(pass_fail, &proc_res);
+
         if matches!(proc_res.truncated, Truncated::Yes)
             && !self.props.dont_check_compiler_stdout
             && !self.props.dont_check_compiler_stderr
@@ -52,10 +54,10 @@ impl TestCx<'_> {
             // don't test rustfix with nll right now
         } else if self.config.rustfix_coverage {
             // Find out which tests have `MachineApplicable` suggestions but are missing
-            // `run-rustfix` or `run-rustfix-only-machine-applicable` headers.
+            // `run-rustfix` or `run-rustfix-only-machine-applicable` directives.
             //
             // This will return an empty `Vec` in case the executed test file has a
-            // `compile-flags: --error-format=xxxx` header with a value other than `json`.
+            // `compile-flags: --error-format=xxxx` directive with a value other than `json`.
             let suggestions = get_suggestions_from_json(
                 &rustfix_input,
                 &HashSet::new(),
@@ -114,10 +116,14 @@ impl TestCx<'_> {
         }
 
         if errors > 0 {
-            println!("To update references, rerun the tests and pass the `--bless` flag");
+            writeln!(
+                self.stdout,
+                "To update references, rerun the tests and pass the `--bless` flag"
+            );
             let relative_path_to_file =
                 self.testpaths.relative_dir.join(self.testpaths.file.file_name().unwrap());
-            println!(
+            writeln!(
+                self.stdout,
                 "To only update this specific test, also pass `--test-args {}`",
                 relative_path_to_file,
             );
@@ -127,9 +133,10 @@ impl TestCx<'_> {
             );
         }
 
-        let expected_errors = errors::load_errors(&self.testpaths.file, self.revision);
-
-        if let WillExecute::Yes = should_run {
+        // If the test is executed, capture its ProcRes separately so that
+        // pattern/forbid checks can report the *runtime* stdout/stderr when they fail.
+        let mut run_proc_res: Option<ProcRes> = None;
+        let output_to_check = if will_execute == WillExecute::Yes {
             let proc_res = self.exec_compiled_test();
             let run_output_errors = if self.props.check_run_results {
                 self.load_compare_outputs(&proc_res, TestOutput::Run, explicit)
@@ -142,58 +149,103 @@ impl TestCx<'_> {
                     &proc_res,
                 );
             }
-            if self.should_run_successfully(pm) {
-                if !proc_res.status.success() {
-                    self.fatal_proc_rec("test run failed!", &proc_res);
+            let code = proc_res.status.code();
+            let run_result = if proc_res.status.success() {
+                RunResult::Pass
+            } else if code.is_some_and(|c| c >= 1 && c <= 127) {
+                RunResult::Fail
+            } else {
+                RunResult::Crash
+            };
+
+            // Help users understand why the test failed by including the actual
+            // exit code and actual run result in the failure message.
+            let pass_hint = format!("code={code:?} so test would pass with `{run_result}`");
+            match pass_fail {
+                PassFailMode::CheckFail
+                | PassFailMode::CheckPass
+                | PassFailMode::BuildFail
+                | PassFailMode::BuildPass => {
+                    unreachable!("test program should not have run in mode {pass_fail:?}")
                 }
-            } else if proc_res.status.success() {
-                self.fatal_proc_rec("test run succeeded!", &proc_res);
+
+                PassFailMode::RunPass => {
+                    if run_result != RunResult::Pass {
+                        self.fatal_proc_rec(
+                            &format!("test did not exit with success! {pass_hint}"),
+                            &proc_res,
+                        );
+                    }
+                }
+
+                PassFailMode::RunFail => {
+                    // If the test is marked as `run-fail` but do not support
+                    // unwinding we allow it to crash, since a panic will trigger an
+                    // abort (crash) instead of unwind (exit with code 101).
+                    let crash_ok = !self.config.can_unwind();
+                    if run_result != RunResult::Fail
+                        && !(crash_ok && run_result == RunResult::Crash)
+                    {
+                        let err = if crash_ok {
+                            format!(
+                                "test did not exit with failure or crash (`{}` can't unwind)! {pass_hint}",
+                                self.config.target
+                            )
+                        } else {
+                            format!("test did not exit with failure! {pass_hint}")
+                        };
+                        self.fatal_proc_rec(&err, &proc_res);
+                    }
+                }
+
+                PassFailMode::RunCrash => {
+                    if run_result != RunResult::Crash {
+                        self.fatal_proc_rec(&format!("test did not crash! {pass_hint}"), &proc_res);
+                    }
+                }
+
+                PassFailMode::RunFailOrCrash => {
+                    if run_result != RunResult::Fail && run_result != RunResult::Crash {
+                        self.fatal_proc_rec(
+                            &format!("test did not exit with failure or crash! {pass_hint}"),
+                            &proc_res,
+                        );
+                    }
+                }
             }
 
-            let output_to_check = self.get_output(&proc_res);
-            if !self.props.error_patterns.is_empty() || !self.props.regex_error_patterns.is_empty()
-            {
-                // "// error-pattern" comments
-                self.check_all_error_patterns(&output_to_check, &proc_res, pm);
-            }
-            self.check_forbid_output(&output_to_check, &proc_res)
-        }
+            let output = self.get_output(&proc_res);
+            // Move the proc_res into our option after we've extracted output.
+            run_proc_res = Some(proc_res);
+            output
+        } else {
+            self.get_output(&proc_res)
+        };
 
         debug!(
-            "run_ui_test: explicit={:?} config.compare_mode={:?} expected_errors={:?} \
-               proc_res.status={:?} props.error_patterns={:?}",
+            "run_ui_test: explicit={:?} config.compare_mode={:?} \
+               proc_res.status={:?} props.error_patterns={:?} output_to_check={:?}",
             explicit,
             self.config.compare_mode,
-            expected_errors,
             proc_res.status,
-            self.props.error_patterns
+            self.props.error_patterns,
+            output_to_check,
         );
 
-        if !explicit && self.config.compare_mode.is_none() {
-            // "//~ERROR comments"
-            self.check_expected_errors(expected_errors, &proc_res);
-        } else if explicit && !expected_errors.is_empty() {
-            let msg = format!(
-                "line {}: cannot combine `--error-format` with {} annotations; use `error-pattern` instead",
-                expected_errors[0].line_num_str(),
-                expected_errors[0].kind.unwrap_or(ErrorKind::Error),
-            );
-            self.fatal(&msg);
-        }
-        let output_to_check = self.get_output(&proc_res);
-        if should_run == WillExecute::No
-            && (!self.props.error_patterns.is_empty()
-                || !self.props.regex_error_patterns.is_empty())
-        {
-            // "// error-pattern" comments
-            self.check_all_error_patterns(&output_to_check, &proc_res, pm);
-        }
-        self.check_forbid_output(&output_to_check, &proc_res);
+        // Compiler diagnostics (expected errors) are always tied to the compile-time ProcRes.
+        self.check_expected_errors(&proc_res);
+
+        // For runtime pattern/forbid checks prefer the executed program's ProcRes if available
+        // so that missing pattern failures include the program's stdout/stderr.
+        let pattern_proc_res = run_proc_res.as_ref().unwrap_or(&proc_res);
+        self.check_all_error_patterns(&output_to_check, pattern_proc_res);
+        self.check_forbid_output(&output_to_check, pattern_proc_res);
 
         if self.props.run_rustfix && self.config.compare_mode.is_none() {
             // And finally, compile the fixed code and make sure it both
             // succeeds and has no diagnostics.
             let mut rustc = self.make_compile_args(
+                self.compiler_kind_for_non_aux(),
                 &self.expected_output_path(UI_FIXED),
                 TargetLocation::ThisFile(self.make_exe_name()),
                 emit_metadata,
@@ -207,7 +259,7 @@ impl TestCx<'_> {
             // (including the revision) here to avoid the test writer having to manually specify a
             // `#![crate_name = "..."]` as a workaround. This is okay since we're only checking if
             // the fixed code is compilable.
-            if self.revision.is_some() {
+            if self.variant.revision.is_some() {
                 let crate_name =
                     self.testpaths.file.file_stem().expect("test must have a file stem");
                 // crate name must be alphanumeric or `_`.
@@ -219,7 +271,7 @@ impl TestCx<'_> {
                 rustc.arg(crate_name);
             }
 
-            let res = self.compose_and_run_compiler(rustc, None, self.testpaths);
+            let res = self.compose_and_run_compiler(rustc, None);
             if !res.status.success() {
                 self.fatal_proc_rec("failed to compile fixed code", &res);
             }

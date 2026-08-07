@@ -18,7 +18,7 @@ pub trait Bar: Sized {
 }
 
 mod x {
-    use {Foo, Bar};
+    use crate::{Foo, Bar};
 
     #[rustc_if_this_changed]
     impl Foo for char { }
@@ -27,18 +27,18 @@ mod x {
 }
 
 mod y {
-    use {Foo, Bar};
+    use crate::{Foo, Bar};
 
-    #[rustc_then_this_would_need(typeck)] //~ ERROR no path
+    #[rustc_then_this_would_need(typeck_root)] //~ ERROR no path
     pub fn call_bar() {
         char::bar('a');
     }
 }
 
 mod z {
-    use y;
+    use crate::y;
 
-    #[rustc_then_this_would_need(typeck)] //~ ERROR no path
+    #[rustc_then_this_would_need(typeck_root)] //~ ERROR no path
     pub fn z() {
         y::call_bar();
     }

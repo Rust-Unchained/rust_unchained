@@ -22,14 +22,14 @@ impl<In, Out> Trait<Bar, In> for Out {
     type Out = Out;
     #[define_opaque(Bar)]
     fn convert(_i: In) -> Self::Out {
-        //[next]~^  ERROR: type annotations needed: cannot satisfy `Bar == _`
+        //[next]~^  ERROR: type annotations needed
         //[current]~^^ ERROR: item does not constrain `Bar::{opaque#0}`
         unreachable!();
     }
 }
 
 impl<In, Out> Trait<(), In> for Out {
-    //~^ ERROR conflicting implementations of trait `Trait<Bar, _>`
+    //~^ ERROR: conflicting implementations of trait
     type Out = In;
     fn convert(i: In) -> Self::Out {
         i

@@ -15,27 +15,30 @@ macro_rules! type_alias {
     }
 }
 
-type_alias! { "c_char.md", c_char = c_char_definition::c_char; #[doc(cfg(all()))] }
+// `#[doc(cfg(true))]` is used to prevent rustdoc from displaying a "Available on ..." box.
+// The implementation of these constants is target-specific, but every target does define them.
+
+type_alias! { "c_char.md", c_char = c_char_definition::c_char; #[doc(cfg(true))] }
 
 type_alias! { "c_schar.md", c_schar = i8; }
 type_alias! { "c_uchar.md", c_uchar = u8; }
 type_alias! { "c_short.md", c_short = i16; }
 type_alias! { "c_ushort.md", c_ushort = u16; }
 
-type_alias! { "c_int.md", c_int = c_int_definition::c_int; #[doc(cfg(all()))] }
-type_alias! { "c_uint.md", c_uint = c_int_definition::c_uint; #[doc(cfg(all()))] }
+type_alias! { "c_int.md", c_int = c_int_definition::c_int; #[doc(cfg(true))] }
+type_alias! { "c_uint.md", c_uint = c_int_definition::c_uint; #[doc(cfg(true))] }
 
-type_alias! { "c_long.md", c_long = c_long_definition::c_long; #[doc(cfg(all()))] }
-type_alias! { "c_ulong.md", c_ulong = c_long_definition::c_ulong; #[doc(cfg(all()))] }
+type_alias! { "c_long.md", c_long = c_long_definition::c_long; #[doc(cfg(true))] }
+type_alias! { "c_ulong.md", c_ulong = c_long_definition::c_ulong; #[doc(cfg(true))] }
 
 type_alias! { "c_longlong.md", c_longlong = i64; }
 type_alias! { "c_ulonglong.md", c_ulonglong = u64; }
 
 type_alias! { "c_float.md", c_float = f32; }
-type_alias! { "c_double.md", c_double = f64; }
+type_alias! { "c_double.md", c_double= c_double_definition::c_double; #[doc(cfg(true))] }
 
 mod c_char_definition {
-    crate::cfg_match! {
+    crate::cfg_select! {
         // These are the targets on which c_char is unsigned. Usually the
         // signedness is the same for all target_os values on a given architecture
         // but there are some exceptions (see isSignedCharDefault() in clang).
@@ -133,7 +136,7 @@ mod c_char_definition {
 }
 
 mod c_long_definition {
-    crate::cfg_match! {
+    crate::cfg_select! {
         any(
             all(target_pointer_width = "64", not(windows)),
             // wasm32 Linux ABI uses 64-bit long
@@ -172,7 +175,7 @@ pub type c_ptrdiff_t = isize;
 pub type c_ssize_t = isize;
 
 mod c_int_definition {
-    crate::cfg_match! {
+    crate::cfg_select! {
         any(target_arch = "avr", target_arch = "msp430") => {
             pub(super) type c_int = i16;
             pub(super) type c_uint = u16;
@@ -180,6 +183,21 @@ mod c_int_definition {
         _ => {
             pub(super) type c_int = i32;
             pub(super) type c_uint = u32;
+        }
+    }
+}
+
+mod c_double_definition {
+    crate::cfg_select! {
+        target_arch = "avr" => {
+            // avr:
+            //     Per https://gcc.gnu.org/wiki/avr-gcc#Type_Layout. The table says `4,8` because
+            //     in C the width of `double` can be changed with the `-mdouble=32/64` setting. But
+            //     32-bits is the default for the rust avr target.
+            pub(super) type c_double = f32;
+        }
+        _ => {
+            pub(super) type c_double = f64;
         }
     }
 }

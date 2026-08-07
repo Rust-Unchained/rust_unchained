@@ -1,5 +1,5 @@
 //@ run-pass
-#![allow(unused_variables)]
+#![warn(unused)]
 #![deny(non_shorthand_field_patterns)]
 
 pub struct Value<A> { pub value: A }
@@ -13,4 +13,5 @@ macro_rules! pat {
 
 fn main() {
     let pat!(value) = Value { value: () };
+    //~^ WARN unused variable: `value`
 }

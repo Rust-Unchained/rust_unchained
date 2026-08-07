@@ -75,7 +75,7 @@ impl<D: Decoder> Decodable<D> for MyStruct {
 
 rustc has a lot of [arena allocated types].
 Deserializing these types isn't possible without access to the arena that they need to be allocated on.
-The [`TyDecoder`] and [`TyEncoder`] traits are supertraits of [`Decoder`] and [`Encoder`] that allow access to a [`TyCtxt`].
+The [`TyDecoder`] and [`TyEncoder`] traits are subtraits of [`Decoder`] and [`Encoder`] that allow access to a [`TyCtxt`].
 
 Types which contain `arena` allocated types can then bound the type parameter of their
 [`Encodable`] and [`Decodable`] implementations with these traits.
@@ -106,7 +106,7 @@ type wrapper, like [`ty::Predicate`] and manually implementing `Encodable` and
 [`Encodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_serialize/trait.Encodable.html
 [`Encoder`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_serialize/trait.Encoder.html
 [`RefDecodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/codec/trait.RefDecodable.html
-[`rustc_middle`]: https://doc.rust-lang.org/nightly/nightly-rustc/src/rustc_type_ir/codec.rs.html#21
+[`rustc_middle`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/index.html
 [`ty::Predicate`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/predicate/struct.Predicate.html
 [`TyCtxt`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TyCtxt.html
 [`TyDecodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_macros/derive.TyDecodable.html
@@ -126,22 +126,24 @@ and `Encodable`.
   all `Encoders` and `Decoders`. These should be used in crates that don't
   depend on [`rustc_middle`], or that have to be serialized by a type that does
   not implement `TyEncoder`.
-- [`MetadataEncodable`] and [`MetadataDecodable`] generate implementations that
-  only allow decoding by [`rustc_metadata::rmeta::encoder::EncodeContext`] and
-  [`rustc_metadata::rmeta::decoder::DecodeContext`]. These are used for types
-  that contain [`rustc_metadata::rmeta::`]`Lazy*`.
+- [`MetadataEncodable`] generates implementations that
+  only allow decoding by [`rustc_metadata::rmeta::encoder::EncodeContext`].
+- [`BlobDecodable`] and [`LazyDecodable`] serve as the decoding counterparts to
+  `MetadataEncodable`. They generate implementations that decode with the
+  metadata blob decoders in `rustc_metadata::rmeta`; use `BlobDecodable` when
+  the type has no lazy metadata handles, and `LazyDecodable` when it does.
 - `TyEncodable` and `TyDecodable` generate implementation that apply to any
   `TyEncoder` or `TyDecoder`. These should be used for types that are only
   serialized in crate metadata and/or the incremental cache, which is most
   serializable types in `rustc_middle`.
 
-[`MetadataDecodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_macros/derive.MetadataDecodable.html
+[`BlobDecodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_macros/derive.BlobDecodable.html
+[`LazyDecodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_macros/derive.LazyDecodable.html
 [`MetadataEncodable`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_macros/derive.MetadataEncodable.html
-[`rustc_macros`]: https://github.com/rust-lang/rust/tree/master/compiler/rustc_macros
-[`rustc_metadata::rmeta::`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/rmeta/index.html
-[`rustc_metadata::rmeta::decoder::DecodeContext`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/rmeta/decoder/struct.DecodeContext.html
+[`rustc_macros`]: https://github.com/rust-lang/rust/tree/HEAD/compiler/rustc_macros
+[`rustc_metadata::rmeta`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/rmeta/index.html
 [`rustc_metadata::rmeta::encoder::EncodeContext`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/rmeta/encoder/struct.EncodeContext.html
-[`rustc_middle`]: https://github.com/rust-lang/rust/tree/master/compiler/rustc_middle
+[`rustc_middle`]: https://github.com/rust-lang/rust/tree/HEAD/compiler/rustc_middle
 
 ## Shorthands
 
@@ -169,7 +171,7 @@ The `LazyArray<[T]>` and `LazyTable<I, T>` types provide some functionality over
   than the one being read.
 
 **note**: `LazyValue<T>` does not cache its value after being deserialized the
-first time. Instead the query system its self is the main way of caching these
+first time. Instead the query system itself is the main way of caching these
 results.
 
 [`LazyArray<T>`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/rmeta/struct.LazyValue.html

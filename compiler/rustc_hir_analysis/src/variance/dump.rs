@@ -1,8 +1,9 @@
 use std::fmt::Write;
 
-use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::LocalDefId;
+use rustc_hir::find_attr;
 use rustc_middle::ty::{GenericArgs, TyCtxt};
-use rustc_span::sym;
 
 fn format_variances(tcx: TyCtxt<'_>, def_id: LocalDefId) -> String {
     let variances = tcx.variances_of(def_id);
@@ -25,23 +26,28 @@ fn format_variances(tcx: TyCtxt<'_>, def_id: LocalDefId) -> String {
 pub(crate) fn variances(tcx: TyCtxt<'_>) {
     let crate_items = tcx.hir_crate_items(());
 
-    if tcx.has_attr(CRATE_DEF_ID, sym::rustc_variance_of_opaques) {
+    if find_attr!(tcx, crate, RustcDumpVariancesOfOpaques) {
         for id in crate_items.opaques() {
-            tcx.dcx().emit_err(crate::errors::VariancesOf {
-                span: tcx.def_span(id),
-                variances: format_variances(tcx, id),
-            });
+            tcx.dcx().span_err(tcx.def_span(id), format_variances(tcx, id));
         }
     }
 
-    for id in crate_items.free_items() {
-        if !tcx.has_attr(id.owner_id, sym::rustc_variance) {
+    for id in crate_items.owners() {
+        if !find_attr!(tcx, id, RustcDumpVariances) {
             continue;
         }
 
-        tcx.dcx().emit_err(crate::errors::VariancesOf {
-            span: tcx.def_span(id.owner_id),
-            variances: format_variances(tcx, id.owner_id.def_id),
-        });
+        match tcx.def_kind(id) {
+            DefKind::AssocFn | DefKind::Fn | DefKind::Enum | DefKind::Struct | DefKind::Union => {
+                tcx.dcx().span_err(tcx.def_span(id), format_variances(tcx, id.def_id));
+            }
+            kind => {
+                let message = format!(
+                    "attr parsing didn't report an error for `#[{}]` on {kind:?}",
+                    rustc_span::sym::rustc_dump_variances,
+                );
+                tcx.dcx().span_delayed_bug(tcx.def_span(id), message);
+            }
+        }
     }
 }

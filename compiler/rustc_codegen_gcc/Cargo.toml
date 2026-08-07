@@ -2,19 +2,15 @@
 name = "rustc_codegen_gcc"
 version = "0.1.0"
 authors = ["Antoni Boucher <bouanto@zoho.com>"]
-edition = "2018"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["dylib"]
 
 [[test]]
-name = "lang_tests_debug"
-path = "tests/lang_tests_debug.rs"
-harness = false
-[[test]]
-name = "lang_tests_release"
-path = "tests/lang_tests_release.rs"
+name = "lang_tests"
+path = "tests/lang_tests.rs"
 harness = false
 
 [features]
@@ -22,16 +18,17 @@ master = ["gccjit/master"]
 default = ["master"]
 
 [dependencies]
-gccjit = "2.5"
-#gccjit = { git = "https://github.com/rust-lang/gccjit.rs" }
+object = { version = "0.37.0", default-features = false, features = ["std", "read"] }
+tempfile = "3.20"
+gccjit = { version = "3.3.0", features = ["dlopen"] }
+#gccjit = { git = "https://github.com/rust-lang/gccjit.rs", branch = "error-dlopen", features = ["dlopen"] }
 
 # Local copy.
-#gccjit = { path = "../gccjit.rs" }
+#gccjit = { path = "../gccjit.rs", features = ["dlopen"] }
 
 [dev-dependencies]
 boml = "0.3.1"
 lang_tester = "0.8.0"
-tempfile = "3.7.1"
 
 [profile.dev]
 # By compiling dependencies with optimizations, performing tests gets much faster.

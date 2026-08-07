@@ -6,14 +6,28 @@ Style and formatting for nightly-only syntax should be removed from this chapter
 
 There is no guarantee of the stability of this chapter in contrast to the rest of the style guide. Refer to the style team policy for nightly formatting procedure regarding breaking changes to this chapter.
 
-### `feature(precise_capturing)`
+### Frontmatter
 
-A `use<'a, T>` precise capturing bound is formatted as if it were a single path segment with non-turbofished angle-bracketed args, like a trait bound whose identifier is `use`.
+*Location: Placed before comments and attributes in the [root](index.html).*
 
-```
-fn foo() -> impl Sized + use<'a> {}
+*Tracking issue: [#136889](https://github.com/rust-lang/rust/issues/136889)*
 
-// is formatted analogously to:
+*Feature gate: `frontmatter`*
 
-fn foo() -> impl Sized + Use<'a> {}
+There should be no blank lines between the frontmatter and either the start of the file or a shebang.
+There can be zero or one line between the frontmatter and any following content.
+
+The frontmatter fences should use the minimum number of dashes necessary for the contained content (one more than the longest series of initial dashes in the
+content, with a minimum of 3 to be recognized as frontmatter delimiters).
+If an infostring is present after the opening fence, there should be one space separating them.
+The frontmatter fence lines should not have trailing whitespace.
+
+```rust
+#!/usr/bin/env cargo
+--- cargo
+[dependencies]
+regex = "1"
+---
+
+fn main() {}
 ```

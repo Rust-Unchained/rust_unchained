@@ -125,6 +125,100 @@ fn test_from_signed_nonzero() {
 }
 
 #[test]
+fn test_from_ascii_bytes_radix() {
+    assert_eq!(NonZero::<u8>::from_ascii_bytes_radix(b"123", 10), Ok(NonZero::new(123).unwrap()));
+    assert_eq!(NonZero::<u8>::from_ascii_bytes_radix(b"1001", 2), Ok(NonZero::new(9).unwrap()));
+    assert_eq!(NonZero::<u8>::from_ascii_bytes_radix(b"123", 8), Ok(NonZero::new(83).unwrap()));
+    assert_eq!(NonZero::<u16>::from_ascii_bytes_radix(b"123", 16), Ok(NonZero::new(291).unwrap()));
+    assert_eq!(
+        NonZero::<u16>::from_ascii_bytes_radix(b"ffff", 16),
+        Ok(NonZero::new(65535).unwrap())
+    );
+    assert_eq!(NonZero::<u8>::from_ascii_bytes_radix(b"z", 36), Ok(NonZero::new(35).unwrap()));
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes_radix(b"0", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::Zero)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes_radix(b"-1", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+    assert_eq!(
+        NonZero::<i8>::from_ascii_bytes_radix(b"-129", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::NegOverflow)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes_radix(b"257", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::PosOverflow)
+    );
+
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes_radix(b"Z", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes_radix(b"_", 2).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+}
+
+#[test]
+fn test_from_ascii_bytes() {
+    assert_eq!(NonZero::<u8>::from_ascii_bytes(b"123"), Ok(NonZero::new(123).unwrap()));
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes(b"0").err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::Zero)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes(b"-1").err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+    assert_eq!(
+        NonZero::<i8>::from_ascii_bytes(b"-129").err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::NegOverflow)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_ascii_bytes(b"257").err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::PosOverflow)
+    );
+}
+
+#[test]
+fn test_from_str_radix() {
+    assert_eq!(NonZero::<u8>::from_str_radix("123", 10), Ok(NonZero::new(123).unwrap()));
+    assert_eq!(NonZero::<u8>::from_str_radix("1001", 2), Ok(NonZero::new(9).unwrap()));
+    assert_eq!(NonZero::<u8>::from_str_radix("123", 8), Ok(NonZero::new(83).unwrap()));
+    assert_eq!(NonZero::<u16>::from_str_radix("123", 16), Ok(NonZero::new(291).unwrap()));
+    assert_eq!(NonZero::<u16>::from_str_radix("ffff", 16), Ok(NonZero::new(65535).unwrap()));
+    assert_eq!(NonZero::<u8>::from_str_radix("z", 36), Ok(NonZero::new(35).unwrap()));
+    assert_eq!(
+        NonZero::<u8>::from_str_radix("0", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::Zero)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_str_radix("-1", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+    assert_eq!(
+        NonZero::<i8>::from_str_radix("-129", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::NegOverflow)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_str_radix("257", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::PosOverflow)
+    );
+
+    assert_eq!(
+        NonZero::<u8>::from_str_radix("Z", 10).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+    assert_eq!(
+        NonZero::<u8>::from_str_radix("_", 2).err().map(|e| e.kind().clone()),
+        Some(IntErrorKind::InvalidDigit)
+    );
+}
+
+#[test]
 fn test_from_str() {
     assert_eq!("123".parse::<NonZero<u8>>(), Ok(NonZero::new(123).unwrap()));
     assert_eq!(
@@ -191,11 +285,11 @@ fn test_nonzero_from_int_on_success() {
 
 #[test]
 fn test_nonzero_from_int_on_err() {
-    assert!(NonZero::<u8>::try_from(0).is_err());
-    assert!(NonZero::<u32>::try_from(0).is_err());
+    assert_eq!(NonZero::<u8>::try_from(0).unwrap_err().kind(), &IntErrorKind::Zero);
+    assert_eq!(NonZero::<u32>::try_from(0).unwrap_err().kind(), &IntErrorKind::Zero);
 
-    assert!(NonZero::<i8>::try_from(0).is_err());
-    assert!(NonZero::<i32>::try_from(0).is_err());
+    assert_eq!(NonZero::<i8>::try_from(0).unwrap_err().kind(), &IntErrorKind::Zero);
+    assert_eq!(NonZero::<i32>::try_from(0).unwrap_err().kind(), &IntErrorKind::Zero);
 }
 
 #[test]
@@ -214,13 +308,11 @@ fn nonzero_const() {
     const ONE: Option<NonZero<u8>> = NonZero::new(1);
     assert!(ONE.is_some());
 
-    /* FIXME(#110395)
     const FROM_NONZERO_U8: u8 = u8::from(NONZERO_U8);
     assert_eq!(FROM_NONZERO_U8, 5);
 
     const NONZERO_CONVERT: NonZero<u32> = NonZero::<u32>::from(NONZERO_U8);
     assert_eq!(NONZERO_CONVERT.get(), 5);
-    */
 }
 
 #[test]
@@ -321,7 +413,7 @@ fn nonzero_trailing_zeros() {
 }
 
 #[test]
-fn test_nonzero_isolate_most_significant_one() {
+fn test_nonzero_isolate_highest_one() {
     // Signed most significant one
     macro_rules! nonzero_int_impl {
         ($($T:ty),+) => {
@@ -335,8 +427,8 @@ fn test_nonzero_isolate_most_significant_one() {
                     let mut i = 0;
                     while i < <$T>::BITS {
                         assert_eq!(
-                            NonZero::<$T>::new(BITS >> i).unwrap().isolate_most_significant_one(),
-                            NonZero::<$T>::new(MOST_SIG_ONE >> i).unwrap().isolate_most_significant_one()
+                            NonZero::<$T>::new(BITS >> i).unwrap().isolate_highest_one(),
+                            NonZero::<$T>::new(MOST_SIG_ONE >> i).unwrap().isolate_highest_one()
                         );
                         i += 1;
                     }
@@ -356,8 +448,8 @@ fn test_nonzero_isolate_most_significant_one() {
                     let mut i = 0;
                     while i < <$T>::BITS {
                         assert_eq!(
-                            NonZero::<$T>::new(BITS >> i).unwrap().isolate_most_significant_one(),
-                            NonZero::<$T>::new(MOST_SIG_ONE >> i).unwrap().isolate_most_significant_one(),
+                            NonZero::<$T>::new(BITS >> i).unwrap().isolate_highest_one(),
+                            NonZero::<$T>::new(MOST_SIG_ONE >> i).unwrap().isolate_highest_one(),
                         );
                         i += 1;
                     }
@@ -371,7 +463,7 @@ fn test_nonzero_isolate_most_significant_one() {
 }
 
 #[test]
-fn test_nonzero_isolate_least_significant_one() {
+fn test_nonzero_isolate_lowest_one() {
     // Signed least significant one
     macro_rules! nonzero_int_impl {
         ($($T:ty),+) => {
@@ -385,8 +477,8 @@ fn test_nonzero_isolate_least_significant_one() {
                     let mut i = 0;
                     while i < <$T>::BITS {
                         assert_eq!(
-                            NonZero::<$T>::new(BITS << i).unwrap().isolate_least_significant_one(),
-                            NonZero::<$T>::new(LEAST_SIG_ONE << i).unwrap().isolate_least_significant_one()
+                            NonZero::<$T>::new(BITS << i).unwrap().isolate_lowest_one(),
+                            NonZero::<$T>::new(LEAST_SIG_ONE << i).unwrap().isolate_lowest_one()
                         );
                         i += 1;
                     }
@@ -406,8 +498,8 @@ fn test_nonzero_isolate_least_significant_one() {
                     let mut i = 0;
                     while i < <$T>::BITS {
                         assert_eq!(
-                            NonZero::<$T>::new(BITS << i).unwrap().isolate_least_significant_one(),
-                            NonZero::<$T>::new(LEAST_SIG_ONE << i).unwrap().isolate_least_significant_one(),
+                            NonZero::<$T>::new(BITS << i).unwrap().isolate_lowest_one(),
+                            NonZero::<$T>::new(LEAST_SIG_ONE << i).unwrap().isolate_lowest_one(),
                         );
                         i += 1;
                     }
@@ -463,4 +555,130 @@ fn test_nonzero_fmt() {
     );
 
     assert_eq!(i, nz);
+}
+
+#[test]
+fn test_nonzero_highest_one() {
+    macro_rules! nonzero_int_impl {
+        ($($T:ty),+) => {
+            $(
+                {
+                    for i in 0..<$T>::BITS {
+                        // Set single bit.
+                        assert_eq!(NonZero::<$T>::new(1 << i).unwrap().highest_one(), i);
+                        if i > <$T>::BITS {
+                            // Set lowest bits.
+                            assert_eq!(
+                                NonZero::<$T>::new(<$T>::MAX >> i).unwrap().highest_one(),
+                                <$T>::BITS - i - 2,
+                            );
+                        }
+                        // Set highest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(-1 << i).unwrap().highest_one(),
+                            <$T>::BITS - 1,
+                        );
+                    }
+                }
+            )+
+        };
+    }
+
+    macro_rules! nonzero_uint_impl {
+        ($($T:ty),+) => {
+            $(
+                {
+                    for i in 0..<$T>::BITS {
+                        // Set single bit.
+                        assert_eq!(NonZero::<$T>::new(1 << i).unwrap().highest_one(), i);
+                        // Set lowest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(<$T>::MAX >> i).unwrap().highest_one(),
+                            <$T>::BITS - i - 1,
+                        );
+                        // Set highest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(<$T>::MAX << i).unwrap().highest_one(),
+                            <$T>::BITS - 1,
+                        );
+                    }
+                }
+            )+
+        };
+    }
+
+    nonzero_int_impl!(i8, i16, i32, i64, i128, isize);
+    nonzero_uint_impl!(u8, u16, u32, u64, u128, usize);
+}
+
+#[test]
+fn test_nonzero_lowest_one() {
+    macro_rules! nonzero_int_impl {
+        ($($T:ty),+) => {
+            $(
+                {
+                    for i in 0..<$T>::BITS {
+                        // Set single bit.
+                        assert_eq!(NonZero::<$T>::new(1 << i).unwrap().lowest_one(), i);
+                        if i > <$T>::BITS {
+                            // Set lowest bits.
+                            assert_eq!(
+                                NonZero::<$T>::new(<$T>::MAX >> i).unwrap().lowest_one(),
+                                0,
+                            );
+                        }
+                        // Set highest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(-1 << i).unwrap().lowest_one(),
+                            i,
+                        );
+                    }
+                }
+            )+
+        };
+    }
+
+    macro_rules! nonzero_uint_impl {
+        ($($T:ty),+) => {
+            $(
+                {
+                    for i in 0..<$T>::BITS {
+                        // Set single bit.
+                        assert_eq!(NonZero::<$T>::new(1 << i).unwrap().lowest_one(), i);
+                        // Set lowest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(<$T>::MAX >> i).unwrap().lowest_one(),
+                            0,
+                        );
+                        // Set highest bits.
+                        assert_eq!(
+                            NonZero::<$T>::new(<$T>::MAX << i).unwrap().lowest_one(),
+                            i,
+                        );
+                    }
+                }
+            )+
+        };
+    }
+
+    nonzero_int_impl!(i8, i16, i32, i64, i128, isize);
+    nonzero_uint_impl!(u8, u16, u32, u64, u128, usize);
+}
+
+#[test]
+fn test_nonzero_bit_width() {
+    macro_rules! nonzero_uint_impl {
+        ($($T:ty),+) => {
+            $(
+                {
+                    assert_eq!(NonZero::<$T>::new(0b010_1100).unwrap().bit_width(), NonZero::new(6).unwrap());
+                    assert_eq!(NonZero::<$T>::new(0b111_1001).unwrap().bit_width(), NonZero::new(7).unwrap());
+                    assert_eq!(NonZero::<$T>::MIN.bit_width(), NonZero::new(1).unwrap());
+                    assert_eq!(NonZero::<$T>::MAX.bit_width(), NonZero::new(<$T>::BITS).unwrap());
+                }
+            )+
+        };
+    }
+
+    nonzero_uint_impl!(u8, u16, u32, u64, u128, usize);
 }

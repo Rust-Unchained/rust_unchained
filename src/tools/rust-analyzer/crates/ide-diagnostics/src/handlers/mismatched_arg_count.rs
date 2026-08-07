@@ -2,17 +2,17 @@ use either::Either;
 use hir::InFile;
 use ide_db::FileRange;
 use syntax::{
-    ast::{self, HasArgList},
     AstNode, AstPtr,
+    ast::{self, HasArgList},
 };
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: mismatched-tuple-struct-pat-arg-count
 //
 // This diagnostic is triggered if a function is invoked with an incorrect amount of arguments.
 pub(crate) fn mismatched_tuple_struct_pat_arg_count(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::MismatchedTupleStructPatArgCount,
 ) -> Diagnostic {
     let s = if d.found == 1 { "" } else { "s" };
@@ -26,26 +26,32 @@ pub(crate) fn mismatched_tuple_struct_pat_arg_count(
         message,
         invalid_args_range(ctx, d.expr_or_pat, d.expected, d.found),
     )
+    .stable()
 }
 
 // Diagnostic: mismatched-arg-count
 //
 // This diagnostic is triggered if a function is invoked with an incorrect amount of arguments.
 pub(crate) fn mismatched_arg_count(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::MismatchedArgCount,
 ) -> Diagnostic {
     let s = if d.expected == 1 { "" } else { "s" };
     let message = format!("expected {} argument{s}, found {}", d.expected, d.found);
+    // E0057 is the code rustc emits when calling something via the `Fn`/`FnMut`/`FnOnce`
+    // traits with the wrong number of arguments; E0061 is used for direct function calls.
+    // (Previously this used E0107, which is actually "wrong number of generic arguments".)
+    let code = if d.is_fn_trait_call { "E0057" } else { "E0061" };
     Diagnostic::new(
-        DiagnosticCode::RustcHardError("E0107"),
+        DiagnosticCode::RustcHardError(code),
         message,
         invalid_args_range(ctx, d.call_expr, d.expected, d.found),
     )
+    .stable()
 }
 
 fn invalid_args_range(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     source: InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
     expected: usize,
     found: usize,
@@ -203,6 +209,7 @@ trait Foo { fn method(&self, _arg: usize) {} }
 
 fn f() {
     let x;
+     // ^ error: type annotations needed
     x.method();
 }
 "#,
@@ -352,9 +359,34 @@ fn f() {
     }
 
     #[test]
+    fn varargs_fn_pointer() {
+        check_diagnostics(
+            r#"
+struct Funcs {
+    f: unsafe extern "C" fn(u8, u8, ...) -> i32,
+    g: unsafe extern "C" fn(...) -> i32,
+}
+
+fn f(funcs: Funcs) {
+    unsafe {
+        (funcs.f)(0, 1);
+        (funcs.f)(0, 1, 2);
+        (funcs.f)(0);
+                 //^ error: expected 2 arguments, found 1
+        (funcs.g)();
+        (funcs.g)(0);
+        (funcs.g)(0, 1);
+    }
+}
+        "#,
+        )
+    }
+
+    #[test]
     fn arg_count_lambda() {
         check_diagnostics(
             r#"
+//- minicore: fn
 fn main() {
     let f = |()| ();
     f();
@@ -367,10 +399,36 @@ fn main() {
         )
     }
 
+    // A multi-argument closure exercises the same tuple-arguments code path in
+    // hir-ty (`TupleArgumentsFlag::TupleArguments` in `crates/hir-ty/src/infer/expr.rs`)
+    // as calls through `Fn`/`FnMut`/`FnOnce`. The mismatch is reported with error
+    // code E0057 (rustc's Fn-trait code), not E0061 which is reserved for direct
+    // function calls. `arg_count_lambda` above covers the 1-tuple case; this one
+    // covers the multi-argument case to make sure the tuple size is reported
+    // correctly.
+    #[test]
+    fn arg_count_multi_arg_closure() {
+        check_diagnostics(
+            r#"
+//- minicore: fn
+fn main() {
+    let f = |_a: u8, _b: u8| ();
+    f();
+   //^^ error: expected 2 arguments, found 0
+    f(1, 2);
+    f(1, 2, 3);
+          //^^ error: expected 2 arguments, found 3
+}
+"#,
+        )
+    }
+
     #[test]
     fn cfgd_out_call_arguments() {
         check_diagnostics(
             r#"
+#![allow(rust_analyzer::inactive_code)]
+
 struct C(#[cfg(FALSE)] ());
 impl C {
     fn new() -> Self {
@@ -394,6 +452,8 @@ fn main() {
     fn cfgd_out_fn_params() {
         check_diagnostics(
             r#"
+#![allow(rust_analyzer::inactive_code)]
+
 fn foo(#[cfg(NEVER)] x: ()) {}
 
 struct S;
@@ -450,6 +510,8 @@ fn g() {
     b::<1, 3>(0, 2);
 
     b(0, 1, 2);
+ // ^ error: type annotations needed
+ // | full type: `fn b<_, _>(u8, u8)`
            //^ error: expected 4 arguments, found 3
 }
             "#,
@@ -484,6 +546,46 @@ fn foo((): (), (): ()) {
       // ^ error: expected 2 arguments, found 1
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn regression_17233() {
+        check_diagnostics(
+            r#"
+pub trait A {
+    type X: B;
+}
+pub trait B: A {
+    fn confused_name(self, _: i32);
+}
+
+pub struct Foo;
+impl Foo {
+    pub fn confused_name(&self) {}
+}
+
+pub fn repro<T: A>() {
+    Foo.confused_name();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn cfg_inside_macro_inside_arg() {
+        check_diagnostics(
+            r#"
+fn foo() {}
+
+macro_rules! make_X {
+    () => { #[cfg(false)] X };
+}
+
+fn main() {
+    foo(make_X!());
+}
+        "#,
         );
     }
 }

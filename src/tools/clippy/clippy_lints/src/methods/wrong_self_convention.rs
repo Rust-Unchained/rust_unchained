@@ -1,12 +1,13 @@
-use crate::methods::SelfKind;
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::ty::is_copy;
+use itertools::Itertools;
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 use std::fmt;
 
 use super::WRONG_SELF_CONVENTION;
+use super::lib::SelfKind;
 
 #[rustfmt::skip]
 const CONVENTIONS: [(&[Convention], &[SelfKind]); 9] = [
@@ -61,39 +62,39 @@ impl Convention {
 impl fmt::Display for Convention {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match *self {
-            Self::Eq(this) => format!("`{this}`").fmt(f),
-            Self::StartsWith(this) => format!("`{this}*`").fmt(f),
-            Self::EndsWith(this) => format!("`*{this}`").fmt(f),
-            Self::NotEndsWith(this) => format!("`~{this}`").fmt(f),
+            Self::Eq(this) => write!(f, "`{this}`"),
+            Self::StartsWith(this) => write!(f, "`{this}*`"),
+            Self::EndsWith(this) => write!(f, "`*{this}`"),
+            Self::NotEndsWith(this) => write!(f, "`~{this}`"),
             Self::IsSelfTypeCopy(is_true) => {
-                format!("`self` type is{} `Copy`", if is_true { "" } else { " not" }).fmt(f)
+                write!(f, "`self` type is{} `Copy`", if is_true { "" } else { " not" })
             },
             Self::ImplementsTrait(is_true) => {
                 let (negation, s_suffix) = if is_true { ("", "s") } else { (" does not", "") };
-                format!("method{negation} implement{s_suffix} a trait").fmt(f)
+                write!(f, "method{negation} implement{s_suffix} a trait")
             },
             Self::IsTraitItem(is_true) => {
                 let suffix = if is_true { " is" } else { " is not" };
-                format!("method{suffix} a trait item").fmt(f)
+                write!(f, "method{suffix} a trait item")
             },
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
-    item_name: &str,
+    item_name: Symbol,
     self_ty: Ty<'tcx>,
     first_arg_ty: Ty<'tcx>,
     first_arg_span: Span,
     implements_trait: bool,
     is_trait_item: bool,
 ) {
+    let item_name_str = item_name.as_str();
     if let Some((conventions, self_kinds)) = &CONVENTIONS.iter().find(|(convs, _)| {
         convs
             .iter()
-            .all(|conv| conv.check(cx, self_ty, item_name, implements_trait, is_trait_item))
+            .all(|conv| conv.check(cx, self_ty, item_name_str, implements_trait, is_trait_item))
     }) {
         // don't lint if it implements a trait but not willing to check `Copy` types conventions (see #7032)
         if implements_trait
@@ -114,22 +115,13 @@ pub(super) fn check<'tcx>(
 
                     let s = conventions
                         .iter()
-                        .filter_map(|conv| {
-                            if (cut_ends_with_conv && matches!(conv, Convention::NotEndsWith(_)))
-                                || matches!(conv, Convention::ImplementsTrait(_))
-                                || matches!(conv, Convention::IsTraitItem(_))
-                            {
-                                None
-                            } else {
-                                Some(conv.to_string())
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" and ");
+                        .filter(|conv| !(cut_ends_with_conv && matches!(conv, Convention::NotEndsWith(_))))
+                        .filter(|conv| !matches!(conv, Convention::ImplementsTrait(_) | Convention::IsTraitItem(_)))
+                        .format(" and ");
 
                     format!("methods with the following characteristics: ({s})")
                 } else {
-                    format!("methods called {}", &conventions[0])
+                    format!("methods called {}", conventions[0])
                 }
             };
 
@@ -139,11 +131,7 @@ pub(super) fn check<'tcx>(
                 first_arg_span,
                 format!(
                     "{suggestion} usually take {}",
-                    &self_kinds
-                        .iter()
-                        .map(|k| k.description())
-                        .collect::<Vec<_>>()
-                        .join(" or ")
+                    self_kinds.iter().map(|k| k.description()).format(" or ")
                 ),
                 None,
                 "consider choosing a less ambiguous name",

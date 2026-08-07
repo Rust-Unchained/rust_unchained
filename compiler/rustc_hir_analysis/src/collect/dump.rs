@@ -1,15 +1,34 @@
 use rustc_hir as hir;
-use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
-use rustc_hir::intravisit;
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{find_attr, intravisit};
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, Unnormalized};
 use rustc_span::sym;
 
+pub(crate) fn generics(tcx: TyCtxt<'_>) {
+    for did in tcx.hir_crate_items(()).definitions() {
+        if did == hir::def_id::CRATE_DEF_ID {
+            continue;
+        }
+
+        if find_attr!(tcx, did, RustcDumpGenerics) {
+            let span = tcx.def_span(did);
+
+            let mut diag =
+                tcx.dcx().struct_span_err(span, format!("{}: {did:?}", sym::rustc_dump_generics));
+
+            let generics = tcx.generics_of(did);
+            diag.span_note(tcx.def_span(did), format!("{generics:#?}"));
+            diag.emit();
+        }
+    }
+}
+
 pub(crate) fn opaque_hidden_types(tcx: TyCtxt<'_>) {
-    if !tcx.has_attr(CRATE_DEF_ID, sym::rustc_hidden_type_of_opaques) {
+    if !find_attr!(tcx, crate, RustcDumpHiddenTypeOfOpaques) {
         return;
     }
-
     for id in tcx.hir_crate_items(()).opaques() {
         if let hir::OpaqueTyOrigin::FnReturn { parent: fn_def_id, .. }
         | hir::OpaqueTyOrigin::AsyncFn { parent: fn_def_id, .. } =
@@ -20,33 +39,52 @@ pub(crate) fn opaque_hidden_types(tcx: TyCtxt<'_>) {
             continue;
         }
 
-        let ty = tcx.type_of(id).instantiate_identity();
+        let ty = tcx.type_of(id).instantiate_identity().skip_norm_wip();
         let span = tcx.def_span(id);
-        tcx.dcx().emit_err(crate::errors::TypeOf { span, ty });
+        tcx.dcx().emit_err(crate::diagnostics::TypeOf { span, ty });
     }
 }
 
-pub(crate) fn predicates_and_item_bounds(tcx: TyCtxt<'_>) {
+pub(crate) fn clauses_and_item_bounds(tcx: TyCtxt<'_>) {
     for id in tcx.hir_crate_items(()).owners() {
-        if tcx.has_attr(id, sym::rustc_dump_predicates) {
-            let preds = tcx.predicates_of(id).instantiate_identity(tcx).predicates;
+        #[expect(deprecated)] // we don't want to unnecessarily retrieve the attrs twice in a row.
+        let attrs = tcx.get_all_attrs(id);
+
+        if find_attr!(attrs, RustcDumpPredicates) {
+            let clauses = tcx
+                .clauses_of(id)
+                .instantiate_identity(tcx)
+                .clauses
+                .into_iter()
+                .map(Unnormalized::skip_norm_wip);
             let span = tcx.def_span(id);
 
             let mut diag = tcx.dcx().struct_span_err(span, sym::rustc_dump_predicates.as_str());
-            for pred in preds {
-                diag.note(format!("{pred:?}"));
+            for clause in clauses {
+                diag.note(format!("{clause:?}"));
             }
             diag.emit();
         }
-        if tcx.has_attr(id, sym::rustc_dump_item_bounds) {
-            let bounds = tcx.item_bounds(id).instantiate_identity();
-            let span = tcx.def_span(id);
 
-            let mut diag = tcx.dcx().struct_span_err(span, sym::rustc_dump_item_bounds.as_str());
-            for bound in bounds {
-                diag.note(format!("{bound:?}"));
-            }
-            diag.emit();
+        if find_attr!(attrs, RustcDumpItemBounds) {
+            let name = sym::rustc_dump_item_bounds.as_str();
+
+            match tcx.def_kind(id) {
+                DefKind::AssocTy => {
+                    let bounds = tcx.item_bounds(id).instantiate_identity().skip_norm_wip();
+                    let span = tcx.def_span(id);
+
+                    let mut diag = tcx.dcx().struct_span_err(span, name);
+                    for bound in bounds {
+                        diag.note(format!("{bound:?}"));
+                    }
+                    diag.emit()
+                }
+                kind => tcx.dcx().span_delayed_bug(
+                    tcx.def_span(id),
+                    format!("attr parsing didn't report an error for `#[{name}]` on {kind:?}"),
+                ),
+            };
         }
     }
 }
@@ -54,7 +92,7 @@ pub(crate) fn predicates_and_item_bounds(tcx: TyCtxt<'_>) {
 pub(crate) fn def_parents(tcx: TyCtxt<'_>) {
     for iid in tcx.hir_free_items() {
         let did = iid.owner_id.def_id;
-        if tcx.has_attr(did, sym::rustc_dump_def_parents) {
+        if find_attr!(tcx, did, RustcDumpDefParents) {
             struct AnonConstFinder<'tcx> {
                 tcx: TyCtxt<'tcx>,
                 anon_consts: Vec<LocalDefId>,
@@ -82,10 +120,9 @@ pub(crate) fn def_parents(tcx: TyCtxt<'_>) {
             for did in [did].into_iter().chain(anon_ct_finder.anon_consts) {
                 let span = tcx.def_span(did);
 
-                let mut diag = tcx.dcx().struct_span_err(
-                    span,
-                    format!("{}: {did:?}", sym::rustc_dump_def_parents.as_str()),
-                );
+                let mut diag = tcx
+                    .dcx()
+                    .struct_span_err(span, format!("{}: {did:?}", sym::rustc_dump_def_parents));
 
                 let mut current_did = did.to_def_id();
                 while let Some(parent_did) = tcx.opt_parent(current_did) {
@@ -102,23 +139,23 @@ pub(crate) fn vtables<'tcx>(tcx: TyCtxt<'tcx>) {
     for id in tcx.hir_free_items() {
         let def_id = id.owner_id.def_id;
 
-        let Some(attr) = tcx.get_attr(def_id, sym::rustc_dump_vtable) else {
+        let Some(&attr_span) = find_attr!(tcx, def_id, RustcDumpVtable(span) => span) else {
             continue;
         };
 
         let vtable_entries = match tcx.hir_item(id).kind {
             hir::ItemKind::Impl(hir::Impl { of_trait: Some(_), .. }) => {
-                let trait_ref = tcx.impl_trait_ref(def_id).unwrap().instantiate_identity();
-                if trait_ref.has_non_region_param() {
+                let trait_ref = tcx.impl_trait_ref(def_id).instantiate_identity();
+                if trait_ref.skip_normalization().has_non_region_param() {
                     tcx.dcx().span_err(
-                        attr.span(),
+                        attr_span,
                         "`rustc_dump_vtable` must be applied to non-generic impl",
                     );
                     continue;
                 }
-                if !tcx.is_dyn_compatible(trait_ref.def_id) {
+                if !tcx.is_dyn_compatible(trait_ref.skip_normalization().def_id) {
                     tcx.dcx().span_err(
-                        attr.span(),
+                        attr_span,
                         "`rustc_dump_vtable` must be applied to dyn-compatible trait",
                     );
                     continue;
@@ -127,7 +164,7 @@ pub(crate) fn vtables<'tcx>(tcx: TyCtxt<'tcx>) {
                     .try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), trait_ref)
                 else {
                     tcx.dcx().span_err(
-                        attr.span(),
+                        attr_span,
                         "`rustc_dump_vtable` applied to impl header that cannot be normalized",
                     );
                     continue;
@@ -138,7 +175,7 @@ pub(crate) fn vtables<'tcx>(tcx: TyCtxt<'tcx>) {
                 let ty = tcx.type_of(def_id).instantiate_identity();
                 if ty.has_non_region_param() {
                     tcx.dcx().span_err(
-                        attr.span(),
+                        attr_span,
                         "`rustc_dump_vtable` must be applied to non-generic type",
                     );
                     continue;
@@ -147,14 +184,13 @@ pub(crate) fn vtables<'tcx>(tcx: TyCtxt<'tcx>) {
                     tcx.try_normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), ty)
                 else {
                     tcx.dcx().span_err(
-                        attr.span(),
+                        attr_span,
                         "`rustc_dump_vtable` applied to type alias that cannot be normalized",
                     );
                     continue;
                 };
-                let ty::Dynamic(data, _, _) = *ty.kind() else {
-                    tcx.dcx()
-                        .span_err(attr.span(), "`rustc_dump_vtable` to type alias of dyn type");
+                let ty::Dynamic(data, _) = *ty.kind() else {
+                    tcx.dcx().span_err(attr_span, "`rustc_dump_vtable` to type alias of dyn type");
                     continue;
                 };
                 if let Some(principal) = data.principal() {
@@ -167,7 +203,7 @@ pub(crate) fn vtables<'tcx>(tcx: TyCtxt<'tcx>) {
             }
             _ => {
                 tcx.dcx().span_err(
-                    attr.span(),
+                    attr_span,
                     "`rustc_dump_vtable` only applies to impl, or type alias of dyn type",
                 );
                 continue;

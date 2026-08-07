@@ -1,19 +1,26 @@
+use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::ops::Deref;
 
 use rustc_ast_ir::Movability;
+use rustc_ast_ir::visit::VisitorResult;
 use rustc_index::bit_set::DenseBitSet;
-use smallvec::SmallVec;
 
 use crate::fold::TypeFoldable;
 use crate::inherent::*;
+use crate::intern::Interned;
 use crate::ir_print::IrPrint;
-use crate::lang_items::TraitSolverLangItem;
+use crate::lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem};
 use crate::relate::Relate;
-use crate::solve::{CanonicalInput, ExternalConstraintsData, PredefinedOpaquesData, QueryResult};
-use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable};
-use crate::{self as ty, search_graph};
+use crate::solve::{
+    AccessedOpaques, CanonicalInput, Certainty, ExternalConstraintsData, QueryResult, inspect,
+};
+use crate::visit::{Flags, TypeVisitable};
+use crate::{
+    self as ty, BoundRegion, BoundVar, CanonicalParamEnvCacheEntry, DebruijnIndex, Region,
+    RegionKind, TraitRef, search_graph,
+};
 
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_interner")]
 pub trait Interner:
@@ -33,8 +40,52 @@ pub trait Interner:
     + IrPrint<ty::FnSig<Self>>
     + IrPrint<ty::PatternKind<Self>>
 {
+    fn next_trait_solver_globally(self) -> bool {
+        true
+    }
+
     type DefId: DefId<Self>;
     type LocalDefId: Copy + Debug + Hash + Eq + Into<Self::DefId> + TypeFoldable<Self>;
+    // Various more specific `DefId`s.
+    //
+    // rustc just defines them all to be `DefId`, but rust-analyzer uses different types so this is convenient for it.
+    //
+    // Note: The `TryFrom<DefId>` always succeeds (in rustc), so don't use it to check if some `DefId`
+    // is of some specific type!
+    type TraitId: SpecificDefId<Self>;
+    type ForeignId: SpecificDefId<Self>;
+    type FunctionId: SpecificDefId<Self>;
+    type ClosureId: SpecificDefId<Self>;
+    type CoroutineClosureId: SpecificDefId<Self>;
+    type CoroutineId: SpecificDefId<Self>;
+    type AdtId: SpecificDefId<Self>;
+    type ImplId: SpecificDefId<Self>;
+    type AnonConstId: SpecificDefId<Self>;
+    type TraitAssocTyId: SpecificDefId<Self>
+        + Into<Self::TraitAssocTermId>
+        + TryFrom<Self::TraitAssocTermId>;
+    type TraitAssocConstId: SpecificDefId<Self>
+        + Into<Self::TraitAssocTermId>
+        + TryFrom<Self::TraitAssocTermId>;
+    type TraitAssocTermId: SpecificDefId<Self>;
+    type OpaqueTyId: SpecificDefId<Self, Self::LocalOpaqueTyId>;
+    type LocalOpaqueTyId: Copy
+        + Debug
+        + Hash
+        + Eq
+        + Into<Self::OpaqueTyId>
+        + Into<Self::LocalDefId>
+        + Into<Self::DefId>
+        + TypeFoldable<Self>;
+    type FreeTyAliasId: SpecificDefId<Self> + Into<Self::FreeTermAliasId>;
+    type FreeConstAliasId: SpecificDefId<Self> + Into<Self::FreeTermAliasId>;
+    type FreeTermAliasId: SpecificDefId<Self>;
+    type ImplOrTraitAssocTyId: SpecificDefId<Self> + Into<Self::ImplOrTraitAssocTermId>;
+    type ImplOrTraitAssocConstId: SpecificDefId<Self> + Into<Self::ImplOrTraitAssocTermId>;
+    type ImplOrTraitAssocTermId: SpecificDefId<Self>;
+    type InherentAssocTyId: SpecificDefId<Self> + Into<Self::InherentAssocTermId>;
+    type InherentAssocConstId: SpecificDefId<Self> + Into<Self::InherentAssocTermId>;
+    type InherentAssocTermId: SpecificDefId<Self>;
     type Span: Span<Self>;
 
     type GenericArgs: GenericArgs<Self>;
@@ -42,18 +93,17 @@ pub trait Interner:
     type GenericArg: GenericArg<Self>;
     type Term: Term<Self>;
 
-    type BoundVarKinds: Copy + Debug + Hash + Eq + SliceLike<Item = Self::BoundVarKind> + Default;
-    type BoundVarKind: Copy + Debug + Hash + Eq;
+    type BoundVarKinds: BoundVarKinds<Self>;
 
     type PredefinedOpaques: Copy
         + Debug
         + Hash
         + Eq
         + TypeFoldable<Self>
-        + Deref<Target = PredefinedOpaquesData<Self>>;
+        + SliceLike<Item = (ty::OpaqueTypeKey<Self>, Self::Ty)>;
     fn mk_predefined_opaques_in_body(
         self,
-        data: PredefinedOpaquesData<Self>,
+        data: &[(ty::OpaqueTypeKey<Self>, Self::Ty)],
     ) -> Self::PredefinedOpaques;
 
     type LocalDefIds: Copy
@@ -64,13 +114,16 @@ pub trait Interner:
         + TypeVisitable<Self>
         + SliceLike<Item = Self::LocalDefId>;
 
-    type CanonicalVars: Copy
+    type CanonicalVarKinds: Copy
         + Debug
         + Hash
         + Eq
-        + SliceLike<Item = ty::CanonicalVarInfo<Self>>
+        + SliceLike<Item = ty::CanonicalVarKind<Self>>
         + Default;
-    fn mk_canonical_var_infos(self, infos: &[ty::CanonicalVarInfo<Self>]) -> Self::CanonicalVars;
+    fn mk_canonical_var_kinds(
+        self,
+        kinds: &[ty::CanonicalVarKind<Self>],
+    ) -> Self::CanonicalVarKinds;
 
     type ExternalConstraints: Copy
         + Debug
@@ -97,9 +150,8 @@ pub trait Interner:
     type Ty: Ty<Self>;
     type Tys: Tys<Self>;
     type FnInputTys: Copy + Debug + Hash + Eq + SliceLike<Item = Self::Ty> + TypeVisitable<Self>;
-    type ParamTy: Copy + Debug + Hash + Eq + ParamLike;
-    type BoundTy: Copy + Debug + Hash + Eq + BoundVarLike<Self>;
-    type PlaceholderTy: PlaceholderLike;
+    type ParamTy: ParamLike;
+    type Symbol: Symbol<Self>;
 
     // Things stored inside of tys
     type ErrorGuaranteed: Copy + Debug + Hash + Eq;
@@ -121,33 +173,47 @@ pub trait Interner:
         + TypeVisitable<Self>
         + SliceLike<Item = Self::Pat>;
     type Safety: Safety<Self>;
-    type Abi: Abi<Self>;
 
     // Kinds of consts
     type Const: Const<Self>;
-    type PlaceholderConst: PlaceholderLike;
+    type Consts: Copy + Debug + Hash + Eq + SliceLike<Item = Self::Const> + Default;
     type ParamConst: Copy + Debug + Hash + Eq + ParamLike;
-    type BoundConst: Copy + Debug + Hash + Eq + BoundVarLike<Self>;
     type ValueConst: ValueConst<Self>;
     type ExprConst: ExprConst<Self>;
-    type ValTree: Copy + Debug + Hash + Eq;
+    type ValTree: Copy + Debug + Hash + Eq + IntoKind<Kind = ty::ValTreeKind<Self>>;
+    type ScalarInt: Copy + Debug + Hash + Eq;
 
     // Kinds of regions
-    type Region: Region<Self>;
-    type EarlyParamRegion: Copy + Debug + Hash + Eq + ParamLike;
+    type EarlyParamRegion: ParamLike;
     type LateParamRegion: Copy + Debug + Hash + Eq;
-    type BoundRegion: Copy + Debug + Hash + Eq + BoundVarLike<Self>;
-    type PlaceholderRegion: PlaceholderLike;
+
+    type InternedRegionKind: Interned<Self, Value = RegionKind<Self>>;
+
+    type RegionAssumptions: Copy
+        + Debug
+        + Hash
+        + Eq
+        + SliceLike<Item = ty::OutlivesClause<Self, Self::GenericArg>>
+        + TypeFoldable<Self>;
 
     // Predicates
     type ParamEnv: ParamEnv<Self>;
     type Predicate: Predicate<Self>;
     type Clause: Clause<Self>;
-    type Clauses: Copy + Debug + Hash + Eq + TypeSuperVisitable<Self> + Flags;
+    type Clauses: Clauses<Self>;
 
     fn with_global_cache<R>(self, f: impl FnOnce(&mut search_graph::GlobalCache<Self>) -> R) -> R;
 
-    fn evaluation_is_concurrent(&self) -> bool;
+    fn canonical_param_env_cache_get_or_insert<R>(
+        self,
+        param_env: Self::ParamEnv,
+        f: impl FnOnce() -> CanonicalParamEnvCacheEntry<Self>,
+        from_entry: impl FnOnce(&CanonicalParamEnvCacheEntry<Self>) -> R,
+    ) -> R;
+
+    /// Useful for testing. If a cache entry is replaced, this should
+    /// (in theory) only happen when concurrent.
+    fn assert_evaluation_is_concurrent(&self);
 
     fn expand_abstract_consts<T: TypeFoldable<Self>>(self, t: T) -> T;
 
@@ -159,24 +225,31 @@ pub trait Interner:
 
     fn opt_alias_variances(
         self,
-        kind: impl Into<ty::AliasTermKind>,
-        def_id: Self::DefId,
+        kind: impl Into<ty::AliasTermKind<Self>>,
     ) -> Option<Self::VariancesOf>;
 
     fn type_of(self, def_id: Self::DefId) -> ty::EarlyBinder<Self, Self::Ty>;
-    fn type_of_opaque_hir_typeck(self, def_id: Self::LocalDefId)
-    -> ty::EarlyBinder<Self, Self::Ty>;
+    fn type_of_opaque_hir_typeck(
+        self,
+        def_id: Self::LocalOpaqueTyId,
+    ) -> ty::EarlyBinder<Self, Self::Ty>;
+    fn is_type_const(self, def_id: Self::DefId) -> bool;
+    fn const_of_item(self, def_id: Self::DefId) -> ty::EarlyBinder<Self, Self::Const>;
+    fn anon_const_kind(self, def_id: Self::DefId) -> ty::AnonConstKind;
+
+    fn def_span(self, def_id: Self::DefId) -> Self::Span;
 
     type AdtDef: AdtDef<Self>;
-    fn adt_def(self, adt_def_id: Self::DefId) -> Self::AdtDef;
+    fn adt_def(self, adt_def_id: Self::AdtId) -> Self::AdtDef;
 
-    fn alias_ty_kind(self, alias: ty::AliasTy<Self>) -> ty::AliasTyKind;
+    fn alias_const_kind_from_def_id(self, def_id: Self::DefId) -> ty::AliasConstKind<Self>;
 
-    fn alias_term_kind(self, alias: ty::AliasTerm<Self>) -> ty::AliasTermKind;
+    // FIXME: remove in favor of explicit construction
+    fn alias_term_kind_from_def_id(self, def_id: Self::DefId) -> ty::AliasTermKind<Self>;
 
     fn trait_ref_and_own_args_for_alias(
         self,
-        def_id: Self::DefId,
+        def_id: Self::TraitAssocTermId,
         args: Self::GenericArgs,
     ) -> (ty::TraitRef<Self>, Self::GenericArgsSlice);
 
@@ -200,26 +273,35 @@ pub trait Interner:
         I: Iterator<Item = T>,
         T: CollectAndApply<Self::Ty, Self::Tys>;
 
-    fn parent(self, def_id: Self::DefId) -> Self::DefId;
+    fn projection_parent(self, def_id: Self::TraitAssocTermId) -> Self::TraitId;
+
+    /// This can be an impl, or a trait if this is a defaulted term.
+    fn impl_or_trait_assoc_term_parent(self, def_id: Self::ImplOrTraitAssocTermId) -> Self::DefId;
+
+    fn inherent_alias_term_parent(self, def_id: Self::InherentAssocTermId) -> Self::ImplId;
 
     fn recursion_limit(self) -> usize;
 
     type Features: Features<Self>;
     fn features(self) -> Self::Features;
 
+    fn assumptions_on_binders(self) -> bool;
+
+    fn renormalize_rigid_aliases(self) -> bool;
+
     fn coroutine_hidden_types(
         self,
-        def_id: Self::DefId,
-    ) -> ty::EarlyBinder<Self, ty::Binder<Self, Self::Tys>>;
+        def_id: Self::CoroutineId,
+    ) -> ty::EarlyBinder<Self, ty::Binder<Self, ty::CoroutineWitnessTypes<Self>>>;
 
     fn fn_sig(
         self,
-        def_id: Self::DefId,
+        def_id: Self::FunctionId,
     ) -> ty::EarlyBinder<Self, ty::Binder<Self, ty::FnSig<Self>>>;
 
-    fn coroutine_movability(self, def_id: Self::DefId) -> Movability;
+    fn coroutine_movability(self, def_id: Self::CoroutineId) -> Movability;
 
-    fn coroutine_for_closure(self, def_id: Self::DefId) -> Self::DefId;
+    fn coroutine_for_closure(self, def_id: Self::CoroutineClosureId) -> Self::CoroutineId;
 
     fn generics_require_sized_self(self, def_id: Self::DefId) -> bool;
 
@@ -238,28 +320,36 @@ pub trait Interner:
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn predicates_of(
+    fn clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn own_predicates_of(
+    fn own_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn explicit_super_predicates_of(
+    fn explicit_super_clauses_of(
+        self,
+        def_id: Self::TraitId,
+    ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
+
+    fn explicit_implied_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
 
-    fn explicit_implied_predicates_of(
+    /// This is equivalent to computing the super-clauses of the trait for this impl
+    /// and filtering them to the outlives clauses. This is purely for performance.
+    fn impl_super_outlives(
         self,
-        def_id: Self::DefId,
-    ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
+        impl_def_id: Self::ImplId,
+    ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn impl_is_const(self, def_id: Self::DefId) -> bool;
-    fn fn_is_const(self, def_id: Self::DefId) -> bool;
+    fn impl_is_const(self, def_id: Self::ImplId) -> bool;
+    fn fn_is_const(self, def_id: Self::FunctionId) -> bool;
+    fn closure_is_const(self, def_id: Self::ClosureId) -> bool;
     fn alias_has_const_conditions(self, def_id: Self::DefId) -> bool;
     fn const_conditions(
         self,
@@ -270,69 +360,95 @@ pub trait Interner:
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = ty::Binder<Self, ty::TraitRef<Self>>>>;
 
-    fn impl_self_is_guaranteed_unsized(self, def_id: Self::DefId) -> bool;
+    fn impl_self_is_guaranteed_unsized(self, def_id: Self::ImplId) -> bool;
 
-    fn has_target_features(self, def_id: Self::DefId) -> bool;
+    fn has_target_features(self, def_id: Self::FunctionId) -> bool;
 
-    fn require_lang_item(self, lang_item: TraitSolverLangItem) -> Self::DefId;
-
-    fn is_lang_item(self, def_id: Self::DefId, lang_item: TraitSolverLangItem) -> bool;
-
-    fn is_default_trait(self, def_id: Self::DefId) -> bool;
-
-    fn as_lang_item(self, def_id: Self::DefId) -> Option<TraitSolverLangItem>;
-
-    fn associated_type_def_ids(self, def_id: Self::DefId) -> impl IntoIterator<Item = Self::DefId>;
-
-    fn for_each_relevant_impl(
+    fn require_projection_lang_item(
         self,
-        trait_def_id: Self::DefId,
-        self_ty: Self::Ty,
-        f: impl FnMut(Self::DefId),
-    );
+        lang_item: SolverProjectionLangItem,
+    ) -> Self::TraitAssocTyId;
 
-    fn has_item_definition(self, def_id: Self::DefId) -> bool;
+    fn require_trait_lang_item(self, lang_item: SolverTraitLangItem) -> Self::TraitId;
 
-    fn impl_specializes(self, impl_def_id: Self::DefId, victim_def_id: Self::DefId) -> bool;
+    fn require_adt_lang_item(self, lang_item: SolverAdtLangItem) -> Self::AdtId;
 
-    fn impl_is_default(self, impl_def_id: Self::DefId) -> bool;
+    fn is_projection_lang_item(
+        self,
+        def_id: Self::TraitAssocTyId,
+        lang_item: SolverProjectionLangItem,
+    ) -> bool;
 
-    fn impl_trait_ref(self, impl_def_id: Self::DefId) -> ty::EarlyBinder<Self, ty::TraitRef<Self>>;
+    fn is_trait_lang_item(self, def_id: Self::TraitId, lang_item: SolverTraitLangItem) -> bool;
 
-    fn impl_polarity(self, impl_def_id: Self::DefId) -> ty::ImplPolarity;
+    fn is_adt_lang_item(self, def_id: Self::AdtId, lang_item: SolverAdtLangItem) -> bool;
 
-    fn trait_is_auto(self, trait_def_id: Self::DefId) -> bool;
+    fn is_default_trait(self, def_id: Self::TraitId) -> bool;
 
-    fn trait_is_coinductive(self, trait_def_id: Self::DefId) -> bool;
+    fn is_sizedness_trait(self, def_id: Self::TraitId) -> bool;
 
-    fn trait_is_alias(self, trait_def_id: Self::DefId) -> bool;
+    fn as_projection_lang_item(
+        self,
+        def_id: Self::TraitAssocTyId,
+    ) -> Option<SolverProjectionLangItem>;
 
-    fn trait_is_dyn_compatible(self, trait_def_id: Self::DefId) -> bool;
+    fn as_trait_lang_item(self, def_id: Self::TraitId) -> Option<SolverTraitLangItem>;
 
-    fn trait_is_fundamental(self, def_id: Self::DefId) -> bool;
+    fn as_adt_lang_item(self, def_id: Self::AdtId) -> Option<SolverAdtLangItem>;
 
-    fn trait_may_be_implemented_via_object(self, trait_def_id: Self::DefId) -> bool;
+    fn associated_type_def_ids(
+        self,
+        def_id: Self::TraitId,
+    ) -> impl IntoIterator<Item = Self::DefId>;
+
+    fn for_each_relevant_impl<R: VisitorResult>(
+        self,
+        trait_ref: TraitRef<Self>,
+        f: impl FnMut(Self::ImplId) -> R,
+    ) -> R;
+    fn for_each_blanket_impl<R: VisitorResult>(
+        self,
+        trait_def_id: Self::TraitId,
+        f: impl FnMut(Self::ImplId) -> R,
+    ) -> R;
+
+    fn has_item_definition(self, def_id: Self::ImplOrTraitAssocTermId) -> bool;
+
+    fn impl_specializes(self, impl_def_id: Self::ImplId, victim_def_id: Self::ImplId) -> bool;
+
+    fn impl_is_default(self, impl_def_id: Self::ImplId) -> bool;
+
+    fn impl_trait_ref(self, impl_def_id: Self::ImplId)
+    -> ty::EarlyBinder<Self, ty::TraitRef<Self>>;
+
+    fn impl_polarity(self, impl_def_id: Self::ImplId) -> ty::ImplPolarity;
+
+    fn is_fully_generic_for_reflection(self, impl_def_id: Self::ImplId) -> bool;
+
+    fn trait_is_auto(self, trait_def_id: Self::TraitId) -> bool;
+
+    fn trait_is_coinductive(self, trait_def_id: Self::TraitId) -> bool;
+
+    fn trait_is_alias(self, trait_def_id: Self::TraitId) -> bool;
+
+    fn trait_is_dyn_compatible(self, trait_def_id: Self::TraitId) -> bool;
+
+    fn trait_is_fundamental(self, def_id: Self::TraitId) -> bool;
 
     /// Returns `true` if this is an `unsafe trait`.
-    fn trait_is_unsafe(self, trait_def_id: Self::DefId) -> bool;
+    fn trait_is_unsafe(self, trait_def_id: Self::TraitId) -> bool;
 
     fn is_impl_trait_in_trait(self, def_id: Self::DefId) -> bool;
 
     fn delay_bug(self, msg: impl ToString) -> Self::ErrorGuaranteed;
 
-    fn is_general_coroutine(self, coroutine_def_id: Self::DefId) -> bool;
-    fn coroutine_is_async(self, coroutine_def_id: Self::DefId) -> bool;
-    fn coroutine_is_gen(self, coroutine_def_id: Self::DefId) -> bool;
-    fn coroutine_is_async_gen(self, coroutine_def_id: Self::DefId) -> bool;
+    fn is_general_coroutine(self, coroutine_def_id: Self::CoroutineId) -> bool;
+    fn coroutine_is_async(self, coroutine_def_id: Self::CoroutineId) -> bool;
+    fn coroutine_is_gen(self, coroutine_def_id: Self::CoroutineId) -> bool;
+    fn coroutine_is_async_gen(self, coroutine_def_id: Self::CoroutineId) -> bool;
 
     type UnsizingParams: Deref<Target = DenseBitSet<u32>>;
-    fn unsizing_params_for_adt(self, adt_def_id: Self::DefId) -> Self::UnsizingParams;
-
-    fn find_const_ty_from_env(
-        self,
-        param_env: Self::ParamEnv,
-        placeholder: Self::PlaceholderConst,
-    ) -> Self::Ty;
+    fn unsizing_params_for_adt(self, adt_def_id: Self::AdtId) -> Self::UnsizingParams;
 
     fn anonymize_bound_vars<T: TypeFoldable<Self>>(
         self,
@@ -341,10 +457,87 @@ pub trait Interner:
 
     fn opaque_types_defined_by(self, defining_anchor: Self::LocalDefId) -> Self::LocalDefIds;
 
-    fn opaque_types_and_generators_defined_by(
+    fn opaque_types_and_coroutines_defined_by(
         self,
         defining_anchor: Self::LocalDefId,
     ) -> Self::LocalDefIds;
+
+    type Probe: Debug + Hash + Eq + Borrow<inspect::Probe<Self>>;
+    fn mk_probe(self, probe: inspect::Probe<Self>) -> Self::Probe;
+    fn evaluate_root_goal_for_proof_tree_raw(
+        self,
+        canonical_goal: CanonicalInput<Self>,
+        root_depth: usize,
+    ) -> (QueryResult<Self>, Self::Probe);
+
+    fn emit_next_solver_overflow_fcw(self, predicate: Self::Predicate, span: Self::Span);
+
+    fn item_name(self, item_index: Self::DefId) -> Self::Symbol;
+
+    fn get_anon_re_bounds_lifetime(self, idx: usize, var_idx: usize) -> Option<Region<Self>>;
+
+    fn get_anon_re_canonical_bounds_lifetime(self, idx: usize) -> Option<Region<Self>>;
+
+    fn get_re_static_lifetime(self) -> Region<Self>;
+
+    fn intern_region(self, region_kind: RegionKind<Self>) -> Region<Self>;
+
+    fn intern_bound_region(
+        self,
+        debruijn: DebruijnIndex,
+        bound_region: BoundRegion<Self>,
+    ) -> Region<Self>;
+
+    fn intern_canonical_bound(self, var: BoundVar) -> Region<Self>;
+}
+
+macro_rules! declare_lift_into {
+    ($($assoc:ident),* $(,)?) => {
+        /// An interner whose associated types can be lifted into another interner `J`.
+        ///
+        /// These are associated type bounds rather than `where` clauses so a caller with
+        /// `I: LiftInto<J>` can rely on the individual associated type `Lift` bounds being
+        /// implied.
+        pub trait LiftInto<J>: Interner<$($assoc: crate::lift::Lift<J, Lifted = J::$assoc>,)*>
+        where
+            J: Interner,
+        {}
+
+        impl<I, J> LiftInto<J> for I
+        where
+            J: Interner,
+            I: Interner<$($assoc: crate::lift::Lift<J, Lifted = J::$assoc>,)*>,
+        {}
+    };
+}
+
+declare_lift_into! {
+    BoundVarKinds,
+    Const,
+    DefId,
+    EarlyParamRegion,
+    ErrorGuaranteed,
+    FreeConstAliasId,
+    FreeTyAliasId,
+    GenericArg,
+    GenericArgs,
+    InherentAssocConstId,
+    InherentAssocTyId,
+    InternedRegionKind,
+    LateParamRegion,
+    OpaqueTyId,
+    ParamEnv,
+    PatList,
+    RegionAssumptions,
+    Symbol,
+    Term,
+    TraitAssocConstId,
+    TraitAssocTermId,
+    TraitAssocTyId,
+    TraitId,
+    Ty,
+    Tys,
+    AnonConstId,
 }
 
 /// Imagine you have a function `F: FnOnce(&[T]) -> R`, plus an iterator `iter`
@@ -379,28 +572,45 @@ impl<T, R> CollectAndApply<T, R> for T {
         F: FnOnce(&[T]) -> R,
     {
         // This code is hot enough that it's worth specializing for the most
-        // common length lists, to avoid the overhead of `SmallVec` creation.
-        // Lengths 0, 1, and 2 typically account for ~95% of cases. If
-        // `size_hint` is incorrect a panic will occur via an `unwrap` or an
-        // `assert`.
-        match iter.size_hint() {
-            (0, Some(0)) => {
-                assert!(iter.next().is_none());
-                f(&[])
-            }
-            (1, Some(1)) => {
-                let t0 = iter.next().unwrap();
-                assert!(iter.next().is_none());
-                f(&[t0])
-            }
-            (2, Some(2)) => {
-                let t0 = iter.next().unwrap();
-                let t1 = iter.next().unwrap();
-                assert!(iter.next().is_none());
-                f(&[t0, t1])
-            }
-            _ => f(&iter.collect::<SmallVec<[_; 8]>>()),
-        }
+        // common length lists, to avoid the overhead of `Vec` creation.
+
+        let Some(t0) = iter.next() else {
+            return f(&[]);
+        };
+
+        let Some(t1) = iter.next() else {
+            return f(&[t0]);
+        };
+
+        let Some(t2) = iter.next() else {
+            return f(&[t0, t1]);
+        };
+
+        let Some(t3) = iter.next() else {
+            return f(&[t0, t1, t2]);
+        };
+
+        let Some(t4) = iter.next() else {
+            return f(&[t0, t1, t2, t3]);
+        };
+
+        let Some(t5) = iter.next() else {
+            return f(&[t0, t1, t2, t3, t4]);
+        };
+
+        let Some(t6) = iter.next() else {
+            return f(&[t0, t1, t2, t3, t4, t5]);
+        };
+
+        let Some(t7) = iter.next() else {
+            return f(&[t0, t1, t2, t3, t4, t5, t6]);
+        };
+
+        let Some(t8) = iter.next() else {
+            return f(&[t0, t1, t2, t3, t4, t5, t6, t7]);
+        };
+
+        f(&[t0, t1, t2, t3, t4, t5, t6, t7, t8].into_iter().chain(iter).collect::<Vec<_>>())
     }
 }
 
@@ -416,35 +626,64 @@ impl<T, R, E> CollectAndApply<T, R> for Result<T, E> {
         F: FnOnce(&[T]) -> R,
     {
         // This code is hot enough that it's worth specializing for the most
-        // common length lists, to avoid the overhead of `SmallVec` creation.
-        // Lengths 0, 1, and 2 typically account for ~95% of cases. If
-        // `size_hint` is incorrect a panic will occur via an `unwrap` or an
-        // `assert`, unless a failure happens first, in which case the result
-        // will be an error anyway.
-        Ok(match iter.size_hint() {
-            (0, Some(0)) => {
-                assert!(iter.next().is_none());
-                f(&[])
-            }
-            (1, Some(1)) => {
-                let t0 = iter.next().unwrap()?;
-                assert!(iter.next().is_none());
-                f(&[t0])
-            }
-            (2, Some(2)) => {
-                let t0 = iter.next().unwrap()?;
-                let t1 = iter.next().unwrap()?;
-                assert!(iter.next().is_none());
-                f(&[t0, t1])
-            }
-            _ => f(&iter.collect::<Result<SmallVec<[_; 8]>, _>>()?),
-        })
+        // common length lists, to avoid the overhead of `Vec` creation.
+
+        let Some(t0) = iter.next() else {
+            return Ok(f(&[]));
+        };
+        let t0 = t0?;
+
+        let Some(t1) = iter.next() else {
+            return Ok(f(&[t0]));
+        };
+        let t1 = t1?;
+
+        let Some(t2) = iter.next() else {
+            return Ok(f(&[t0, t1]));
+        };
+        let t2 = t2?;
+
+        let Some(t3) = iter.next() else {
+            return Ok(f(&[t0, t1, t2]));
+        };
+        let t3 = t3?;
+
+        let Some(t4) = iter.next() else {
+            return Ok(f(&[t0, t1, t2, t3]));
+        };
+        let t4 = t4?;
+
+        let Some(t5) = iter.next() else {
+            return Ok(f(&[t0, t1, t2, t3, t4]));
+        };
+        let t5 = t5?;
+
+        let Some(t6) = iter.next() else {
+            return Ok(f(&[t0, t1, t2, t3, t4, t5]));
+        };
+        let t6 = t6?;
+
+        let Some(t7) = iter.next() else {
+            return Ok(f(&[t0, t1, t2, t3, t4, t5, t6]));
+        };
+        let t7 = t7?;
+
+        let Some(t8) = iter.next() else {
+            return Ok(f(&[t0, t1, t2, t3, t4, t5, t6, t7]));
+        };
+        let t8 = t8?;
+
+        Ok(f(&[Ok(t0), Ok(t1), Ok(t2), Ok(t3), Ok(t4), Ok(t5), Ok(t6), Ok(t7), Ok(t8)]
+            .into_iter()
+            .chain(iter)
+            .collect::<Result<Vec<_>, _>>()?))
     }
 }
 
 impl<I: Interner> search_graph::Cx for I {
     type Input = CanonicalInput<I>;
-    type Result = QueryResult<I>;
+    type Result = (QueryResult<I>, AccessedOpaques<I>);
+    type AmbiguityKind = Certainty;
 
     type DepNodeIndex = I::DepNodeIndex;
     type Tracked<T: Debug + Clone> = I::Tracked<T>;
@@ -464,7 +703,7 @@ impl<I: Interner> search_graph::Cx for I {
     fn with_global_cache<R>(self, f: impl FnOnce(&mut search_graph::GlobalCache<Self>) -> R) -> R {
         I::with_global_cache(self, f)
     }
-    fn evaluation_is_concurrent(&self) -> bool {
-        self.evaluation_is_concurrent()
+    fn assert_evaluation_is_concurrent(&self) {
+        self.assert_evaluation_is_concurrent()
     }
 }

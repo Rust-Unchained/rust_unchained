@@ -1,17 +1,18 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::{implements_trait, is_copy};
+use clippy_utils::visitors::for_each_expr_without_closures;
+use core::ops::ControlFlow;
 use rustc_ast::BindingMode;
 use rustc_errors::Applicability;
-use rustc_hir::{Body, Expr, ExprKind, HirId, HirIdSet, PatKind};
+use rustc_hir::{Body, CaptureBy, Closure, Expr, ExprKind, HirId, HirIdSet, Param, PatKind};
 use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 use rustc_lint::LateContext;
 use rustc_middle::mir::{FakeReadCause, Mutability};
-use rustc_middle::ty::{self, BorrowKind};
-use rustc_span::sym;
+use rustc_middle::ty::{self, BorrowKind, UpvarCapture};
+use rustc_span::{Symbol, sym};
 
-use super::ITER_OVEREAGER_CLONED;
-use crate::redundant_clone::REDUNDANT_CLONE;
+use super::{ITER_OVEREAGER_CLONED, REDUNDANT_ITER_CLONED};
 
 #[derive(Clone, Copy)]
 pub(super) enum Op<'a> {
@@ -26,7 +27,7 @@ pub(super) enum Op<'a> {
     // later `.cloned()`
     // and add `&` to the parameter of closure parameter
     // e.g. `find` `filter`
-    FixClosure(&'a str, &'a Expr<'a>),
+    FixClosure(Symbol, &'a Expr<'a>),
 
     // later `.cloned()`
     // e.g. `skip` `take`
@@ -44,9 +45,9 @@ pub(super) fn check<'tcx>(
     let typeck = cx.typeck_results();
     if let Some(iter_id) = cx.tcx.get_diagnostic_item(sym::Iterator)
         && let Some(method_id) = typeck.type_dependent_def_id(expr.hir_id)
-        && cx.tcx.trait_of_item(method_id) == Some(iter_id)
+        && cx.tcx.trait_of_assoc(method_id) == Some(iter_id)
         && let Some(method_id) = typeck.type_dependent_def_id(cloned_call.hir_id)
-        && cx.tcx.trait_of_item(method_id) == Some(iter_id)
+        && cx.tcx.trait_of_assoc(method_id) == Some(iter_id)
         && let cloned_recv_ty = typeck.expr_ty_adjusted(cloned_recv)
         && let Some(iter_assoc_ty) = cx.get_associated_type(cloned_recv_ty, iter_id, sym::Item)
         && matches!(*iter_assoc_ty.kind(), ty::Ref(_, ty, _) if !is_copy(cx, ty))
@@ -65,6 +66,11 @@ pub(super) fn check<'tcx>(
             let body @ Body { params: [p], .. } = cx.tcx.hir_body(closure.body) else {
                 return;
             };
+
+            if param_captured_by_move_block(cx, body.value, p) {
+                return;
+            }
+
             let mut delegate = MoveDelegate {
                 used_move: HirIdSet::default(),
             };
@@ -82,7 +88,8 @@ pub(super) fn check<'tcx>(
                 }
 
                 match it.kind {
-                    PatKind::Binding(BindingMode(_, Mutability::Mut), _, _, _) | PatKind::Ref(_, Mutability::Mut) => {
+                    PatKind::Binding(BindingMode(_, Mutability::Mut), _, _, _)
+                    | PatKind::Ref(_, _, Mutability::Mut) => {
                         to_be_discarded = true;
                         false
                     },
@@ -96,7 +103,7 @@ pub(super) fn check<'tcx>(
         }
 
         let (lint, msg, trailing_clone) = match op {
-            Op::RmCloned | Op::NeedlessMove(_) => (REDUNDANT_CLONE, "unneeded cloning of iterator items", ""),
+            Op::RmCloned | Op::NeedlessMove(_) => (REDUNDANT_ITER_CLONED, "unneeded cloning of iterator items", ""),
             Op::LaterCloned | Op::FixClosure(_, _) => (
                 ITER_OVEREAGER_CLONED,
                 "unnecessarily eager cloning of iterator items",
@@ -138,6 +145,34 @@ pub(super) fn check<'tcx>(
 
 struct MoveDelegate {
     used_move: HirIdSet,
+}
+
+/// Checks if the expression contains a closure or coroutine with `move` capture semantics that
+/// captures the given parameter.
+fn param_captured_by_move_block(cx: &LateContext<'_>, expr: &Expr<'_>, param: &Param<'_>) -> bool {
+    let mut param_hir_ids = HirIdSet::default();
+    param.pat.walk(|pat| {
+        param_hir_ids.insert(pat.hir_id);
+        true
+    });
+
+    for_each_expr_without_closures(expr, |e| {
+        if let ExprKind::Closure(Closure {
+            capture_clause: CaptureBy::Value { .. },
+            def_id,
+            ..
+        }) = e.kind
+            && cx.tcx.closure_captures(*def_id).iter().any(|capture| {
+                matches!(capture.info.capture_kind, UpvarCapture::ByValue)
+                    && matches!(capture.place.base, PlaceBase::Upvar(upvar) if param_hir_ids.contains(&upvar.var_path.hir_id))
+            })
+        {
+            return ControlFlow::Break(());
+        }
+
+        ControlFlow::Continue(())
+    })
+    .is_some()
 }
 
 impl<'tcx> Delegate<'tcx> for MoveDelegate {

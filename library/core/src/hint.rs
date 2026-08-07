@@ -4,6 +4,7 @@
 //!
 //! Hints may be compile time or runtime.
 
+use crate::marker::Destruct;
 use crate::mem::MaybeUninit;
 use crate::{intrinsics, ub_checks};
 
@@ -98,7 +99,7 @@ use crate::{intrinsics, ub_checks};
 #[inline]
 #[stable(feature = "unreachable", since = "1.27.0")]
 #[rustc_const_stable(feature = "const_unreachable_unchecked", since = "1.57.0")]
-#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+#[track_caller]
 pub const unsafe fn unreachable_unchecked() -> ! {
     ub_checks::assert_unsafe_precondition!(
         check_language_ub,
@@ -231,7 +232,7 @@ pub const unsafe fn assert_unchecked(cond: bool) {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore-wasm
 /// use std::sync::atomic::{AtomicBool, Ordering};
 /// use std::sync::Arc;
 /// use std::{hint, thread};
@@ -267,39 +268,47 @@ pub const unsafe fn assert_unchecked(cond: bool) {
 #[inline(always)]
 #[stable(feature = "renamed_spin_loop", since = "1.49.0")]
 pub fn spin_loop() {
-    #[cfg(target_arch = "x86")]
-    {
-        // SAFETY: the `cfg` attr ensures that we only execute this on x86 targets.
-        unsafe { crate::arch::x86::_mm_pause() };
-    }
+    crate::cfg_select! {
+        miri => {
+            unsafe extern "Rust" {
+                safe fn miri_spin_loop();
+            }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: the `cfg` attr ensures that we only execute this on x86_64 targets.
-        unsafe { crate::arch::x86_64::_mm_pause() };
-    }
-
-    #[cfg(target_arch = "riscv32")]
-    {
-        crate::arch::riscv32::pause();
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        crate::arch::riscv64::pause();
-    }
-
-    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
-    {
-        // SAFETY: the `cfg` attr ensures that we only execute this on aarch64 targets.
-        unsafe { crate::arch::aarch64::__isb(crate::arch::aarch64::SY) };
-    }
-
-    #[cfg(all(target_arch = "arm", target_feature = "v6"))]
-    {
-        // SAFETY: the `cfg` attr ensures that we only execute this on arm targets
-        // with support for the v6 feature.
-        unsafe { crate::arch::arm::__yield() };
+            // Miri does support some of the intrinsics that are called below, but to guarantee
+            // consistent behavior across targets, this custom function is used.
+            miri_spin_loop();
+        }
+        target_arch = "x86" => {
+            // SAFETY: the `cfg` attr ensures that we only execute this on x86 targets.
+            crate::arch::x86::_mm_pause()
+        }
+        target_arch = "x86_64" => {
+            // SAFETY: the `cfg` attr ensures that we only execute this on x86_64 targets.
+            crate::arch::x86_64::_mm_pause()
+        }
+        target_arch = "riscv32" => crate::arch::riscv32::pause(),
+        target_arch = "riscv64" => crate::arch::riscv64::pause(),
+        any(target_arch = "aarch64", target_arch = "arm64ec") => {
+            // SAFETY: the `cfg` attr ensures that we only execute this on aarch64 targets.
+            unsafe { crate::arch::aarch64::__isb(crate::arch::aarch64::SY) }
+        }
+        all(
+            target_arch = "arm",
+            any(
+                all(target_feature = "v6k", not(target_feature = "thumb-mode")),
+                target_feature = "v6t2",
+                all(target_feature = "v6", target_feature = "mclass"),
+            )
+        ) => {
+            // SAFETY: the `cfg` attr ensures that we only execute this on arm
+            // targets with support for the this feature. On ARMv6 in Thumb
+            // mode, T2 is required (see Arm DDI0406C Section A8.8.427),
+            // otherwise ARMv6-M or ARMv6K is enough
+            unsafe { crate::arch::arm::__yield() }
+        }
+        target_arch = "loongarch32" => crate::arch::loongarch32::ibar::<0>(),
+        target_arch = "loongarch64" => crate::arch::loongarch64::ibar::<0>(),
+        _ => { /* do nothing */ }
     }
 }
 
@@ -319,6 +328,10 @@ pub fn spin_loop() {
 /// identity function. As such, it **must not be relied upon to control critical program behavior.**
 /// This also means that this function does not offer any guarantees for cryptographic or security
 /// purposes.
+///
+/// This limitation is not specific to `black_box`; there is no mechanism in the entire Rust
+/// language that can provide the guarantees required for constant-time cryptography.
+/// (There is also no such mechanism in LLVM, so the same is true for every other LLVM-based compiler.)
 ///
 /// </div>
 ///
@@ -501,7 +514,7 @@ pub const fn black_box<T>(dummy: T) -> T {
 /// macro_rules! make_error {
 ///     ($($args:expr),*) => {
 ///         core::hint::must_use({
-///             let error = $crate::make_error(core::format_args!($($args),*));
+///             let error = make_error(core::format_args!($($args),*));
 ///             error
 ///         })
 ///     };
@@ -645,9 +658,7 @@ pub const fn must_use<T>(value: T) -> T {
 ///     }
 /// }
 /// ```
-///
-///
-#[unstable(feature = "likely_unlikely", issue = "136873")]
+#[unstable(feature = "likely_unlikely", issue = "151619")]
 #[inline(always)]
 pub const fn likely(b: bool) -> bool {
     crate::intrinsics::likely(b)
@@ -697,7 +708,7 @@ pub const fn likely(b: bool) -> bool {
 ///     }
 /// }
 /// ```
-#[unstable(feature = "likely_unlikely", issue = "136873")]
+#[unstable(feature = "likely_unlikely", issue = "151619")]
 #[inline(always)]
 pub const fn unlikely(b: bool) -> bool {
     crate::intrinsics::unlikely(b)
@@ -706,10 +717,13 @@ pub const fn unlikely(b: bool) -> bool {
 /// Hints to the compiler that given path is cold, i.e., unlikely to be taken. The compiler may
 /// choose to optimize paths that are not cold at the expense of paths that are cold.
 ///
+/// Note that like all hints, the exact effect to codegen is not guaranteed. Using `cold_path`
+/// can actually *decrease* performance if the branch is called more than expected. It is advisable
+/// to perform benchmarks to tell if this function is useful.
+///
 /// # Examples
 ///
 /// ```
-/// #![feature(cold_path)]
 /// use core::hint::cold_path;
 ///
 /// fn foo(x: &[i32]) {
@@ -730,8 +744,43 @@ pub const fn unlikely(b: bool) -> bool {
 ///     }
 /// }
 /// ```
-#[unstable(feature = "cold_path", issue = "136873")]
+///
+/// This can also be used to implement `likely` and `unlikely` helpers to hint the condition rather
+/// than the branch:
+///
+/// ```
+/// use core::hint::cold_path;
+///
+/// #[inline(always)]
+/// pub const fn likely(b: bool) -> bool {
+///     if !b {
+///         cold_path();
+///     }
+///     b
+/// }
+///
+/// #[inline(always)]
+/// pub const fn unlikely(b: bool) -> bool {
+///     if b {
+///         cold_path();
+///     }
+///     b
+/// }
+///
+/// fn foo(x: i32) {
+///     if likely(x > 0) {
+///         println!("this branch is likely to be taken");
+///     } else {
+///         println!("this branch is unlikely to be taken");
+///     }
+/// }
+/// ```
+#[stable(feature = "cold_path", since = "1.95.0")]
+#[rustc_const_stable(feature = "cold_path", since = "1.95.0")]
 #[inline(always)]
+// Even if for some reason the cold_path intrinsic is not visible to codegen, the coldness will
+// ensure that branches this is in are still known to be cold.
+#[cold]
 pub const fn cold_path() {
     crate::intrinsics::cold_path()
 }
@@ -763,8 +812,6 @@ pub const fn cold_path() {
 ///
 /// Distribute values evenly between two buckets:
 /// ```
-/// #![feature(select_unpredictable)]
-///
 /// use std::hash::BuildHasher;
 /// use std::hint;
 ///
@@ -780,18 +827,204 @@ pub const fn cold_path() {
 /// # assert_eq!(bucket_one.len() + bucket_two.len(), 1);
 /// ```
 #[inline(always)]
-#[unstable(feature = "select_unpredictable", issue = "133962")]
-pub fn select_unpredictable<T>(condition: bool, true_val: T, false_val: T) -> T {
+#[stable(feature = "select_unpredictable", since = "1.88.0")]
+#[rustc_const_unstable(feature = "const_select_unpredictable", issue = "145938")]
+pub const fn select_unpredictable<T>(condition: bool, true_val: T, false_val: T) -> T
+where
+    T: [const] Destruct,
+{
     // FIXME(https://github.com/rust-lang/unsafe-code-guidelines/issues/245):
     // Change this to use ManuallyDrop instead.
     let mut true_val = MaybeUninit::new(true_val);
     let mut false_val = MaybeUninit::new(false_val);
+
+    struct DropOnPanic<T> {
+        // Invariant: valid pointer and points to an initialized value that is not further used,
+        // i.e. it can be dropped by this guard.
+        inner: *mut T,
+    }
+
+    impl<T> Drop for DropOnPanic<T> {
+        fn drop(&mut self) {
+            // SAFETY: Must be guaranteed on construction of local type `DropOnPanic`.
+            unsafe { self.inner.drop_in_place() }
+        }
+    }
+
+    let true_ptr = true_val.as_mut_ptr();
+    let false_ptr = false_val.as_mut_ptr();
+
     // SAFETY: The value that is not selected is dropped, and the selected one
     // is returned. This is necessary because the intrinsic doesn't drop the
     // value that is  not selected.
     unsafe {
-        crate::intrinsics::select_unpredictable(!condition, &mut true_val, &mut false_val)
-            .assume_init_drop();
+        // Extract the selected value first, ensure it is dropped as well if dropping the unselected
+        // value panics. We construct a temporary by-pointer guard around the selected value while
+        // dropping the unselected value. Arguments overlap here, so we can not use mutable
+        // reference for these arguments.
+        let guard = crate::intrinsics::select_unpredictable(condition, true_ptr, false_ptr);
+        let drop = crate::intrinsics::select_unpredictable(condition, false_ptr, true_ptr);
+
+        // SAFETY: both pointers are well-aligned and point to initialized values inside a
+        // `MaybeUninit` each. In both possible values for `condition` the pointer `guard` and
+        // `drop` do not alias (even though the two argument pairs we have selected from did alias
+        // each other).
+        let guard = DropOnPanic { inner: guard };
+        drop.drop_in_place();
+        crate::mem::forget(guard);
+
+        // Note that it is important to use the values here. Reading from the pointer we got makes
+        // LLVM forget the !unpredictable annotation sometimes (in tests, integer sized values in
+        // particular seemed to confuse it, also observed in llvm/llvm-project #82340).
         crate::intrinsics::select_unpredictable(condition, true_val, false_val).assume_init()
+    }
+}
+
+/// The expected temporal locality of a memory prefetch operation.
+///
+/// Locality expresses how likely the prefetched data is to be reused soon,
+/// and therefore which level of cache it should be brought into.
+///
+/// The locality is just a hint, and may be ignored on some targets or by the hardware.
+///
+/// Used with functions like [`prefetch_read`] and [`prefetch_write`].
+///
+/// [`prefetch_read`]: crate::hint::prefetch_read
+/// [`prefetch_write`]: crate::hint::prefetch_write
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Locality {
+    /// Data is expected to be reused eventually.
+    ///
+    /// Typically prefetches into L3 cache (if the CPU supports it).
+    L3,
+    /// Data is expected to be reused in the near future.
+    ///
+    /// Typically prefetches into L2 cache.
+    L2,
+    /// Data is expected to be reused very soon.
+    ///
+    /// Typically prefetches into L1 cache.
+    L1,
+}
+
+impl Locality {
+    /// Convert to the constant that LLVM associates with a locality.
+    const fn to_llvm(self) -> i32 {
+        match self {
+            Self::L3 => 1,
+            Self::L2 => 2,
+            Self::L1 => 3,
+        }
+    }
+}
+
+/// Prefetch the cache line containing `ptr` for a future read.
+///
+/// A strategically placed prefetch can reduce cache miss latency if the data is accessed
+/// soon after, but may also increase bandwidth usage or evict other cache lines.
+///
+/// A prefetch is a *hint*, and may be ignored on certain targets or by the hardware.
+///
+/// Passing a dangling or invalid pointer is permitted: the memory will not
+/// actually be dereferenced, and no faults are raised.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(hint_prefetch)]
+/// use std::hint::{Locality, prefetch_read};
+/// use std::mem::size_of_val;
+///
+/// // Prefetch all of `slice` into the L1 cache.
+/// fn prefetch_slice<T>(slice: &[T]) {
+///     // On most systems the cache line size is 64 bytes.
+///     for offset in (0..size_of_val(slice)).step_by(64) {
+///         prefetch_read(slice.as_ptr().wrapping_add(offset), Locality::L1);
+///     }
+/// }
+/// ```
+#[inline(always)]
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+pub const fn prefetch_read<T>(ptr: *const T, locality: Locality) {
+    match locality {
+        Locality::L3 => intrinsics::prefetch_read_data::<T, { Locality::L3.to_llvm() }>(ptr),
+        Locality::L2 => intrinsics::prefetch_read_data::<T, { Locality::L2.to_llvm() }>(ptr),
+        Locality::L1 => intrinsics::prefetch_read_data::<T, { Locality::L1.to_llvm() }>(ptr),
+    }
+}
+
+/// Prefetch the cache line containing `ptr` for a single future read, but attempt to avoid
+/// polluting the cache.
+///
+/// A strategically placed prefetch can reduce cache miss latency if the data is accessed
+/// soon after, but may also increase bandwidth usage or evict other cache lines.
+///
+/// A prefetch is a *hint*, and may be ignored on certain targets or by the hardware.
+///
+/// Passing a dangling or invalid pointer is permitted: the memory will not
+/// actually be dereferenced, and no faults are raised.
+#[inline(always)]
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+pub const fn prefetch_read_non_temporal<T>(ptr: *const T, locality: Locality) {
+    // The LLVM intrinsic does not currently support specifying the locality.
+    let _ = locality;
+    intrinsics::prefetch_read_data::<T, 0>(ptr)
+}
+
+/// Prefetch the cache line containing `ptr` for a future write.
+///
+/// A strategically placed prefetch can reduce cache miss latency if the data is accessed
+/// soon after, but may also increase bandwidth usage or evict other cache lines.
+///
+/// A prefetch is a *hint*, and may be ignored on certain targets or by the hardware.
+///
+/// Passing a dangling or invalid pointer is permitted: the memory will not
+/// actually be dereferenced, and no faults are raised.
+#[inline(always)]
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+pub const fn prefetch_write<T>(ptr: *mut T, locality: Locality) {
+    match locality {
+        Locality::L3 => intrinsics::prefetch_write_data::<T, { Locality::L3.to_llvm() }>(ptr),
+        Locality::L2 => intrinsics::prefetch_write_data::<T, { Locality::L2.to_llvm() }>(ptr),
+        Locality::L1 => intrinsics::prefetch_write_data::<T, { Locality::L1.to_llvm() }>(ptr),
+    }
+}
+
+/// Prefetch the cache line containing `ptr` for a single future write, but attempt to avoid
+/// polluting the cache.
+///
+/// A strategically placed prefetch can reduce cache miss latency if the data is accessed
+/// soon after, but may also increase bandwidth usage or evict other cache lines.
+///
+/// A prefetch is a *hint*, and may be ignored on certain targets or by the hardware.
+///
+/// Passing a dangling or invalid pointer is permitted: the memory will not
+/// actually be dereferenced, and no faults are raised.
+#[inline(always)]
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+pub const fn prefetch_write_non_temporal<T>(ptr: *const T, locality: Locality) {
+    // The LLVM intrinsic does not currently support specifying the locality.
+    let _ = locality;
+    intrinsics::prefetch_write_data::<T, 0>(ptr)
+}
+
+/// Prefetch the cache line containing `ptr` into the instruction cache for a future read.
+///
+/// A strategically placed prefetch can reduce cache miss latency if the instructions are
+/// accessed soon after, but may also increase bandwidth usage or evict other cache lines.
+///
+/// A prefetch is a *hint*, and may be ignored on certain targets or by the hardware.
+///
+/// Passing a dangling or invalid pointer is permitted: the memory will not
+/// actually be dereferenced, and no faults are raised.
+#[inline(always)]
+#[unstable(feature = "hint_prefetch", issue = "146941")]
+pub const fn prefetch_read_instruction<T>(ptr: *const T, locality: Locality) {
+    match locality {
+        Locality::L3 => intrinsics::prefetch_read_instruction::<T, { Locality::L3.to_llvm() }>(ptr),
+        Locality::L2 => intrinsics::prefetch_read_instruction::<T, { Locality::L2.to_llvm() }>(ptr),
+        Locality::L1 => intrinsics::prefetch_read_instruction::<T, { Locality::L1.to_llvm() }>(ptr),
     }
 }

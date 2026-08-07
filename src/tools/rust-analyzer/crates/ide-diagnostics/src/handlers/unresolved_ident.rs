@@ -4,7 +4,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 //
 // This diagnostic is triggered if an expr-position ident is invalid.
 pub(crate) fn unresolved_ident(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::UnresolvedIdent,
 ) -> Diagnostic {
     let mut range =
@@ -13,7 +13,6 @@ pub(crate) fn unresolved_ident(
         range.range = in_node_range + range.range.start();
     }
     Diagnostic::new(DiagnosticCode::RustcHardError("E0425"), "no such value in this scope", range)
-        .experimental()
 }
 
 #[cfg(test)]

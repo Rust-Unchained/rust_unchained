@@ -1,4 +1,3 @@
-#![allow(clippy::needless_if)]
 #![warn(clippy::filetype_is_file)]
 
 fn main() -> std::io::Result<()> {

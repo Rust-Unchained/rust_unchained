@@ -6,7 +6,7 @@
 //! loop instruction to be missed. This test therefore contains a simple loop
 //! with trivial instructions in it, to see, where the label is placed.
 //!
-//! This must be a `rmake`-test and cannot be a `tests/assembly`-test, since the
+//! This must be a `rmake`-test and cannot be a `tests/assembly-llvm/`-test, since the
 //! wrong output is only produced with direct assembly generation, but not when
 //! "emit-asm" is used, as described in the issue description of #129301:
 //! https://github.com/rust-lang/rust/issues/129301#issue-2475070770
@@ -15,9 +15,11 @@
 // crashes... so I'm going to disable this test for windows for now.
 //@ ignore-windows-gnu
 
-use run_make_support::{llvm_objdump, rustc};
+use run_make_support::{llvm_objdump, path, rustc, rustc_minicore};
 
 fn main() {
+    rustc_minicore().target("avr-none").target_cpu("avr").output("libminicore.rlib").run();
+
     rustc()
         .input("avr-rjmp-offsets.rs")
         .opt_level("s")
@@ -36,6 +38,7 @@ fn main() {
         .linker("rust-lld")
         .link_arg("--entry=main")
         .output("compiled")
+        .extern_("minicore", path("libminicore.rlib"))
         .run();
 
     let disassembly = llvm_objdump().disassemble().input("compiled").run().stdout_utf8();

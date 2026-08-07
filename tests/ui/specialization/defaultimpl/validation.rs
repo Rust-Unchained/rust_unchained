@@ -1,10 +1,10 @@
 #![feature(negative_impls)]
-#![feature(specialization)] //~ WARN the feature `specialization` is incomplete
+#![feature(specialization)]
 
 struct S;
 struct Z;
 
-default impl S {} //~ ERROR inherent impls cannot be `default`
+default impl S {} //~ ERROR inherent impls cannot be default
 
 default unsafe impl Send for S {}
 //~^ ERROR impls of auto traits cannot be default

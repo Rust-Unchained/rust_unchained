@@ -5,7 +5,7 @@ mod reparsing;
 
 use rowan::TextRange;
 
-use crate::{syntax_node::GreenNode, SyntaxError, SyntaxTreeBuilder};
+use crate::{SyntaxError, SyntaxTreeBuilder, syntax_node::GreenNode};
 
 pub(crate) use crate::parsing::reparsing::incremental_reparse;
 
@@ -13,7 +13,7 @@ pub(crate) fn parse_text(text: &str, edition: parser::Edition) -> (GreenNode, Ve
     let _p = tracing::info_span!("parse_text").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
-    let parser_output = parser::TopEntryPoint::SourceFile.parse(&parser_input, edition);
+    let parser_output = parser::TopEntryPoint::SourceFile.parse(&parser_input);
     let (node, errors, _eof) = build_tree(lexed, parser_output);
     (node, errors)
 }
@@ -26,7 +26,7 @@ pub(crate) fn parse_text_at(
     let _p = tracing::info_span!("parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
-    let parser_output = entry.parse(&parser_input, edition);
+    let parser_output = entry.parse(&parser_input);
     let (node, errors, _eof) = build_tree(lexed, parser_output);
     (node, errors)
 }

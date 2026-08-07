@@ -6,9 +6,9 @@ use std::process::Command;
 use camino::{Utf8Path, Utf8PathBuf};
 use glob::glob;
 
-use crate::common::{UI_COVERAGE, UI_COVERAGE_MAP};
+use crate::common::{TestSuite, UI_COVERAGE, UI_COVERAGE_MAP};
 use crate::runtest::{Emit, ProcRes, TestCx, WillExecute};
-use crate::util::static_regex;
+use crate::util::{ArgFileCommand, static_regex};
 
 impl<'test> TestCx<'test> {
     fn coverage_dump_path(&self) -> &Utf8Path {
@@ -27,9 +27,9 @@ impl<'test> TestCx<'test> {
         }
         drop(proc_res);
 
-        let mut dump_command = Command::new(coverage_dump_path);
+        let mut dump_command = ArgFileCommand::new(coverage_dump_path);
         dump_command.arg(llvm_ir_path);
-        let proc_res = self.run_command_to_procres(&mut dump_command);
+        let proc_res = self.run_command_to_procres(dump_command);
         if !proc_res.status.success() {
             self.fatal_proc_rec("coverage-dump failed!", &proc_res);
         }
@@ -91,7 +91,7 @@ impl<'test> TestCx<'test> {
         let mut profraw_paths = vec![profraw_path];
         let mut bin_paths = vec![self.make_exe_name()];
 
-        if self.config.suite == "coverage-run-rustdoc" {
+        if self.config.suite == TestSuite::CoverageRunRustdoc {
             self.run_doctests_for_coverage(&mut profraw_paths, &mut bin_paths);
         }
 
@@ -197,7 +197,7 @@ impl<'test> TestCx<'test> {
 
         rustdoc_cmd.arg(&self.testpaths.file);
 
-        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None, self.testpaths);
+        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None);
         if !proc_res.status.success() {
             self.fatal_proc_rec("rustdoc --test failed!", &proc_res)
         }
@@ -227,7 +227,11 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn run_llvm_tool(&self, name: &str, configure_cmd_fn: impl FnOnce(&mut Command)) -> ProcRes {
+    fn run_llvm_tool(
+        &self,
+        name: &str,
+        configure_cmd_fn: impl FnOnce(&mut ArgFileCommand),
+    ) -> ProcRes {
         let tool_path = self
             .config
             .llvm_bin_dir
@@ -235,10 +239,10 @@ impl<'test> TestCx<'test> {
             .expect("this test expects the LLVM bin dir to be available")
             .join(name);
 
-        let mut cmd = Command::new(tool_path);
+        let mut cmd = ArgFileCommand::new(tool_path);
         configure_cmd_fn(&mut cmd);
 
-        self.run_command_to_procres(&mut cmd)
+        self.run_command_to_procres(cmd)
     }
 
     fn normalize_coverage_output(&self, coverage: &str) -> Result<String, String> {
@@ -357,9 +361,9 @@ impl<'test> TestCx<'test> {
                 // Add this line to the current subview.
                 subviews
                     .last_mut()
-                    .ok_or(format!(
-                        "unexpected subview line outside of a subview on line {line_num}"
-                    ))?
+                    .ok_or_else(|| {
+                        format!("unexpected subview line outside of a subview on line {line_num}")
+                    })?
                     .push(line);
             } else {
                 // This line is not part of a subview, so sort and print any

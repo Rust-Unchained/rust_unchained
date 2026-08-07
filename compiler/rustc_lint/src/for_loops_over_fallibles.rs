@@ -49,6 +49,13 @@ impl<'tcx> LateLintPass<'tcx> for ForLoopsOverFallibles {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         let Some((pat, arg)) = extract_for_loop(expr) else { return };
 
+        // Do not put suggestions for external macros.
+        if pat.span.from_expansion() {
+            return;
+        }
+
+        let arg_span = arg.span.source_callsite();
+
         let ty = cx.typeck_results().expr_ty(arg);
 
         let (adt, args, ref_mutability) = match ty.kind() {
@@ -75,30 +82,32 @@ impl<'tcx> LateLintPass<'tcx> for ForLoopsOverFallibles {
         };
 
         let sub = if let Some(recv) = extract_iterator_next_call(cx, arg)
+            && recv.span.can_be_used_for_suggestions()
+            && recv.span.between(arg_span.shrink_to_hi()).can_be_used_for_suggestions()
             && let Ok(recv_snip) = cx.sess().source_map().span_to_snippet(recv.span)
         {
             ForLoopsOverFalliblesLoopSub::RemoveNext {
-                suggestion: recv.span.between(arg.span.shrink_to_hi()),
+                suggestion: recv.span.between(arg_span.shrink_to_hi()),
                 recv_snip,
             }
         } else {
             ForLoopsOverFalliblesLoopSub::UseWhileLet {
                 start_span: expr.span.with_hi(pat.span.lo()),
-                end_span: pat.span.between(arg.span),
+                end_span: pat.span.between(arg_span),
                 var,
             }
         };
         let question_mark = suggest_question_mark(cx, adt, args, expr.span)
-            .then(|| ForLoopsOverFalliblesQuestionMark { suggestion: arg.span.shrink_to_hi() });
+            .then(|| ForLoopsOverFalliblesQuestionMark { suggestion: arg_span.shrink_to_hi() });
         let suggestion = ForLoopsOverFalliblesSuggestion {
             var,
             start_span: expr.span.with_hi(pat.span.lo()),
-            end_span: pat.span.between(arg.span),
+            end_span: pat.span.between(arg_span),
         };
 
         cx.emit_span_lint(
             FOR_LOOPS_OVER_FALLIBLES,
-            arg.span,
+            arg_span,
             ForLoopsOverFalliblesDiag { article, ref_prefix, ty, sub, question_mark, suggestion },
         );
     }
@@ -174,9 +183,9 @@ fn suggest_question_mark<'tcx>(
         cause,
         param_env,
         // Erase any region vids from the type, which may not be resolved
-        infcx.tcx.erase_regions(ty),
+        infcx.tcx.erase_and_anonymize_regions(ty),
         into_iterator_did,
     );
 
-    ocx.select_all_or_error().is_empty()
+    ocx.evaluate_obligations_error_on_ambiguity().is_empty()
 }

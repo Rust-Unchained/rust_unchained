@@ -12,18 +12,11 @@
 #![allow(internal_features)]
 #![cfg_attr(test, feature(test))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
-    test(no_crate_inject, attr(deny(warnings)))
-)]
-#![doc(rust_logo)]
-#![feature(core_intrinsics)]
+#![doc(test(no_crate_inject, attr(deny(warnings), allow(internal_features))))]
 #![feature(decl_macro)]
 #![feature(dropck_eyepatch)]
-#![feature(maybe_uninit_slice)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
 #![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 
@@ -32,7 +25,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
-use std::{cmp, intrinsics, slice};
+use std::{cmp, hint, slice};
 
 use smallvec::SmallVec;
 
@@ -147,25 +140,19 @@ impl<T> TypedArena<T> {
     /// Allocates an object in the `TypedArena`, returning a reference to it.
     #[inline]
     pub fn alloc(&self, object: T) -> &mut T {
+        assert!(size_of::<T>() != 0);
+
         if self.ptr == self.end {
             self.grow(1)
         }
 
         unsafe {
-            if size_of::<T>() == 0 {
-                self.ptr.set(self.ptr.get().wrapping_byte_add(1));
-                let ptr = ptr::NonNull::<T>::dangling().as_ptr();
-                // Don't drop the object. This `write` is equivalent to `forget`.
-                ptr::write(ptr, object);
-                &mut *ptr
-            } else {
-                let ptr = self.ptr.get();
-                // Advance the pointer.
-                self.ptr.set(self.ptr.get().add(1));
-                // Write into uninitialized memory.
-                ptr::write(ptr, object);
-                &mut *ptr
-            }
+            let ptr = self.ptr.get();
+            // Advance the pointer.
+            self.ptr.set(self.ptr.get().add(1));
+            // Write into uninitialized memory.
+            ptr::write(ptr, object);
+            &mut *ptr
         }
     }
 
@@ -178,8 +165,22 @@ impl<T> TypedArena<T> {
         available_bytes >= additional_bytes
     }
 
+    /// Allocates storage for `len >= 1` values in this arena, and returns a
+    /// raw pointer to the first value's storage.
+    ///
+    /// # Safety
+    ///
+    /// Caller must initialize each of the `len` slots to a droppable value
+    /// before the arena is dropped.
+    ///
+    /// In practice, this typically means that the caller must be able to
+    /// raw-copy `len` already-initialized values into the slice without any
+    /// possibility of panicking.
+    ///
+    /// FIXME(Zalathar): This is *very* fragile; perhaps we need a different
+    /// approach to arena-allocating slices of droppable values.
     #[inline]
-    fn alloc_raw_slice(&self, len: usize) -> *mut T {
+    unsafe fn alloc_raw_slice(&self, len: usize) -> *mut T {
         assert!(size_of::<T>() != 0);
         assert!(len != 0);
 
@@ -214,7 +215,7 @@ impl<T> TypedArena<T> {
         &self,
         iter: impl IntoIterator<Item = Result<T, E>>,
     ) -> Result<&mut [T], E> {
-        // Despite the similarlty with `DroplessArena`, we cannot reuse their fast case. The reason
+        // Despite the similarity with `DroplessArena`, we cannot reuse their fast case. The reason
         // is subtle: these arenas are reentrant. In other words, `iter` may very well be holding a
         // reference to `self` and adding elements to the arena during iteration.
         //
@@ -235,9 +236,15 @@ impl<T> TypedArena<T> {
         }
         // Move the content to the arena by copying and then forgetting it.
         let len = vec.len();
-        let start_ptr = self.alloc_raw_slice(len);
+
+        // SAFETY: After allocating raw storage for exactly `len` values, we
+        // must fully initialize the storage without panicking, and we must
+        // also prevent the stale values in the vec from being dropped.
         Ok(unsafe {
+            let start_ptr = self.alloc_raw_slice(len);
+            // Initialize the newly-allocated storage without panicking.
             vec.as_ptr().copy_to_nonoverlapping(start_ptr, len);
+            // Prevent the stale values in the vec from being dropped.
             vec.set_len(0);
             slice::from_raw_parts_mut(start_ptr, len)
         })
@@ -274,10 +281,9 @@ impl<T> TypedArena<T> {
             // Also ensure that this chunk can fit `additional`.
             new_cap = cmp::max(additional, new_cap);
 
-            let mut chunk = ArenaChunk::<T>::new(new_cap);
+            let chunk = chunks.push_mut(ArenaChunk::<T>::new(new_cap));
             self.ptr.set(chunk.start());
             self.end.set(chunk.end());
-            chunks.push(chunk);
         }
     }
 
@@ -290,16 +296,10 @@ impl<T> TypedArena<T> {
         let end = self.ptr.get().addr();
         // We then calculate the number of elements to be dropped in the last chunk,
         // which is the filled area's length.
-        let diff = if size_of::<T>() == 0 {
-            // `T` is ZST. It can't have a drop flag, so the value here doesn't matter. We get
-            // the number of zero-sized values in the last and only chunk, just out of caution.
-            // Recall that `end` was incremented for each allocated value.
-            end - start
-        } else {
-            // FIXME: this should *likely* use `offset_from`, but more
-            // investigation is needed (including running tests in miri).
-            (end - start) / size_of::<T>()
-        };
+        assert_ne!(size_of::<T>(), 0);
+        // FIXME: this should *likely* use `offset_from`, but more
+        // investigation is needed (including running tests in miri).
+        let diff = (end - start) / size_of::<T>();
         // Pass that to the `destroy` method.
         unsafe {
             last_chunk.destroy(diff);
@@ -406,7 +406,7 @@ impl DroplessArena {
             // Also ensure that this chunk can fit `additional`.
             new_cap = cmp::max(additional, new_cap);
 
-            let mut chunk = ArenaChunk::new(align_up(new_cap, PAGE));
+            let chunk = chunks.push_mut(ArenaChunk::new(align_up(new_cap, PAGE)));
             self.start.set(chunk.start());
 
             // Align the end to DROPLESS_ALIGNMENT.
@@ -417,8 +417,6 @@ impl DroplessArena {
             debug_assert!(chunk.start().addr() <= end);
 
             self.end.set(chunk.end().with_addr(end));
-
-            chunks.push(chunk);
         }
     }
 
@@ -438,7 +436,7 @@ impl DroplessArena {
             let bytes = align_up(layout.size(), DROPLESS_ALIGNMENT);
 
             // Tell LLVM that `end` is aligned to DROPLESS_ALIGNMENT.
-            unsafe { intrinsics::assume(end == align_down(end, DROPLESS_ALIGNMENT)) };
+            unsafe { hint::assert_unchecked(end == align_down(end, DROPLESS_ALIGNMENT)) };
 
             if let Some(sub) = end.checked_sub(bytes) {
                 let new_end = align_down(sub, layout.align());
@@ -496,19 +494,6 @@ impl DroplessArena {
         }
     }
 
-    /// Used by `Lift` to check whether this slice is allocated
-    /// in this arena.
-    #[inline]
-    pub fn contains_slice<T>(&self, slice: &[T]) -> bool {
-        for chunk in self.chunks.borrow_mut().iter_mut() {
-            let ptr = slice.as_ptr().cast::<u8>().cast_mut();
-            if chunk.start() <= ptr && chunk.end() >= ptr {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Allocates a string slice that is copied into the `DroplessArena`, returning a
     /// reference to it. Will panic if passed an empty string.
     ///
@@ -557,11 +542,12 @@ impl DroplessArena {
 
     #[inline]
     pub fn alloc_from_iter<T, I: IntoIterator<Item = T>>(&self, iter: I) -> &mut [T] {
+        assert!(!mem::needs_drop::<T>());
+        assert!(size_of::<T>() != 0);
+
         // Warning: this function is reentrant: `iter` could hold a reference to `&self` and
         // allocate additional elements while we're iterating.
         let iter = iter.into_iter();
-        assert!(size_of::<T>() != 0);
-        assert!(!mem::needs_drop::<T>());
 
         let size_hint = iter.size_hint();
 
@@ -590,8 +576,9 @@ impl DroplessArena {
         &self,
         iter: impl IntoIterator<Item = Result<T, E>>,
     ) -> Result<&mut [T], E> {
-        // Despite the similarlty with `alloc_from_iter`, we cannot reuse their fast case, as we
+        // Despite the similarity with `alloc_from_iter`, we cannot reuse their fast case, as we
         // cannot know the minimum length of the iterator in this case.
+        assert!(!mem::needs_drop::<T>());
         assert!(size_of::<T>() != 0);
 
         // Takes care of reentrancy.
@@ -611,21 +598,32 @@ impl DroplessArena {
     }
 }
 
-/// Declare an `Arena` containing one dropless arena and many typed arenas (the
-/// types of the typed arenas are specified by the arguments).
+/// Declares an `Arena` that can allocate values of a variety of `Copy`, `needs_drop` and
+/// `!needs_drop` types.
 ///
-/// There are three cases of interest.
-/// - Types that are `Copy`: these need not be specified in the arguments. They
-///   will use the `DroplessArena`.
-/// - Types that are `!Copy` and `!Drop`: these must be specified in the
-///   arguments. An empty `TypedArena` will be created for each one, but the
-///   `DroplessArena` will always be used and the `TypedArena` will stay empty.
-///   This is odd but harmless, because an empty arena allocates no memory.
-/// - Types that are `!Copy` and `Drop`: these must be specified in the
-///   arguments. The `TypedArena` will be used for them.
+/// The declared arena actually contains a single [`DroplessArena`], plus a separate
+/// [`TypedArena`] for each of the types listed in the body of the macro invocation.
 ///
-#[rustc_macro_transparency = "semitransparent"]
-pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
+/// Any type that is `Copy` can be allocated in the arena without needing to be listed
+/// explicitly. Those values will be stored in the [`DroplessArena`].
+///
+/// Types that are `!Copy` can only be allocated if they are listed in the macro invocation.
+/// For types that are `!Copy + needs_drop`, values will be stored in the corresponding
+/// [`TypedArena`] and will be dropped when the arena is dropped.
+///
+/// As an optimization, types that are `!Copy + !needs_drop` will actually be stored in the
+/// [`DroplessArena`], and the corresponding [`TypedArena`] will remain empty. This makes
+/// better use of the dropless arena's storage blocks, while the overhead of having a few
+/// unused typed-arenas is negligible.
+#[rustc_macro_transparency = "semiopaque"]
+pub macro declare_arena(
+    // Each of these entries becomes a `$name: TypedArena<$ty>` field in the arena.
+    // This allows values of non-copy type $ty to be allocated in the arena.
+    // The field names must be distinct, but have no further significance.
+    $(
+        $name:ident: $ty:ty,
+    )*
+) {
     #[derive(Default)]
     pub struct Arena<'tcx> {
         pub dropless: $crate::DroplessArena,

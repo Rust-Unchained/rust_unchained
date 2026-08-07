@@ -5,6 +5,9 @@ use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 
+use crate::PassPolicy;
+use crate::strip_debuginfo::drop_invalid_debuginfos;
+
 /// Various parts of MIR building introduce temporaries that are commonly not needed.
 ///
 /// Notably, `if CONST` and `match CONST` end up being used-once temporaries, which
@@ -22,8 +25,8 @@ use rustc_middle::ty::TyCtxt;
 pub(super) struct SingleUseConsts;
 
 impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        PassPolicy::optimization(sess.mir_opt_level() > 0)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -33,7 +36,7 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
             locals_in_debug_info: DenseBitSet::new_empty(body.local_decls.len()),
         };
 
-        finder.ineligible_locals.insert_range(..=Local::from_usize(body.arg_count));
+        finder.ineligible_locals.insert_range(..Local::arg(body.arg_count));
 
         finder.visit_body(body);
 
@@ -57,7 +60,7 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
             };
             let (place, rvalue) = *place_and_rvalue;
             assert_eq!(place.as_local(), Some(local));
-            let Rvalue::Use(operand) = rvalue else { bug!("No longer a use?") };
+            let Rvalue::Use(operand, _) = rvalue else { bug!("No longer a use?") };
 
             let mut replacer = LocalReplacer { tcx, local, operand: Some(operand) };
 
@@ -82,10 +85,8 @@ impl<'tcx> crate::MirPass<'tcx> for SingleUseConsts {
                 );
             }
         }
-    }
 
-    fn is_required(&self) -> bool {
-        true
+        drop_invalid_debuginfos(body);
     }
 }
 
@@ -110,7 +111,7 @@ struct SingleUseConstsFinder {
 impl<'tcx> Visitor<'tcx> for SingleUseConstsFinder {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         if let Some(local) = place.as_local()
-            && let Rvalue::Use(operand) = rvalue
+            && let Rvalue::Use(operand, _) = rvalue
             && let Operand::Constant(_) = operand
         {
             let locations = &mut self.locations[local];

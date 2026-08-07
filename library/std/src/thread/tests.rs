@@ -1,11 +1,10 @@
-use super::Builder;
 use crate::any::Any;
 use crate::panic::panic_any;
 use crate::result;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::mpsc::{Sender, channel};
 use crate::sync::{Arc, Barrier};
-use crate::thread::{self, Scope, ThreadId};
+use crate::thread::{self, Builder, Scope, ThreadId};
 use crate::time::{Duration, Instant};
 
 // !!! These tests are dangerous. If something is buggy, they will hang, !!!
@@ -153,11 +152,11 @@ where
 {
     let (tx, rx) = channel();
 
-    let x: Box<_> = Box::new(1);
-    let x_in_parent = (&*x) as *const i32 as usize;
+    let x: Box<i32> = Box::new(1);
+    let x_in_parent = (&raw const *x).addr();
 
     spawnfn(Box::new(move || {
-        let x_in_child = (&*x) as *const i32 as usize;
+        let x_in_child = (&raw const *x).addr();
         tx.send(x_in_child).unwrap();
     }));
 
@@ -287,6 +286,8 @@ fn test_park_unpark_called_other_thread() {
     for _ in 0..10 {
         let th = thread::current();
 
+        // Here we rely on `thread::spawn` (specifically the part that runs after spawning
+        // the thread) to not consume the parking token.
         let _guard = thread::spawn(move || {
             super::sleep(Duration::from_millis(50));
             th.unpark();
@@ -316,6 +317,8 @@ fn test_park_timeout_unpark_called_other_thread() {
     for _ in 0..10 {
         let th = thread::current();
 
+        // Here we rely on `thread::spawn` (specifically the part that runs after spawning
+        // the thread) to not consume the parking token.
         let _guard = thread::spawn(move || {
             super::sleep(Duration::from_millis(50));
             th.unpark();
@@ -344,6 +347,13 @@ fn test_thread_id_equal() {
 fn test_thread_id_not_equal() {
     let spawned_id = thread::spawn(|| thread::current().id()).join().unwrap();
     assert!(thread::current().id() != spawned_id);
+}
+
+#[test]
+fn test_thread_os_id_not_equal() {
+    let spawned_id = thread::spawn(|| thread::current_os_id()).join().unwrap();
+    let current_id = thread::current_os_id();
+    assert!(current_id != spawned_id);
 }
 
 #[test]

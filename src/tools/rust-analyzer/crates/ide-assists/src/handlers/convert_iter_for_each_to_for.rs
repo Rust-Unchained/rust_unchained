@@ -1,12 +1,11 @@
-use hir::{sym, Name};
+use hir::{Name, sym};
 use ide_db::famous_defs::FamousDefs;
-use stdx::format_to;
 use syntax::{
-    ast::{self, edit_in_place::Indent, make, HasArgList, HasLoopBody},
     AstNode,
+    ast::{self, HasArgList, HasLoopBody, edit::AstNodeEdit},
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists, utils::wrap_paren};
 
 // Assist: convert_iter_for_each_to_for
 //
@@ -34,7 +33,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn convert_iter_for_each_to_for(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let method = ctx.find_node_at_offset::<ast::MethodCallExpr>()?;
 
@@ -53,22 +52,25 @@ pub(crate) fn convert_iter_for_each_to_for(
     let range = stmt.as_ref().map_or(method.syntax(), AstNode::syntax).text_range();
 
     acc.add(
-        AssistId("convert_iter_for_each_to_for", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("convert_iter_for_each_to_for"),
         "Replace this `Iterator::for_each` with a for loop",
         range,
         |builder| {
+            let target_node = stmt.as_ref().map_or(method.syntax(), AstNode::syntax);
+            let editor = builder.make_editor(target_node);
+            let make = editor.make();
             let indent =
                 stmt.as_ref().map_or_else(|| method.indent_level(), ast::ExprStmt::indent_level);
 
             let block = match body {
-                ast::Expr::BlockExpr(block) => block,
-                _ => make::block_expr(Vec::new(), Some(body)),
+                ast::Expr::BlockExpr(block) => block.reset_indent(),
+                _ => make.block_expr(Vec::new(), Some(body.reset_indent().indent(1.into()))),
             }
-            .clone_for_update();
-            block.reindent_to(indent);
+            .indent(indent);
 
-            let expr_for_loop = make::expr_for_loop(param, receiver, block);
-            builder.replace(range, expr_for_loop.to_string())
+            let expr_for_loop = make.expr_for_loop(param, receiver, block);
+            editor.replace(target_node, expr_for_loop.syntax());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -96,7 +98,7 @@ pub(crate) fn convert_iter_for_each_to_for(
 // ```
 pub(crate) fn convert_for_loop_with_for_each(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let for_loop = ctx.find_node_at_offset::<ast::ForExpr>()?;
     let iterable = for_loop.iterable()?;
@@ -108,36 +110,44 @@ pub(crate) fn convert_for_loop_with_for_each(
     }
 
     acc.add(
-        AssistId("convert_for_loop_with_for_each", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("convert_for_loop_with_for_each"),
         "Replace this for loop with `Iterator::for_each`",
         for_loop.syntax().text_range(),
         |builder| {
-            let mut buf = String::new();
+            let editor = builder.make_editor(for_loop.syntax());
+            let make = editor.make();
 
-            if let Some((expr_behind_ref, method, krate)) =
+            let mut receiver = iterable.clone();
+
+            let iter_method = if let Some((expr_behind_ref, method, krate)) =
                 is_ref_and_impls_iter_method(&ctx.sema, &iterable)
             {
+                receiver = expr_behind_ref;
                 // We have either "for x in &col" and col implements a method called iter
                 //             or "for x in &mut col" and col implements a method called iter_mut
-                format_to!(
-                    buf,
-                    "{expr_behind_ref}.{}()",
-                    method.display(ctx.db(), krate.edition(ctx.db()))
-                );
-            } else if let ast::Expr::RangeExpr(..) = iterable {
-                // range expressions need to be parenthesized for the syntax to be correct
-                format_to!(buf, "({iterable})");
-            } else if impls_core_iter(&ctx.sema, &iterable) {
-                format_to!(buf, "{iterable}");
-            } else if let ast::Expr::RefExpr(_) = iterable {
-                format_to!(buf, "({iterable}).into_iter()");
+                method.display(ctx.db(), krate.edition(ctx.db())).to_string()
             } else {
-                format_to!(buf, "{iterable}.into_iter()");
+                "into_iter".to_owned()
+            };
+
+            receiver = wrap_paren(receiver, make, ast::prec::ExprPrecedence::Postfix);
+
+            if !impls_core_iter(&ctx.sema, &iterable) {
+                receiver = make
+                    .expr_method_call(receiver, make.name_ref(&iter_method), make.arg_list([]))
+                    .into();
             }
 
-            format_to!(buf, ".for_each(|{pat}| {body});");
+            let loop_arg = make.expr_closure([make.untyped_param(pat)], body.into());
+            let for_each = make.expr_method_call(
+                receiver,
+                make.name_ref("for_each"),
+                make.arg_list([loop_arg.into()]),
+            );
+            let for_each = make.expr_stmt(for_each.into());
 
-            builder.replace(for_loop.syntax().text_range(), buf)
+            editor.replace(for_loop.syntax(), for_each.syntax());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -154,9 +164,9 @@ fn is_ref_and_impls_iter_method(
         _ => return None,
     };
     let wanted_method = Name::new_symbol_root(if ref_expr.mut_token().is_some() {
-        sym::iter_mut.clone()
+        sym::iter_mut
     } else {
-        sym::iter.clone()
+        sym::iter
     });
     let expr_behind_ref = ref_expr.expr()?;
     let ty = sema.type_of_expr(&expr_behind_ref)?.adjusted();
@@ -165,7 +175,7 @@ fn is_ref_and_impls_iter_method(
     let iter_trait = FamousDefs(sema, krate).core_iter_Iterator()?;
 
     let has_wanted_method = ty
-        .iterate_method_candidates(sema.db, &scope, None, Some(&wanted_method), |func| {
+        .iterate_method_candidates(sema.db, &scope, Some(&wanted_method), |func| {
             if func.ret_type(sema.db).impls_trait(sema.db, iter_trait, &[]) {
                 return Some(());
             }
@@ -186,7 +196,7 @@ fn impls_core_iter(sema: &hir::Semantics<'_, ide_db::RootDatabase>, iterable: &a
 
         let module = sema.scope(iterable.syntax())?.module();
 
-        let krate = module.krate();
+        let krate = module.krate(sema.db);
         let iter_trait = FamousDefs(sema, krate).core_iter_Iterator()?;
         cov_mark::hit!(test_already_impls_iterator);
         Some(it_typ.impls_trait(sema.db, iter_trait, &[]))
@@ -195,7 +205,7 @@ fn impls_core_iter(sema: &hir::Semantics<'_, ide_db::RootDatabase>, iterable: &a
 }
 
 fn validate_method_call_expr(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     expr: ast::MethodCallExpr,
 ) -> Option<(ast::Expr, ast::Expr)> {
     let name_ref = expr.name_ref()?;
@@ -214,7 +224,7 @@ fn validate_method_call_expr(
 
     let it_type = sema.type_of_expr(&receiver)?.adjusted();
     let module = sema.scope(receiver.syntax())?.module();
-    let krate = module.krate();
+    let krate = module.krate(ctx.db());
 
     let iter_trait = FamousDefs(sema, krate).core_iter_Iterator()?;
     it_type.impls_trait(sema.db, iter_trait, &[]).then_some((expr, receiver))
@@ -281,15 +291,23 @@ fn main() {
             r#"
 //- minicore: iterators
 fn main() {
-    let it = core::iter::repeat(92);
-    it.$0for_each(|(x, y)| println!("x: {}, y: {}", x, y));
+    {
+        let it = core::iter::repeat(92);
+        it.$0for_each(|param| match param {
+            (x, y) => println!("x: {}, y: {}", x, y),
+        });
+    }
 }
 "#,
             r#"
 fn main() {
-    let it = core::iter::repeat(92);
-    for (x, y) in it {
-        println!("x: {}, y: {}", x, y)
+    {
+        let it = core::iter::repeat(92);
+        for param in it {
+            match param {
+                (x, y) => println!("x: {}, y: {}", x, y),
+            }
+        }
     }
 }
 "#,

@@ -1,23 +1,22 @@
 //@ ignore-gdb
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // Check that structs get placed in the correct namespace
 
-// lldb-command:run
-// lldb-command:v struct1
-// lldb-check:(struct_namespace::Struct1)[...]
-// lldb-command:v struct2
-// lldb-check:(struct_namespace::Struct2)[...]
+//@ lldb-command:run
+//@ lldb-command:v struct1
+//@ lldb-check:(struct_namespace::Struct1)[...]
+//@ lldb-command:v struct2
+//@ lldb-check:(struct_namespace::Struct2)[...]
 
-// lldb-command:v mod1_struct1
-// lldb-check:(struct_namespace::mod1::Struct1)[...]
-// lldb-command:v mod1_struct2
-// lldb-check:(struct_namespace::mod1::Struct2)[...]
+//@ lldb-command:v mod1_struct1
+//@ lldb-check:(struct_namespace::mod1::Struct1)[...]
+//@ lldb-command:v mod1_struct2
+//@ lldb-check:(struct_namespace::mod1::Struct2)[...]
 
 #![allow(unused_variables)]
 #![allow(dead_code)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 struct Struct1 {
     a: u32,

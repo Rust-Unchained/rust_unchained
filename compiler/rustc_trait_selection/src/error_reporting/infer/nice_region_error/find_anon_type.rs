@@ -75,7 +75,7 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
 
     fn visit_ty(&mut self, arg: &'tcx hir::Ty<'tcx, AmbigArg>) -> Self::Result {
         match arg.kind {
-            hir::TyKind::BareFn(_) => {
+            hir::TyKind::FnPtr(_) => {
                 self.current_index.shift_in(1);
                 let _ = intravisit::walk_ty(self, arg);
                 self.current_index.shift_out(1);
@@ -160,7 +160,7 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
 }
 
 // The visitor captures the corresponding `hir::Ty` of the anonymous region
-// in the case of structs ie. `hir::TyKind::Path`.
+// in the case of structs i.e. `hir::TyKind::Path`.
 // This visitor would be invoked for each lifetime corresponding to a struct,
 // and would walk the types like Vec<Ref> in the above example and Ref looking for the HIR
 // where that lifetime appears. This allows us to highlight the
@@ -190,8 +190,8 @@ impl<'tcx> Visitor<'tcx> for TyPathVisitor<'tcx> {
             }
 
             Some(rbv::ResolvedArg::LateBound(debruijn_index, _, id)) => {
-                debug!("FindNestedTypeVisitor::visit_ty: LateBound depth = {:?}", debruijn_index,);
-                debug!("id={:?}", id);
+                debug!("FindNestedTypeVisitor::visit_ty: LateBound depth = {debruijn_index:?}");
+                debug!("id={id:?}");
                 if debruijn_index == self.current_index && id.to_def_id() == self.region_def_id {
                     return ControlFlow::Break(());
                 }

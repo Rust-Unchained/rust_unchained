@@ -1,78 +1,16 @@
-use std::iter;
-
-use rustc_abi::{FIRST_VARIANT, VariantIdx};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::interpret::LitToConstInput;
 use rustc_middle::query::Providers;
 use rustc_middle::thir::visit;
 use rustc_middle::thir::visit::Visitor;
 use rustc_middle::ty::abstract_const::CastKind;
-use rustc_middle::ty::{self, Expr, TyCtxt, TypeVisitableExt};
-use rustc_middle::{bug, mir, thir};
+use rustc_middle::ty::{self, Expr, LitToConstInput, TyCtxt, TypeVisitableExt};
+use rustc_middle::{mir, thir};
 use rustc_span::Span;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
-use crate::errors::{GenericConstantTooComplex, GenericConstantTooComplexSub};
-
-/// Destructures array, ADT or tuple constants into the constants
-/// of their fields.
-fn destructure_const<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    const_: ty::Const<'tcx>,
-) -> ty::DestructuredConst<'tcx> {
-    let ty::ConstKind::Value(cv) = const_.kind() else {
-        bug!("cannot destructure constant {:?}", const_)
-    };
-
-    let branches = cv.valtree.unwrap_branch();
-
-    let (fields, variant) = match cv.ty.kind() {
-        ty::Array(inner_ty, _) | ty::Slice(inner_ty) => {
-            // construct the consts for the elements of the array/slice
-            let field_consts = branches
-                .iter()
-                .map(|b| ty::Const::new_value(tcx, *b, *inner_ty))
-                .collect::<Vec<_>>();
-            debug!(?field_consts);
-
-            (field_consts, None)
-        }
-        ty::Adt(def, _) if def.variants().is_empty() => bug!("unreachable"),
-        ty::Adt(def, args) => {
-            let (variant_idx, branches) = if def.is_enum() {
-                let (head, rest) = branches.split_first().unwrap();
-                (VariantIdx::from_u32(head.unwrap_leaf().to_u32()), rest)
-            } else {
-                (FIRST_VARIANT, branches)
-            };
-            let fields = &def.variant(variant_idx).fields;
-            let mut field_consts = Vec::with_capacity(fields.len());
-
-            for (field, field_valtree) in iter::zip(fields, branches) {
-                let field_ty = field.ty(tcx, args);
-                let field_const = ty::Const::new_value(tcx, *field_valtree, field_ty);
-                field_consts.push(field_const);
-            }
-            debug!(?field_consts);
-
-            (field_consts, Some(variant_idx))
-        }
-        ty::Tuple(elem_tys) => {
-            let fields = iter::zip(*elem_tys, branches)
-                .map(|(elem_ty, elem_valtree)| ty::Const::new_value(tcx, *elem_valtree, elem_ty))
-                .collect::<Vec<_>>();
-
-            (fields, None)
-        }
-        _ => bug!("cannot destructure constant {:?}", const_),
-    };
-
-    let fields = tcx.arena.alloc_from_iter(fields);
-
-    ty::DestructuredConst { variant, fields }
-}
+use crate::diagnostics::{GenericConstantTooComplex, GenericConstantTooComplexSub};
 
 /// We do not allow all binary operations in abstract consts, so filter disallowed ones.
 fn check_binop(op: mir::BinOp) -> bool {
@@ -116,11 +54,15 @@ fn recurse_build<'tcx>(
         &ExprKind::PlaceUnwrapUnsafeBinder { .. }
         | &ExprKind::ValueUnwrapUnsafeBinder { .. }
         | &ExprKind::WrapUnsafeBinder { .. } => {
-            todo!("FIXME(unsafe_binders)")
+            unimplemented!("FIXME(unsafe_binders)")
         }
         &ExprKind::Literal { lit, neg } => {
             let sp = node.span;
-            tcx.at(sp).lit_to_const(LitToConstInput { lit: &lit.node, ty: node.ty, neg })
+            match tcx.at(sp).lit_to_const(LitToConstInput { lit: lit.node, ty: Some(node.ty), neg })
+            {
+                Some(value) => ty::Const::new_value(tcx, value.valtree, value.ty),
+                None => ty::Const::new_misc_error(tcx),
+            }
         }
         &ExprKind::NonHirLiteral { lit, user_ty: _ } => {
             let val = ty::ValTree::from_scalar_int(tcx, lit);
@@ -128,8 +70,9 @@ fn recurse_build<'tcx>(
         }
         &ExprKind::ZstLiteral { user_ty: _ } => ty::Const::zero_sized(tcx, node.ty),
         &ExprKind::NamedConst { def_id, args, user_ty: _ } => {
-            let uneval = ty::UnevaluatedConst::new(def_id, args);
-            ty::Const::new_unevaluated(tcx, uneval)
+            let uneval =
+                ty::AliasConst::new(tcx, ty::AliasConstKind::new_from_def_id(tcx, def_id), args);
+            ty::Const::new_alias(tcx, ty::IsRigid::No, uneval)
         }
         ExprKind::ConstParam { param, .. } => ty::Const::new_param(tcx, *param),
 
@@ -163,7 +106,7 @@ fn recurse_build<'tcx>(
         // }
         // ```
         ExprKind::Block { block } => {
-            if let thir::Block { stmts: box [], expr: Some(e), .. } = &body.blocks[*block] {
+            if let thir::Block { stmts: [], expr: Some(e), .. } = &body.blocks[*block] {
                 recurse_build(tcx, body, *e, root_span)?
             } else {
                 maybe_supported_error(GenericConstantTooComplexSub::BlockNotSupported(node.span))?
@@ -226,10 +169,13 @@ fn recurse_build<'tcx>(
         ExprKind::Yield { .. } => {
             error(GenericConstantTooComplexSub::YieldNotSupported(node.span))?
         }
-        ExprKind::Continue { .. } | ExprKind::Break { .. } | ExprKind::Loop { .. } => {
+        ExprKind::Continue { .. }
+        | ExprKind::ConstContinue { .. }
+        | ExprKind::Break { .. }
+        | ExprKind::Loop { .. }
+        | ExprKind::LoopMatch { .. } => {
             error(GenericConstantTooComplexSub::LoopNotSupported(node.span))?
         }
-        ExprKind::Box { .. } => error(GenericConstantTooComplexSub::BoxNotSupported(node.span))?,
         ExprKind::ByUse { .. } => {
             error(GenericConstantTooComplexSub::ByUseNotSupported(node.span))?
         }
@@ -260,9 +206,11 @@ fn recurse_build<'tcx>(
         ExprKind::VarRef { .. }
         | ExprKind::UpvarRef { .. }
         | ExprKind::StaticRef { .. }
-        | ExprKind::OffsetOf { .. }
         | ExprKind::ThreadLocalRef(_) => {
             error(GenericConstantTooComplexSub::OperationNotSupported(node.span))?
+        }
+        ExprKind::Reborrow { .. } => {
+            unimplemented!();
         }
     })
 }
@@ -316,7 +264,6 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
                 count.has_non_region_param()
             }
             thir::ExprKind::Scope { .. }
-            | thir::ExprKind::Box { .. }
             | thir::ExprKind::If { .. }
             | thir::ExprKind::Call { .. }
             | thir::ExprKind::ByUse { .. }
@@ -329,6 +276,7 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
             | thir::ExprKind::NeverToAny { .. }
             | thir::ExprKind::PointerCoercion { .. }
             | thir::ExprKind::Loop { .. }
+            | thir::ExprKind::LoopMatch { .. }
             | thir::ExprKind::Let { .. }
             | thir::ExprKind::Match { .. }
             | thir::ExprKind::Block { .. }
@@ -342,6 +290,7 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
             | thir::ExprKind::RawBorrow { .. }
             | thir::ExprKind::Break { .. }
             | thir::ExprKind::Continue { .. }
+            | thir::ExprKind::ConstContinue { .. }
             | thir::ExprKind::Return { .. }
             | thir::ExprKind::Become { .. }
             | thir::ExprKind::Array { .. }
@@ -358,9 +307,11 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
             | thir::ExprKind::ZstLiteral { .. }
             | thir::ExprKind::StaticRef { .. }
             | thir::ExprKind::InlineAsm(_)
-            | thir::ExprKind::OffsetOf { .. }
             | thir::ExprKind::ThreadLocalRef(_)
             | thir::ExprKind::Yield { .. } => false,
+            thir::ExprKind::Reborrow { .. } => {
+                unimplemented!();
+            }
         }
     }
     fn pat_is_poly(&mut self, pat: &thir::Pat<'tcx>) -> bool {
@@ -416,7 +367,7 @@ fn thir_abstract_const<'tcx>(
         // we want to look into them or treat them as opaque projections.
         //
         // Right now we do neither of that and simply always fail to unify them.
-        DefKind::AnonConst | DefKind::InlineConst => (),
+        DefKind::AnonConst => (),
         _ => return Ok(None),
     }
 
@@ -431,9 +382,9 @@ fn thir_abstract_const<'tcx>(
 
     let root_span = body.exprs[body_id].span;
 
-    Ok(Some(ty::EarlyBinder::bind(recurse_build(tcx, body, body_id, root_span)?)))
+    Ok(Some(ty::EarlyBinder::bind(tcx, recurse_build(tcx, body, body_id, root_span)?)))
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { destructure_const, thir_abstract_const, ..*providers };
+    *providers = Providers { thir_abstract_const, ..*providers };
 }

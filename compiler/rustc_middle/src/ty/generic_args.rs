@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use rustc_data_structures::intern::Interned;
 use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_hir::def_id::DefId;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, extension};
+use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable, extension};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_type_ir::WithCachedTypeInfo;
 use rustc_type_ir::walk::TypeWalker;
@@ -50,14 +50,17 @@ impl<'tcx> rustc_type_ir::inherent::GenericArgs<TyCtxt<'tcx>> for ty::GenericArg
         self.rebase_onto(tcx, source_ancestor, target_args)
     }
 
+    #[track_caller]
     fn type_at(self, i: usize) -> Ty<'tcx> {
         self.type_at(i)
     }
 
+    #[track_caller]
     fn region_at(self, i: usize) -> ty::Region<'tcx> {
         self.region_at(i)
     }
 
+    #[track_caller]
     fn const_at(self, i: usize) -> ty::Const<'tcx> {
         self.const_at(i)
     }
@@ -96,14 +99,12 @@ impl<'tcx> rustc_type_ir::inherent::GenericArgs<TyCtxt<'tcx>> for ty::GenericArg
                 signature_parts_ty,
                 tupled_upvars_ty,
                 coroutine_captures_by_ref_ty,
-                coroutine_witness_ty,
             ] => ty::CoroutineClosureArgsParts {
                 parent_args,
                 closure_kind_ty: closure_kind_ty.expect_ty(),
                 signature_parts_ty: signature_parts_ty.expect_ty(),
                 tupled_upvars_ty: tupled_upvars_ty.expect_ty(),
                 coroutine_captures_by_ref_ty: coroutine_captures_by_ref_ty.expect_ty(),
-                coroutine_witness_ty: coroutine_witness_ty.expect_ty(),
             },
             _ => bug!("closure args missing synthetics"),
         }
@@ -111,23 +112,16 @@ impl<'tcx> rustc_type_ir::inherent::GenericArgs<TyCtxt<'tcx>> for ty::GenericArg
 
     fn split_coroutine_args(self) -> ty::CoroutineArgsParts<TyCtxt<'tcx>> {
         match self[..] {
-            [
-                ref parent_args @ ..,
-                kind_ty,
-                resume_ty,
-                yield_ty,
-                return_ty,
-                witness,
-                tupled_upvars_ty,
-            ] => ty::CoroutineArgsParts {
-                parent_args,
-                kind_ty: kind_ty.expect_ty(),
-                resume_ty: resume_ty.expect_ty(),
-                yield_ty: yield_ty.expect_ty(),
-                return_ty: return_ty.expect_ty(),
-                witness: witness.expect_ty(),
-                tupled_upvars_ty: tupled_upvars_ty.expect_ty(),
-            },
+            [ref parent_args @ .., kind_ty, resume_ty, yield_ty, return_ty, tupled_upvars_ty] => {
+                ty::CoroutineArgsParts {
+                    parent_args,
+                    kind_ty: kind_ty.expect_ty(),
+                    resume_ty: resume_ty.expect_ty(),
+                    yield_ty: yield_ty.expect_ty(),
+                    return_ty: return_ty.expect_ty(),
+                    tupled_upvars_ty: tupled_upvars_ty.expect_ty(),
+                }
+            }
             _ => bug!("coroutine args missing synthetics"),
         }
     }
@@ -137,7 +131,7 @@ impl<'tcx> rustc_type_ir::inherent::IntoKind for GenericArg<'tcx> {
     type Kind = GenericArgKind<'tcx>;
 
     fn kind(self) -> Self::Kind {
-        self.unpack()
+        self.kind()
     }
 }
 
@@ -218,7 +212,7 @@ impl<'tcx> From<ty::Const<'tcx>> for GenericArg<'tcx> {
 
 impl<'tcx> From<ty::Term<'tcx>> for GenericArg<'tcx> {
     fn from(value: ty::Term<'tcx>) -> Self {
-        match value.unpack() {
+        match value.kind() {
             ty::TermKind::Ty(t) => t.into(),
             ty::TermKind::Const(c) => c.into(),
         }
@@ -227,7 +221,7 @@ impl<'tcx> From<ty::Term<'tcx>> for GenericArg<'tcx> {
 
 impl<'tcx> GenericArg<'tcx> {
     #[inline]
-    pub fn unpack(self) -> GenericArgKind<'tcx> {
+    pub fn kind(self) -> GenericArgKind<'tcx> {
         let ptr =
             unsafe { self.ptr.map_addr(|addr| NonZero::new_unchecked(addr.get() & !TAG_MASK)) };
         // SAFETY: use of `Interned::new_unchecked` here is ok because these
@@ -251,7 +245,7 @@ impl<'tcx> GenericArg<'tcx> {
 
     #[inline]
     pub fn as_region(self) -> Option<ty::Region<'tcx>> {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(re) => Some(re),
             _ => None,
         }
@@ -259,7 +253,7 @@ impl<'tcx> GenericArg<'tcx> {
 
     #[inline]
     pub fn as_type(self) -> Option<Ty<'tcx>> {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Type(ty) => Some(ty),
             _ => None,
         }
@@ -267,7 +261,7 @@ impl<'tcx> GenericArg<'tcx> {
 
     #[inline]
     pub fn as_const(self) -> Option<ty::Const<'tcx>> {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Const(ct) => Some(ct),
             _ => None,
         }
@@ -275,7 +269,7 @@ impl<'tcx> GenericArg<'tcx> {
 
     #[inline]
     pub fn as_term(self) -> Option<ty::Term<'tcx>> {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(_) => None,
             GenericArgKind::Type(ty) => Some(ty.into()),
             GenericArgKind::Const(ct) => Some(ct.into()),
@@ -300,7 +294,7 @@ impl<'tcx> GenericArg<'tcx> {
     }
 
     pub fn is_non_region_infer(self) -> bool {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(_) => false,
             // FIXME: This shouldn't return numerical/float.
             GenericArgKind::Type(ty) => ty.is_ty_or_numeric_infer(),
@@ -326,11 +320,11 @@ impl<'tcx> GenericArg<'tcx> {
 impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for GenericArg<'a> {
     type Lifted = GenericArg<'tcx>;
 
-    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted> {
-        match self.unpack() {
-            GenericArgKind::Lifetime(lt) => tcx.lift(lt).map(|lt| lt.into()),
-            GenericArgKind::Type(ty) => tcx.lift(ty).map(|ty| ty.into()),
-            GenericArgKind::Const(ct) => tcx.lift(ct).map(|ct| ct.into()),
+    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
+        match self.kind() {
+            GenericArgKind::Lifetime(lt) => tcx.lift(lt).into(),
+            GenericArgKind::Type(ty) => tcx.lift(ty).into(),
+            GenericArgKind::Const(ct) => tcx.lift(ct).into(),
         }
     }
 }
@@ -340,7 +334,7 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for GenericArg<'tcx> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(lt) => lt.try_fold_with(folder).map(Into::into),
             GenericArgKind::Type(ty) => ty.try_fold_with(folder).map(Into::into),
             GenericArgKind::Const(ct) => ct.try_fold_with(folder).map(Into::into),
@@ -348,7 +342,7 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for GenericArg<'tcx> {
     }
 
     fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(lt) => lt.fold_with(folder).into(),
             GenericArgKind::Type(ty) => ty.fold_with(folder).into(),
             GenericArgKind::Const(ct) => ct.fold_with(folder).into(),
@@ -358,7 +352,7 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for GenericArg<'tcx> {
 
 impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for GenericArg<'tcx> {
     fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
-        match self.unpack() {
+        match self.kind() {
             GenericArgKind::Lifetime(lt) => lt.visit_with(visitor),
             GenericArgKind::Type(ty) => ty.visit_with(visitor),
             GenericArgKind::Const(ct) => ct.visit_with(visitor),
@@ -368,7 +362,7 @@ impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for GenericArg<'tcx> {
 
 impl<'tcx, E: TyEncoder<'tcx>> Encodable<E> for GenericArg<'tcx> {
     fn encode(&self, e: &mut E) {
-        self.unpack().encode(e)
+        self.kind().encode(e)
     }
 }
 
@@ -390,7 +384,7 @@ impl<'tcx> GenericArgs<'tcx> {
     ///
     /// If any of the generic arguments are not types.
     pub fn into_type_list(&self, tcx: TyCtxt<'tcx>) -> &'tcx List<Ty<'tcx>> {
-        tcx.mk_type_list_from_iter(self.iter().map(|arg| match arg.unpack() {
+        tcx.mk_type_list_from_iter(self.iter().map(|arg| match arg.kind() {
             GenericArgKind::Type(ty) => ty,
             _ => bug!("`into_type_list` called on generic arg with non-types"),
         }))
@@ -527,7 +521,7 @@ impl<'tcx> GenericArgs<'tcx> {
     /// Returns generic arguments that are not lifetimes.
     #[inline]
     pub fn non_erasable_generics(&self) -> impl DoubleEndedIterator<Item = GenericArgKind<'tcx>> {
-        self.iter().filter_map(|k| match k.unpack() {
+        self.iter().filter_map(|arg| match arg.kind() {
             ty::GenericArgKind::Lifetime(_) => None,
             generic => Some(generic),
         })
@@ -536,21 +530,28 @@ impl<'tcx> GenericArgs<'tcx> {
     #[inline]
     #[track_caller]
     pub fn type_at(&self, i: usize) -> Ty<'tcx> {
-        self[i].as_type().unwrap_or_else(|| bug!("expected type for param #{} in {:?}", i, self))
+        self[i].as_type().unwrap_or_else(
+            #[track_caller]
+            || bug!("expected type for param #{} in {:?}", i, self),
+        )
     }
 
     #[inline]
     #[track_caller]
     pub fn region_at(&self, i: usize) -> ty::Region<'tcx> {
-        self[i]
-            .as_region()
-            .unwrap_or_else(|| bug!("expected region for param #{} in {:?}", i, self))
+        self[i].as_region().unwrap_or_else(
+            #[track_caller]
+            || bug!("expected region for param #{} in {:?}", i, self),
+        )
     }
 
     #[inline]
     #[track_caller]
     pub fn const_at(&self, i: usize) -> ty::Const<'tcx> {
-        self[i].as_const().unwrap_or_else(|| bug!("expected const for param #{} in {:?}", i, self))
+        self[i].as_const().unwrap_or_else(
+            #[track_caller]
+            || bug!("expected const for param #{} in {:?}", i, self),
+        )
     }
 
     #[inline]
@@ -587,8 +588,11 @@ impl<'tcx> GenericArgs<'tcx> {
         tcx.mk_args_from_iter(target_args.iter().chain(self.iter().skip(defs.count())))
     }
 
+    /// Truncates this list of generic args to have at most the number of args in `generics`.
+    ///
+    /// You might be looking for [`TraitRef::from_assoc`](super::TraitRef::from_assoc).
     pub fn truncate_to(&self, tcx: TyCtxt<'tcx>, generics: &ty::Generics) -> GenericArgsRef<'tcx> {
-        tcx.mk_args_from_iter(self.iter().take(generics.count()))
+        tcx.mk_args(&self[..generics.count()])
     }
 
     pub fn print_as_list(&self) -> String {
@@ -711,7 +715,7 @@ impl<'tcx, T: TypeVisitable<TyCtxt<'tcx>>> TypeVisitable<TyCtxt<'tcx>> for &'tcx
 /// Stores the user-given args to reach some fully qualified path
 /// (e.g., `<T>::Item` or `<T as Trait>::Item`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable, TypeFoldable, TypeVisitable)]
+#[derive(StableHash, TypeFoldable, TypeVisitable, Lift)]
 pub struct UserArgs<'tcx> {
     /// The args for the item as given by the user.
     pub args: GenericArgsRef<'tcx>,
@@ -738,7 +742,7 @@ pub struct UserArgs<'tcx> {
 /// the self type, giving `Foo<?A>`. Finally, we unify that with
 /// the self type here, which contains `?A` to be `&'static u32`
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
-#[derive(HashStable, TypeFoldable, TypeVisitable)]
+#[derive(StableHash, TypeFoldable, TypeVisitable, Lift)]
 pub struct UserSelfTy<'tcx> {
     pub impl_def_id: DefId,
     pub self_ty: Ty<'tcx>,

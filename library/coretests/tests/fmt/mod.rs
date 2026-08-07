@@ -3,12 +3,39 @@ mod float;
 mod num;
 
 #[test]
+fn test_lifetime() {
+    // Trigger all different forms of expansion,
+    // and check that each of them can be stored as a variable.
+    let a = format_args!("hello");
+    let a = format_args!("hello {a}");
+    let a = format_args!("hello {a:1}");
+    let a = format_args!("hello {a} {a:?}");
+    assert_eq!(a.to_string(), "hello hello hello hello hello hello hello");
+
+    // Check that temporaries as arguments are extended.
+    let b = format_args!("{}", String::new());
+    let c = format_args!("{}{}", String::new(), String::new());
+    assert_eq!(b.to_string(), "");
+    assert_eq!(c.to_string(), "");
+
+    // Without arguments, it should also work in consts.
+    const A: std::fmt::Arguments<'static> = format_args!("hello");
+    assert_eq!(A.to_string(), "hello");
+}
+
+#[test]
 fn test_format_flags() {
     // No residual flags left by pointer formatting
     let p = "".as_ptr();
     assert_eq!(format!("{:p} {:x}", p, 16), format!("{p:p} 10"));
 
     assert_eq!(format!("{: >3}", 'a'), "  a");
+
+    /// Regression test for <https://github.com/rust-lang/rust/issues/50280#issuecomment-626035934>.
+    fn show(a: fn() -> f32, b: fn(&Vec<i8>) -> f32) {
+        println!("the two pointers: {:p} {:p}", a, b);
+    }
+    show(|| 1.0, |_| 2.0);
 }
 
 #[test]
@@ -40,6 +67,55 @@ fn test_fmt_debug_of_raw_pointers() {
     let vtable = &mut 500 as &mut dyn Debug;
     check_fmt(vtable as *mut dyn Debug, "Pointer { addr: ", ", metadata: DynMetadata(");
     check_fmt(vtable as *const dyn Debug, "Pointer { addr: ", ", metadata: DynMetadata(");
+}
+
+#[test]
+fn test_fmt_debug_of_mut_reference() {
+    let mut x: u32 = 0;
+
+    assert_eq!(format!("{:?}", &mut x), "0");
+}
+
+#[test]
+fn test_fmt_pointer() {
+    use std::rc::Rc;
+    use std::sync::Arc;
+    let p: *const u8 = std::ptr::null();
+    let rc = Rc::new(1usize);
+    let arc = Arc::new(1usize);
+    let b = Box::new("hi");
+
+    let _ = format!("{rc:p}{arc:p}{b:p}");
+
+    if cfg!(target_pointer_width = "32") {
+        assert_eq!(format!("{:#p}", p), "0x00000000");
+    } else {
+        assert_eq!(format!("{:#p}", p), "0x0000000000000000");
+    }
+    assert_eq!(format!("{:p}", p), "0x0");
+}
+
+#[test]
+fn test_default_write_impls() {
+    use core::fmt::Write;
+
+    struct Buf(String);
+
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.write_str(s)
+        }
+    }
+
+    let mut buf = Buf(String::new());
+    buf.write_char('a').unwrap();
+
+    assert_eq!(buf.0, "a");
+
+    let mut buf = Buf(String::new());
+    buf.write_fmt(format_args!("a")).unwrap();
+
+    assert_eq!(buf.0, "a");
 }
 
 #[test]

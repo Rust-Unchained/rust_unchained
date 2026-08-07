@@ -61,6 +61,7 @@ declare_clippy_lint! {
     complexity,
     "checks for blocks nested beyond a certain threshold"
 }
+
 impl_lint_pass!(ExcessiveNesting => [EXCESSIVE_NESTING]);
 
 pub struct ExcessiveNesting {
@@ -164,7 +165,7 @@ impl Visitor<'_> for NestingVisitor<'_, '_> {
         }
 
         match &item.kind {
-            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Mod(.., ModKind::Loaded(_, Inline::Yes, _, _)) => {
+            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Mod(.., ModKind::Loaded(_, Inline::Yes, _)) => {
                 self.nest_level += 1;
 
                 if !self.check_indent(item.span, item.id) {

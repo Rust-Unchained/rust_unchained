@@ -1,16 +1,13 @@
-use rustc_ast::attr;
 use rustc_ast::entry::EntryPointType;
 use rustc_errors::codes::*;
-use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
-use rustc_hir::{CRATE_HIR_ID, ItemId, Node};
+use rustc_hir::{ItemId, Node, find_attr};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::RemapFileNameExt;
-use rustc_session::config::{CrateType, EntryFnType, RemapPathScopeComponents, sigpipe};
-use rustc_span::{Span, Symbol, sym};
+use rustc_session::config::{CrateType, EntryFnType, sigpipe};
+use rustc_span::{RemapPathScopeComponents, Span};
 
-use crate::errors::{AttrOnlyInFunctions, ExternMain, MultipleRustcMain, NoMainErr};
+use crate::diagnostics::{ExternMain, MultipleRustcMain, NoMainErr};
 
 struct EntryContext<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -31,7 +28,7 @@ fn entry_fn(tcx: TyCtxt<'_>, (): ()) -> Option<(DefId, EntryFnType)> {
     }
 
     // If the user wants no main function at all, then stop here.
-    if attr::contains_name(tcx.hir_attrs(CRATE_HIR_ID), sym::no_main) {
+    if find_attr!(tcx, crate, NoMain) {
         return None;
     }
 
@@ -44,26 +41,12 @@ fn entry_fn(tcx: TyCtxt<'_>, (): ()) -> Option<(DefId, EntryFnType)> {
     configure_main(tcx, &ctxt)
 }
 
-fn attr_span_by_symbol(ctxt: &EntryContext<'_>, id: ItemId, sym: Symbol) -> Option<Span> {
-    let attrs = ctxt.tcx.hir_attrs(id.hir_id());
-    attr::find_by_name(attrs, sym).map(|attr| attr.span())
-}
-
 fn check_and_search_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
-    if !matches!(ctxt.tcx.def_kind(id.owner_id), DefKind::Fn) {
-        for attr in [sym::rustc_main] {
-            if let Some(span) = attr_span_by_symbol(ctxt, id, attr) {
-                ctxt.tcx.dcx().emit_err(AttrOnlyInFunctions { span, attr });
-            }
-        }
-        return;
-    }
-
     let at_root = ctxt.tcx.opt_local_parent(id.owner_id.def_id) == Some(CRATE_DEF_ID);
 
     let attrs = ctxt.tcx.hir_attrs(id.hir_id());
     let entry_point_type = rustc_ast::entry::entry_point_type(
-        attrs,
+        find_attr!(attrs, RustcMain),
         at_root,
         ctxt.tcx.opt_item_name(id.owner_id.to_def_id()),
     );
@@ -129,7 +112,7 @@ fn no_main_err(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) {
     let filename = tcx
         .sess
         .local_crate_source_file()
-        .map(|src| src.for_scope(&tcx.sess, RemapPathScopeComponents::DIAGNOSTICS).to_path_buf())
+        .map(|src| src.path(RemapPathScopeComponents::DIAGNOSTICS).to_path_buf())
         .unwrap_or_else(|| {
             has_filename = false;
             Default::default()

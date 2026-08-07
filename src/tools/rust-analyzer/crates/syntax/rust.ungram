@@ -39,7 +39,10 @@ PathSegment =
 | NameRef GenericArgList?
 | NameRef ParenthesizedArgList RetType?
 | NameRef ReturnTypeSyntax
-| '<' Type ('as' PathType)? '>'
+| TypeAnchor
+
+TypeAnchor =
+  '<' Type ('as' PathType)? '>'
 
 ReturnTypeSyntax =
   '(' '..' ')'
@@ -98,7 +101,7 @@ WhereClause =
   'where' predicates:(WherePred (',' WherePred)* ','?)
 
 WherePred =
-  ('for' GenericParamList)?  (Lifetime | Type) ':' TypeBoundList?
+  ForBinder? (Lifetime | Type) ':' TypeBoundList?
 
 
 //*************************//
@@ -123,9 +126,41 @@ MacroStmts =
 Attr =
   '#' '!'? '[' Meta ']'
 
+CfgAttrMeta =
+  'cfg_attr' '(' CfgPredicate ',' (Meta (',' Meta)* ','?) ')'
+
+CfgMeta =
+  'cfg' '(' CfgPredicate ','? ')'
+
+CfgPredicate =
+  CfgAtom
+| CfgComposite
+
+CfgAtom =
+  ('#ident' | 'true' | 'false') ('=' '@string')?
+
+CfgComposite =
+  keyword:'#ident' '(' (CfgPredicate (',' CfgPredicate)* ','?) ')'
+
 Meta =
-  'unsafe' '(' Path ('=' Expr | TokenTree)? ')'
-| Path ('=' Expr | TokenTree)?
+  CfgAttrMeta
+| CfgMeta
+| UnsafeMeta
+| PathMeta
+| KeyValueMeta
+| TokenTreeMeta
+
+UnsafeMeta =
+  'unsafe' '(' Meta ')'
+
+PathMeta =
+  Path
+
+KeyValueMeta =
+  Path '=' Expr
+
+TokenTreeMeta =
+  Path TokenTree
 
 //*************************//
 //          Items          //
@@ -133,6 +168,7 @@ Meta =
 
 SourceFile =
   '#shebang'?
+  '#frontmatter'?
   Attr*
   Item*
 
@@ -150,10 +186,10 @@ Item =
 | Static
 | Struct
 | Trait
-| TraitAlias
 | TypeAlias
 | Union
 | Use
+| AsmExpr
 
 MacroRules =
   Attr* Visibility?
@@ -240,19 +276,24 @@ RecordFieldList =
  '{' fields:(RecordField (',' RecordField)* ','?)? '}'
 
 RecordField =
-  Attr* Visibility?
-  Name ':' Type ('=' Expr)?
+  Attr* Visibility? 'unsafe'?
+  MutRestriction?
+  Name ':' Type ('=' default_val:ConstArg)?
 
 TupleFieldList =
   '(' fields:(TupleField (',' TupleField)* ','?)? ')'
 
 TupleField =
   Attr* Visibility?
+  MutRestriction?
   Type
 
 FieldList =
   RecordFieldList
 | TupleFieldList
+
+MutRestriction =
+  'mut' VisibilityInner
 
 Enum =
   Attr* Visibility?
@@ -264,7 +305,7 @@ VariantList =
 
 Variant =
   Attr* Visibility?
-  Name FieldList? ('=' Expr)?
+  (Name | '_') FieldList? ('=' ConstArg)?
 
 Union =
   Attr* Visibility?
@@ -287,8 +328,10 @@ VariantDef =
 Const =
   Attr* Visibility?
   'default'?
-  'const' (Name | '_') ':' Type
-  ('=' body:Expr)? ';'
+  'type'?
+  'const' (Name | '_') GenericParamList? ':' Type
+  ('=' body:Expr)?
+  WhereClause? ';'
 
 Static =
   Attr* Visibility?
@@ -299,12 +342,13 @@ Static =
 Trait =
   Attr* Visibility?
   'unsafe'? 'auto'?
+  ImplRestriction?
   'trait' Name GenericParamList?
-  (':' TypeBoundList?)? WhereClause? AssocItemList
+  (((':' TypeBoundList?)? WhereClause? AssocItemList) |
+  ('=' TypeBoundList? WhereClause? ';'))
 
-TraitAlias =
-  Attr* Visibility?
-  'trait' Name GenericParamList? '=' TypeBoundList? WhereClause? ';'
+ImplRestriction =
+  'impl' VisibilityInner
 
 AssocItemList =
   '{' Attr* AssocItem* '}'
@@ -334,8 +378,10 @@ ExternItem =
 | TypeAlias
 
 Visibility =
-  'pub' ('(' 'in'? Path ')')?
+  'pub' VisibilityInner?
 
+VisibilityInner =
+  '(' 'in'? Path ')'
 
 //****************************//
 // Statements and Expressions //
@@ -348,7 +394,7 @@ Stmt =
 | LetStmt
 
 LetStmt =
-  Attr* 'let' Pat (':' Type)?
+  Attr* 'super'? 'let' Pat (':' Type)?
   '=' initializer:Expr
   LetElse?
   ';'
@@ -396,6 +442,12 @@ Expr =
 | YeetExpr
 | LetExpr
 | UnderscoreExpr
+| IncludeBytesExpr
+
+// We need a special expression for this because we don't have access to the file,
+// and emitting a specific array will have problems with the length.
+IncludeBytesExpr =
+  'builtin' '#' 'include_bytes'
 
 OffsetOfExpr =
   Attr* 'builtin' '#' 'offset_of' '(' Type ',' fields:(NameRef ('.' NameRef)* ) ')'
@@ -404,7 +456,8 @@ OffsetOfExpr =
 // global_asm := "global_asm!(" format_string *("," format_string) *("," operand) [","] ")"
 // format_string := STRING_LITERAL / RAW_STRING_LITERAL
 AsmExpr =
-  Attr* 'builtin' '#' 'asm' '(' template:(Expr (',' Expr)*) (AsmPiece (',' AsmPiece)*)? ','? ')'
+  Attr* 'builtin' '#' ( 'asm' | 'global_asm' | 'naked_asm' )
+  '(' template:(Expr (',' Expr)*) (AsmPiece (',' AsmPiece)*)? ','? ')'
 
 // operand_expr := expr / "_" / expr "=>" expr / expr "=>" "_"
 AsmOperandExpr = in_expr:Expr ('=>' out_expr:Expr)?
@@ -415,17 +468,17 @@ AsmRegSpec = '@string' | NameRef
 // reg_operand := [ident "="] dir_spec "(" reg_spec ")" operand_expr
 AsmRegOperand = AsmDirSpec '(' AsmRegSpec ')' AsmOperandExpr
 // clobber_abi := "clobber_abi(" <abi> *("," <abi>) [","] ")"
-AsmClobberAbi = 'clobber_abi' '(' ('@string' (',' '@string')* ','?) ')'
+AsmClobberAbi = Attr* 'clobber_abi' '(' ('@string' (',' '@string')* ','?) ')'
 // option := "pure" / "nomem" / "readonly" / "preserves_flags" / "noreturn" / "nostack" / "att_syntax" / "raw"
 AsmOption = 'pure' | 'nomem' | 'readonly' | 'preserves_flags' | 'noreturn' | 'nostack' | 'att_syntax' | 'raw' | 'may_unwind'
 // options := "options(" option *("," option) [","] ")"
-AsmOptions = 'options' '(' (AsmOption (',' AsmOption)*) ','? ')'
+AsmOptions = Attr* 'options' '(' (AsmOption (',' AsmOption)*) ','? ')'
 AsmLabel = 'label' BlockExpr
 AsmSym = 'sym' Path
 AsmConst = 'const' Expr
 // operand := reg_operand / clobber_abi / options
 AsmOperand = AsmRegOperand | AsmLabel | AsmSym | AsmConst
-AsmOperandNamed = (Name '=')? AsmOperand
+AsmOperandNamed = Attr* (Name '=')? AsmOperand
 AsmPiece = AsmOperandNamed | AsmClobberAbi | AsmOptions
 
 FormatArgsExpr =
@@ -435,7 +488,10 @@ FormatArgsExpr =
   ')'
 
 FormatArgsArg =
-  (Name '=')? Expr
+  arg_name:FormatArgsArgName? Expr
+
+FormatArgsArgName =
+  '=' // This also has a name, but it's any token and we can't put it here
 
 MacroExpr =
   MacroCall
@@ -466,8 +522,11 @@ RefExpr =
 TryExpr =
   Attr* Expr '?'
 
+TryBlockModifier =
+  'try' ('bikeshed' Type)?
+
 BlockExpr =
-  Attr* Label? ('try' | 'unsafe' | ('async' 'move'?) | ('gen' 'move'?) | 'const') StmtList
+  Attr* Label? (TryBlockModifier | 'unsafe' | ('async' 'move'?) | ('gen' 'move'?) | 'const') StmtList
 
 PrefixExpr =
   Attr* op:('-' | '!' | '*') Expr
@@ -527,10 +586,10 @@ FieldExpr =
   Attr* Expr '.' NameRef
 
 ClosureExpr =
-  Attr* ClosureBinder? 'const'? 'static'? 'async'? 'gen'? 'move'?  ParamList RetType?
+  Attr* ForBinder? 'const'? 'static'? 'async'? 'gen'? 'move'?  ParamList RetType?
   body:Expr
 
-ClosureBinder =
+ForBinder =
   'for' GenericParamList
 
 IfExpr =
@@ -612,6 +671,7 @@ Type =
 | NeverType
 | ParenType
 | PathType
+| PatternType
 | PtrType
 | RefType
 | SliceType
@@ -651,7 +711,10 @@ FnPtrType =
   'const'? 'async'? 'unsafe'? Abi? 'fn' ParamList RetType?
 
 ForType =
-  'for' GenericParamList Type
+  ForBinder Type
+
+PatternType =
+  'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
 
 ImplTraitType =
   'impl' TypeBoundList
@@ -664,7 +727,7 @@ TypeBoundList =
 
 TypeBound =
   Lifetime
-| ('~' 'const' | 'const')? 'async'? '?'? Type
+| ForBinder? ('~' 'const' | '[' 'const' ']' | 'const')? 'async'? '?'? Type
 | 'use' UseBoundGenericArgs
 
 UseBoundGenericArgs =
@@ -695,6 +758,14 @@ Pat =
 | TuplePat
 | TupleStructPat
 | ConstBlockPat
+| DerefPat
+| NotNull
+
+NotNull =
+    '!' 'null'
+
+DerefPat =
+    'builtin' '#' 'deref' '(' Pat ')'
 
 LiteralPat =
   '-'? Literal

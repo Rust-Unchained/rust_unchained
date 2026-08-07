@@ -1,12 +1,8 @@
 use crate::assist_context::{AssistContext, Assists};
-use ide_db::{
-    assists::{AssistId, AssistKind},
-    defs::Definition,
-    LineIndexDatabase,
-};
+use ide_db::{assists::AssistId, defs::Definition, line_index};
 use syntax::{
-    ast::{self, edit_in_place::Indent},
     AstNode,
+    ast::{self, HasName, edit::AstNodeEdit},
 };
 
 // Assist: bind_unused_param
@@ -22,10 +18,11 @@ use syntax::{
 //     let _ = x;
 // }
 // ```
-pub(crate) fn bind_unused_param(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn bind_unused_param(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let param: ast::Param = ctx.find_node_at_offset()?;
 
     let Some(ast::Pat::IdentPat(ident_pat)) = param.pat() else { return None };
+    let name = ident_pat.name().filter(|n| !n.text().starts_with('_'))?;
 
     let param_def = {
         let local = ctx.sema.to_def(&ident_pat)?;
@@ -36,21 +33,21 @@ pub(crate) fn bind_unused_param(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         return None;
     }
 
-    let func = param.syntax().ancestors().find_map(ast::Fn::cast)?;
+    let func = param.syntax().ancestors().nth(2).and_then(ast::Fn::cast)?;
     let stmt_list = func.body()?.stmt_list()?;
     let l_curly_range = stmt_list.l_curly_token()?.text_range();
     let r_curly_range = stmt_list.r_curly_token()?.text_range();
 
     acc.add(
-        AssistId("bind_unused_param", AssistKind::QuickFix),
-        format!("Bind as `let _ = {ident_pat};`"),
+        AssistId::quick_fix("bind_unused_param"),
+        format!("Bind as `let _ = {name};`"),
         param.syntax().text_range(),
         |builder| {
-            let line_index = ctx.db().line_index(ctx.file_id().into());
+            let line_index = line_index(ctx.db(), ctx.vfs_file_id());
 
             let indent = func.indent_level();
             let text_indent = indent + 1;
-            let mut text = format!("\n{text_indent}let _ = {ident_pat};");
+            let mut text = format!("\n{text_indent}let _ = {name};");
 
             let left_line = line_index.line_col(l_curly_range.end()).line;
             let right_line = line_index.line_col(r_curly_range.start()).line;
@@ -81,6 +78,22 @@ fn foo($0y: i32) {}
 "#,
             r#"
 fn foo(y: i32) {
+    let _ = y;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn bind_unused_ref_ident_pat() {
+        cov_mark::check!(single_line);
+        check_assist(
+            bind_unused_param,
+            r#"
+fn foo(ref $0y: i32) {}
+"#,
+            r#"
+fn foo(ref y: i32) {
     let _ = y;
 }
 "#,
@@ -153,6 +166,28 @@ impl Trait for () {
             bind_unused_param,
             r#"
 fn foo(x: i32, $0y: i32) { y; }
+"#,
+        );
+    }
+
+    #[test]
+    fn keep_underscore_used() {
+        check_assist_not_applicable(
+            bind_unused_param,
+            r#"
+fn foo($0_x: i32, y: i32) {}
+"#,
+        );
+    }
+
+    #[test]
+    fn not_applicable_closure() {
+        check_assist_not_applicable(
+            bind_unused_param,
+            r#"
+fn foo() {
+    let _ = |$0x| 2;
+}
 "#,
         );
     }

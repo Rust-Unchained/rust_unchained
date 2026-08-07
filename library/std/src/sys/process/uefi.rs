@@ -1,16 +1,16 @@
 use r_efi::protocols::{simple_text_input, simple_text_output};
 
+use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 use crate::collections::BTreeMap;
 pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{OsStr, OsString};
 use crate::num::{NonZero, NonZeroI32};
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
+use crate::process::StdioPipes;
 use crate::sys::fs::File;
+use crate::sys::io::error_string;
 use crate::sys::pal::helpers;
-use crate::sys::pal::os::error_string;
-use crate::sys::pipe::AnonPipe;
 use crate::sys::unsupported;
-use crate::sys_common::process::{CommandEnv, CommandEnvs};
 use crate::{fmt, io};
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -27,19 +27,13 @@ pub struct Command {
     env: CommandEnv,
 }
 
-// passed back to std::process with the pipes connected to the child, if any
-// were requested
-pub struct StdioPipes {
-    pub stdin: Option<AnonPipe>,
-    pub stdout: Option<AnonPipe>,
-    pub stderr: Option<AnonPipe>,
-}
-
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub enum Stdio {
     Inherit,
     Null,
     MakePipe,
+    #[allow(dead_code)] // This variant exists only for the Debug impl
+    InheritFile(File),
 }
 
 impl Command {
@@ -90,6 +84,14 @@ impl Command {
         self.env.iter()
     }
 
+    pub fn get_env_clear(&self) -> bool {
+        self.env.does_clear()
+    }
+
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        CommandResolvedEnvs::new(self.env.capture())
+    }
+
     pub fn get_current_dir(&self) -> Option<&Path> {
         None
     }
@@ -120,6 +122,7 @@ impl Command {
                 )
             }
             .map(Some),
+            Stdio::InheritFile(_) => Err(unsupported()?),
             Stdio::Inherit => Ok(None),
         }
     }
@@ -135,105 +138,102 @@ impl Command {
                 )
             }
             .map(Some),
+            Stdio::InheritFile(_) => Err(unsupported()?),
             Stdio::Inherit => Ok(None),
             Stdio::MakePipe => unsupported(),
         }
     }
-
-    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-        let mut cmd = uefi_command_internal::Image::load_image(&self.prog)?;
-
-        // UEFI adds the bin name by default
-        if !self.args.is_empty() {
-            let args = uefi_command_internal::create_args(&self.prog, &self.args);
-            cmd.set_args(args);
-        }
-
-        // Setup Stdout
-        let stdout = self.stdout.unwrap_or(Stdio::MakePipe);
-        let stdout = Self::create_pipe(stdout)?;
-        if let Some(con) = stdout {
-            cmd.stdout_init(con)
-        } else {
-            cmd.stdout_inherit()
-        };
-
-        // Setup Stderr
-        let stderr = self.stderr.unwrap_or(Stdio::MakePipe);
-        let stderr = Self::create_pipe(stderr)?;
-        if let Some(con) = stderr {
-            cmd.stderr_init(con)
-        } else {
-            cmd.stderr_inherit()
-        };
-
-        // Setup Stdin
-        let stdin = self.stdin.unwrap_or(Stdio::Null);
-        let stdin = Self::create_stdin(stdin)?;
-        if let Some(con) = stdin {
-            cmd.stdin_init(con)
-        } else {
-            cmd.stdin_inherit()
-        };
-
-        let env = env_changes(&self.env);
-
-        // Set any new vars
-        if let Some(e) = &env {
-            for (k, (_, v)) in e {
-                match v {
-                    Some(v) => unsafe { crate::env::set_var(k, v) },
-                    None => unsafe { crate::env::remove_var(k) },
-                }
-            }
-        }
-
-        let stat = cmd.start_image()?;
-
-        // Rollback any env changes
-        if let Some(e) = env {
-            for (k, (v, _)) in e {
-                match v {
-                    Some(v) => unsafe { crate::env::set_var(k, v) },
-                    None => unsafe { crate::env::remove_var(k) },
-                }
-            }
-        }
-
-        let stdout = cmd.stdout()?;
-        let stderr = cmd.stderr()?;
-
-        Ok((ExitStatus(stat), stdout, stderr))
-    }
 }
 
-impl From<AnonPipe> for Stdio {
-    fn from(pipe: AnonPipe) -> Stdio {
+pub fn output(command: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    let prog_path = resolve_program(&command.prog)
+        .ok_or(io::const_error!(io::ErrorKind::NotFound, "could not find the program."))?;
+    let mut cmd = uefi_command_internal::Image::load_image(prog_path.as_os_str())?;
+
+    // UEFI adds the bin name by default
+    if !command.args.is_empty() {
+        let args = uefi_command_internal::create_args(&command.prog, &command.args);
+        cmd.set_args(args);
+    }
+
+    // Setup Stdout
+    let stdout = command.stdout.take().unwrap_or(Stdio::MakePipe);
+    let stdout = Command::create_pipe(stdout)?;
+    if let Some(con) = stdout {
+        cmd.stdout_init(con)
+    } else {
+        cmd.stdout_inherit()
+    };
+
+    // Setup Stderr
+    let stderr = command.stderr.take().unwrap_or(Stdio::MakePipe);
+    let stderr = Command::create_pipe(stderr)?;
+    if let Some(con) = stderr {
+        cmd.stderr_init(con)
+    } else {
+        cmd.stderr_inherit()
+    };
+
+    // Setup Stdin
+    let stdin = command.stdin.take().unwrap_or(Stdio::Null);
+    let stdin = Command::create_stdin(stdin)?;
+    if let Some(con) = stdin {
+        cmd.stdin_init(con)
+    } else {
+        cmd.stdin_inherit()
+    };
+
+    let env = env_changes(&command.env);
+
+    // Set any new vars
+    if let Some(e) = &env {
+        for (k, (_, v)) in e {
+            match v {
+                Some(v) => unsafe { crate::env::set_var(k, v) },
+                None => unsafe { crate::env::remove_var(k) },
+            }
+        }
+    }
+
+    let stat = cmd.start_image()?;
+
+    // Rollback any env changes
+    if let Some(e) = env {
+        for (k, (v, _)) in e {
+            match v {
+                Some(v) => unsafe { crate::env::set_var(k, v) },
+                None => unsafe { crate::env::remove_var(k) },
+            }
+        }
+    }
+
+    let stdout = cmd.stdout()?;
+    let stderr = cmd.stderr()?;
+
+    Ok((ExitStatus(stat), stdout, stderr))
+}
+
+impl From<ChildPipe> for Stdio {
+    fn from(pipe: ChildPipe) -> Stdio {
         pipe.diverge()
     }
 }
 
 impl From<io::Stdout> for Stdio {
     fn from(_: io::Stdout) -> Stdio {
-        // FIXME: This is wrong.
-        // Instead, the Stdio we have here should be a unit struct.
-        panic!("unsupported")
+        Stdio::Inherit
     }
 }
 
 impl From<io::Stderr> for Stdio {
     fn from(_: io::Stderr) -> Stdio {
-        // FIXME: This is wrong.
-        // Instead, the Stdio we have here should be a unit struct.
-        panic!("unsupported")
+        Stdio::Inherit
     }
 }
 
 impl From<File> for Stdio {
-    fn from(_file: File) -> Stdio {
-        // FIXME: This is wrong.
-        // Instead, the Stdio we have here should be a unit struct.
-        panic!("unsupported")
+    fn from(file: File) -> Stdio {
+        Stdio::InheritFile(file)
     }
 }
 
@@ -359,6 +359,47 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
     }
 }
 
+pub type ChildPipe = crate::sys::pipe::Pipe;
+
+pub fn read_output(
+    out: ChildPipe,
+    _stdout: &mut Vec<u8>,
+    _err: ChildPipe,
+    _stderr: &mut Vec<u8>,
+) -> io::Result<()> {
+    match out.diverge() {}
+}
+
+// Search for programs similar to UEFI Shell defined in Section 3.6.1. It follows the following flow:
+// 1. If program is already absolute path, just check if it exists.
+// 2. For non-absolute path, search relative to current directory.
+// 3. Search the path list sequentially.
+//
+// [UEFI Shell Specification](https://uefi.org/sites/default/files/resources/UEFI_Shell_2_2.pdf).
+fn resolve_program<S: AsRef<OsStr> + ?Sized>(prog: &S) -> Option<PathBuf> {
+    let absolute_prog_path = crate::path::absolute(prog.as_ref()).ok()?;
+
+    match crate::fs::exists(&absolute_prog_path) {
+        Ok(true) => return Some(absolute_prog_path),
+        // If program path was already absolute and is not found, then stop.
+        Ok(false) if Path::new(prog.as_ref()).is_absolute() => return None,
+        _ => {}
+    }
+
+    // Search for the program in path.
+    if let Ok(path_var) = crate::env::var("path") {
+        for p in crate::env::split_paths(&path_var) {
+            let temp = p.join(prog.as_ref());
+
+            if let Ok(true) = crate::fs::exists(&temp) {
+                return Some(temp);
+            }
+        }
+    }
+
+    None
+}
+
 #[allow(dead_code)]
 mod uefi_command_internal {
     use r_efi::protocols::{loaded_image, simple_text_input, simple_text_output};
@@ -370,8 +411,8 @@ mod uefi_command_internal {
     use crate::os::uefi::ffi::{OsStrExt, OsStringExt};
     use crate::ptr::NonNull;
     use crate::slice;
+    use crate::sys::helpers::WStrUnits;
     use crate::sys::pal::helpers::{self, OwnedTable};
-    use crate::sys_common::wstr::WStrUnits;
 
     pub struct Image {
         handle: NonNull<crate::ffi::c_void>,
@@ -599,7 +640,7 @@ mod uefi_command_internal {
             }
 
             if let Some((ptr, len)) = self.args {
-                let _ = unsafe { Box::from_raw(crate::ptr::slice_from_raw_parts_mut(ptr, len)) };
+                let _ = unsafe { Box::from_raw(ptr.cast_slice(len)) };
             }
         }
     }
@@ -892,4 +933,8 @@ fn env_changes(env: &CommandEnv) -> Option<BTreeMap<EnvKey, (Option<OsString>, O
     }
 
     Some(result)
+}
+
+pub fn getpid() -> u32 {
+    panic!("no pids on this platform")
 }

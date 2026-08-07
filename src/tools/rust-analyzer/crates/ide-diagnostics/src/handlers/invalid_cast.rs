@@ -18,7 +18,10 @@ macro_rules! format_ty {
 // Diagnostic: invalid-cast
 //
 // This diagnostic is triggered if the code contains an illegal cast
-pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast) -> Diagnostic {
+pub(crate) fn invalid_cast(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::InvalidCast<'_>,
+) -> Diagnostic {
     let display_range = ctx.sema.diagnostics_display_range(d.expr.map(|it| it.into()));
     let (code, message) = match d.error {
         CastError::CastToBool => (
@@ -51,7 +54,7 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast) -
             DiagnosticCode::RustcHardError("E0606"),
             format_ty!(ctx, "casting `{}` as `{}` is invalid", d.expr_ty, d.cast_ty),
         ),
-        CastError::IntToFatCast => (
+        CastError::IntToWideCast => (
             DiagnosticCode::RustcHardError("E0606"),
             format_ty!(ctx, "cannot cast `{}` to a fat pointer `{}`", d.expr_ty, d.cast_ty),
         ),
@@ -95,24 +98,32 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast) -
             DiagnosticCode::RustcHardError("E0605"),
             format_ty!(ctx, "non-primitive cast: `{}` as `{}`", d.expr_ty, d.cast_ty),
         ),
+        CastError::PtrPtrAddingAutoTraits => (
+            DiagnosticCode::RustcHardError("E0804"),
+            "cannot add auto trait to dyn bound via pointer cast".to_owned(),
+        ),
         // CastError::UnknownCastPtrKind | CastError::UnknownExprPtrKind => (
         //     DiagnosticCode::RustcHardError("E0641"),
         //     "cannot cast to a pointer of an unknown kind".to_owned(),
         // ),
     };
-    Diagnostic::new(code, message, display_range)
+    Diagnostic::new(code, message, display_range).stable()
 }
 
 // Diagnostic: cast-to-unsized
 //
 // This diagnostic is triggered when casting to an unsized type
-pub(crate) fn cast_to_unsized(ctx: &DiagnosticsContext<'_>, d: &hir::CastToUnsized) -> Diagnostic {
+pub(crate) fn cast_to_unsized(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::CastToUnsized<'_>,
+) -> Diagnostic {
     let display_range = ctx.sema.diagnostics_display_range(d.expr.map(|it| it.into()));
     Diagnostic::new(
         DiagnosticCode::RustcHardError("E0620"),
         format_ty!(ctx, "cast to unsized type: `{}`", d.cast_ty),
         display_range,
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -166,7 +177,7 @@ fn main() {
     let _ = ptr as bool;
           //^^^^^^^^^^^ error: cannot cast `*const ()` as `bool`
     let v = "hello" as bool;
-          //^^^^^^^^^^^^^^^ error: casting `&str` as `bool` is invalid: needs casting through a raw pointer first
+          //^^^^^^^^^^^^^^^ error: casting `&'static str` as `bool` is invalid: needs casting through a raw pointer first
 }
 "#,
         );
@@ -379,7 +390,7 @@ struct Bar;
 
 impl Foo for Bar {}
 
-fn to_raw<T>(_: *mut T) -> *mut () {
+fn to_raw<T: ?Sized>(_: *mut T) -> *mut () {
     loop {}
 }
 
@@ -441,7 +452,8 @@ fn main() {
   //^^^^^^^^^^^^^^^^^ error: cannot cast thin pointer `*const i32` to fat pointer `*const [i32]`
 
     let t: *mut (dyn Trait + 'static) = 0 as *mut _;
-                                      //^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*mut _`
+                                      //^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*mut (dyn Trait + 'static)`
+
     let mut fail: *const str = 0 as *const str;
                              //^^^^^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*const str`
     let mut fail2: *const str = 0isize as *const str;
@@ -508,11 +520,13 @@ trait Trait<'a> {}
 
 fn add_auto<'a>(x: *mut dyn Trait<'a>) -> *mut (dyn Trait<'a> + Send) {
     x as _
+  //^^^^^^ error: cannot add auto trait to dyn bound via pointer cast
 }
 
 // (to test diagnostic list formatting)
 fn add_multiple_auto<'a>(x: *mut dyn Trait<'a>) -> *mut (dyn Trait<'a> + Send + Sync + Unpin) {
     x as _
+  //^^^^^^ error: cannot add auto trait to dyn bound via pointer cast
 }
 "#,
         );
@@ -538,7 +552,7 @@ fn main() {
     fn ptr_to_trait_obj_ok() {
         check_diagnostics(
             r#"
-//- minicore: pointee
+//- minicore: pointee, send, sync
 trait Trait<'a> {}
 
 fn remove_auto<'a>(x: *mut (dyn Trait<'a> + Send)) -> *mut dyn Trait<'a> {
@@ -955,7 +969,7 @@ fn main() {
 fn main() {
     let pointer: usize = &1_i32 as *const i32 as usize;
     let _reference: &'static i32 = unsafe { pointer as *const i32 as &'static i32 };
-                                          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: non-primitive cast: `*const i32` as `&i32`
+                                          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: non-primitive cast: `*const i32` as `&'static i32`
 }
 "#,
         );
@@ -976,7 +990,7 @@ fn main() {
     fn rustc_issue_106883() {
         check_diagnostics_with_disabled(
             r#"
-//- minicore: sized, deref
+//- minicore: sized, deref, coerce_unsized, unsize
 use core::ops::Deref;
 
 struct Foo;
@@ -991,7 +1005,7 @@ impl Deref for Foo {
 
 fn main() {
     let _ = "foo" as bool;
-          //^^^^^^^^^^^^^ error: casting `&str` as `bool` is invalid: needs casting through a raw pointer first
+          //^^^^^^^^^^^^^ error: casting `&'static str` as `bool` is invalid: needs casting through a raw pointer first
 
     let _ = Foo as bool;
           //^^^^^^^^^^^ error: non-primitive cast: `Foo` as `bool`
@@ -1011,7 +1025,6 @@ fn _slice(bar: &[i32]) -> bool {
         check_diagnostics(
             r#"
 //- minicore: coerce_unsized, dispatch_from_dyn
-#![feature(trait_upcasting)]
 trait Foo {}
 trait Bar: Foo {}
 
@@ -1159,6 +1172,49 @@ impl<T> KnownLayout for [T] {
 struct ZerocopyKnownLayoutMaybeUninit(<<Flexible as Field>::Type as KnownLayout>::MaybeUninit);
 
 fn test(ptr: *mut [u8]) -> *mut ZerocopyKnownLayoutMaybeUninit {
+    ptr as *mut _
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_19431() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized
+struct Dst([u8]);
+
+struct Struct {
+    body: Dst,
+}
+
+trait Field {
+    type Type: ?Sized;
+}
+
+impl Field for Struct {
+    type Type = Dst;
+}
+
+trait KnownLayout {
+    type MaybeUninit: ?Sized;
+    type PointerMetadata;
+}
+
+impl<T> KnownLayout for [T] {
+    type MaybeUninit = [T];
+    type PointerMetadata = usize;
+}
+
+impl KnownLayout for Dst {
+    type MaybeUninit = Dst;
+    type PointerMetadata = <[u8] as KnownLayout>::PointerMetadata;
+}
+
+struct ZerocopyKnownLayoutMaybeUninit(<<Struct as Field>::Type as KnownLayout>::MaybeUninit);
+
+fn test(ptr: *mut ZerocopyKnownLayoutMaybeUninit) -> *mut <<Struct as Field>::Type as KnownLayout>::MaybeUninit {
     ptr as *mut _
 }
 "#,

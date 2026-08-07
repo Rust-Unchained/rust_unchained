@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 use std::{env, process};
 
-use self::utils::Compiler;
+use crate::build_sysroot::{SysrootConfig, SysrootKind};
+use crate::utils::Compiler;
 
 mod abi_cafe;
 mod bench;
@@ -17,6 +18,7 @@ mod prepare;
 mod rustc_info;
 mod shared_utils;
 mod tests;
+mod todo;
 mod utils;
 
 fn usage() {
@@ -38,13 +40,7 @@ enum Command {
     Test,
     AbiCafe,
     Bench,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum SysrootKind {
-    None,
-    Clif,
-    Llvm,
+    CheckTodo,
 }
 
 #[derive(Clone, Debug)]
@@ -57,12 +53,6 @@ fn main() {
     if env::var_os("RUST_BACKTRACE").is_none() {
         env::set_var("RUST_BACKTRACE", "1");
     }
-    env::set_var("CG_CLIF_DISABLE_INCR_CACHE", "1");
-
-    // Force incr comp even in release mode unless in CI or incremental builds are explicitly disabled
-    if env::var_os("CARGO_BUILD_INCREMENTAL").is_none() {
-        env::set_var("CARGO_BUILD_INCREMENTAL", "true");
-    }
 
     let mut args = env::args().skip(1);
     let command = match args.next().as_deref() {
@@ -71,6 +61,7 @@ fn main() {
         Some("test") => Command::Test,
         Some("abi-cafe") => Command::AbiCafe,
         Some("bench") => Command::Bench,
+        Some("check-todo") => Command::CheckTodo,
         Some(flag) if flag.starts_with('-') => arg_error!("Expected command found flag {}", flag),
         Some(command) => arg_error!("Unknown command {}", command),
         None => {
@@ -79,9 +70,13 @@ fn main() {
         }
     };
 
-    let mut out_dir = PathBuf::from(".");
+    let mut out_dir = std::env::current_dir().unwrap();
     let mut download_dir = None;
-    let mut sysroot_kind = SysrootKind::Clif;
+    let mut sysroot_config = SysrootConfig {
+        sysroot_kind: SysrootKind::Clif,
+        panic_unwind_support: false,
+        keep_sysroot: false,
+    };
     let mut use_unstable_features = true;
     let mut frozen = false;
     let mut skip_tests = vec![];
@@ -99,7 +94,7 @@ fn main() {
                 })));
             }
             "--sysroot" => {
-                sysroot_kind = match args.next().as_deref() {
+                sysroot_config.sysroot_kind = match args.next().as_deref() {
                     Some("none") => SysrootKind::None,
                     Some("clif") => SysrootKind::Clif,
                     Some("llvm") => SysrootKind::Llvm,
@@ -107,7 +102,9 @@ fn main() {
                     None => arg_error!("--sysroot requires argument"),
                 }
             }
+            "--keep-sysroot" => sysroot_config.keep_sysroot = true,
             "--no-unstable-features" => use_unstable_features = false,
+            "--panic-unwind-support" => sysroot_config.panic_unwind_support = true,
             "--frozen" => frozen = true,
             "--skip-test" => {
                 // FIXME check that all passed in tests actually exist
@@ -140,6 +137,10 @@ fn main() {
             frozen,
         });
         process::exit(0);
+    }
+
+    if command == Command::CheckTodo {
+        todo::run();
     }
 
     let rustup_toolchain_name = match (env::var("CARGO"), env::var("RUSTC"), env::var("RUSTDOC")) {
@@ -201,16 +202,17 @@ fn main() {
             &dirs,
             &bootstrap_host_compiler,
             use_unstable_features,
+            sysroot_config.panic_unwind_support,
         ))
     };
     match command {
-        Command::Prepare => {
+        Command::Prepare | Command::CheckTodo => {
             // Handled above
         }
         Command::Test => {
             tests::run_tests(
                 &dirs,
-                sysroot_kind,
+                &sysroot_config,
                 use_unstable_features,
                 &skip_tests.iter().map(|test| &**test).collect::<Vec<_>>(),
                 &cg_clif_dylib,
@@ -225,7 +227,7 @@ fn main() {
                 process::exit(1);
             }
             abi_cafe::run(
-                sysroot_kind,
+                &sysroot_config,
                 &dirs,
                 &cg_clif_dylib,
                 rustup_toolchain_name.as_deref(),
@@ -235,7 +237,7 @@ fn main() {
         Command::Build => {
             build_sysroot::build_sysroot(
                 &dirs,
-                sysroot_kind,
+                &sysroot_config,
                 &cg_clif_dylib,
                 &bootstrap_host_compiler,
                 rustup_toolchain_name.as_deref(),
@@ -245,7 +247,7 @@ fn main() {
         Command::Bench => {
             let compiler = build_sysroot::build_sysroot(
                 &dirs,
-                sysroot_kind,
+                &sysroot_config,
                 &cg_clif_dylib,
                 &bootstrap_host_compiler,
                 rustup_toolchain_name.as_deref(),

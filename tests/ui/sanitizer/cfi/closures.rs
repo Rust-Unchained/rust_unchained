@@ -3,9 +3,10 @@
 //@ revisions: cfi kcfi
 // FIXME(#122848) Remove only-linux once OSX CFI binaries work
 //@ only-linux
+//@ ignore-backends: gcc
 //@ [cfi] needs-sanitizer-cfi
 //@ [kcfi] needs-sanitizer-kcfi
-//@ compile-flags: -C target-feature=-crt-static
+//@ compile-flags: -C target-feature=-crt-static -C unsafe-allow-abi-mismatch=sanitizer
 //@ [cfi] compile-flags: -C codegen-units=1 -C lto -C prefer-dynamic=off -C opt-level=0
 //@ [cfi] compile-flags: -Z sanitizer=cfi
 //@ [kcfi] compile-flags: -Z sanitizer=kcfi
@@ -31,7 +32,7 @@ fn dyn_fn_with_params() {
 
 #[test]
 fn call_fn_trait() {
-   let f: &(dyn Fn()) = &(|| {}) as _;
+   let f: &dyn Fn() = &(|| {}) as _;
    f.call(());
 }
 
@@ -47,7 +48,7 @@ fn use_fnmut<F: FnMut()>(mut f: F) {
 
 #[test]
 fn fn_to_fnmut() {
-    let f: &(dyn Fn()) = &(|| {}) as _;
+    let f: &dyn Fn() = &(|| {}) as _;
     use_fnmut(f);
 }
 

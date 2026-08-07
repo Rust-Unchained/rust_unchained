@@ -33,6 +33,7 @@ fn main() {
         // armv7s-apple-ios and i386-apple-ios only supports iOS 10.0
         "ios" if target() == "armv7s-apple-ios" || target() == "i386-apple-ios" => ("10.0", "10.0"),
         "ios" => ("15.0", "16.0"),
+        "watchos" if target() == "aarch64-apple-watchos" => ("28.0", "30.0"),
         "watchos" => ("7.0", "9.0"),
         "tvos" => ("14.0", "15.0"),
         "visionos" => ("1.1", "1.2"),
@@ -41,7 +42,6 @@ fn main() {
 
     // Remove env vars to get `rustc`'s default
     let output = rustc()
-        .target(target())
         .env_remove("MACOSX_DEPLOYMENT_TARGET")
         .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
         .env_remove("WATCHOS_DEPLOYMENT_TARGET")
@@ -58,7 +58,6 @@ fn main() {
     run_in_tmpdir(|| {
         let rustc = || {
             let mut rustc = rustc();
-            rustc.target(target());
             rustc.crate_type("lib");
             rustc.emit("obj");
             rustc.input("foo.rs");
@@ -82,7 +81,6 @@ fn main() {
 
         let rustc = || {
             let mut rustc = rustc();
-            rustc.target(target());
             rustc.crate_type("dylib");
             rustc.input("foo.rs");
             rustc.output("libfoo.dylib");
@@ -108,7 +106,6 @@ fn main() {
     run_in_tmpdir(|| {
         let rustc = || {
             let mut rustc = rustc();
-            rustc.target(target());
             rustc.crate_type("bin");
             rustc.input("foo.rs");
             rustc.output("foo");
@@ -147,7 +144,6 @@ fn main() {
     run_in_tmpdir(|| {
         let rustc = || {
             let mut rustc = rustc();
-            rustc.target(target());
             rustc.incremental("incremental");
             rustc.crate_type("lib");
             rustc.emit("obj");
@@ -173,9 +169,8 @@ fn main() {
 
     // Test that all binaries in rlibs produced by `rustc` have the same version.
     // Regression test for https://github.com/rust-lang/rust/issues/128419.
-    let sysroot = rustc().print("sysroot").run().stdout_utf8();
-    let target_sysroot = path(sysroot.trim()).join("lib/rustlib").join(target()).join("lib");
-    let rlibs = shallow_find_files(&target_sysroot, |path| has_extension(path, "rlib"));
+    let sysroot_libs_dir = rustc().print("target-libdir").target(target()).run().stdout_utf8();
+    let rlibs = shallow_find_files(sysroot_libs_dir.trim(), |path| has_extension(path, "rlib"));
 
     let output = cmd("otool").arg("-l").args(rlibs).run().stdout_utf8();
     let re = regex::Regex::new(r"(minos|version) ([0-9.]*)").unwrap();

@@ -2,21 +2,24 @@
 //!
 //! The main entry point is the `step` method.
 
+use std::iter;
+
 use either::Either;
 use rustc_abi::{FIRST_VARIANT, FieldIdx};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_index::IndexSlice;
-use rustc_middle::ty::layout::FnAbiOf;
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_middle::{bug, mir, span_bug};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 use rustc_target::callconv::FnAbi;
+use tracing::field::Empty;
 use tracing::{info, instrument, trace};
 
 use super::{
-    FnArg, FnVal, ImmTy, Immediate, InterpCx, InterpResult, Machine, MemPlaceMeta, PlaceTy,
-    Projectable, Scalar, interp_ok, throw_ub, throw_unsup_format,
+    EnteredTraceSpan, FnArg, FnVal, ImmTy, Immediate, InterpCx, InterpResult, Machine,
+    MemPlaceMeta, PlaceTy, Projectable, RetagMode, interp_ok, throw_ub, throw_unsup_format,
 };
-use crate::util;
+use crate::{enter_trace_span, util};
 
 struct EvaluatedCalleeAndArgs<'tcx, M: Machine<'tcx>> {
     callee: FnVal<'tcx, M::ExtraFnVal>,
@@ -75,21 +78,24 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     ///
     /// This does NOT move the statement counter forward, the caller has to do that!
     pub fn eval_statement(&mut self, stmt: &mir::Statement<'tcx>) -> InterpResult<'tcx> {
-        info!("{:?}", stmt);
+        let _trace = enter_trace_span!(
+            M,
+            step::eval_statement,
+            stmt = ?stmt.kind,
+            span = ?stmt.source_info.span,
+            tracing_separate_thread = Empty,
+        )
+        .or_if_tracing_disabled(|| info!("{:?}", stmt.kind));
 
         use rustc_middle::mir::StatementKind::*;
 
         match &stmt.kind {
-            Assign(box (place, rvalue)) => self.eval_rvalue_into_place(rvalue, *place)?,
+            Assign((place, rvalue)) => self.eval_rvalue_into_place(rvalue, *place)?,
 
             SetDiscriminant { place, variant_index } => {
-                let dest = self.eval_place(**place)?;
+                let dest =
+                    self.eval_place(**place, /* skip_validity_for_simple_deref */ false)?;
                 self.write_discriminant(*variant_index, &dest)?;
-            }
-
-            Deinit(place) => {
-                let dest = self.eval_place(**place)?;
-                self.write_uninit(&dest)?;
             }
 
             // Mark locals as alive
@@ -106,17 +112,12 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // interpreter is solely intended for borrowck'ed code.
             FakeRead(..) => {}
 
-            // Stacked Borrows.
-            Retag(kind, place) => {
-                let dest = self.eval_place(**place)?;
-                M::retag_place_contents(self, *kind, &dest)?;
-            }
-
-            Intrinsic(box intrinsic) => self.eval_nondiverging_intrinsic(intrinsic)?,
+            Intrinsic(intrinsic) => self.eval_nondiverging_intrinsic(intrinsic)?,
 
             // Evaluate the place expression, without reading from it.
-            PlaceMention(box place) => {
-                let _ = self.eval_place(*place)?;
+            PlaceMention(place) => {
+                let _ =
+                    self.eval_place(**place, /* skip_validity_for_simple_deref */ false)?;
             }
 
             // This exists purely to guide borrowck lifetime inference, and does not have
@@ -160,7 +161,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         rvalue: &mir::Rvalue<'tcx>,
         place: mir::Place<'tcx>,
     ) -> InterpResult<'tcx> {
-        let dest = self.eval_place(place)?;
+        // We can skip validity because we'll write to the place which checks everything we care
+        // about for references, and the pointee must be sized so there's nothing to check for raw
+        // pointers.
+        let dest = self.eval_place(place, /* skip_validity_for_simple_deref */ true)?;
         // FIXME: ensure some kind of non-aliasing between LHS and RHS?
         // Also see https://github.com/rust-lang/rust/issues/68364.
 
@@ -171,18 +175,16 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.write_pointer(ptr, &dest)?;
             }
 
-            Use(ref operand) => {
+            Use(ref operand, with_retag) => {
                 // Avoid recomputing the layout
                 let op = self.eval_operand(operand, Some(dest.layout))?;
-                self.copy_op(&op, &dest)?;
+                let mode = if with_retag.yes() { RetagMode::Default } else { RetagMode::None };
+                M::with_retag_mode(self, mode, |ecx| ecx.copy_op(&op, &dest))?;
             }
 
-            CopyForDeref(place) => {
-                let op = self.eval_place_to_op(place, Some(dest.layout))?;
-                self.copy_op(&op, &dest)?;
-            }
+            CopyForDeref(_) => bug!("`CopyForDeref` in runtime MIR"),
 
-            BinaryOp(bin_op, box (ref left, ref right)) => {
+            BinaryOp(bin_op, (ref left, ref right)) => {
                 let layout = util::binop_left_homogeneous(bin_op).then_some(dest.layout);
                 let left = self.read_immediate(&self.eval_operand(left, layout)?)?;
                 let layout = util::binop_right_homogeneous(bin_op).then_some(left.layout);
@@ -193,20 +195,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
 
             UnaryOp(un_op, ref operand) => {
-                // The operand always has the same type as the result.
-                let val = self.read_immediate(&self.eval_operand(operand, Some(dest.layout))?)?;
+                let layout = util::unop_homogeneous(un_op).then_some(dest.layout);
+                let val = self.read_immediate(&self.eval_operand(operand, layout)?)?;
                 let result = self.unary_op(un_op, &val)?;
                 assert_eq!(result.layout, dest.layout, "layout mismatch for result of {un_op:?}");
                 self.write_immediate(*result, &dest)?;
             }
 
-            NullaryOp(null_op, ty) => {
-                let ty = self.instantiate_from_current_frame_and_normalize_erasing_regions(ty)?;
-                let val = self.nullary_op(null_op, ty)?;
-                self.write_immediate(*val, &dest)?;
-            }
-
-            Aggregate(box ref kind, ref operands) => {
+            Aggregate(ref kind, ref operands) => {
                 self.write_aggregate(kind, operands, &dest)?;
             }
 
@@ -214,27 +210,42 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.write_repeat(operand, &dest)?;
             }
 
-            Len(place) => {
-                let src = self.eval_place(place)?;
-                let len = src.len(self)?;
-                self.write_scalar(Scalar::from_target_usize(len, self), &dest)?;
+            Ref(_, borrow_kind, place) => {
+                // `x = &*ptr` does not need a validity check on `ptr` because we will already
+                // check `x` below.
+                let src = self.eval_place(place, /* skip_validity_for_simple_deref */ true)?;
+                let place = self.force_allocation(&src)?;
+                let mut val = ImmTy::from_immediate(place.to_ref(self), dest.layout);
+                // A fresh reference was created, make sure it gets retagged with the right mode.
+                let mode = if borrow_kind.is_two_phase_borrow() {
+                    RetagMode::TwoPhase
+                } else {
+                    RetagMode::Default
+                };
+                M::with_retag_mode(self, mode, |ecx| {
+                    // If validation is disabled, we still want to do this retag. This is because
+                    // const-eval disables validation for performance reasons but wants to retag
+                    // shared references. So we add a bit of a hack here to do the retag manually
+                    // if the write would not incur validation.
+                    if !M::enforce_validity(ecx, val.layout) {
+                        if let Some(new_val) = M::retag_ptr_value(ecx, &val, val.layout.ty)? {
+                            val = new_val;
+                        }
+                    }
+                    // Now do the actual write.
+                    ecx.write_immediate(*val, &dest)
+                })?;
             }
 
-            Ref(_, borrow_kind, place) => {
-                let src = self.eval_place(place)?;
-                let place = self.force_allocation(&src)?;
-                let val = ImmTy::from_immediate(place.to_ref(self), dest.layout);
-                // A fresh reference was created, make sure it gets retagged.
-                let val = M::retag_ptr_value(
-                    self,
-                    if borrow_kind.allows_two_phase_borrow() {
-                        mir::RetagKind::TwoPhase
-                    } else {
-                        mir::RetagKind::Default
-                    },
-                    &val,
-                )?;
-                self.write_immediate(*val, &dest)?;
+            Reborrow(_, mutability, place) => {
+                let op = self.eval_place_to_op(place, None)?;
+                if mutability.is_not() {
+                    // Shared generic reborrows use `CoerceShared`: a bitwise copy into a
+                    // distinct same-layout target ADT.
+                    self.copy_op_allow_transmute(&op, &dest)?;
+                } else {
+                    self.copy_op(&op, &dest)?;
+                }
             }
 
             RawPtr(kind, place) => {
@@ -247,21 +258,19 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     false
                 };
 
-                let src = self.eval_place(place)?;
+                let src =
+                    self.eval_place(place, /* skip_validity_for_simple_deref */ false)?;
                 let place = self.force_allocation(&src)?;
                 let mut val = ImmTy::from_immediate(place.to_ref(self), dest.layout);
                 if !place_base_raw && !kind.is_fake() {
                     // If this was not already raw, it needs retagging -- except for "fake"
                     // raw borrows whose defining property is that they do not get retagged.
-                    val = M::retag_ptr_value(self, mir::RetagKind::Raw, &val)?;
+                    val = M::with_retag_mode(self, RetagMode::Raw, |ecx| {
+                        interp_ok(M::retag_ptr_value(ecx, &val, val.layout.ty)?.unwrap_or(val))
+                    })?;
                 }
+                // This writes a raw pointer so it will not do any retags.
                 self.write_immediate(*val, &dest)?;
-            }
-
-            ShallowInitBox(ref operand, _) => {
-                let src = self.eval_operand(operand, None)?;
-                let v = self.read_immediate(&src)?;
-                self.write_immediate(*v, &dest)?;
             }
 
             Cast(cast_kind, ref operand, cast_ty) => {
@@ -299,7 +308,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         operands: &IndexSlice<FieldIdx, mir::Operand<'tcx>>,
         dest: &PlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
-        self.write_uninit(dest)?; // make sure all the padding ends up as uninit
         let (variant_index, variant_dest, active_field_index) = match *kind {
             mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) => {
                 let variant_dest = self.project_downcast(dest, variant_index)?;
@@ -333,11 +341,22 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
         for (field_index, operand) in operands.iter_enumerated() {
             let field_index = active_field_index.unwrap_or(field_index);
-            let field_dest = self.project_field(&variant_dest, field_index.as_usize())?;
+            let field_dest = self.project_field(&variant_dest, field_index)?;
             let op = self.eval_operand(operand, Some(field_dest.layout))?;
-            self.copy_op(&op, &field_dest)?;
+            // We validate manually below so we don't have to do it here.
+            self.copy_op_no_validate(&op, &field_dest, /*allow_transmute*/ false)?;
         }
-        self.write_discriminant(variant_index, dest)
+        self.write_discriminant(variant_index, dest)?;
+        // Validate that the entire thing is valid, and reset padding that might be in between the
+        // fields.
+        if M::enforce_validity(self, dest.layout()) {
+            self.validate_place(
+                dest,
+                M::enforce_validity_recursively(self, dest.layout()),
+                /*reset_provenance_and_padding*/ true,
+            )?;
+        }
+        interp_ok(())
     }
 
     /// Repeats `operand` into the destination. `dest` must have array type, and that type
@@ -381,34 +400,33 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
     /// Evaluate the arguments of a function call
     fn eval_fn_call_argument(
-        &self,
+        &mut self,
         op: &mir::Operand<'tcx>,
+        move_definitely_disjoint: bool,
     ) -> InterpResult<'tcx, FnArg<'tcx, M::Provenance>> {
         interp_ok(match op {
-            mir::Operand::Copy(_) | mir::Operand::Constant(_) => {
+            mir::Operand::Copy(_) | mir::Operand::Constant(_) | mir::Operand::RuntimeChecks(_) => {
                 // Make a regular copy.
                 let op = self.eval_operand(op, None)?;
                 FnArg::Copy(op)
             }
             mir::Operand::Move(place) => {
-                // If this place lives in memory, preserve its location.
-                // We call `place_to_op` which will be an `MPlaceTy` whenever there exists
-                // an mplace for this place. (This is in contrast to `PlaceTy::as_mplace_or_local`
-                // which can return a local even if that has an mplace.)
-                let place = self.eval_place(*place)?;
-                let op = self.place_to_op(&place)?;
-
-                match op.as_mplace_or_imm() {
-                    Either::Left(mplace) => FnArg::InPlace(mplace),
-                    Either::Right(_imm) => {
-                        // This argument doesn't live in memory, so there's no place
-                        // to make inaccessible during the call.
-                        // We rely on there not being any stray `PlaceTy` that would let the
-                        // caller directly access this local!
-                        // This is also crucial for tail calls, where we want the `FnArg` to
-                        // stay valid when the old stack frame gets popped.
-                        FnArg::Copy(op)
+                // We will read from this place, which checks everything there is to check,
+                // so we can skip the extra validity check here.
+                let place =
+                    self.eval_place(*place, /* skip_validity_for_simple_deref */ true)?;
+                if move_definitely_disjoint {
+                    // We still have to ensure that no *other* pointers are used to access this place,
+                    // so *if* it is in memory then we have to treat it as `InPlace`.
+                    // Use `place_to_op` to guarantee that we notice it being in memory.
+                    let op = self.place_to_op(&place)?;
+                    match op.as_mplace_or_imm() {
+                        Either::Left(mplace) => FnArg::InPlace(mplace),
+                        Either::Right(_imm) => FnArg::Copy(op),
                     }
+                } else {
+                    // We have to force this into memory to detect aliasing among `Move` arguments.
+                    FnArg::InPlace(self.force_allocation(&place)?)
                 }
             }
         })
@@ -417,18 +435,53 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Shared part of `Call` and `TailCall` implementation — finding and evaluating all the
     /// necessary information about callee and arguments to make a call.
     fn eval_callee_and_args(
-        &self,
+        &mut self,
         terminator: &mir::Terminator<'tcx>,
         func: &mir::Operand<'tcx>,
         args: &[Spanned<mir::Operand<'tcx>>],
+        dest: &mir::Place<'tcx>,
     ) -> InterpResult<'tcx, EvaluatedCalleeAndArgs<'tcx, M>> {
         let func = self.eval_operand(func, None)?;
+
+        // Evaluating function call arguments. The tricky part here is dealing with `Move`
+        // arguments: we have to ensure no two such arguments alias. This would be most easily done
+        // by just forcing them all into memory and then doing the usual in-place argument
+        // protection, but then we'd force *a lot* of arguments into memory. So we do some syntactic
+        // pre-processing here where if all `move` arguments are syntactically distinct local
+        // variables (and none is indirect), we can skip the in-memory forcing.
+        // We have to include `dest` in that list so that we can detect aliasing of an in-place
+        // argument with the return place.
+        let move_definitely_disjoint = 'move_definitely_disjoint: {
+            let mut previous_locals = FxHashSet::<mir::Local>::default();
+            for place in args
+                .iter()
+                .filter_map(|a| {
+                    // We only have to care about `Move` arguments.
+                    if let mir::Operand::Move(place) = &a.node { Some(place) } else { None }
+                })
+                .chain(iter::once(dest))
+            {
+                if place.is_indirect_first_projection() {
+                    // An indirect in-place argument could alias with anything else...
+                    break 'move_definitely_disjoint false;
+                }
+                if !previous_locals.insert(place.local) {
+                    // This local is the base for two arguments! They might overlap.
+                    break 'move_definitely_disjoint false;
+                }
+            }
+            // We found no violation so they are all definitely disjoint.
+            true
+        };
         let args = args
             .iter()
-            .map(|arg| self.eval_fn_call_argument(&arg.node))
+            .map(|arg| self.eval_fn_call_argument(&arg.node, move_definitely_disjoint))
             .collect::<InterpResult<'tcx, Vec<_>>>()?;
 
-        let fn_sig_binder = func.layout.ty.fn_sig(*self.tcx);
+        let fn_sig_binder = {
+            let _trace = enter_trace_span!(M, "fn_sig", ty = ?func.layout.ty.kind());
+            func.layout.ty.fn_sig(*self.tcx)
+        };
         let fn_sig = self.tcx.normalize_erasing_late_bound_regions(self.typing_env, fn_sig_binder);
         let extra_args = &args[fn_sig.inputs().len()..];
         let extra_args =
@@ -441,10 +494,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 (fn_val, self.fn_abi_of_fn_ptr(fn_sig_binder, extra_args)?, false)
             }
             ty::FnDef(def_id, args) => {
-                let instance = self.resolve(def_id, args)?;
+                let instance = self.resolve(def_id, args.no_bound_vars().unwrap())?;
                 (
                     FnVal::Instance(instance),
-                    self.fn_abi_of_instance(instance, extra_args)?,
+                    self.fn_abi_of_instance_no_deduced_attrs(instance, extra_args)?,
                     instance.def.requires_caller_location(*self.tcx),
                 )
             }
@@ -457,7 +510,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     }
 
     fn eval_terminator(&mut self, terminator: &mir::Terminator<'tcx>) -> InterpResult<'tcx> {
-        info!("{:?}", terminator.kind);
+        let _trace = enter_trace_span!(
+            M,
+            step::eval_terminator,
+            terminator = ?terminator.kind,
+            span = ?terminator.source_info.span,
+            tracing_separate_thread = Empty,
+        )
+        .or_if_tracing_disabled(|| info!("{:?}", terminator.kind));
 
         use rustc_middle::mir::TerminatorKind::*;
         match terminator.kind {
@@ -503,22 +563,27 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let old_stack = self.frame_idx();
                 let old_loc = self.frame().loc;
 
+                // Evaluation order consistent with assignment: destination first.
+                let dest_place =
+                    self.eval_place(destination, /* skip_validity_for_simple_deref */ false)?;
                 let EvaluatedCalleeAndArgs { callee, args, fn_sig, fn_abi, with_caller_location } =
-                    self.eval_callee_and_args(terminator, func, args)?;
+                    self.eval_callee_and_args(terminator, func, args, &destination)?;
 
-                let destination = self.force_allocation(&self.eval_place(destination)?)?;
                 self.init_fn_call(
                     callee,
-                    (fn_sig.abi, fn_abi),
+                    (fn_sig.abi(), fn_abi),
                     &args,
                     with_caller_location,
-                    &destination,
+                    &dest_place,
                     target,
                     if fn_abi.can_unwind { unwind } else { mir::UnwindAction::Unreachable },
                 )?;
                 // Sanity-check that `eval_fn_call` either pushed a new frame or
-                // did a jump to another block.
-                if self.frame_idx() == old_stack && self.frame().loc == old_loc {
+                // did a jump to another block. We disable the sanity check for functions that
+                // can't return, since Miri sometimes does have to keep the location the same
+                // for those (which is fine since execution will continue on a different thread).
+                if target.is_some() && self.frame_idx() == old_stack && self.frame().loc == old_loc
+                {
                     span_bug!(terminator.source_info.span, "evaluating this call made no progress");
                 }
             }
@@ -527,9 +592,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let old_frame_idx = self.frame_idx();
 
                 let EvaluatedCalleeAndArgs { callee, args, fn_sig, fn_abi, with_caller_location } =
-                    self.eval_callee_and_args(terminator, func, args)?;
+                    self.eval_callee_and_args(terminator, func, args, &mir::Place::return_place())?;
 
-                self.init_fn_tail_call(callee, (fn_sig.abi, fn_abi), &args, with_caller_location)?;
+                self.init_fn_tail_call(
+                    callee,
+                    (fn_sig.abi(), fn_abi),
+                    &args,
+                    with_caller_location,
+                )?;
 
                 if self.frame_idx() != old_frame_idx {
                     span_bug!(
@@ -539,10 +609,19 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 }
             }
 
-            Drop { place, target, unwind, replace: _ } => {
-                let place = self.eval_place(place)?;
-                let instance = Instance::resolve_drop_in_place(*self.tcx, place.layout.ty);
-                if let ty::InstanceKind::DropGlue(_, None) = instance.def {
+            Drop { place, target, unwind, replace: _, drop } => {
+                assert!(
+                    drop.is_none(),
+                    "Async Drop must be expanded or reset to sync in runtime MIR"
+                );
+                let place =
+                    self.eval_place(place, /* skip_validity_for_simple_deref */ false)?;
+                let instance = {
+                    let _trace =
+                        enter_trace_span!(M, resolve::resolve_drop_glue, ty = ?place.layout.ty);
+                    Instance::resolve_drop_glue(*self.tcx, place.layout.ty)
+                };
+                if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)) = instance.def {
                     // This is the branch we enter if and only if the dropped type has no drop glue
                     // whatsoever. This can happen as a result of monomorphizing a drop of a
                     // generic. In order to make sure that generic and non-generic code behaves

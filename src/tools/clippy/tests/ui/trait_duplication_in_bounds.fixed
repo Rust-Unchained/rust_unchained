@@ -1,6 +1,6 @@
 #![deny(clippy::trait_duplication_in_bounds)]
 #![allow(unused)]
-#![feature(associated_const_equality, const_trait_impl)]
+#![feature(const_trait_impl)]
 
 use std::any::Any;
 
@@ -167,11 +167,10 @@ where
 }
 
 // #13476
-#[const_trait]
-trait ConstTrait {}
-const fn const_trait_bounds_good<T: ConstTrait + ~const ConstTrait>() {}
+const trait ConstTrait {}
+const fn const_trait_bounds_good<T: ConstTrait + [const] ConstTrait>() {}
 
-const fn const_trait_bounds_bad<T: ~const ConstTrait>() {}
+const fn const_trait_bounds_bad<T: [const] ConstTrait>() {}
 //~^ trait_duplication_in_bounds
 
 fn projections<T, U, V>()
@@ -193,14 +192,5 @@ fn main() {
 fn assoc_tys_bounds<T>()
 where
     T: Iterator<Item: Clone> + Iterator<Item: Clone>,
-{
-}
-trait AssocConstTrait {
-    const ASSOC: usize;
-}
-fn assoc_const_args<T>()
-where
-    T: AssocConstTrait<ASSOC = 0>,
-    //~^ trait_duplication_in_bounds
 {
 }

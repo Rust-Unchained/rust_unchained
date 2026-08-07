@@ -1,17 +1,20 @@
 use std::iter::once;
 use std::path::{self, Path, PathBuf};
 
-use rustc_ast::ptr::P;
 use rustc_ast::{AttrVec, Attribute, Inline, Item, ModSpans};
+use rustc_attr_parsing::template;
+use rustc_attr_parsing::validate_attr::emit_malformed_attribute;
 use rustc_errors::{Diag, ErrorGuaranteed};
-use rustc_parse::{exp, new_parser_from_file, unwrap_or_emit_fatal, validate_attr};
+use rustc_parse::lexer::StripTokens;
+use rustc_parse::{exp, new_parser_from_file, unwrap_or_emit_fatal};
 use rustc_session::Session;
 use rustc_session::parse::ParseSess;
+use rustc_span::fatal_error::FatalError;
 use rustc_span::{Ident, Span, sym};
 use thin_vec::ThinVec;
 
 use crate::base::ModuleData;
-use crate::errors::{
+use crate::diagnostics::{
     ModuleCircular, ModuleFileNotFound, ModuleInBlock, ModuleInBlockName, ModuleMultipleCandidates,
 };
 
@@ -31,7 +34,7 @@ pub struct ModulePathSuccess {
 }
 
 pub(crate) struct ParsedExternalMod {
-    pub items: ThinVec<P<Item>>,
+    pub items: ThinVec<Box<Item>>,
     pub spans: ModSpans,
     pub file_path: PathBuf,
     pub dir_path: PathBuf,
@@ -67,10 +70,14 @@ pub(crate) fn parse_external_mod(
         }
 
         // Actually parse the external file as a module.
-        let mut parser =
-            unwrap_or_emit_fatal(new_parser_from_file(&sess.psess, &mp.file_path, Some(span)));
+        let mut parser = unwrap_or_emit_fatal(new_parser_from_file(
+            &sess.psess,
+            &mp.file_path,
+            StripTokens::ShebangAndFrontmatter,
+            Some(span),
+        ));
         let (inner_attrs, items, inner_span) =
-            parser.parse_mod(exp!(Eof)).map_err(|err| ModError::ParserError(err))?;
+            parser.parse_mod(exp!(Eof)).map_err(ModError::ParserError)?;
         attrs.extend(inner_attrs);
         (items, inner_span, mp.file_path)
     };
@@ -121,7 +128,7 @@ pub(crate) fn mod_dir_path(
 
             (dir_path, dir_ownership)
         }
-        Inline::No => {
+        Inline::No { .. } => {
             // FIXME: This is a subset of `parse_external_mod` without actual parsing,
             // check whether the logic for unloaded, loaded and inline modules can be unified.
             let file_path = mod_file_path(sess, ident, attrs, &module.dir_path, dir_ownership)
@@ -179,6 +186,7 @@ pub(crate) fn mod_file_path_from_attr(
     attrs: &[Attribute],
     dir_path: &Path,
 ) -> Option<PathBuf> {
+    // FIXME(154781) use a parsed attribute here
     // Extract path string from first `#[path = "path_string"]` attribute.
     let first_path = attrs.iter().find(|at| at.has_name(sym::path))?;
     let Some(path_sym) = first_path.value_str() else {
@@ -190,7 +198,17 @@ pub(crate) fn mod_file_path_from_attr(
         // Usually bad forms are checked during semantic analysis via
         // `TyCtxt::check_mod_attrs`), but by the time that runs the macro
         // is expanded, and it doesn't give an error.
-        validate_attr::emit_fatal_malformed_builtin_attribute(&sess.psess, first_path, sym::path);
+        emit_malformed_attribute(
+            &sess.psess,
+            first_path.style,
+            first_path.span,
+            sym::path,
+            template!(
+                NameValueStr: "file",
+                "https://doc.rust-lang.org/reference/items/modules.html#the-path-attribute"
+            ),
+        );
+        FatalError.raise()
     };
 
     let path_str = path_sym.as_str();

@@ -50,16 +50,17 @@ for larger features an implementation could be broken up into multiple PRs.
 [stabilization-guide]: https://rustc-dev-guide.rust-lang.org/stabilization_guide.html#stabilization-pr
 [doc-guide]: https://rustc-dev-guide.rust-lang.org/stabilization_guide.html#documentation-prs
 [nightly-style-procedure]: https://github.com/rust-lang/style-team/blob/main/nightly-style-procedure.md 
-[Style Guide]: https://github.com/rust-lang/rust/tree/master/src/doc/style-guide
+[Style Guide]: https://github.com/rust-lang/rust/tree/HEAD/src/doc/style-guide
 
 ### Unresolved Questions
 <!--
 Include any open questions that need to be answered before the feature can be
-stabilised.
+stabilised. It is useful to link related discussions and conculsions as they
+develop.
 -->
 
-XXX --- list all the "unresolved questions" found in the RFC to ensure they are
-not forgotten
+- [ ] list all the "unresolved questions" found in the RFC to ensure they are
+  not forgotten.
 
 ### Implementation history
 

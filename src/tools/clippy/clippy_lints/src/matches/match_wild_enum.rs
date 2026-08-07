@@ -1,5 +1,6 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::SpanExt;
 use clippy_utils::{is_refutable, peel_hir_pat_refs, recurse_or_patterns};
 use rustc_errors::Applicability;
 use rustc_hir::def::{CtorKind, DefKind, Res};
@@ -15,8 +16,7 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>]) {
     let ty = cx.typeck_results().expr_ty(ex).peel_refs();
     let adt_def = match ty.kind() {
         ty::Adt(adt_def, _)
-            if adt_def.is_enum()
-                && !(is_type_diagnostic_item(cx, ty, sym::Option) || is_type_diagnostic_item(cx, ty, sym::Result)) =>
+            if adt_def.is_enum() && !matches!(ty.opt_diag_name(cx), Some(sym::Option | sym::Result)) =>
         {
             adt_def
         },
@@ -67,10 +67,7 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>]) {
                 }) => {
                     // FIXME(clippy): don't you want to use the hir id of the peeled pat?
                     let id = match cx.qpath_res(path, *hir_id) {
-                        Res::Def(
-                            DefKind::Const | DefKind::ConstParam | DefKind::AnonConst | DefKind::InlineConst,
-                            _,
-                        ) => return,
+                        Res::Def(DefKind::Const { .. } | DefKind::ConstParam | DefKind::AnonConst, _) => return,
                         Res::Def(_, id) => id,
                         _ => return,
                     };
@@ -108,7 +105,7 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>]) {
                     },
                     _,
                 ) => path_prefix.with_prefix(path.segments),
-                _ => (),
+                QPath::TypeRelative(..) => (),
             }
         });
     }
@@ -116,11 +113,12 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>]) {
     let format_suggestion = |variant: &VariantDef| {
         format!(
             "{}{}{}{}",
-            if let Some(ident) = wildcard_ident {
-                format!("{} @ ", ident.name)
-            } else {
-                String::new()
-            },
+            wildcard_ident.map_or(String::new(), |ident| {
+                ident
+                    .span
+                    .get_text(cx)
+                    .map_or_else(|| format!("{} @ ", ident.name), |s| format!("{s} @ "))
+            }),
             if let CommonPrefixSearcher::Path(path_prefix) = path_prefix {
                 let mut s = String::new();
                 for seg in path_prefix {
@@ -138,7 +136,7 @@ pub(crate) fn check(cx: &LateContext<'_>, ex: &Expr<'_>, arms: &[Arm<'_>]) {
                 Some(CtorKind::Fn) if variant.fields.len() == 1 => "(_)",
                 Some(CtorKind::Fn) => "(..)",
                 Some(CtorKind::Const) => "",
-                None => "{ .. }",
+                None => " { .. }",
             }
         )
     };
@@ -207,5 +205,5 @@ impl<'a> CommonPrefixSearcher<'a> {
 }
 
 fn is_hidden(cx: &LateContext<'_>, variant_def: &VariantDef) -> bool {
-    cx.tcx.is_doc_hidden(variant_def.def_id) || cx.tcx.has_attr(variant_def.def_id, sym::unstable)
+    cx.tcx.is_doc_hidden(variant_def.def_id)
 }

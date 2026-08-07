@@ -4,17 +4,18 @@
 #![feature(const_trait_impl)]
 #![allow(refining_impl_trait)]
 
-#[const_trait]
-pub trait Foo {
-    fn method(self) -> impl ~const Bar;
+pub const trait Foo {
+    fn method(self) -> impl [const] Bar;
 }
 
-#[const_trait]
-pub trait Bar {}
+pub const trait Bar {}
 
 struct A<T>(T);
-impl<T> const Foo for A<T> where A<T>: ~const Bar {
-    fn method(self) -> impl ~const Bar {
+const impl<T> Foo for A<T>
+where
+    A<T>: [const] Bar,
+{
+    fn method(self) -> impl [const] Bar {
         self
     }
 }

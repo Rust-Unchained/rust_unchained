@@ -58,7 +58,7 @@
 use crate::cell::Cell;
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use crate::sync::atomic::{Atomic, AtomicBool, AtomicPtr};
-use crate::sync::poison::once::ExclusiveState;
+use crate::sync::once::OnceExclusiveState;
 use crate::thread::{self, Thread};
 use crate::{fmt, ptr, sync as public};
 
@@ -74,11 +74,12 @@ pub struct OnceState {
 }
 
 // Four states that a Once can be in, encoded into the lower bits of
-// `state_and_queue` in the Once structure.
-const INCOMPLETE: usize = 0x0;
-const POISONED: usize = 0x1;
-const RUNNING: usize = 0x2;
-const COMPLETE: usize = 0x3;
+// `state_and_queue` in the Once structure. By choosing COMPLETE as the all-zero
+// state the `is_completed` check can be a bit faster on some platforms.
+const INCOMPLETE: usize = 0x3;
+const POISONED: usize = 0x2;
+const RUNNING: usize = 0x1;
+const COMPLETE: usize = 0x0;
 
 // Mask to learn about the state. All other bits are the queue of waiters if
 // this is in the RUNNING state.
@@ -121,6 +122,11 @@ impl Once {
     }
 
     #[inline]
+    pub const fn new_complete() -> Once {
+        Once { state_and_queue: AtomicPtr::new(ptr::without_provenance_mut(COMPLETE)) }
+    }
+
+    #[inline]
     pub fn is_completed(&self) -> bool {
         // An `Acquire` load is enough because that makes all the initialization
         // operations visible to us, and, this being a fast path, weaker
@@ -130,21 +136,21 @@ impl Once {
     }
 
     #[inline]
-    pub(crate) fn state(&mut self) -> ExclusiveState {
+    pub(crate) fn state(&mut self) -> OnceExclusiveState {
         match self.state_and_queue.get_mut().addr() {
-            INCOMPLETE => ExclusiveState::Incomplete,
-            POISONED => ExclusiveState::Poisoned,
-            COMPLETE => ExclusiveState::Complete,
+            INCOMPLETE => OnceExclusiveState::Incomplete,
+            POISONED => OnceExclusiveState::Poisoned,
+            COMPLETE => OnceExclusiveState::Complete,
             _ => unreachable!("invalid Once state"),
         }
     }
 
     #[inline]
-    pub(crate) fn set_state(&mut self, new_state: ExclusiveState) {
+    pub(crate) fn set_state(&mut self, new_state: OnceExclusiveState) {
         *self.state_and_queue.get_mut() = match new_state {
-            ExclusiveState::Incomplete => ptr::without_provenance_mut(INCOMPLETE),
-            ExclusiveState::Poisoned => ptr::without_provenance_mut(POISONED),
-            ExclusiveState::Complete => ptr::without_provenance_mut(COMPLETE),
+            OnceExclusiveState::Incomplete => ptr::without_provenance_mut(INCOMPLETE),
+            OnceExclusiveState::Poisoned => ptr::without_provenance_mut(POISONED),
+            OnceExclusiveState::Complete => ptr::without_provenance_mut(COMPLETE),
         };
     }
 
@@ -275,7 +281,9 @@ fn wait(
             // If the managing thread happens to signal and unpark us before we
             // can park ourselves, the result could be this thread never gets
             // unparked. Luckily `park` comes with the guarantee that if it got
-            // an `unpark` just before on an unparked thread it does not park.
+            // an `unpark` just before on an unparked thread it does not park. Crucially, we know
+            // the `unpark` must have happened between the `compare_exchange_weak` above and here,
+            // and there's no other `park` in that code that could steal our token.
             // SAFETY: we retrieved this handle on the current thread above.
             unsafe { node.thread.park() }
         }

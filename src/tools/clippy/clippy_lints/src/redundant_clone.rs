@@ -1,8 +1,9 @@
 use clippy_utils::diagnostics::{span_lint_hir, span_lint_hir_and_then};
-use clippy_utils::fn_has_unsatisfiable_preds;
 use clippy_utils::mir::{LocalUsage, PossibleBorrowerMap, visit_local_usage};
-use clippy_utils::source::SpanRangeExt;
-use clippy_utils::ty::{has_drop, is_copy, is_type_diagnostic_item, is_type_lang_item, walk_ptrs_ty_depth};
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::SpanExt;
+use clippy_utils::ty::{has_drop, is_copy, peel_and_count_ty_refs};
+use clippy_utils::{fn_has_unsatisfiable_clauses, sym};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Body, FnDecl, LangItem, def_id};
@@ -11,7 +12,7 @@ use rustc_middle::mir;
 use rustc_middle::ty::{self, Ty};
 use rustc_session::declare_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::{BytePos, Span, sym};
+use rustc_span::{BytePos, Span};
 
 macro_rules! unwrap_or_continue {
     ($x:expr) => {
@@ -72,8 +73,8 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClone {
         _: Span,
         def_id: LocalDefId,
     ) {
-        // Building MIR for `fn`s with unsatisfiable preds results in ICE.
-        if fn_has_unsatisfiable_preds(cx, def_id.to_def_id()) {
+        // Building MIR for `fn`s with unsatisfiable clauses results in ICE.
+        if fn_has_unsatisfiable_clauses(cx, def_id.to_def_id()) {
             return;
         }
 
@@ -96,14 +97,13 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClone {
             let (fn_def_id, arg, arg_ty, clone_ret) =
                 unwrap_or_continue!(is_call_with_ref_arg(cx, mir, &terminator.kind));
 
-            let from_borrow = cx.tcx.lang_items().get(LangItem::CloneFn) == Some(fn_def_id)
-                || cx.tcx.is_diagnostic_item(sym::to_owned_method, fn_def_id)
-                || (cx.tcx.is_diagnostic_item(sym::to_string_method, fn_def_id)
-                    && is_type_lang_item(cx, arg_ty, LangItem::String));
+            let fn_name = cx.tcx.get_diagnostic_name(fn_def_id);
 
-            let from_deref = !from_borrow
-                && (cx.tcx.is_diagnostic_item(sym::path_to_pathbuf, fn_def_id)
-                    || cx.tcx.is_diagnostic_item(sym::os_str_to_os_string, fn_def_id));
+            let from_borrow = cx.tcx.lang_items().get(LangItem::CloneFn) == Some(fn_def_id)
+                || fn_name == Some(sym::to_owned_method)
+                || (fn_name == Some(sym::to_string_method) && arg_ty.is_lang_item(cx, LangItem::String));
+
+            let from_deref = !from_borrow && matches!(fn_name, Some(sym::path_to_pathbuf | sym::os_str_to_os_string));
 
             if !from_borrow && !from_deref {
                 continue;
@@ -148,8 +148,9 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClone {
                     is_call_with_ref_arg(cx, mir, &pred_terminator.kind)
                     && res == cloned
                     && cx.tcx.is_diagnostic_item(sym::deref_method, pred_fn_def_id)
-                    && (is_type_diagnostic_item(cx, pred_arg_ty, sym::PathBuf)
-                        || is_type_diagnostic_item(cx, pred_arg_ty, sym::OsString))
+                    && let ty::Adt(pred_arg_def, _) = pred_arg_ty.kind()
+                    && let Some(pred_arg_name) = cx.tcx.get_diagnostic_name(pred_arg_def.did())
+                    && matches!(pred_arg_name, sym::PathBuf | sym::OsString)
                 {
                     (pred_arg, res)
                 } else {
@@ -213,7 +214,7 @@ impl<'tcx> LateLintPass<'tcx> for RedundantClone {
                 .unwrap_crate_local()
                 .lint_root;
 
-            if let Some(snip) = span.get_source_text(cx)
+            if let Some(snip) = span.get_text(cx)
                 && let Some(dot) = snip.rfind('.')
             {
                 let sugg_span = span.with_lo(span.lo() + BytePos(u32::try_from(dot).unwrap()));
@@ -263,7 +264,7 @@ fn is_call_with_ref_arg<'tcx>(
         && args.len() == 1
         && let mir::Operand::Move(mir::Place { local, .. }) = &args[0].node
         && let ty::FnDef(def_id, _) = *func.ty(mir, cx.tcx).kind()
-        && let (inner_ty, 1) = walk_ptrs_ty_depth(args[0].node.ty(mir, cx.tcx))
+        && let (inner_ty, 1, _) = peel_and_count_ty_refs(args[0].node.ty(mir, cx.tcx))
         && !is_copy(cx, inner_ty)
     {
         Some((def_id, *local, inner_ty, destination.as_local()?))
@@ -292,7 +293,7 @@ fn find_stmt_assigns_to<'tcx>(
     })?;
 
     match (by_ref, rvalue) {
-        (true, mir::Rvalue::Ref(_, _, place)) | (false, mir::Rvalue::Use(mir::Operand::Copy(place))) => {
+        (true, mir::Rvalue::Ref(_, _, place)) | (false, mir::Rvalue::Use(mir::Operand::Copy(place), _)) => {
             Some(base_local_and_movability(cx, mir, *place))
         },
         (false, mir::Rvalue::Ref(_, _, place)) => {
@@ -367,25 +368,25 @@ struct CloneUsage {
 }
 
 fn visit_clone_usage(cloned: mir::Local, clone: mir::Local, mir: &mir::Body<'_>, bb: mir::BasicBlock) -> CloneUsage {
-    if let Some((
-        LocalUsage {
-            local_use_locs: cloned_use_locs,
-            local_consume_or_mutate_locs: cloned_consume_or_mutate_locs,
-        },
-        LocalUsage {
-            local_use_locs: _,
-            local_consume_or_mutate_locs: clone_consume_or_mutate_locs,
-        },
-    )) = visit_local_usage(
-        &[cloned, clone],
+    if let Some(
+        [
+            LocalUsage {
+                local_use_locs: cloned_use_locs,
+                local_consume_or_mutate_locs: cloned_consume_or_mutate_locs,
+            },
+            LocalUsage {
+                local_use_locs: _,
+                local_consume_or_mutate_locs: clone_consume_or_mutate_locs,
+            },
+        ],
+    ) = visit_local_usage(
+        [cloned, clone],
         mir,
         mir::Location {
             block: bb,
             statement_index: mir.basic_blocks[bb].statements.len(),
         },
-    )
-    .map(|mut vec| (vec.remove(0), vec.remove(0)))
-    {
+    ) {
         CloneUsage {
             cloned_use_loc: cloned_use_locs.first().copied().into(),
             cloned_consume_or_mutate_loc: cloned_consume_or_mutate_locs.first().copied(),

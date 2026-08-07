@@ -1,12 +1,12 @@
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
 use span::Edition;
 use test_fixture::WithFixture;
 
-use crate::{db::DefDatabase, test_db::TestDB};
+use crate::test_db::TestDB;
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
-    let item_tree = db.file_item_tree(file_id.into());
+    let item_tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
     let pretty = item_tree.pretty_print(&db, Edition::CURRENT);
     expect.assert_eq(&pretty);
 }
@@ -30,30 +30,27 @@ use crate::{A, B};
 
 use a::{c, d::{e}};
         "#,
-        expect![[r##"
-            #![doc = " file comment"]
+        expect![[r#"
             #![no_std]
-            #![doc = " another file comment"]
 
-            // AstId: 1
+            // AstId: ExternCrate[070B, 0]
             pub(self) extern crate self as renamed;
 
-            // AstId: 2
-            pub(super) extern crate bli;
+            // AstId: ExternCrate[1EA5, 0]
+            pub(in super) extern crate bli;
 
-            // AstId: 3
+            // AstId: Use[0000, 0]
             pub use crate::path::{nested, items as renamed, Trait as _};
 
-            // AstId: 4
+            // AstId: Use[0000, 1]
             pub(self) use globs::*;
 
-            #[doc = " docs on import"]
-            // AstId: 5
+            // AstId: Use[0000, 2]
             pub(self) use crate::{A, B};
 
-            // AstId: 6
+            // AstId: Use[0000, 3]
             pub(self) use a::{c, d::{e}};
-        "##]],
+        "#]],
     );
 }
 
@@ -73,23 +70,23 @@ extern "C" {
     fn ex_fn();
 }
         "#,
-        expect![[r##"
+        expect![[r#"
             #[on_extern_block]
-            // AstId: 1
-            extern "C" {
+            // AstId: ExternBlock[0000, 0]
+            extern {
                 #[on_extern_type]
-                // AstId: 2
+                // AstId: TypeAlias[A09C, 0]
                 pub(self) type ExType;
 
                 #[on_extern_static]
-                // AstId: 3
-                pub(self) static EX_STATIC: u8 = _;
+                // AstId: Static[D85E, 0]
+                pub(self) static EX_STATIC = _;
 
                 #[on_extern_fn]
-                // AstId: 4
-                pub(self) fn ex_fn() -> ();
+                // AstId: Fn[B240, 0]
+                pub(self) fn ex_fn;
             }
-        "##]],
+        "#]],
     );
 }
 
@@ -124,44 +121,21 @@ enum E {
 }
         "#,
         expect![[r#"
-            // AstId: 1
+            // AstId: Struct[ED35, 0]
             pub(self) struct Unit;
 
             #[derive(Debug)]
-            // AstId: 2
-            pub(self) struct Struct {
-                #[doc = " fld docs"]
-                pub(self) fld: (),
-            }
+            // AstId: Struct[A47C, 0]
+            pub(self) struct Struct { ... }
 
-            // AstId: 3
-            pub(self) struct Tuple(
-                #[attr]
-                pub(self) 0: u8,
-            );
+            // AstId: Struct[C8C9, 0]
+            pub(self) struct Tuple(...);
 
-            // AstId: 4
-            pub(self) union Ize {
-                pub(self) a: (),
-                pub(self) b: (),
-            }
+            // AstId: Union[2797, 0]
+            pub(self) union Ize { ... }
 
-            // AstId: 5
-            pub(self) enum E {
-                // AstId: 6
-                #[doc = " comment on Unit"]
-                Unit,
-                // AstId: 7
-                #[doc = " comment on Tuple"]
-                Tuple(
-                    pub(self) 0: u8,
-                ),
-                // AstId: 8
-                Struct {
-                    #[doc = " comment on a: u8"]
-                    pub(self) a: u8,
-                },
-            }
+            // AstId: Enum[7D23, 0]
+            pub(self) enum E { ... }
         "#]],
     );
 }
@@ -185,35 +159,19 @@ trait Tr: SuperTrait + 'lifetime {
 }
         "#,
         expect![[r#"
-            // AstId: 1
-            pub static mut ST: () = _;
+            // AstId: Static[F7C1, 0]
+            pub static ST = _;
 
-            // AstId: 2
-            pub(self) const _: Anon = _;
+            // AstId: Const[84BB, 0]
+            pub(self) const _ = _;
 
             #[attr]
             #[inner_attr_in_fn]
-            // AstId: 3
-            pub(self) fn f(
-                #[attr]
-                u8,
-                (),
-            ) -> () { ... }
+            // AstId: Fn[BE8F, 0]
+            pub(self) fn f;
 
-            // AstId: 4
-            pub(self) trait Tr<Self>
-            where
-                Self: SuperTrait,
-                Self: 'lifetime
-            {
-                // AstId: 6
-                pub(self) type Assoc: AssocBound = Default;
-
-                // AstId: 7
-                pub(self) fn method(
-                    self: &Self,
-                ) -> ();
-            }
+            // AstId: Trait[9320, 0]
+            pub(self) trait Tr { ... }
         "#]],
     );
 }
@@ -234,18 +192,16 @@ mod inline {
 mod outline;
         "#,
         expect![[r##"
-            #[doc = " outer"]
-            #[doc = " inner"]
-            // AstId: 1
+            // AstId: Module[03AE, 0]
             pub(self) mod inline {
-                // AstId: 3
+                // AstId: Use[0000, 0]
                 pub(self) use super::*;
 
-                // AstId: 4
-                pub(self) fn fn_in_module() -> () { ... }
+                // AstId: Fn[2A78, 0]
+                pub(self) fn fn_in_module;
             }
 
-            // AstId: 2
+            // AstId: Module[C08B, 0]
             pub(self) mod outline;
         "##]],
     );
@@ -264,163 +220,16 @@ pub macro m2() {}
 m!();
         "#,
         expect![[r#"
-            // AstId: 1
+            // AstId: MacroRules[7E68, 0]
             macro_rules! m { ... }
 
-            // AstId: 2
+            // AstId: MacroDef[1C1E, 0]
             pub macro m2 { ... }
 
-            // AstId: 3, SyntaxContext: 2, ExpandTo: Items
+            // AstId: MacroCall[7E68, 0], SyntaxContextId: ROOT2024, ExpandTo: Items
             m!(...);
         "#]],
     );
-}
-
-#[test]
-fn mod_paths() {
-    check(
-        r#"
-struct S {
-    a: self::Ty,
-    b: super::SuperTy,
-    c: super::super::SuperSuperTy,
-    d: ::abs::Path,
-    e: crate::Crate,
-    f: plain::path::Ty,
-}
-        "#,
-        expect![[r#"
-            // AstId: 1
-            pub(self) struct S {
-                pub(self) a: self::Ty,
-                pub(self) b: super::SuperTy,
-                pub(self) c: super::super::SuperSuperTy,
-                pub(self) d: ::abs::Path,
-                pub(self) e: crate::Crate,
-                pub(self) f: plain::path::Ty,
-            }
-        "#]],
-    )
-}
-
-#[test]
-fn types() {
-    check(
-        r#"
-struct S {
-    a: Mixed<'a, T, Item=(), OtherItem=u8>,
-    b: <Fully as Qualified>::Syntax,
-    c: <TypeAnchored>::Path::<'a>,
-    d: dyn for<'a> Trait<'a>,
-}
-        "#,
-        expect![[r#"
-            // AstId: 1
-            pub(self) struct S {
-                pub(self) a: Mixed::<'a, T, Item = (), OtherItem = u8>,
-                pub(self) b: Qualified::<Self=Fully>::Syntax,
-                pub(self) c: <TypeAnchored>::Path::<'a>,
-                pub(self) d: dyn for<'a> Trait::<'a>,
-            }
-        "#]],
-    )
-}
-
-#[test]
-fn generics() {
-    check(
-        r#"
-struct S<'a, 'b: 'a, T: Copy + 'a + 'b, const K: u8 = 0> {
-    field: &'a &'b T,
-}
-
-struct Tuple<T: Copy, U: ?Sized>(T, U);
-
-impl<'a, 'b: 'a, T: Copy + 'a + 'b, const K: u8 = 0> S<'a, 'b, T, K> {
-    fn f<G: 'a>(arg: impl Copy) -> impl Copy {}
-}
-
-enum Enum<'a, T, const U: u8> {}
-union Union<'a, T, const U: u8> {}
-
-trait Tr<'a, T: 'a>: Super where Self: for<'a> Tr<'a, T> {}
-        "#,
-        expect![[r#"
-            // AstId: 1
-            pub(self) struct S<'a, 'b, T, const K: u8>
-            where
-                T: Copy,
-                T: 'a,
-                T: 'b,
-                'b: 'a
-            {
-                pub(self) field: &'a &'b T,
-            }
-
-            // AstId: 2
-            pub(self) struct Tuple<T, U>(
-                pub(self) 0: T,
-                pub(self) 1: U,
-            )
-            where
-                T: Copy,
-                U: ?Sized;
-
-            // AstId: 3
-            impl<'a, 'b, T, const K: u8> S::<'a, 'b, T, K>
-            where
-                T: Copy,
-                T: 'a,
-                T: 'b,
-                'b: 'a
-            {
-                // AstId: 9
-                pub(self) fn f<G>(
-                    impl Copy,
-                ) -> impl Copy
-                where
-                    G: 'a { ... }
-            }
-
-            // AstId: 4
-            pub(self) enum Enum<'a, T, const U: u8> {
-            }
-
-            // AstId: 5
-            pub(self) union Union<'a, T, const U: u8> {
-            }
-
-            // AstId: 6
-            pub(self) trait Tr<'a, Self, T>
-            where
-                Self: Super,
-                T: 'a,
-                Self: for<'a> Tr::<'a, T>
-            {
-            }
-        "#]],
-    )
-}
-
-#[test]
-fn generics_with_attributes() {
-    check(
-        r#"
-struct S<#[cfg(never)] T>;
-struct S<A, B, #[cfg(never)] C>;
-struct S<A, #[cfg(never)] B, C>;
-        "#,
-        expect![[r#"
-            // AstId: 1
-            pub(self) struct S<#[cfg(never)] T>;
-
-            // AstId: 2
-            pub(self) struct S<A, B, #[cfg(never)] C>;
-
-            // AstId: 3
-            pub(self) struct S<A, #[cfg(never)] B, C>;
-        "#]],
-    )
 }
 
 #[test]
@@ -430,8 +239,50 @@ fn pub_self() {
 pub(self) struct S;
         "#,
         expect![[r#"
-            // AstId: 1
+            // AstId: Struct[5024, 0]
             pub(self) struct S;
         "#]],
     )
+}
+
+#[test]
+fn crate_attrs_should_preserve_order() {
+    check(
+        r#"
+//- /main.rs crate:foo crate-attr:no_std crate-attr:features(f16) crate-attr:crate_type="bin"
+        "#,
+        expect![[r##"
+            #![no_std]
+            #![features(f16)]
+            #![crate_type = "bin"]
+        "##]],
+    );
+}
+
+#[test]
+fn crate_attrs_with_disabled_cfg_injected() {
+    check(
+        r#"
+//- /main.rs crate:foo crate-attr:no_std crate-attr:cfg(false) crate-attr:features(f16,f128) crate-attr:crate_type="bin"
+        "#,
+        expect![[r#"
+            #![no_std]
+            #![cfg(false)]
+        "#]],
+    );
+}
+
+#[test]
+fn crate_attrs_with_disabled_cfg_in_source() {
+    check(
+        r#"
+//- /lib.rs crate:foo crate-attr:no_std
+#![cfg(false)]
+#![no_core]
+        "#,
+        expect![[r#"
+            #![no_std]
+            #![cfg(false)]
+        "#]],
+    );
 }

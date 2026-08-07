@@ -1,12 +1,15 @@
 //! Various helper functions to work with SyntaxNodes.
 use std::ops::ControlFlow;
 
+use either::Either;
 use itertools::Itertools;
 use parser::T;
 use span::Edition;
 use syntax::{
+    AstNode, AstToken, Direction, Preorder, RustLanguage, SyntaxToken, WalkEvent,
+    algo::non_trivia_sibling,
     ast::{self, HasLoopBody, MacroCall, PathSegmentKind, VisibilityKind},
-    AstNode, AstToken, Preorder, RustLanguage, WalkEvent,
+    syntax_editor::Element,
 };
 
 pub fn expr_as_name_ref(expr: &ast::Expr) -> Option<ast::NameRef> {
@@ -46,7 +49,7 @@ pub fn is_closure_or_blk_with_modif(expr: &ast::Expr) -> bool {
                 block_expr.modifier(),
                 Some(
                     ast::BlockModifier::Async(_)
-                        | ast::BlockModifier::Try(_)
+                        | ast::BlockModifier::Try { .. }
                         | ast::BlockModifier::Const(_)
                 )
             )
@@ -79,14 +82,13 @@ pub fn preorder_expr_with_ctx_checker(
                 continue;
             }
         };
-        if let Some(let_stmt) = node.parent().and_then(ast::LetStmt::cast) {
-            if let_stmt.initializer().map(|it| it.syntax() != &node).unwrap_or(true)
-                && let_stmt.let_else().map(|it| it.syntax() != &node).unwrap_or(true)
-            {
-                // skipping potential const pat expressions in  let statements
-                preorder.skip_subtree();
-                continue;
-            }
+        if let Some(let_stmt) = node.parent().and_then(ast::LetStmt::cast)
+            && let_stmt.initializer().map(|it| it.syntax() != &node).unwrap_or(true)
+            && let_stmt.let_else().map(|it| it.syntax() != &node).unwrap_or(true)
+        {
+            // skipping potential const pat expressions in  let statements
+            preorder.skip_subtree();
+            continue;
         }
 
         match ast::Stmt::cast(node.clone()) {
@@ -121,7 +123,7 @@ pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut dyn FnMut(ast::Pat)) {
         match ast::Stmt::cast(node.clone()) {
             Some(ast::Stmt::LetStmt(l)) => {
                 if let Some(pat) = l.pat() {
-                    let _ = walk_pat(&pat, &mut |pat| {
+                    _ = walk_pat(&pat, &mut |pat| {
                         cb(pat);
                         ControlFlow::<(), ()>::Continue(())
                     });
@@ -146,7 +148,7 @@ pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut dyn FnMut(ast::Pat)) {
                                 block_expr.modifier(),
                                 Some(
                                     ast::BlockModifier::Async(_)
-                                        | ast::BlockModifier::Try(_)
+                                        | ast::BlockModifier::Try { .. }
                                         | ast::BlockModifier::Const(_)
                                 )
                             )
@@ -159,7 +161,7 @@ pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut dyn FnMut(ast::Pat)) {
                     }
                 } else if let Some(pat) = ast::Pat::cast(node) {
                     preorder.skip_subtree();
-                    let _ = walk_pat(&pat, &mut |pat| {
+                    _ = walk_pat(&pat, &mut |pat| {
                         cb(pat);
                         ControlFlow::<(), ()>::Continue(())
                     });
@@ -266,10 +268,7 @@ pub fn is_pattern_cond(expr: ast::Expr) -> bool {
         ast::Expr::BinExpr(expr)
             if expr.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And)) =>
         {
-            expr.lhs()
-                .map(is_pattern_cond)
-                .or_else(|| expr.rhs().map(is_pattern_cond))
-                .unwrap_or(false)
+            expr.lhs().map_or(false, is_pattern_cond) || expr.rhs().map_or(false, is_pattern_cond)
         }
         ast::Expr::ParenExpr(expr) => expr.expr().is_some_and(is_pattern_cond),
         ast::Expr::LetExpr(_) => true,
@@ -292,7 +291,7 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
             match b.modifier() {
                 Some(
                     ast::BlockModifier::Async(_)
-                    | ast::BlockModifier::Try(_)
+                    | ast::BlockModifier::Try { .. }
                     | ast::BlockModifier::Const(_),
                 ) => return cb(expr),
 
@@ -306,10 +305,10 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
                 Some(ast::BlockModifier::AsyncGen(_)) => (),
                 None => (),
             }
-            if let Some(stmt_list) = b.stmt_list() {
-                if let Some(e) = stmt_list.tail_expr() {
-                    for_each_tail_expr(&e, cb);
-                }
+            if let Some(stmt_list) = b.stmt_list()
+                && let Some(e) = stmt_list.tail_expr()
+            {
+                for_each_tail_expr(&e, cb);
             }
         }
         ast::Expr::IfExpr(if_) => {
@@ -365,7 +364,8 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
         | ast::Expr::YeetExpr(_)
         | ast::Expr::OffsetOfExpr(_)
         | ast::Expr::FormatArgsExpr(_)
-        | ast::Expr::AsmExpr(_) => cb(expr),
+        | ast::Expr::AsmExpr(_)
+        | ast::Expr::IncludeBytesExpr(_) => cb(expr),
     }
 }
 
@@ -421,6 +421,48 @@ fn for_each_break_expr(
 
 pub fn eq_label_lt(lt1: &Option<ast::Lifetime>, lt2: &Option<ast::Lifetime>) -> bool {
     lt1.as_ref().zip(lt2.as_ref()).is_some_and(|(lt, lbl)| lt.text() == lbl.text())
+}
+
+/// Find the loop or block to break or continue, multiple results may be caused by macros.
+pub fn find_loops(
+    sema: &hir::Semantics<'_, crate::RootDatabase>,
+    token: &syntax::SyntaxToken,
+) -> Option<impl Iterator<Item = ast::Expr>> {
+    let parent = token.parent()?;
+    let lbl = syntax::match_ast! {
+        match parent {
+            ast::BreakExpr(break_) => break_.lifetime(),
+            ast::ContinueExpr(continue_) => continue_.lifetime(),
+            _ => None,
+        }
+    };
+    let label_matches =
+        move |it: Option<ast::Label>| match (lbl.as_ref(), it.and_then(|it| it.lifetime())) {
+            (Some(lbl), Some(it)) => lbl.text() == it.text(),
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+
+    let find_ancestors = move |token| {
+        for anc in sema.token_ancestors_with_macros(token).filter_map(ast::Expr::cast) {
+            let node = match &anc {
+                ast::Expr::LoopExpr(loop_) if label_matches(loop_.label()) => anc,
+                ast::Expr::WhileExpr(while_) if label_matches(while_.label()) => anc,
+                ast::Expr::ForExpr(for_) if label_matches(for_.label()) => anc,
+                ast::Expr::BlockExpr(blk)
+                    if blk.label().is_some() && label_matches(blk.label()) =>
+                {
+                    anc
+                }
+                _ => continue,
+            };
+
+            return Some(node);
+        }
+        None
+    };
+
+    sema.descend_into_macros(token.clone()).into_iter().filter_map(find_ancestors).into()
 }
 
 struct TreeWithDepthIterator {
@@ -484,7 +526,7 @@ pub fn parse_tt_as_comma_sep_paths(
             None => None,
             Some(tok) => Some(tok),
         });
-    let input_expressions = tokens.group_by(|tok| tok.kind() == T![,]);
+    let input_expressions = tokens.chunk_by(|tok| tok.kind() == T![,]);
     let paths = input_expressions
         .into_iter()
         .filter_map(|(is_sep, group)| (!is_sep).then_some(group))
@@ -503,4 +545,38 @@ pub fn parse_tt_as_comma_sep_paths(
 pub fn macro_call_for_string_token(string: &ast::String) -> Option<MacroCall> {
     let macro_call = string.syntax().parent_ancestors().find_map(ast::MacroCall::cast)?;
     Some(macro_call)
+}
+
+pub fn is_in_macro_matcher(token: &SyntaxToken) -> bool {
+    let Some(macro_def) = token
+        .parent_ancestors()
+        .map_while(Either::<ast::TokenTree, ast::Macro>::cast)
+        .find_map(Either::right)
+    else {
+        return false;
+    };
+    let range = token.text_range();
+    let Some(body) = (match macro_def {
+        ast::Macro::MacroDef(macro_def) => {
+            if let Some(args) = macro_def.args() {
+                return args.syntax().text_range().contains_range(range);
+            }
+            macro_def.body()
+        }
+        ast::Macro::MacroRules(macro_rules) => macro_rules.token_tree(),
+    }) else {
+        return false;
+    };
+    if !body.syntax().text_range().contains_range(range) {
+        return false;
+    }
+    body.token_trees_and_tokens().filter_map(|tt| tt.into_node()).any(|tt| {
+        let Some(next) = non_trivia_sibling(tt.syntax().syntax_element(), Direction::Next) else {
+            return false;
+        };
+        let Some(next_next) = next.next_sibling_or_token() else { return false };
+        next.kind() == T![=]
+            && next_next.kind() == T![>]
+            && tt.syntax().text_range().contains_range(range)
+    })
 }

@@ -1,4 +1,6 @@
-use crate::spec::{PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions, cvs};
+use crate::spec::{
+    Arch, Env, LlvmAbi, Os, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions, cvs,
+};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -11,12 +13,12 @@ pub(crate) fn target() -> Target {
             std: Some(true),
         },
         pointer_width: 32,
-        arch: "riscv32".into(),
+        arch: Arch::RiscV32,
 
         options: TargetOptions {
             families: cvs!["unix"],
-            os: "espidf".into(),
-            env: "newlib".into(),
+            os: Os::EspIdf,
+            env: Env::Newlib,
             vendor: "espressif".into(),
             linker: Some("riscv32-esp-elf-gcc".into()),
             cpu: "generic-rv32".into(),
@@ -27,7 +29,7 @@ pub(crate) fn target() -> Target {
             atomic_cas: true,
 
             features: "+m,+a,+c".into(),
-            llvm_abiname: "ilp32".into(),
+            llvm_abiname: LlvmAbi::Ilp32,
             panic_strategy: PanicStrategy::Abort,
             relocation_model: RelocModel::Static,
             emit_debug_gdb_scripts: false,

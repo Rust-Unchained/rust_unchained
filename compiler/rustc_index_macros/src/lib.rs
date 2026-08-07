@@ -25,8 +25,7 @@ mod newtype;
 /// The impls provided by default are Clone, Copy, PartialEq, Eq, and Hash.
 ///
 /// Accepted attributes for customization:
-/// - `#[derive(HashStable_Generic)]`/`#[derive(HashStable)]`: derives
-///   `HashStable`, as normal.
+/// - `#[stable_hash]`: derives `StableHash`.
 /// - `#[encodable]`: derives `Encodable`/`Decodable`.
 /// - `#[orderable]`: derives `PartialOrd`/`Ord`, plus step-related methods.
 /// - `#[debug_format = "Foo({})"]`: derives `Debug` with particular output.
@@ -34,7 +33,17 @@ mod newtype;
 ///   optimizations. The default max value is 0xFFFF_FF00.
 /// - `#[gate_rustc_only]`: makes parts of the generated code nightly-only.
 #[proc_macro]
-#[cfg_attr(feature = "nightly", allow_internal_unstable(step_trait, rustc_attrs, trusted_step))]
+#[cfg_attr(
+    feature = "nightly",
+    allow_internal_unstable(
+        step_trait,
+        rustc_attrs,
+        trusted_step,
+        pattern_types,
+        pattern_type_macro,
+        structural_match,
+    )
+)]
 pub fn newtype_index(input: TokenStream) -> TokenStream {
     newtype::newtype(input)
 }

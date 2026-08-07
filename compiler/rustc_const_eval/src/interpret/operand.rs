@@ -1,17 +1,19 @@
 //! Functions concerning immediate values and operands, and reading from operands.
 //! All high-level functions to read from memory work on operands as sources.
 
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use either::{Either, Left, Right};
 use rustc_abi as abi;
 use rustc_abi::{BackendRepr, HasDataLayout, Size};
 use rustc_hir::def::Namespace;
 use rustc_middle::mir::interpret::ScalarSizeMismatch;
-use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, TyAndLayout};
 use rustc_middle::ty::print::{FmtPrinter, PrettyPrinter};
 use rustc_middle::ty::{ConstInt, ScalarInt, Ty, TyCtxt};
 use rustc_middle::{bug, mir, span_bug, ty};
+use rustc_span::DUMMY_SP;
+use tracing::field::Empty;
 use tracing::trace;
 
 use super::{
@@ -19,6 +21,7 @@ use super::{
     OffsetMode, PlaceTy, Pointer, Projectable, Provenance, Scalar, alloc_range, err_ub,
     from_known_layout, interp_ok, mir_assign_valid_types, throw_ub,
 };
+use crate::enter_trace_span;
 
 /// An `Immediate` represents a single immediate self-contained Rust value.
 ///
@@ -81,7 +84,7 @@ impl<Prov: Provenance> Immediate<Prov> {
     pub fn to_scalar(self) -> Scalar<Prov> {
         match self {
             Immediate::Scalar(val) => val,
-            Immediate::ScalarPair(..) => bug!("Got a scalar pair where a scalar was expected"),
+            Immediate::ScalarPair { .. } => bug!("Got a scalar pair where a scalar was expected"),
             Immediate::Uninit => bug!("Got uninit where a scalar was expected"),
         }
     }
@@ -126,7 +129,10 @@ impl<Prov: Provenance> Immediate<Prov> {
                     );
                 }
             }
-            (Immediate::ScalarPair(a_val, b_val), BackendRepr::ScalarPair(a, b)) => {
+            (
+                Immediate::ScalarPair(a_val, b_val),
+                BackendRepr::ScalarPair { a, b, b_offset: _ },
+            ) => {
                 assert_eq!(
                     a_val.size(),
                     a.size(cx),
@@ -172,6 +178,16 @@ impl<Prov: Provenance> Immediate<Prov> {
         }
         interp_ok(())
     }
+
+    pub fn has_provenance(&self) -> bool {
+        match self {
+            Immediate::Scalar(scalar) => matches!(scalar, Scalar::Ptr { .. }),
+            Immediate::ScalarPair(s1, s2) => {
+                matches!(s1, Scalar::Ptr { .. }) || matches!(s2, Scalar::Ptr { .. })
+            }
+            Immediate::Uninit => false,
+        }
+    }
 }
 
 // ScalarPair needs a type to interpret, so we often have an immediate and a type together
@@ -185,31 +201,29 @@ pub struct ImmTy<'tcx, Prov: Provenance = CtfeProvenance> {
 impl<Prov: Provenance> std::fmt::Display for ImmTy<'_, Prov> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         /// Helper function for printing a scalar to a FmtPrinter
-        fn p<'a, 'tcx, Prov: Provenance>(
-            cx: &mut FmtPrinter<'a, 'tcx>,
+        fn print_scalar<'a, 'tcx, Prov: Provenance>(
+            p: &mut FmtPrinter<'a, 'tcx>,
             s: Scalar<Prov>,
             ty: Ty<'tcx>,
         ) -> Result<(), std::fmt::Error> {
             match s {
-                Scalar::Int(int) => cx.pretty_print_const_scalar_int(int, ty, true),
+                Scalar::Int(int) => p.pretty_print_const_scalar_int(int, ty, true),
                 Scalar::Ptr(ptr, _sz) => {
                     // Just print the ptr value. `pretty_print_const_scalar_ptr` would also try to
                     // print what is points to, which would fail since it has no access to the local
                     // memory.
-                    cx.pretty_print_const_pointer(ptr, ty)
+                    p.pretty_print_const_pointer(ptr, ty)
                 }
             }
         }
         ty::tls::with(|tcx| {
             match self.imm {
                 Immediate::Scalar(s) => {
-                    if let Some(ty) = tcx.lift(self.layout.ty) {
-                        let s =
-                            FmtPrinter::print_string(tcx, Namespace::ValueNS, |cx| p(cx, s, ty))?;
-                        f.write_str(&s)?;
-                        return Ok(());
-                    }
-                    write!(f, "{:x}: {}", s, self.layout.ty)
+                    let ty = tcx.lift(self.layout.ty);
+                    let s = FmtPrinter::print_string(tcx, Namespace::ValueNS, |p| {
+                        print_scalar(p, s, ty)
+                    })?;
+                    f.write_str(&s)
                 }
                 Immediate::ScalarPair(a, b) => {
                     // FIXME(oli-obk): at least print tuples and slices nicely
@@ -252,7 +266,7 @@ impl<'tcx, Prov: Provenance> ImmTy<'tcx, Prov> {
     #[inline]
     pub fn from_scalar_pair(a: Scalar<Prov>, b: Scalar<Prov>, layout: TyAndLayout<'tcx>) -> Self {
         debug_assert!(
-            matches!(layout.backend_repr, BackendRepr::ScalarPair(..)),
+            matches!(layout.backend_repr, BackendRepr::ScalarPair { .. }),
             "`ImmTy::from_scalar_pair` on non-scalar-pair layout"
         );
         let imm = Immediate::ScalarPair(a, b);
@@ -265,7 +279,7 @@ impl<'tcx, Prov: Provenance> ImmTy<'tcx, Prov> {
         debug_assert!(
             match (imm, layout.backend_repr) {
                 (Immediate::Scalar(..), BackendRepr::Scalar(..)) => true,
-                (Immediate::ScalarPair(..), BackendRepr::ScalarPair(..)) => true,
+                (Immediate::ScalarPair { .. }, BackendRepr::ScalarPair { .. }) => true,
                 (Immediate::Uninit, _) if layout.is_sized() => true,
                 _ => false,
             },
@@ -307,10 +321,10 @@ impl<'tcx, Prov: Provenance> ImmTy<'tcx, Prov> {
     #[inline]
     pub fn from_ordering(c: std::cmp::Ordering, tcx: TyCtxt<'tcx>) -> Self {
         // Can use any typing env, since `Ordering` is always monomorphic.
-        let ty = tcx.ty_ordering_enum(None);
+        let ty = tcx.ty_ordering_enum(DUMMY_SP);
         let layout =
             tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).unwrap();
-        Self::from_scalar(Scalar::from_i8(c as i8), layout)
+        Self::from_scalar(Scalar::Int(c.into()), layout)
     }
 
     pub fn from_pair(a: Self, b: Self, cx: &(impl HasTypingEnv<'tcx> + HasTyCtxt<'tcx>)) -> Self {
@@ -404,14 +418,15 @@ impl<'tcx, Prov: Provenance> ImmTy<'tcx, Prov> {
                 **self
             }
             // extract fields from types with `ScalarPair` ABI
-            (Immediate::ScalarPair(a_val, b_val), BackendRepr::ScalarPair(a, b)) => {
-                Immediate::from(if offset.bytes() == 0 {
-                    a_val
-                } else {
-                    assert_eq!(offset, a.size(cx).align_to(b.align(cx).abi));
-                    b_val
-                })
-            }
+            (
+                Immediate::ScalarPair(a_val, b_val),
+                BackendRepr::ScalarPair { a: _, b: _, b_offset },
+            ) => Immediate::from(if offset.bytes() == 0 {
+                a_val
+            } else {
+                assert_eq!(offset, b_offset);
+                b_val
+            }),
             // everything else is a bug
             _ => bug!(
                 "invalid field access on immediate {} at offset {}, original layout {:#?}",
@@ -508,6 +523,10 @@ impl<'tcx, Prov: Provenance> OpTy<'tcx, Prov> {
     pub(super) fn op(&self) -> &Operand<Prov> {
         &self.op
     }
+
+    pub fn is_immediate_uninit(&self) -> bool {
+        matches!(self.op, Operand::Immediate(Immediate::Uninit))
+    }
 }
 
 impl<'tcx, Prov: Provenance> Projectable<'tcx, Prov> for OpTy<'tcx, Prov> {
@@ -591,15 +610,15 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 )?;
                 Some(ImmTy::from_scalar(scalar, mplace.layout))
             }
-            BackendRepr::ScalarPair(
-                abi::Scalar::Initialized { value: a, .. },
-                abi::Scalar::Initialized { value: b, .. },
-            ) => {
+            BackendRepr::ScalarPair {
+                a: abi::Scalar::Initialized { value: a, .. },
+                b: abi::Scalar::Initialized { value: b, .. },
+                b_offset,
+            } => {
                 // We checked `ptr_align` above, so all fields will have the alignment they need.
                 // We would anyway check against `ptr_align.restrict_for_offset(b_offset)`,
                 // which `ptr.offset(b_offset)` cannot possibly fail to satisfy.
                 let (a_size, b_size) = (a.size(self), b.size(self));
-                let b_offset = a_size.align_to(b.align(self).abi);
                 assert!(b_offset.bytes() > 0); // in `operand_field` we use the offset to tell apart the fields
                 let a_val = alloc.read_scalar(
                     alloc_range(Size::ZERO, a_size),
@@ -621,7 +640,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Try returning an immediate for the operand. If the layout does not permit loading this as an
     /// immediate, return where in memory we can find the data.
     /// Note that for a given layout, this operation will either always return Left or Right!
-    /// succeed!  Whether it returns Left depends on whether the layout can be represented
+    /// Whether it returns Left depends on whether the layout can be represented
     /// in an `Immediate`, not on which data is stored there currently.
     ///
     /// This is an internal function that should not usually be used; call `read_immediate` instead.
@@ -653,10 +672,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         if !matches!(
             op.layout().backend_repr,
             BackendRepr::Scalar(abi::Scalar::Initialized { .. })
-                | BackendRepr::ScalarPair(
-                    abi::Scalar::Initialized { .. },
-                    abi::Scalar::Initialized { .. }
-                )
+                | BackendRepr::ScalarPair {
+                    a: abi::Scalar::Initialized { .. },
+                    b: abi::Scalar::Initialized { .. },
+                    b_offset: _,
+                }
         ) {
             span_bug!(self.cur_span(), "primitive read not possible for type: {}", op.layout().ty);
         }
@@ -769,6 +789,13 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         mir_place: mir::Place<'tcx>,
         layout: Option<TyAndLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::Provenance>> {
+        let _trace = enter_trace_span!(
+            M,
+            step::eval_place_to_op,
+            ?mir_place,
+            tracing_separate_thread = Empty
+        );
+
         // Do not use the layout passed in as argument if the base we are looking at
         // here is not the entire place.
         let layout = if mir_place.projection.is_empty() { layout } else { None };
@@ -812,10 +839,18 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         mir_op: &mir::Operand<'tcx>,
         layout: Option<TyAndLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::Provenance>> {
+        let _trace =
+            enter_trace_span!(M, step::eval_operand, ?mir_op, tracing_separate_thread = Empty);
+
         use rustc_middle::mir::Operand::*;
         let op = match mir_op {
             // FIXME: do some more logic on `move` to invalidate the old location
             &Copy(place) | &Move(place) => self.eval_place_to_op(place, layout)?,
+
+            &RuntimeChecks(checks) => {
+                let val = M::runtime_checks(self, checks)?;
+                ImmTy::from_bool(val, self.tcx()).into()
+            }
 
             Constant(constant) => {
                 let c = self.instantiate_from_current_frame_and_normalize_erasing_regions(
@@ -835,7 +870,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
     pub(crate) fn const_val_to_op(
         &self,
-        val_val: mir::ConstValue<'tcx>,
+        val_val: mir::ConstValue,
         ty: Ty<'tcx>,
         layout: Option<TyAndLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::Provenance>> {
@@ -859,9 +894,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
             mir::ConstValue::Scalar(x) => adjust_scalar(x)?.into(),
             mir::ConstValue::ZeroSized => Immediate::Uninit,
-            mir::ConstValue::Slice { data, meta } => {
+            mir::ConstValue::Slice { alloc_id, meta } => {
                 // This is const data, no mutation allowed.
-                let alloc_id = self.tcx.reserve_and_set_memory_alloc(data);
                 let ptr = Pointer::new(CtfeProvenance::from(alloc_id).as_immutable(), Size::ZERO);
                 Immediate::new_slice(self.global_root_pointer(ptr)?.into(), meta, self)
             }
@@ -877,9 +911,9 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(Immediate, 48);
     static_assert_size!(ImmTy<'_>, 64);
-    static_assert_size!(Operand, 56);
+    static_assert_size!(Immediate, 48);
     static_assert_size!(OpTy<'_>, 72);
+    static_assert_size!(Operand, 56);
     // tidy-alphabetical-end
 }

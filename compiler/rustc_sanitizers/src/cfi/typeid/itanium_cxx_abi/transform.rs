@@ -6,15 +6,15 @@
 
 use std::iter;
 
-use rustc_hir as hir;
-use rustc_hir::LangItem;
+use rustc_hir::{self as hir, LangItem, find_attr};
 use rustc_middle::bug;
 use rustc_middle::ty::{
-    self, ExistentialPredicateStableCmpExt as _, Instance, InstanceKind, IntTy, List, TraitRef, Ty,
-    TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UintTy,
+    self, AssocContainer, ExistentialPredicateStableCmpExt as _, Instance, IntTy, List, TraitRef,
+    Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UintTy,
+    Unnormalized,
 };
+use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
-use rustc_span::sym;
 use rustc_trait_selection::traits;
 use tracing::{debug, instrument};
 
@@ -138,13 +138,13 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                 {
                     // Don't transform repr(transparent) types with an user-defined CFI encoding to
                     // preserve the user-defined CFI encoding.
-                    if let Some(_) = self.tcx.get_attr(adt_def.did(), sym::cfi_encoding) {
+                    if find_attr!(self.tcx, adt_def.did(), CfiEncoding { .. }) {
                         return t;
                     }
                     let variant = adt_def.non_enum_variant();
                     let typing_env = ty::TypingEnv::post_analysis(self.tcx, variant.def_id);
                     let field = variant.fields.iter().find(|field| {
-                        let ty = self.tcx.type_of(field.did).instantiate_identity();
+                        let ty = self.tcx.type_of(field.did).instantiate_identity().skip_norm_wip();
                         let is_zst = self
                             .tcx
                             .layout_of(typing_env.as_query_input(ty))
@@ -215,9 +215,10 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                 }
             }
 
-            ty::Alias(..) => self.fold_ty(
-                self.tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), t),
-            ),
+            ty::Alias(..) => self.fold_ty(self.tcx.normalize_erasing_regions(
+                ty::TypingEnv::fully_monomorphized(),
+                Unnormalized::new_wip(t),
+            )),
 
             ty::Bound(..) | ty::Error(..) | ty::Infer(..) | ty::Param(..) | ty::Placeholder(..) => {
                 bug!("fold_ty: unexpected `{:?}`", t.kind());
@@ -240,24 +241,27 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
         .flat_map(|super_poly_trait_ref| {
             tcx.associated_items(super_poly_trait_ref.def_id())
                 .in_definition_order()
-                .filter(|item| item.is_type())
+                .filter(|item| item.can_have_equality_constraint(tcx))
                 .filter(|item| !tcx.generics_require_sized_self(item.def_id))
-                .map(move |assoc_ty| {
+                .map(move |assoc_item| {
                     super_poly_trait_ref.map_bound(|super_trait_ref| {
-                        let alias_ty =
-                            ty::AliasTy::new_from_args(tcx, assoc_ty.def_id, super_trait_ref.args);
-                        let resolved = tcx.normalize_erasing_regions(
-                            ty::TypingEnv::fully_monomorphized(),
-                            alias_ty.to_ty(tcx),
+                        let projection_term = ty::AliasTerm::new_from_def_id(
+                            tcx,
+                            assoc_item.def_id,
+                            super_trait_ref.args,
                         );
-                        debug!("Resolved {:?} -> {resolved}", alias_ty.to_ty(tcx));
+                        let term = tcx.normalize_erasing_regions(
+                            ty::TypingEnv::fully_monomorphized(),
+                            Unnormalized::new_wip(projection_term.to_term(tcx, ty::IsRigid::No)),
+                        );
+                        debug!(
+                            "Projection {:?} -> {term}",
+                            projection_term.to_term(tcx, ty::IsRigid::No)
+                        );
                         ty::ExistentialPredicate::Projection(
                             ty::ExistentialProjection::erase_self_ty(
                                 tcx,
-                                ty::ProjectionPredicate {
-                                    projection_term: alias_ty.into(),
-                                    term: resolved.into(),
-                                },
+                                ty::ProjectionPredicate { projection_term, term },
                             ),
                         )
                     })
@@ -268,7 +272,7 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
     let preds = tcx.mk_poly_existential_predicates_from_iter(
         iter::once(principal_pred).chain(assoc_preds.into_iter()),
     );
-    Ty::new_dynamic(tcx, preds, tcx.lifetimes.re_erased, ty::Dyn)
+    Ty::new_dynamic(tcx, preds, tcx.lifetimes.re_erased)
 }
 
 /// Transforms an instance for LLVM CFI and cross-language LLVM CFI support using Itanium C++ ABI
@@ -308,8 +312,8 @@ pub(crate) fn transform_instance<'tcx>(
 ) -> Instance<'tcx> {
     // FIXME: account for async-drop-glue
     if (matches!(instance.def, ty::InstanceKind::Virtual(..))
-        && tcx.is_lang_item(instance.def_id(), LangItem::DropInPlace))
-        || matches!(instance.def, ty::InstanceKind::DropGlue(..))
+        && tcx.is_lang_item(instance.def_id(), LangItem::DropGlue))
+        || matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..)))
     {
         // Adjust the type ids of DropGlues
         //
@@ -334,20 +338,20 @@ pub(crate) fn transform_instance<'tcx>(
             ty::List::empty(),
         ));
         let predicates = tcx.mk_poly_existential_predicates(&[ty::Binder::dummy(predicate)]);
-        let self_ty = Ty::new_dynamic(tcx, predicates, tcx.lifetimes.re_erased, ty::Dyn);
+        let self_ty = Ty::new_dynamic(tcx, predicates, tcx.lifetimes.re_erased);
         instance.args = tcx.mk_args_trait(self_ty, List::empty());
     } else if let ty::InstanceKind::Virtual(def_id, _) = instance.def {
         // Transform self into a trait object of the trait that defines the method for virtual
         // functions to match the type erasure done below.
-        let upcast_ty = match tcx.trait_of_item(def_id) {
+        let upcast_ty = match tcx.trait_of_assoc(def_id) {
             Some(trait_id) => trait_object_ty(
                 tcx,
-                ty::Binder::dummy(ty::TraitRef::from_method(tcx, trait_id, instance.args)),
+                ty::Binder::dummy(ty::TraitRef::from_assoc(tcx, trait_id, instance.args)),
             ),
             // drop_in_place won't have a defining trait, skip the upcast
             None => instance.args.type_at(0),
         };
-        let ty::Dynamic(preds, lifetime, kind) = upcast_ty.kind() else {
+        let ty::Dynamic(preds, lifetime) = upcast_ty.kind() else {
             bug!("Tried to remove autotraits from non-dynamic type {upcast_ty}");
         };
         let self_ty = if preds.principal().is_some() {
@@ -355,7 +359,7 @@ pub(crate) fn transform_instance<'tcx>(
                 tcx.mk_poly_existential_predicates_from_iter(preds.into_iter().filter(|pred| {
                     !matches!(pred.skip_binder(), ty::ExistentialPredicate::AutoTrait(..))
                 }));
-            Ty::new_dynamic(tcx, filtered_preds, *lifetime, *kind)
+            Ty::new_dynamic(tcx, filtered_preds, *lifetime)
         } else {
             // If there's no principal type, re-encode it as a unit, since we don't know anything
             // about it. This technically discards the knowledge that it was a type that was made
@@ -363,8 +367,8 @@ pub(crate) fn transform_instance<'tcx>(
             tcx.types.unit
         };
         instance.args = tcx.mk_args_trait(self_ty, instance.args.into_iter().skip(1));
-    } else if let ty::InstanceKind::VTableShim(def_id) = instance.def
-        && let Some(trait_id) = tcx.trait_of_item(def_id)
+    } else if let ty::InstanceKind::Shim(ty::ShimKind::VTable(def_id)) = instance.def
+        && let Some(trait_id) = tcx.trait_of_assoc(def_id)
     {
         // Adjust the type ids of VTableShims to the type id expected in the call sites for the
         // entry in the vtable (i.e., by using the signature of the closure passed as an argument
@@ -414,7 +418,7 @@ pub(crate) fn transform_instance<'tcx>(
                 }
                 ty::Coroutine(..) => match tcx.coroutine_kind(instance.def_id()).unwrap() {
                     hir::CoroutineKind::Coroutine(..) => (
-                        tcx.require_lang_item(LangItem::Coroutine, None),
+                        tcx.require_lang_item(LangItem::Coroutine, DUMMY_SP),
                         Some(instance.args.as_coroutine().resume_ty()),
                     ),
                     hir::CoroutineKind::Desugared(desugaring, _) => {
@@ -423,11 +427,11 @@ pub(crate) fn transform_instance<'tcx>(
                             hir::CoroutineDesugaring::AsyncGen => LangItem::AsyncIterator,
                             hir::CoroutineDesugaring::Gen => LangItem::Iterator,
                         };
-                        (tcx.require_lang_item(lang_item, None), None)
+                        (tcx.require_lang_item(lang_item, DUMMY_SP), None)
                     }
                 },
                 ty::CoroutineClosure(..) => (
-                    tcx.require_lang_item(LangItem::FnOnce, None),
+                    tcx.require_lang_item(LangItem::FnOnce, DUMMY_SP),
                     Some(
                         tcx.instantiate_bound_regions_with_erased(
                             instance.args.as_coroutine_closure().coroutine_closure_sig(),
@@ -458,6 +462,30 @@ pub(crate) fn transform_instance<'tcx>(
     instance
 }
 
+fn default_or_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Option<DefId> {
+    match instance.def {
+        ty::InstanceKind::Item(def_id) | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(def_id, _)) => {
+            tcx.opt_associated_item(def_id).map(|item| item.def_id)
+        }
+        _ => None,
+    }
+}
+
+/// Determines if an instance represents a trait method implementation and returns the necessary
+/// information for type erasure.
+///
+/// This function handles two main cases:
+///
+/// * **Implementation in an `impl` block**: When the instance represents a concrete implementation
+///   of a trait method in an `impl` block, it extracts the trait reference, method ID, and trait
+///   ID from the implementation. The method ID is obtained from the `trait_item_def_id` field of
+///   the associated item, which points to the original trait method definition.
+///
+/// * **Provided method in a `trait` block or synthetic `shim`**: When the instance represents a
+///   default implementation provided in the trait definition itself or a synthetic shim, it uses
+///   the instance's own `def_id` as the method ID and determines the trait ID from the associated
+///   item.
+///
 fn implemented_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
@@ -466,22 +494,22 @@ fn implemented_method<'tcx>(
     let method_id;
     let trait_id;
     let trait_method;
-    let ancestor = if let Some(impl_id) = tcx.impl_of_method(instance.def_id()) {
-        // Implementation in an `impl` block
-        trait_ref = tcx.impl_trait_ref(impl_id)?;
-        let impl_method = tcx.associated_item(instance.def_id());
-        method_id = impl_method.trait_item_def_id?;
+    let assoc = tcx.opt_associated_item(instance.def_id())?;
+    let ancestor = if let AssocContainer::TraitImpl(Ok(trait_method_id)) = assoc.container {
+        let impl_id = tcx.parent(instance.def_id());
+        trait_ref = tcx.impl_trait_ref(impl_id);
+        method_id = trait_method_id;
         trait_method = tcx.associated_item(method_id);
         trait_id = trait_ref.skip_binder().def_id;
         impl_id
-    } else if let InstanceKind::Item(def_id) = instance.def
-        && let Some(trait_method_bound) = tcx.opt_associated_item(def_id)
+    } else if let AssocContainer::Trait = assoc.container
+        && let Some(trait_method_def_id) = default_or_shim(tcx, instance)
     {
-        // Provided method in a `trait` block
-        trait_method = trait_method_bound;
-        method_id = instance.def_id();
-        trait_id = tcx.trait_of_item(method_id)?;
-        trait_ref = ty::EarlyBinder::bind(TraitRef::from_method(tcx, trait_id, instance.args));
+        // Provided method in a `trait` block or a synthetic `shim`
+        trait_method = assoc;
+        method_id = trait_method_def_id;
+        trait_id = tcx.parent(method_id);
+        trait_ref = ty::EarlyBinder::bind(tcx, TraitRef::from_assoc(tcx, trait_id, instance.args));
         trait_id
     } else {
         return None;

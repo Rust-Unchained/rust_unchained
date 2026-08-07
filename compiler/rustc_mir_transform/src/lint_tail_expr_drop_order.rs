@@ -2,18 +2,20 @@ use std::cell::RefCell;
 use std::collections::hash_map;
 use std::rc::Rc;
 
+use itertools::Itertools as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_errors::Subdiagnostic;
+use rustc_errors::formatting::DiagMessageAddArg;
+use rustc_errors::{Subdiagnostic, msg};
 use rustc_hir::CRATE_HIR_ID;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::MixedBitSet;
 use rustc_index::{IndexSlice, IndexVec};
-use rustc_macros::{LintDiagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::bug;
 use rustc_middle::mir::{
-    self, BasicBlock, Body, ClearCrossCrate, Local, Location, Place, StatementKind, TerminatorKind,
-    dump_mir,
+    self, BasicBlock, Body, ClearCrossCrate, Local, Location, MirDumper, Place, StatementKind,
+    TerminatorKind,
 };
 use rustc_middle::ty::significant_drop_order::{
     extract_component_with_significant_dtor, ty_dtor_span,
@@ -22,8 +24,8 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 use rustc_mir_dataflow::{Analysis, MaybeReachable, ResultsCursor};
+use rustc_session::lint;
 use rustc_session::lint::builtin::TAIL_EXPR_DROP_ORDER;
-use rustc_session::lint::{self};
 use rustc_span::{DUMMY_SP, Span, Symbol};
 use tracing::debug;
 
@@ -134,6 +136,7 @@ impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
                     target: _,
                     unwind: _,
                     replace: _,
+                    drop: _,
                 } = &terminator.kind
                 && place_has_common_prefix(dropped_place, self.place)
             {
@@ -184,7 +187,7 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
         return;
     }
     if body.span.edition().at_least_rust_2024()
-        || tcx.lints_that_dont_need_to_run(()).contains(&lint::LintId::of(TAIL_EXPR_DROP_ORDER))
+        || tcx.skippable_lints(()).contains(&lint::LintId::of(TAIL_EXPR_DROP_ORDER))
     {
         return;
     }
@@ -225,7 +228,10 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
         return;
     }
 
-    dump_mir(tcx, false, "lint_tail_expr_drop_order", &0 as _, body, |_, _| Ok(()));
+    if let Some(dumper) = MirDumper::new(tcx, "lint_tail_expr_drop_order", body) {
+        dumper.dump_mir(body);
+    }
+
     let locals_with_user_names = collect_user_names(body);
     let is_closure_like = tcx.is_closure_like(def_id.to_def_id());
 
@@ -233,8 +239,9 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
     // When we encounter a DROP of some place P we only care
     // about the drop if `P` may be initialized.
     let move_data = MoveData::gather_moves(body, tcx, |_| true);
-    let maybe_init = MaybeInitializedPlaces::new(tcx, body, &move_data);
-    let mut maybe_init = maybe_init.iterate_to_fixpoint(tcx, body, None).into_results_cursor(body);
+    let mut maybe_init = MaybeInitializedPlaces::new(tcx, body, &move_data)
+        .iterate_to_fixpoint(tcx, body, None)
+        .into_results_cursor(body);
     let mut block_drop_value_info =
         IndexVec::from_elem_n(MovePathIndexAtBlock::Unknown, body.basic_blocks.len());
     for (&block, candidates) in &bid_per_block {
@@ -333,9 +340,9 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
             // Suppose that all BIDs point into the same local,
             // we can remove the this local from the observed drops,
             // so that we can focus our diagnosis more on the others.
-            if candidates.iter().all(|&(_, place)| candidates[0].1.local == place.local) {
+            if let Ok(local) = candidates.iter().map(|&(_, place)| place.local).all_equal_value() {
                 for path_idx in all_locals_dropped.iter() {
-                    if move_data.move_paths[path_idx].place.local == candidates[0].1.local {
+                    if move_data.move_paths[path_idx].place.local == local {
                         to_exclude.insert(path_idx);
                     }
                 }
@@ -459,6 +466,7 @@ fn collect_user_names(body: &Body<'_>) -> FxIndexMap<Local, Symbol> {
     for var_debug_info in &body.var_debug_info {
         if let mir::VarDebugInfoContents::Place(place) = &var_debug_info.value
             && let Some(local) = place.local_or_deref_local()
+            && !body.local_decls[local].from_compiler_desugaring()
         {
             names.entry(local).or_insert(var_debug_info.name);
         }
@@ -491,14 +499,18 @@ fn assign_observables_names(
     names
 }
 
-#[derive(LintDiagnostic)]
-#[diag(mir_transform_tail_expr_drop_order)]
+#[derive(Diagnostic)]
+#[diag("relative drop order changing in Rust 2024")]
 struct TailExprDropOrderLint<'a> {
     #[subdiagnostic]
     local_labels: Vec<LocalLabel<'a>>,
-    #[label(mir_transform_drop_location)]
+    #[label(
+        "now the temporary value is dropped here, before the local variables in the block or statement"
+    )]
     drop_span: Option<Span>,
-    #[note(mir_transform_note_epilogue)]
+    #[note(
+        "most of the time, changing drop order is harmless; inspect the `impl Drop`s for side effects like releasing locks or sending messages"
+    )]
     _epilogue: (),
 }
 
@@ -513,22 +525,40 @@ struct LocalLabel<'a> {
 /// A custom `Subdiagnostic` implementation so that the notes are delivered in a specific order
 impl Subdiagnostic for LocalLabel<'_> {
     fn add_to_diag<G: rustc_errors::EmissionGuarantee>(self, diag: &mut rustc_errors::Diag<'_, G>) {
-        diag.arg("name", self.name);
-        diag.arg("is_generated_name", self.is_generated_name);
-        diag.arg("is_dropped_first_edition_2024", self.is_dropped_first_edition_2024);
-        let msg = diag.eagerly_translate(crate::fluent_generated::mir_transform_tail_expr_local);
-        diag.span_label(self.span, msg);
+        diag.span_label(
+            self.span,
+            msg!(
+                "{$is_generated_name ->
+                    [true] this value will be stored in a temporary; let us call it `{$name}`
+                    *[false] `{$name}` calls a custom destructor
+                }"
+            )
+            .arg("name", self.name)
+            .arg("is_generated_name", self.is_generated_name)
+            .format(),
+        );
         for dtor in self.destructors {
             dtor.add_to_diag(diag);
         }
-        let msg =
-            diag.eagerly_translate(crate::fluent_generated::mir_transform_label_local_epilogue);
-        diag.span_label(self.span, msg);
+        diag.span_label(self.span, msg!(
+            "{$is_dropped_first_edition_2024 ->
+                [true] up until Edition 2021 `{$name}` is dropped last but will be dropped earlier in Edition 2024
+                *[false] `{$name}` will be dropped later as of Edition 2024
+            }"
+        )
+            .arg("is_dropped_first_edition_2024", self.is_dropped_first_edition_2024)
+            .arg("name", self.name)
+            .format());
     }
 }
 
 #[derive(Subdiagnostic)]
-#[note(mir_transform_tail_expr_dtor)]
+#[note(
+    "{$dtor_kind ->
+        [dyn] `{$name}` may invoke a custom destructor because it contains a trait object
+        *[concrete] `{$name}` invokes this custom destructor
+    }"
+)]
 struct DestructorLabel<'a> {
     #[primary_span]
     span: Span,

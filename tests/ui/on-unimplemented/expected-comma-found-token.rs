@@ -1,13 +1,10 @@
-// Tests that two closures cannot simultaneously have mutable
-// access to the variable, whether that mutable access be used
-// for direct assignment or for taking mutable ref. Issue #6801.
+//! Test for invalid MetaItem syntax in the attribute
 
+#![crate_type = "lib"]
 #![feature(rustc_attrs)]
 
 #[rustc_on_unimplemented(
-    message="the message"
-    label="the label" //~ ERROR expected `,`, found `label`
+    message="the message" //~ ERROR attribute items not separated with `,`
+    label="the label"
 )]
 trait T {}
-
-fn main() {  }

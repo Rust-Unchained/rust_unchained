@@ -1,18 +1,22 @@
 //! Compiled declarative macro expanders (`macro_rules!` and `macro`)
 
-use base_db::CrateId;
-use intern::sym;
-use span::{Edition, HirFileIdRepr, MacroCallId, Span, SyntaxContextId};
+use std::ops::ControlFlow;
+
+use base_db::{Crate, SourceDatabase};
+use span::{Edition, Span, SyntaxContext};
 use stdx::TupleExt;
-use syntax::{ast, AstNode};
+use syntax::{
+    AstNode,
+    ast::{self, HasAttrs},
+};
 use syntax_bridge::DocCommentDesugarMode;
-use triomphe::Arc;
 
 use crate::{
-    attrs::RawAttrs,
-    db::ExpandDatabase,
-    hygiene::{apply_mark, Transparency},
-    tt, AstId, ExpandError, ExpandErrorKind, ExpandResult, Lookup,
+    AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, Lookup, MacroCallId,
+    MacroCallStyle,
+    attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
+    hygiene::{Transparency, apply_mark},
+    tt,
 };
 
 /// Old-style `macro_rules` or the new macros 2.0
@@ -26,12 +30,12 @@ pub struct DeclarativeMacroExpander {
 impl DeclarativeMacroExpander {
     pub fn expand(
         &self,
-        db: &dyn ExpandDatabase,
-        tt: tt::TopSubtree,
+        db: &dyn SourceDatabase,
+        tt: &tt::TopSubtree,
         call_id: MacroCallId,
         span: Span,
     ) -> ExpandResult<(tt::TopSubtree, Option<u32>)> {
-        let loc = db.lookup_intern_macro_call(call_id);
+        let loc = call_id.loc(db);
         match self.mac.err() {
             Some(_) => ExpandResult::new(
                 (tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }), None),
@@ -40,10 +44,14 @@ impl DeclarativeMacroExpander {
             None => self
                 .mac
                 .expand(
-                    &tt,
-                    |s| s.ctx = apply_mark(db, s.ctx, call_id, self.transparency, self.edition),
+                    db,
+                    tt,
+                    |s| {
+                        s.ctx =
+                            apply_mark(db, s.ctx, call_id.into(), self.transparency, self.edition)
+                    },
+                    loc.kind.call_style(),
                     span,
-                    loc.def.edition,
                 )
                 .map_err(Into::into),
         }
@@ -51,9 +59,10 @@ impl DeclarativeMacroExpander {
 
     pub fn expand_unhygienic(
         &self,
-        tt: tt::TopSubtree,
+        db: &dyn SourceDatabase,
+        tt: &tt::TopSubtree,
+        call_style: MacroCallStyle,
         call_site: Span,
-        def_site_edition: Edition,
     ) -> ExpandResult<tt::TopSubtree> {
         match self.mac.err() {
             Some(_) => ExpandResult::new(
@@ -62,52 +71,59 @@ impl DeclarativeMacroExpander {
             ),
             None => self
                 .mac
-                .expand(&tt, |_| (), call_site, def_site_edition)
+                .expand(db, tt, |_| (), call_style, call_site)
                 .map(TupleExt::head)
                 .map_err(Into::into),
         }
     }
+}
 
-    pub(crate) fn expander(
-        db: &dyn ExpandDatabase,
-        def_crate: CrateId,
-        id: AstId<ast::Macro>,
-    ) -> Arc<DeclarativeMacroExpander> {
-        let (root, map) = crate::db::parse_with_map(db, id.file_id);
+#[salsa::tracked]
+impl AstId<ast::Macro> {
+    /// Fetches (and compiles) the expander of this decl macro.
+    #[salsa::tracked(returns(ref))]
+    pub fn decl_macro_expander(
+        self,
+        db: &dyn SourceDatabase,
+        def_crate: Crate,
+    ) -> DeclarativeMacroExpander {
+        let id = self;
+        let (root, map) = id.file_id.parse_with_map(db);
+
         let root = root.syntax_node();
 
-        let transparency = |node| {
-            // ... would be nice to have the item tree here
-            let attrs = RawAttrs::new(db, node, map.as_ref()).filter(db, def_crate);
-            match attrs
-                .iter()
-                .find(|it| {
-                    it.path
-                        .as_ident()
-                        .map(|it| *it == sym::rustc_macro_transparency.clone())
-                        .unwrap_or(false)
-                })?
-                .token_tree_value()?
-                .token_trees()
-                .flat_tokens()
-            {
-                [tt::TokenTree::Leaf(tt::Leaf::Ident(i)), ..] => match &i.sym {
-                    s if *s == sym::transparent => Some(Transparency::Transparent),
-                    s if *s == sym::semitransparent => Some(Transparency::SemiTransparent),
-                    s if *s == sym::opaque => Some(Transparency::Opaque),
-                    _ => None,
+        let transparency = |node: ast::AnyHasAttrs| {
+            let mut cfg_options = None;
+            expand_cfg_attr(
+                node.attrs(),
+                || cfg_options.get_or_insert_with(|| def_crate.cfg_options(db)),
+                |attr, _| {
+                    if let ast::Meta::KeyValueMeta(attr) = attr
+                        && attr.path().is1("rustc_macro_transparency")
+                        && let Some(value) = attr.value_string()
+                    {
+                        match &*value {
+                            "transparent" => ControlFlow::Break(Transparency::Transparent),
+                            // "semitransparent" is for old rustc versions.
+                            "semiopaque" | "semitransparent" => {
+                                ControlFlow::Break(Transparency::SemiOpaque)
+                            }
+                            "opaque" => ControlFlow::Break(Transparency::Opaque),
+                            _ => ControlFlow::Continue(()),
+                        }
+                    } else {
+                        ControlFlow::Continue(())
+                    }
                 },
-                _ => None,
-            }
+            )
         };
-        let ctx_edition = |ctx: SyntaxContextId| {
-            let crate_graph = db.crate_graph();
+        let ctx_edition = |ctx: SyntaxContext| {
             if ctx.is_root() {
-                crate_graph[def_crate].edition
+                def_crate.data(db).edition
             } else {
-                let data = db.lookup_intern_syntax_context(ctx);
                 // UNWRAP-SAFETY: Only the root context has no outer expansion
-                crate_graph[data.outer_expn.unwrap().lookup(db).def.krate].edition
+                let krate = crate::MacroCallId::from(ctx.outer_expn(db).unwrap()).loc(db).def.krate;
+                krate.data(db).edition
             }
         };
         let (mac, transparency) = match id.to_ptr(db).to_node(&root) {
@@ -116,7 +132,7 @@ impl DeclarativeMacroExpander {
                     Some(arg) => {
                         let tt = syntax_bridge::syntax_node_to_token_tree(
                             arg.syntax(),
-                            map.as_ref(),
+                            map,
                             map.span_for_range(
                                 macro_rules.macro_rules_token().unwrap().text_range(),
                             ),
@@ -129,7 +145,8 @@ impl DeclarativeMacroExpander {
                         "expected a token tree".into(),
                     )),
                 },
-                transparency(&macro_rules).unwrap_or(Transparency::SemiTransparent),
+                transparency(ast::AnyHasAttrs::from(macro_rules))
+                    .unwrap_or(Transparency::SemiOpaque),
             ),
             ast::Macro::MacroDef(macro_def) => (
                 match macro_def.body() {
@@ -139,14 +156,14 @@ impl DeclarativeMacroExpander {
                         let args = macro_def.args().map(|args| {
                             syntax_bridge::syntax_node_to_token_tree(
                                 args.syntax(),
-                                map.as_ref(),
+                                map,
                                 span,
                                 DocCommentDesugarMode::Mbe,
                             )
                         });
                         let body = syntax_bridge::syntax_node_to_token_tree(
                             body.syntax(),
-                            map.as_ref(),
+                            map,
                             span,
                             DocCommentDesugarMode::Mbe,
                         );
@@ -157,13 +174,13 @@ impl DeclarativeMacroExpander {
                         "expected a token tree".into(),
                     )),
                 },
-                transparency(&macro_def).unwrap_or(Transparency::Opaque),
+                transparency(macro_def.into()).unwrap_or(Transparency::Opaque),
             ),
         };
-        let edition = ctx_edition(match id.file_id.repr() {
-            HirFileIdRepr::MacroFile(macro_file) => macro_file.macro_call_id.lookup(db).ctxt,
-            HirFileIdRepr::FileId(file) => SyntaxContextId::root(file.edition()),
+        let edition = ctx_edition(match id.file_id {
+            HirFileId::MacroFile(macro_file) => macro_file.lookup(db).ctxt,
+            HirFileId::FileId(file) => SyntaxContext::root(file.edition(db)),
         });
-        Arc::new(DeclarativeMacroExpander { mac, transparency, edition })
+        DeclarativeMacroExpander { mac, transparency, edition }
     }
 }

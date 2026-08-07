@@ -1,7 +1,5 @@
 # Testing the compiler
 
-<!-- toc -->
-
 The Rust project runs a wide variety of different tests, orchestrated by the
 build system (`./x test`). This section gives a brief overview of the different
 testing tools. Subsequent chapters dive into [running tests](running.md) and
@@ -26,7 +24,7 @@ The [Compiletest chapter][compiletest] goes into detail on how to use this tool.
 > Example: `./x test tests/ui`
 
 [compiletest]: compiletest.md
-[`tests`]: https://github.com/rust-lang/rust/tree/master/tests
+[`tests`]: https://github.com/rust-lang/rust/tree/HEAD/tests
 
 ### Package tests
 
@@ -64,17 +62,20 @@ would require recompiling the entire standard library, and the entirety of
 package tests:
 
 * `--doc` — Only runs documentation tests in the package.
-* `--no-doc` — Run all tests *except* documentation tests.
+* `--all-targets` — Run all tests *except* documentation tests.
+* `--tests` — Only runs unit and integration tests
 
-[tidy-unit-tests]: https://github.com/rust-lang/rust/blob/master/src/tools/tidy/src/unit_tests.rs
+[tidy-unit-tests]: https://github.com/rust-lang/rust/blob/HEAD/src/tools/tidy/src/unit_tests.rs
 
 ### Tidy
 
 Tidy is a custom tool used for validating source code style and formatting
 conventions, such as rejecting long lines. There is more information in the
-[section on coding conventions](../conventions.md#formatting).
+[section on coding conventions](../conventions.md#formatting) or the [Tidy Readme].
 
 > Examples: `./x test tidy`
+
+[Tidy Readme]: https://github.com/rust-lang/rust/blob/HEAD/src/tools/tidy/Readme.md
 
 
 ### Formatting
@@ -102,20 +103,23 @@ by passing a path to a book to `./x test`.
 
 ### Documentation link checker
 
-Links across all documentation is validated with a link checker tool.
+Links across all documentation is validated with a link checker tool,
+and it can be invoked so:
 
-> Example: `./x test src/tools/linkchecker`
-
-> Example: `./x test linkchecker`
+```console
+./x test linkchecker
+```
 
 This requires building all of the documentation, which might take a while.
 
-### Dist check
+### `distcheck`
 
 `distcheck` verifies that the source distribution tarball created by the build
 system will unpack, build, and run all tests.
 
-> Example: `./x test distcheck`
+```console
+./x test distcheck
+```
 
 ### Tool tests
 
@@ -139,7 +143,7 @@ In CI, some tools are allowed to fail. Failures send notifications to the
 corresponding teams, and is tracked on the [toolstate website]. More information
 can be found in the [toolstate documentation].
 
-[`src/tools`]: https://github.com/rust-lang/rust/tree/master/src/tools/
+[`src/tools`]: https://github.com/rust-lang/rust/tree/HEAD/src/tools/
 [toolstate documentation]: https://forge.rust-lang.org/infra/toolstate.html
 [toolstate website]: https://rust-lang-nursery.github.io/rust-toolstate/
 

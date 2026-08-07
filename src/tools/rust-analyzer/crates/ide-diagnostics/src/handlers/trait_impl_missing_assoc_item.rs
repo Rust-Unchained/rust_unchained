@@ -1,14 +1,14 @@
 use hir::InFile;
 use itertools::Itertools;
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: trait-impl-missing-assoc_item
 //
 // Diagnoses missing trait items in a trait impl.
 pub(crate) fn trait_impl_missing_assoc_item(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TraitImplMissingAssocItems,
 ) -> Diagnostic {
     let missing = d.missing.iter().format_with(", ", |(name, item), f| {
@@ -29,6 +29,7 @@ pub(crate) fn trait_impl_missing_assoc_item(
             &|impl_| impl_.trait_().map(|t| t.syntax().text_range()),
         ),
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -125,5 +126,60 @@ trait Trait {
 impl !Trait for () {}
 "#,
         )
+    }
+
+    #[test]
+    fn impl_sized_for_unsized() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Trait {
+    type Item
+    where
+        Self: Sized;
+
+    fn item()
+    where
+        Self: Sized;
+}
+
+trait OtherTrait {}
+
+impl Trait for () {
+    type Item = ();
+    fn item() {}
+}
+impl Trait for Adt<i32> {}
+   //^^^^^ error: not all trait items implemented, missing: `type Item`, `fn item`
+
+// Items with Self: Sized bound not required to be implemented for unsized types.
+impl Trait for str {}
+impl Trait for dyn OtherTrait {}
+impl Trait for Adt<[i32]> {}
+impl Trait for Slice<i32> {}
+impl Trait for (str,) {}
+
+struct Adt<T>(i32, T);
+struct Slice<T>([T]);
+ "#,
+        )
+    }
+
+    #[test]
+    fn no_false_positive_on_specialization() {
+        check_diagnostics(
+            r#"
+#![feature(specialization)]
+
+pub trait Foo {
+    fn foo();
+}
+
+impl<T> Foo for T {
+    default fn foo() {}
+}
+impl Foo for bool {}
+"#,
+        );
     }
 }

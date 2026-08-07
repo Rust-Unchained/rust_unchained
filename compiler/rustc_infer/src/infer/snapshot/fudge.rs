@@ -1,18 +1,20 @@
+use std::fmt::Debug;
 use std::ops::Range;
 
 use rustc_data_structures::{snapshot_vec as sv, unify as ut};
 use rustc_middle::ty::{
     self, ConstVid, FloatVid, IntVid, RegionVid, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder,
-    TypeSuperFoldable,
+    TypeSuperFoldable, TypeVisitableExt,
 };
-use rustc_type_ir::TypeVisitableExt;
 use tracing::instrument;
 use ut::UnifyKey;
 
 use super::VariableLengths;
-use crate::infer::type_variable::TypeVariableOrigin;
+use crate::infer::type_variable::{FloatVariableOrigin, TypeVariableOrigin};
 use crate::infer::unify_key::{ConstVariableValue, ConstVidKey};
-use crate::infer::{ConstVariableOrigin, InferCtxt, RegionVariableOrigin, UnificationTable};
+use crate::infer::{
+    ConstVariableOrigin, InferCtxt, InferCtxtInner, RegionVariableOrigin, UnificationTable,
+};
 
 fn vars_since_snapshot<'tcx, T>(
     table: &UnificationTable<'_, 'tcx, T>,
@@ -23,6 +25,14 @@ where
     super::UndoLog<'tcx>: From<sv::UndoLog<ut::Delegate<T>>>,
 {
     T::from_index(snapshot_var_len as u32)..T::from_index(table.len() as u32)
+}
+
+fn float_vars_since_snapshot(
+    inner: &mut InferCtxtInner<'_>,
+    snapshot_var_len: usize,
+) -> (Range<FloatVid>, Vec<FloatVariableOrigin>) {
+    let range = vars_since_snapshot(&inner.float_unification_table(), snapshot_var_len);
+    (range.clone(), range.map(|index| inner.float_origin_origin_storage[index]).collect())
 }
 
 fn const_vars_since_snapshot<'tcx>(
@@ -85,11 +95,12 @@ impl<'tcx> InferCtxt<'tcx> {
     /// the actual types (`?T`, `Option<?T>`) -- and remember that
     /// after the snapshot is popped, the variable `?T` is no longer
     /// unified.
-    #[instrument(skip(self, f), level = "debug")]
+    #[instrument(skip(self, f), level = "debug", ret)]
     pub fn fudge_inference_if_ok<T, E, F>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce() -> Result<T, E>,
         T: TypeFoldable<TyCtxt<'tcx>>,
+        E: Debug,
     {
         let variable_lengths = self.variable_lengths();
         let (snapshot_vars, value) = self.probe(|_| {
@@ -112,7 +123,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
     fn fudge_inference<T: TypeFoldable<TyCtxt<'tcx>>>(
         &self,
-        snapshot_vars: SnapshotVarData,
+        snapshot_vars: SnapshotVarData<'tcx>,
         value: T,
     ) -> T {
         // Micro-optimization: if no variables have been created, then
@@ -125,16 +136,16 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 }
 
-struct SnapshotVarData {
-    region_vars: (Range<RegionVid>, Vec<RegionVariableOrigin>),
+struct SnapshotVarData<'tcx> {
+    region_vars: (Range<RegionVid>, Vec<RegionVariableOrigin<'tcx>>),
     type_vars: (Range<TyVid>, Vec<TypeVariableOrigin>),
     int_vars: Range<IntVid>,
-    float_vars: Range<FloatVid>,
+    float_vars: (Range<FloatVid>, Vec<FloatVariableOrigin>),
     const_vars: (Range<ConstVid>, Vec<ConstVariableOrigin>),
 }
 
-impl SnapshotVarData {
-    fn new(infcx: &InferCtxt<'_>, vars_pre_snapshot: VariableLengths) -> SnapshotVarData {
+impl<'tcx> SnapshotVarData<'tcx> {
+    fn new(infcx: &InferCtxt<'tcx>, vars_pre_snapshot: VariableLengths) -> SnapshotVarData<'tcx> {
         let mut inner = infcx.inner.borrow_mut();
         let region_vars = inner
             .unwrap_region_constraints()
@@ -142,8 +153,7 @@ impl SnapshotVarData {
         let type_vars = inner.type_variables().vars_since_snapshot(vars_pre_snapshot.type_var_len);
         let int_vars =
             vars_since_snapshot(&inner.int_unification_table(), vars_pre_snapshot.int_var_len);
-        let float_vars =
-            vars_since_snapshot(&inner.float_unification_table(), vars_pre_snapshot.float_var_len);
+        let float_vars = float_vars_since_snapshot(&mut inner, vars_pre_snapshot.float_var_len);
 
         let const_vars = const_vars_since_snapshot(
             &mut inner.const_unification_table(),
@@ -157,14 +167,14 @@ impl SnapshotVarData {
         region_vars.0.is_empty()
             && type_vars.0.is_empty()
             && int_vars.is_empty()
-            && float_vars.is_empty()
+            && float_vars.0.is_empty()
             && const_vars.0.is_empty()
     }
 }
 
 struct InferenceFudger<'a, 'tcx> {
     infcx: &'a InferCtxt<'tcx>,
-    snapshot_vars: SnapshotVarData,
+    snapshot_vars: SnapshotVarData<'tcx>,
 }
 
 impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for InferenceFudger<'a, 'tcx> {
@@ -202,8 +212,11 @@ impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for InferenceFudger<'a, 'tcx> {
                     }
                 }
                 ty::FloatVar(vid) => {
-                    if self.snapshot_vars.float_vars.contains(&vid) {
-                        self.infcx.next_float_var()
+                    if self.snapshot_vars.float_vars.0.contains(&vid) {
+                        let idx = vid.as_usize() - self.snapshot_vars.float_vars.0.start.as_usize();
+                        let FloatVariableOrigin { span, lint_id } =
+                            self.snapshot_vars.float_vars.1[idx];
+                        self.infcx.next_float_var(span, lint_id)
                     } else {
                         ty
                     }

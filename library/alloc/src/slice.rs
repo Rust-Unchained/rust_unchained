@@ -11,16 +11,14 @@
 
 use core::borrow::{Borrow, BorrowMut};
 #[cfg(not(no_global_oom_handling))]
+use core::clone::TrivialClone;
+#[cfg(not(no_global_oom_handling))]
 use core::cmp::Ordering::{self, Less};
 #[cfg(not(no_global_oom_handling))]
 use core::mem::MaybeUninit;
 #[cfg(not(no_global_oom_handling))]
 use core::ptr;
-#[unstable(feature = "array_chunks", issue = "74985")]
-pub use core::slice::ArrayChunks;
-#[unstable(feature = "array_chunks", issue = "74985")]
-pub use core::slice::ArrayChunksMut;
-#[unstable(feature = "array_windows", issue = "75027")]
+#[stable(feature = "array_windows", since = "1.94.0")]
 pub use core::slice::ArrayWindows;
 #[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 pub use core::slice::EscapeAscii;
@@ -69,7 +67,7 @@ use crate::boxed::Box;
 use crate::vec::Vec;
 
 impl<T> [T] {
-    /// Sorts the slice, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order, preserving initial order of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*n* \* log(*n*))
     /// worst-case.
@@ -137,7 +135,8 @@ impl<T> [T] {
         stable_sort(self, T::lt);
     }
 
-    /// Sorts the slice with a comparison function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a comparison function, preserving initial order of
+    /// equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*n* \* log(*n*))
     /// worst-case.
@@ -197,7 +196,8 @@ impl<T> [T] {
         stable_sort(self, |a, b| compare(a, b) == Less);
     }
 
-    /// Sorts the slice with a key extraction function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a key extraction function, preserving initial order
+    /// of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*m* \* *n* \* log(*n*))
     /// worst-case, where the key function is *O*(*m*).
@@ -252,7 +252,8 @@ impl<T> [T] {
         stable_sort(self, |a, b| f(a).lt(&f(b)));
     }
 
-    /// Sorts the slice with a key extraction function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a key extraction function, preserving initial order
+    /// of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*m* \* *n* + *n* \*
     /// log(*n*)) worst-case, where the key function is *O*(*m*).
@@ -440,16 +441,19 @@ impl<T> [T] {
             }
         }
 
-        impl<T: Copy> ConvertVec for T {
+        impl<T: TrivialClone> ConvertVec for T {
             #[inline]
             fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A> {
-                let mut v = Vec::with_capacity_in(s.len(), alloc);
+                let len = s.len();
+                let mut v = Vec::with_capacity_in(len, alloc);
                 // SAFETY:
                 // allocated above with the capacity of `s`, and initialize to `s.len()` in
                 // ptr::copy_to_non_overlapping below.
-                unsafe {
-                    s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
-                    v.set_len(s.len());
+                if len > 0 {
+                    unsafe {
+                        s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), len);
+                        v.set_len(len);
+                    }
                 }
                 v
             }
@@ -472,9 +476,9 @@ impl<T> [T] {
     /// ```
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     #[inline]
-    #[rustc_diagnostic_item = "slice_into_vec"]
-    pub fn into_vec<A: Allocator>(self: Box<Self, A>) -> Vec<T, A> {
+    pub const fn into_vec<A: Allocator>(self: Box<Self, A>) -> Vec<T, A> {
         unsafe {
             let len = self.len();
             let (b, alloc) = Box::into_raw_with_allocator(self);
@@ -489,8 +493,6 @@ impl<T> [T] {
     /// This function will panic if the capacity would overflow.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// assert_eq!([1, 2].repeat(3), vec![1, 2, 1, 2, 1, 2]);
@@ -637,9 +639,7 @@ impl [u8] {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_uppercase(&self) -> Vec<u8> {
-        let mut me = self.to_vec();
-        me.make_ascii_uppercase();
-        me
+        self.iter().map(|b| b.to_ascii_uppercase()).collect()
     }
 
     /// Returns a vector containing a copy of this slice where each byte
@@ -658,9 +658,7 @@ impl [u8] {
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[inline]
     pub fn to_ascii_lowercase(&self) -> Vec<u8> {
-        let mut me = self.to_vec();
-        me.make_ascii_lowercase();
-        me
+        self.iter().map(|b| b.to_ascii_lowercase()).collect()
     }
 }
 
@@ -825,7 +823,7 @@ impl<T: Clone, A: Allocator> SpecCloneIntoVec<T, A> for [T] {
 }
 
 #[cfg(not(no_global_oom_handling))]
-impl<T: Copy, A: Allocator> SpecCloneIntoVec<T, A> for [T] {
+impl<T: TrivialClone, A: Allocator> SpecCloneIntoVec<T, A> for [T] {
     fn clone_into(&self, target: &mut Vec<T, A>) {
         target.clear();
         target.extend_from_slice(self);

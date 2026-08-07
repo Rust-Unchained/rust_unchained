@@ -1,5 +1,6 @@
 //@ run-pass
 //@ needs-unwind
+//@ ignore-backends: gcc
 //@ revisions: default mir-opt
 //@[mir-opt] compile-flags: -Zmir-opt-level=4
 
@@ -44,6 +45,7 @@ fn main() {
     assert_panicked(move || { small[1]; });
     assert_panicked(move || { small.index_mut(1); });
     assert_panicked(move || { small[1] += 1; });
+    //~^ WARN value assigned to `small` is never read
 
     let sorted: BTreeMap<bool, bool> = Default::default();
     assert_panicked(|| { sorted.index(&false); });

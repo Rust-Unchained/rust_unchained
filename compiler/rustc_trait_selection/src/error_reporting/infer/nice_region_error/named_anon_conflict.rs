@@ -3,12 +3,12 @@
 
 use rustc_errors::Diag;
 use rustc_middle::ty;
-use rustc_span::kw;
+use rustc_middle::ty::RegionExt;
 use tracing::debug;
 
+use crate::diagnostics::ExplicitLifetimeRequired;
 use crate::error_reporting::infer::nice_region_error::NiceRegionError;
 use crate::error_reporting::infer::nice_region_error::find_anon_type::find_anon_type;
-use crate::errors::ExplicitLifetimeRequired;
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// When given a `ConcreteFailure` for a function with parameters containing a named region and
@@ -27,12 +27,12 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // only introduced anonymous regions in parameters) as well as a
         // version new_ty of its type where the anonymous region is replaced
         // with the named one.
-        let (named, anon, anon_param_info, region_info) = if sub.has_name()
+        let (named, anon, anon_param_info, region_info) = if sub.is_named(self.tcx())
             && let Some(region_info) = self.tcx().is_suitable_region(self.generic_param_scope, sup)
             && let Some(anon_param_info) = self.find_param_with_region(sup, sub)
         {
             (sub, sup, anon_param_info, region_info)
-        } else if sup.has_name()
+        } else if sup.is_named(self.tcx())
             && let Some(region_info) = self.tcx().is_suitable_region(self.generic_param_scope, sub)
             && let Some(anon_param_info) = self.find_param_with_region(sub, sup)
         {
@@ -58,14 +58,10 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         let scope_def_id = region_info.scope;
         let is_impl_item = region_info.is_impl_item;
 
-        match anon_param_info.kind {
-            ty::LateParamRegionKind::Named(_, kw::UnderscoreLifetime)
-            | ty::LateParamRegionKind::Anon(_) => {}
-            _ => {
-                /* not an anonymous region */
-                debug!("try_report_named_anon_conflict: not an anonymous region");
-                return None;
-            }
+        if anon_param_info.kind.is_named(self.tcx()) {
+            /* not an anonymous region */
+            debug!("try_report_named_anon_conflict: not an anonymous region");
+            return None;
         }
 
         if is_impl_item {
@@ -78,7 +74,18 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         {
             return None;
         }
+        let orig_ty = anon_param_info.orig_param_ty;
+        // Don't suggest naming the outer lifetime when it already appears in the pointee
+        // (e.g. `&'a mut Buffer<'a>`); point at borrow splitting instead.
+        let suggestion_would_alias_lifetime =
+            if let ty::Ref(_, orig_inner_ty, ty::Mutability::Mut) = orig_ty.kind() {
+                self.tcx().any_free_region_meets(orig_inner_ty, |r| r == named)
+            } else {
+                false
+            };
+
         let named = named.to_string();
+        let new_ty_span = if suggestion_would_alias_lifetime { None } else { Some(new_ty_span) };
         let err = match param.pat.simple_ident() {
             Some(simple_ident) => ExplicitLifetimeRequired::WithIdent {
                 span,
@@ -86,8 +93,15 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                 named,
                 new_ty_span,
                 new_ty,
+                link_nomicon: suggestion_would_alias_lifetime,
             },
-            None => ExplicitLifetimeRequired::WithParamType { span, named, new_ty_span, new_ty },
+            None => ExplicitLifetimeRequired::WithParamType {
+                span,
+                named,
+                new_ty_span,
+                new_ty,
+                link_nomicon: suggestion_would_alias_lifetime,
+            },
         };
         Some(self.tcx().sess.dcx().create_err(err))
     }

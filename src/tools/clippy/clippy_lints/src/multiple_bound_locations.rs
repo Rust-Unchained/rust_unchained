@@ -6,7 +6,7 @@ use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::source::SpanExt;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -31,7 +31,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.78.0"]
     pub MULTIPLE_BOUND_LOCATIONS,
-    suspicious,
+    style,
     "defining generic bounds in multiple locations"
 }
 
@@ -47,7 +47,7 @@ impl EarlyLintPass for MultipleBoundLocations {
 
             for param in &generics.params {
                 if !param.bounds.is_empty() {
-                    generic_params_with_bounds.insert(param.ident.name.as_str(), param.ident.span);
+                    generic_params_with_bounds.insert(param.ident.as_str(), param.ident.span);
                 }
             }
             for clause in &generics.where_clause.predicates {
@@ -64,12 +64,11 @@ impl EarlyLintPass for MultipleBoundLocations {
                     },
                     WherePredicateKind::RegionPredicate(pred) => {
                         if !pred.bounds.is_empty()
-                            && let Some(bound_span) = generic_params_with_bounds.get(&pred.lifetime.ident.name.as_str())
+                            && let Some(bound_span) = generic_params_with_bounds.get(&pred.lifetime.ident.as_str())
                         {
                             emit_lint(cx, *bound_span, pred.lifetime.ident.span);
                         }
                     },
-                    WherePredicateKind::EqPredicate(_) => {},
                 }
             }
         }

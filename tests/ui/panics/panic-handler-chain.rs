@@ -1,9 +1,7 @@
 //@ run-pass
 //@ needs-unwind
 //@ needs-threads
-#![allow(stable_features)]
-
-#![feature(std_panic)]
+//@ ignore-backends: gcc
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::panic;

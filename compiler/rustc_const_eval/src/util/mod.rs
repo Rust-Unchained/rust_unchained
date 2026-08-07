@@ -6,7 +6,7 @@ mod check_validity_requirement;
 mod compare_types;
 mod type_name;
 
-pub use self::alignment::{is_disaligned, is_within_packed};
+pub use self::alignment::{most_packed_projection, place_unalignment};
 pub use self::check_validity_requirement::check_validity_requirement;
 pub(crate) use self::check_validity_requirement::validate_scalar_in_layout;
 pub use self::compare_types::{relate_types, sub_types};
@@ -36,5 +36,15 @@ pub fn binop_right_homogeneous(op: mir::BinOp) -> bool {
         | MulUnchecked | MulWithOverflow | Div | Rem | BitXor | BitAnd | BitOr | Eq | Ne | Lt
         | Le | Gt | Ge | Cmp => true,
         Offset | Shl | ShlUnchecked | Shr | ShrUnchecked => false,
+    }
+}
+
+/// Classify whether an operator is "homogeneous", i.e., the operand has the
+/// same type as the result.
+#[inline]
+pub fn unop_homogeneous(op: mir::UnOp) -> bool {
+    match op {
+        mir::UnOp::Not | mir::UnOp::Neg => true,
+        mir::UnOp::PtrMetadata => false,
     }
 }

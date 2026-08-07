@@ -2,9 +2,9 @@ use std::fmt;
 
 use hir::{DisplayTarget, Field, HirDisplay, Layout, Semantics, Type};
 use ide_db::{
+    RootDatabase,
     defs::Definition,
     helpers::{get_definition, pick_best_token},
-    RootDatabase,
 };
 use syntax::{AstNode, SyntaxKind};
 
@@ -83,7 +83,7 @@ pub(crate) fn view_memory_layout(
 ) -> Option<RecursiveMemoryLayout> {
     let sema = Semantics::new(db);
     let file = sema.parse_guess_edition(position.file_id);
-    let display_target = sema.first_crate_or_default(position.file_id).to_display_target(db);
+    let display_target = sema.first_crate(position.file_id)?.to_display_target(db);
     let token =
         pick_best_token(file.syntax().token_at_offset(position.offset), |kind| match kind {
             SyntaxKind::IDENT => 3,
@@ -107,8 +107,8 @@ pub(crate) fn view_memory_layout(
     fn read_layout(
         nodes: &mut Vec<MemoryLayoutNode>,
         db: &RootDatabase,
-        ty: &Type,
-        layout: &Layout,
+        ty: &Type<'_>,
+        layout: &Layout<'_>,
         parent_idx: usize,
         display_target: DisplayTarget,
     ) {
@@ -141,7 +141,7 @@ pub(crate) fn view_memory_layout(
             if let Ok(child_layout) = child_ty.layout(db) {
                 nodes.push(MemoryLayoutNode {
                     item_name: field.name(db),
-                    typename: child_ty.display(db, display_target).to_string(),
+                    typename: { child_ty.display(db, display_target).to_string() },
                     size: child_layout.size(),
                     alignment: child_layout.align(),
                     offset: match *field {
@@ -219,7 +219,7 @@ mod tests {
     ) -> Option<RecursiveMemoryLayout> {
         let (analysis, position, _) = fixture::annotations(ra_fixture);
 
-        view_memory_layout(&analysis.db, position)
+        hir::attach_db(&analysis.db, || view_memory_layout(&analysis.db, position))
     }
 
     #[test]

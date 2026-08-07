@@ -18,8 +18,10 @@
         target_os = "linux",
         target_os = "netbsd",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "openbsd",
         target_os = "fuchsia",
+        target_os = "managarm",
     ),
     link_section = ".init_array"
 )]

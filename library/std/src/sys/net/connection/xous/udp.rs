@@ -3,9 +3,10 @@ use core::sync::atomic::{Atomic, AtomicUsize, Ordering};
 
 use super::*;
 use crate::cell::Cell;
-use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use crate::os::xous::services;
 use crate::sync::Arc;
+use crate::sys::net::connection::each_addr;
 use crate::time::Duration;
 use crate::{fmt, io};
 
@@ -32,40 +33,45 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    pub fn bind(socketaddr: io::Result<&SocketAddr>) -> io::Result<UdpSocket> {
-        let addr = socketaddr?;
-        // Construct the request
-        let mut connect_request = ConnectRequest { raw: [0u8; 4096] };
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
+        return each_addr(addr, inner);
 
-        // Serialize the StdUdpBind structure. This is done "manually" because we don't want to
-        // make an auto-serdes (like bincode or rkyv) crate a dependency of Xous.
-        let port_bytes = addr.port().to_le_bytes();
-        connect_request.raw[0] = port_bytes[0];
-        connect_request.raw[1] = port_bytes[1];
-        match addr.ip() {
-            IpAddr::V4(addr) => {
-                connect_request.raw[2] = 4;
-                for (dest, src) in connect_request.raw[3..].iter_mut().zip(addr.octets()) {
-                    *dest = src;
+        fn inner(addr: &SocketAddr) -> io::Result<UdpSocket> {
+            // Construct the request
+            let mut connect_request = ConnectRequest { raw: [0u8; 4096] };
+
+            // Serialize the StdUdpBind structure. This is done "manually" because we don't want to
+            // make an auto-serdes (like bincode or rkyv) crate a dependency of Xous.
+            let port_bytes = addr.port().to_le_bytes();
+            connect_request.raw[0] = port_bytes[0];
+            connect_request.raw[1] = port_bytes[1];
+            match addr.ip() {
+                IpAddr::V4(addr) => {
+                    connect_request.raw[2] = 4;
+                    for (dest, src) in connect_request.raw[3..].iter_mut().zip(addr.octets()) {
+                        *dest = src;
+                    }
+                }
+                IpAddr::V6(addr) => {
+                    connect_request.raw[2] = 6;
+                    for (dest, src) in connect_request.raw[3..].iter_mut().zip(addr.octets()) {
+                        *dest = src;
+                    }
                 }
             }
-            IpAddr::V6(addr) => {
-                connect_request.raw[2] = 6;
-                for (dest, src) in connect_request.raw[3..].iter_mut().zip(addr.octets()) {
-                    *dest = src;
-                }
-            }
-        }
 
-        let response = crate::os::xous::ffi::lend_mut(
-            services::net_server(),
-            services::NetLendMut::StdUdpBind.into(),
-            &mut connect_request.raw,
-            0,
-            4096,
-        );
+            let response = crate::os::xous::ffi::lend_mut(
+                services::net_server(),
+                services::NetLendMut::StdUdpBind.into(),
+                &mut connect_request.raw,
+                0,
+                4096,
+            );
 
-        if let Ok((_, valid)) = response {
+            let Ok((_, valid)) = response else {
+                return Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid response"));
+            };
+
             // The first four bytes should be zero upon success, and will be nonzero
             // for an error.
             let response = connect_request.raw;
@@ -87,8 +93,9 @@ impl UdpSocket {
                     ));
                 }
             }
+
             let fd = response[1] as u16;
-            return Ok(UdpSocket {
+            Ok(UdpSocket {
                 fd,
                 local: *addr,
                 remote: Cell::new(None),
@@ -96,9 +103,8 @@ impl UdpSocket {
                 write_timeout: Cell::new(0),
                 handle_count: Arc::new(AtomicUsize::new(1)),
                 nonblocking: Cell::new(false),
-            });
+            })
         }
-        Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid response"))
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -139,12 +145,13 @@ impl UdpSocket {
             0,
         ) {
             if receive_request.raw[0] != 0 {
-                // error case
-                if receive_request.raw[1] == NetError::TimedOut as u8 {
+                // Error case — code lives at byte 4 (where `send_message`
+                // also reads it). Byte 1 is part of the marker header.
+                if receive_request.raw[4] == NetError::TimedOut as u8 {
                     return Err(io::const_error!(io::ErrorKind::TimedOut, "recv timed out"));
-                } else if receive_request.raw[1] == NetError::WouldBlock as u8 {
+                } else if receive_request.raw[4] == NetError::WouldBlock as u8 {
                     return Err(io::const_error!(io::ErrorKind::WouldBlock, "recv would block"));
-                } else if receive_request.raw[1] == NetError::LibraryError as u8 {
+                } else if receive_request.raw[4] == NetError::LibraryError as u8 {
                     return Err(io::const_error!(io::ErrorKind::Other, "library error"));
                 } else {
                     return Err(io::const_error!(io::ErrorKind::Other, "library error"));
@@ -172,10 +179,12 @@ impl UdpSocket {
                 } else {
                     return Err(io::const_error!(io::ErrorKind::Other, "library error"));
                 };
-                for (&s, d) in rr[22..22 + rxlen as usize].iter().zip(buf.iter_mut()) {
-                    *d = s;
-                }
-                Ok((rxlen as usize, addr))
+                let max = (rxlen as usize).min(buf.len()).min(rr.len() - 22);
+                // Both sides must be sliced: `max` is shorter than `buf` whenever
+                // the datagram doesn't fill it, and `copy_from_slice` panics on a
+                // length mismatch.
+                buf[..max].copy_from_slice(&rr[22..][..max]);
+                Ok((max, addr))
             }
         } else {
             Err(io::const_error!(io::ErrorKind::InvalidInput, "unable to recv"))
@@ -198,10 +207,11 @@ impl UdpSocket {
         self.peek_from(buf).map(|(len, _addr)| len)
     }
 
-    pub fn connect(&self, maybe_addr: io::Result<&SocketAddr>) -> io::Result<()> {
-        let addr = maybe_addr?;
-        self.remote.set(Some(*addr));
-        Ok(())
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+        each_addr(addr, |addr| {
+            self.remote.set(Some(*addr));
+            Ok(())
+        })
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -233,13 +243,12 @@ impl UdpSocket {
                 }
             }
         }
-        let len = buf.len() as u16;
-        let len_bytes = len.to_le_bytes();
+        let header_len = 21;
+        let len = buf.len().min(tx_req.raw.len() - header_len);
+        let len_bytes = (len as u16).to_le_bytes();
         tx_req.raw[19] = len_bytes[0];
         tx_req.raw[20] = len_bytes[1];
-        for (&s, d) in buf.iter().zip(tx_req.raw[21..].iter_mut()) {
-            *d = s;
-        }
+        tx_req.raw[header_len..header_len + len].copy_from_slice(&buf[..len]);
 
         // let buf = unsafe {
         //     xous::MemoryRange::new(
@@ -298,7 +307,7 @@ impl UdpSocket {
                         }
                     } else {
                         // no error
-                        return Ok(len as usize);
+                        return Ok(len);
                     }
                 }
                 Err(crate::os::xous::ffi::Error::ServerQueueFull) => {

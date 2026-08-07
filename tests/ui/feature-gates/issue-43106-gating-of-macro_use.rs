@@ -5,6 +5,8 @@
 
 #![macro_use(my_macro)]
 //~^ ERROR arguments to `macro_use` are not allowed here
+//~| WARN cannot be used on
+//~| WARN previously accepted
 
 #[macro_use(my_macro)]
 //~^ ERROR arguments to `macro_use` are not allowed here
@@ -13,13 +15,21 @@ mod macro_escape {
     //~^ ERROR arguments to `macro_use` are not allowed here
 
     #[macro_use = "2700"] struct S;
-    //~^ ERROR malformed `macro_use` attribute
+    //~^ ERROR malformed
+    //~| WARN cannot be used on
+    //~| WARN previously accepted
 
     #[macro_use] fn f() { }
+    //~^ WARN cannot be used on
+    //~| WARN previously accepted
 
     #[macro_use] type T = S;
+    //~^ WARN cannot be used on
+    //~| WARN previously accepted
 
     #[macro_use] impl S { }
+    //~^ WARN cannot be used on
+    //~| WARN previously accepted
 }
 
 fn main() { }

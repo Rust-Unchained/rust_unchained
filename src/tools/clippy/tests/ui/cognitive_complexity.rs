@@ -1,5 +1,5 @@
 #![warn(clippy::cognitive_complexity)]
-#![allow(
+#![expect(
     clippy::eq_op,
     clippy::needless_borrows_for_generic_args,
     clippy::needless_return,
@@ -470,5 +470,30 @@ mod issue14422 {
         }
         return;
         return;
+    }
+}
+
+#[clippy::cognitive_complexity = "1"]
+mod attribute_stacking {
+    fn bad() {
+        //~^ cognitive_complexity
+        if true {
+            println!("a");
+        }
+    }
+
+    #[clippy::cognitive_complexity = "2"]
+    fn ok() {
+        if true {
+            println!("a");
+        }
+    }
+
+    // should revert to cognitive_complexity = "1"
+    fn bad_again() {
+        //~^ cognitive_complexity
+        if true {
+            println!("a");
+        }
     }
 }

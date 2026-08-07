@@ -6,9 +6,9 @@
 use bitflags::bitflags;
 
 use crate::{
+    MacroId, ModuleDefId,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs},
     visibility::Visibility,
-    MacroId, ModuleDefId,
 };
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
@@ -35,9 +35,20 @@ pub struct Item<Def, Import = ImportId> {
     pub import: Option<Import>,
 }
 
+impl<Def: PartialEq, Import: Copy + PartialEq> Item<Def, Import> {
+    /// Whether `import` is the same import that produced `self`, now resolving to a different
+    /// `def`. This happens when an import is first recorded as an indeterminate resolution
+    /// (e.g. only one namespace was available at the time) and later re-resolves to another
+    /// def, such as an explicit import that shadows a glob only after the glob has been seen.
+    pub(crate) fn is_reresolved_by(&self, def: &Def, import: Option<Import>) -> bool {
+        import.is_some() && self.import == import && self.def != *def
+    }
+}
+
 pub type TypesItem = Item<ModuleDefId, ImportOrExternCrate>;
 pub type ValuesItem = Item<ModuleDefId, ImportOrGlob>;
-pub type MacrosItem = Item<MacroId, ImportOrGlob>;
+// May be Externcrate for `[macro_use]`'d macros
+pub type MacrosItem = Item<MacroId, ImportOrExternCrate>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct PerNs {
@@ -84,7 +95,7 @@ impl PerNs {
         }
     }
 
-    pub fn macros(def: MacroId, vis: Visibility, import: Option<ImportOrGlob>) -> PerNs {
+    pub fn macros(def: MacroId, vis: Visibility, import: Option<ImportOrExternCrate>) -> PerNs {
         PerNs { types: None, values: None, macros: Some(Item { def, vis, import }) }
     }
 
@@ -108,16 +119,16 @@ impl PerNs {
         self.values.map(|it| it.def)
     }
 
-    pub fn take_values_import(self) -> Option<(ModuleDefId, Option<ImportOrGlob>)> {
-        self.values.map(|it| (it.def, it.import))
+    pub fn take_values_full(self) -> Option<ValuesItem> {
+        self.values
     }
 
     pub fn take_macros(self) -> Option<MacroId> {
         self.macros.map(|it| it.def)
     }
 
-    pub fn take_macros_import(self) -> Option<(MacroId, Option<ImportOrGlob>)> {
-        self.macros.map(|it| (it.def, it.import))
+    pub fn take_macros_full(self) -> Option<MacrosItem> {
+        self.macros
     }
 
     pub fn filter_visibility(self, mut f: impl FnMut(Visibility) -> bool) -> PerNs {
@@ -146,11 +157,7 @@ impl PerNs {
     }
 
     pub fn or_else(self, f: impl FnOnce() -> PerNs) -> PerNs {
-        if self.is_full() {
-            self
-        } else {
-            self.or(f())
-        }
+        if self.is_full() { self } else { self.or(f()) }
     }
 
     pub fn iter_items(self) -> impl Iterator<Item = (ItemInNs, Option<ImportOrExternCrate>)> {
@@ -162,9 +169,6 @@ impl PerNs {
                 self.values
                     .map(|it| (ItemInNs::Values(it.def), it.import.map(ImportOrExternCrate::from))),
             )
-            .chain(
-                self.macros
-                    .map(|it| (ItemInNs::Macros(it.def), it.import.map(ImportOrExternCrate::from))),
-            )
+            .chain(self.macros.map(|it| (ItemInNs::Macros(it.def), it.import)))
     }
 }

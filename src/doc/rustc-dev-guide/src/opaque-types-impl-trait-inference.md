@@ -5,7 +5,7 @@ This kind of type inference is particularly complex because,
 unlike other kinds of type inference,
 it can work across functions and function bodies.
 
-[hidden type]: ./borrow_check/region_inference/member_constraints.html?highlight=%22hidden%20type%22#member-constraints
+[hidden type]: ./borrow-check/region-inference/member-constraints.html?highlight=%22hidden%20type%22#member-constraints
 [opaque type]: ./opaque-types-type-alias-impl-trait.md
 
 ## Running example
@@ -13,13 +13,16 @@ it can work across functions and function bodies.
 To help explain how it works, let's consider an example.
 
 ```rust
+#![feature(type_alias_impl_trait)]
 mod m {
     pub type Seq<T> = impl IntoIterator<Item = T>;
 
+    #[define_opaque(Seq)]
     pub fn produce_singleton<T>(t: T) -> Seq<T> {
         vec![t]
     }
 
+    #[define_opaque(Seq)]
     pub fn produce_doubleton<T>(t: T, u: T) -> Seq<T> {
         vec![t, u]
     }

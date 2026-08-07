@@ -1,5 +1,5 @@
 #![warn(clippy::expect_used)]
-#![allow(clippy::unnecessary_literal_unwrap)]
+#![expect(clippy::unnecessary_literal_unwrap)]
 
 fn expect_option() {
     let opt = Some(0);
@@ -16,7 +16,22 @@ fn expect_result() {
     //~^ expect_used
 }
 
-fn main() {
-    expect_option();
-    expect_result();
+#[allow(clippy::ok_expect)]
+#[allow(clippy::err_expect)]
+fn issue_15247() {
+    let x: Result<u8, u8> = Err(0);
+    x.ok().expect("Huh");
+    //~^ expect_used
+
+    { x.ok() }.expect("...");
+    //~^ expect_used
+
+    let y: Result<u8, u8> = Ok(0);
+    y.err().expect("Huh");
+    //~^ expect_used
+
+    { y.err() }.expect("...");
+    //~^ expect_used
 }
+
+fn main() {}

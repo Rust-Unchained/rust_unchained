@@ -24,8 +24,7 @@
 //! CFG_RELEASE="0.0.0" cargo +nightly expand > /tmp/rustc_span.rs
 //! ```
 
-use std::collections::HashMap;
-
+use indexmap::IndexMap;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::parse::{Parse, ParseStream, Result};
@@ -148,12 +147,12 @@ struct Predefined {
 }
 
 struct Entries {
-    map: HashMap<String, Predefined>,
+    map: IndexMap<String, Predefined>,
 }
 
 impl Entries {
     fn with_capacity(capacity: usize) -> Self {
-        Entries { map: HashMap::with_capacity(capacity) }
+        Entries { map: IndexMap::with_capacity(capacity) }
     }
 
     fn insert(&mut self, span: Span, s: &str, errors: &mut Errors) -> u32 {
@@ -189,18 +188,14 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     let mut keyword_stream = quote! {};
     let mut symbols_stream = quote! {};
     let mut prefill_stream = quote! {};
-    let mut entries = Entries::with_capacity(input.keywords.len() + input.symbols.len() + 10);
-    let mut prev_key: Option<(Span, String)> = None;
-
-    let mut check_order = |span: Span, s: &str, errors: &mut Errors| {
-        if let Some((prev_span, ref prev_str)) = prev_key {
-            if s < prev_str {
-                errors.error(span, format!("Symbol `{s}` must precede `{prev_str}`"));
-                errors.error(prev_span, format!("location of previous symbol `{prev_str}`"));
-            }
-        }
-        prev_key = Some((span, s.to_string()));
-    };
+    let prefill_ints = 0..=9;
+    let prefill_letters = ('A'..='Z').chain('a'..='z');
+    let mut entries = Entries::with_capacity(
+        input.keywords.len()
+            + input.symbols.len()
+            + prefill_ints.clone().count()
+            + prefill_letters.clone().count(),
+    );
 
     // Generate the listed keywords.
     for keyword in input.keywords.iter() {
@@ -219,7 +214,6 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     // Generate the listed symbols.
     for symbol in input.symbols.iter() {
         let name = &symbol.name;
-        check_order(symbol.name.span(), &name.to_string(), &mut errors);
 
         let value = match &symbol.value {
             Value::SameAsName => name.to_string(),
@@ -246,12 +240,11 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
         });
     }
 
-    // Generate symbols for the strings "0", "1", ..., "9".
-    for n in 0..10 {
-        let n = n.to_string();
-        entries.insert(Span::call_site(), &n, &mut errors);
+    // Generate symbols for ascii letters and digits
+    for s in prefill_ints.map(|n| n.to_string()).chain(prefill_letters.map(|c| c.to_string())) {
+        entries.insert(Span::call_site(), &s, &mut errors);
         prefill_stream.extend(quote! {
-            #n,
+            #s,
         });
     }
 
@@ -271,7 +264,9 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
             break;
         }
 
-        let value = match proc_macro::tracked_env::var(env_var.value()) {
+        let tracked_env = proc_macro::tracked::env_var(env_var.value());
+
+        let value = match tracked_env {
             Ok(value) => value,
             Err(err) => {
                 errors.list.push(syn::Error::new_spanned(expr, err));
@@ -295,11 +290,15 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     }
 
     let symbol_digits_base = entries.map["0"].idx;
+    let symbol_uppercase_letters_base = entries.map["A"].idx;
+    let symbol_lowercase_letters_base = entries.map["a"].idx;
     let predefined_symbols_count = entries.len();
     let output = quote! {
         const SYMBOL_DIGITS_BASE: u32 = #symbol_digits_base;
+        const SYMBOL_UPPERCASE_LETTERS_BASE: u32 = #symbol_uppercase_letters_base;
+        const SYMBOL_LOWERCASE_LETTERS_BASE: u32 = #symbol_lowercase_letters_base;
 
-        /// The number of predefined symbols; this is the the first index for
+        /// The number of predefined symbols; this is the first index for
         /// extra pre-interned symbols in an Interner created via
         /// [`Interner::with_extra_symbols`].
         pub const PREDEFINED_SYMBOLS_COUNT: u32 = #predefined_symbols_count;

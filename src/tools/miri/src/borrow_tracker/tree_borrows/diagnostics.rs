@@ -4,10 +4,10 @@ use std::ops::Range;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_span::{Span, SpanData};
 
-use crate::borrow_tracker::ProtectorKind;
 use crate::borrow_tracker::tree_borrows::perms::{PermTransition, Permission};
 use crate::borrow_tracker::tree_borrows::tree::LocationState;
 use crate::borrow_tracker::tree_borrows::unimap::UniIndex;
+use crate::borrow_tracker::{AccessKind, ProtectorKind};
 use crate::*;
 
 /// Cause of an access: either a real access or one
@@ -15,7 +15,7 @@ use crate::*;
 #[derive(Clone, Copy, Debug)]
 pub enum AccessCause {
     Explicit(AccessKind),
-    Reborrow,
+    Reborrow(AccessKind),
     Dealloc,
     FnExit(AccessKind),
 }
@@ -24,7 +24,7 @@ impl fmt::Display for AccessCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Explicit(kind) => write!(f, "{kind}"),
-            Self::Reborrow => write!(f, "reborrow"),
+            Self::Reborrow(_) => write!(f, "reborrow"),
             Self::Dealloc => write!(f, "deallocation"),
             // This is dead code, since the protector release access itself can never
             // cause UB (while the protector is active, if some other access invalidates
@@ -40,7 +40,7 @@ impl AccessCause {
         let rel = if is_foreign { "foreign" } else { "child" };
         match self {
             Self::Explicit(kind) => format!("{rel} {kind}"),
-            Self::Reborrow => format!("reborrow (acting as a {rel} read access)"),
+            Self::Reborrow(kind) => format!("reborrow (acting as a {rel} {kind})"),
             Self::Dealloc => format!("deallocation (acting as a {rel} write access)"),
             Self::FnExit(kind) => format!("protector release (acting as a {rel} {kind})"),
         }
@@ -77,6 +77,32 @@ pub struct Event {
     pub span: Span,
 }
 
+/// Diagnostics data about the current access and the location we are accessing.
+/// Used to create history events and errors.
+#[derive(Clone, Debug)]
+pub struct DiagnosticInfo {
+    pub alloc_id: AllocId,
+    pub span: Span,
+    /// The range the diagnostic actually applies to.
+    /// This is always a subset of `access_range`.
+    pub transition_range: Range<u64>,
+    /// The range the access is happening to. Is `None` if this is the protector release access
+    pub access_range: Option<AllocRange>,
+    pub access_cause: AccessCause,
+}
+impl DiagnosticInfo {
+    /// Creates a history event.
+    pub fn create_event(&self, transition: PermTransition, is_foreign: bool) -> Event {
+        Event {
+            transition,
+            is_foreign,
+            access_cause: self.access_cause,
+            access_range: self.access_range,
+            transition_range: self.transition_range.clone(),
+            span: self.span,
+        }
+    }
+}
 /// List of all events that affected a tag.
 /// NOTE: not all of these events are relevant for a particular location,
 /// the events should be filtered before the generation of diagnostics.
@@ -131,7 +157,7 @@ impl HistoryData {
             // to the user. The meaningful one is `access_range`.
             let access = access_cause.print_as_access(is_foreign);
             let access_range_text = match access_range {
-                Some(r) => format!("at offsets {r:?}"),
+                Some(r) => format!("at offsets {r}"),
                 None => format!("on every location previously accessed by this tag"),
             };
             self.events.push((
@@ -179,7 +205,7 @@ impl NodeDebugInfo {
     /// Add a name to the tag. If a same tag is associated to several pointers,
     /// it can have several names which will be separated by commas.
     pub fn add_name(&mut self, name: &str) {
-        if let Some(ref mut prev_name) = &mut self.name {
+        if let Some(prev_name) = &mut self.name {
             prev_name.push_str(", ");
             prev_name.push_str(name);
         } else {
@@ -244,8 +270,8 @@ pub(super) enum TransitionError {
     ChildAccessForbidden(Permission),
     /// A protector was triggered due to an invalid transition that loses
     /// too much permissions.
-    /// For example, if a protected tag goes from `Active` to `Disabled` due
-    /// to a foreign write this will produce a `ProtectedDisabled(Active)`.
+    /// For example, if a protected tag goes from `Unique` to `Disabled` due
+    /// to a foreign write this will produce a `ProtectedDisabled(Unique)`.
     /// This kind of error can only occur on foreign accesses.
     ProtectedDisabled(Permission),
     /// Cannot deallocate because some tag in the allocation is strongly protected.
@@ -280,34 +306,41 @@ impl History {
 pub(super) struct TbError<'node> {
     /// What failure occurred.
     pub error_kind: TransitionError,
-    /// The allocation in which the error is happening.
-    pub alloc_id: AllocId,
-    /// The offset (into the allocation) at which the conflict occurred.
-    pub error_offset: u64,
+    /// Diagnostic data about the access that caused the error.
+    pub access_info: &'node DiagnosticInfo,
     /// The tag on which the error was triggered.
     /// On protector violations, this is the tag that was protected.
     /// On accesses rejected due to insufficient permissions, this is the
     /// tag that lacked those permissions.
-    pub conflicting_info: &'node NodeDebugInfo,
-    // What kind of access caused this error (read, write, reborrow, deallocation)
-    pub access_cause: AccessCause,
-    /// Which tag the access that caused this error was made through, i.e.
+    pub conflicting_node_info: &'node NodeDebugInfo,
+    /// Which tag, if any, the access that caused this error was made through, i.e.
     /// which tag was used to read/write/deallocate.
-    pub accessed_info: &'node NodeDebugInfo,
+    /// Not set on wildcard accesses.
+    pub accessed_node_info: Option<&'node NodeDebugInfo>,
 }
 
 impl TbError<'_> {
     /// Produce a UB error.
     pub fn build<'tcx>(self) -> InterpErrorKind<'tcx> {
         use TransitionError::*;
-        let cause = self.access_cause;
-        let accessed = self.accessed_info;
-        let conflicting = self.conflicting_info;
-        let accessed_is_conflicting = accessed.tag == conflicting.tag;
+        let cause = self.access_info.access_cause;
+        let error_offset = self.access_info.transition_range.start;
+        let accessed = self.accessed_node_info;
+        let accessed_str =
+            self.accessed_node_info.map(|v| format!("{v}")).unwrap_or_else(|| "<wildcard>".into());
+        let conflicting = self.conflicting_node_info;
+        // An access is considered conflicting if it happened through a
+        // different tag than the one who caused UB.
+        // When doing a wildcard access (where `accessed` is `None`) we
+        // do not know which precise tag the accessed happened from,
+        // however we can be certain that it did not come from the
+        // conflicting tag.
+        // This is because the wildcard data structure already removes
+        // all tags through which an access would cause UB.
+        let accessed_is_conflicting = accessed.map(|a| a.tag) == Some(conflicting.tag);
         let title = format!(
-            "{cause} through {accessed} at {alloc_id:?}[{offset:#x}] is forbidden",
-            alloc_id = self.alloc_id,
-            offset = self.error_offset
+            "{cause} through {accessed_str} at {alloc_id}[{error_offset:#x}] is forbidden",
+            alloc_id = self.access_info.alloc_id
         );
         let (title, details, conflicting_tag_name) = match self.error_kind {
             ChildAccessForbidden(perm) => {
@@ -316,7 +349,7 @@ impl TbError<'_> {
                 let mut details = Vec::new();
                 if !accessed_is_conflicting {
                     details.push(format!(
-                        "the accessed tag {accessed} is a child of the conflicting tag {conflicting}"
+                        "the accessed tag {accessed_str} is a child of the conflicting tag {conflicting}"
                     ));
                 }
                 let access = cause.print_as_access(/* is_foreign */ false);
@@ -330,7 +363,7 @@ impl TbError<'_> {
                 let access = cause.print_as_access(/* is_foreign */ true);
                 let details = vec![
                     format!(
-                        "the accessed tag {accessed} is foreign to the {conflicting_tag_name} tag {conflicting} (i.e., it is not a child)"
+                        "the accessed tag {accessed_str} is foreign to the {conflicting_tag_name} tag {conflicting} (i.e., it is not a child)"
                     ),
                     format!(
                         "this {access} would cause the {conflicting_tag_name} tag {conflicting} (currently {before_disabled}) to become Disabled"
@@ -343,7 +376,7 @@ impl TbError<'_> {
                 let conflicting_tag_name = "strongly protected";
                 let details = vec![
                     format!(
-                        "the allocation of the accessed tag {accessed} also contains the {conflicting_tag_name} tag {conflicting}"
+                        "the allocation of the accessed tag {accessed_str} also contains the {conflicting_tag_name} tag {conflicting}"
                     ),
                     format!("the {conflicting_tag_name} tag {conflicting} disallows deallocations"),
                 ];
@@ -351,16 +384,32 @@ impl TbError<'_> {
             }
         };
         let mut history = HistoryData::default();
-        if !accessed_is_conflicting {
-            history.extend(self.accessed_info.history.forget(), "accessed", false);
+        if let Some(accessed_info) = self.accessed_node_info
+            && !accessed_is_conflicting
+        {
+            history.extend(accessed_info.history.forget(), "accessed", false);
         }
         history.extend(
-            self.conflicting_info.history.extract_relevant(self.error_offset, self.error_kind),
+            self.conflicting_node_info.history.extract_relevant(error_offset, self.error_kind),
             conflicting_tag_name,
             true,
         );
         err_machine_stop!(TerminationInfo::TreeBorrowsUb { title, details, history })
     }
+}
+
+/// Cannot access this allocation with wildcard provenance, as there are no
+/// valid exposed references for this access kind.
+pub fn no_valid_exposed_references_error<'tcx>(
+    DiagnosticInfo { alloc_id, transition_range, access_cause, .. }: &DiagnosticInfo,
+) -> InterpErrorKind<'tcx> {
+    let title = format!(
+        "{access_cause} through <wildcard> at {alloc_id:?}[{offset:#x}] is forbidden",
+        offset = transition_range.start
+    );
+    let details = vec![format!("there are no exposed tags which may perform this access here")];
+    let history = HistoryData::default();
+    err_machine_stop!(TerminationInfo::TreeBorrowsUb { title, details, history })
 }
 
 type S = &'static str;
@@ -407,7 +456,7 @@ struct DisplayFmtWrapper {
 /// will show each permission line as
 /// ```text
 /// 0.. 1.. 2.. 3.. 4.. 5
-/// [Act|Res|Frz|Dis|___]
+/// [Unq|Res|Frz|Dis|___]
 /// ```
 struct DisplayFmtPermission {
     /// Text that starts the permission block.
@@ -418,7 +467,7 @@ struct DisplayFmtPermission {
     close: S,
     /// Text to show when a permission is not initialized.
     /// Should have the same width as a `Permission`'s `.short_name()`, i.e.
-    /// 3 if using the `Res/Act/Frz/Dis` notation.
+    /// 3 if using the `Res/Unq/Frz/Dis` notation.
     uninit: S,
     /// Text to separate the `start` and `end` values of a range.
     range_sep: S,
@@ -461,6 +510,8 @@ struct DisplayFmtPadding {
     indent_middle: S,
     /// Indentation for the last child.
     indent_last: S,
+    /// Replaces `join_last` for a wildcard root.
+    wildcard_root: S,
 }
 /// How to show whether a location has been accessed
 ///
@@ -474,7 +525,7 @@ struct DisplayFmtPadding {
 /// ```
 /// will show states as
 /// ```text
-///  Act
+///  Unq
 /// ?Res
 /// ____
 /// ```
@@ -498,13 +549,13 @@ struct DisplayFmt {
 }
 impl DisplayFmt {
     /// Print the permission with the format
-    /// ` Res`/` Re*`/` Act`/` Frz`/` Dis` for accessed locations
-    /// and `?Res`/`?Re*`/`?Act`/`?Frz`/`?Dis` for unaccessed locations.
+    /// ` Res`/` Re*`/` Unq`/` Frz`/` Dis` for accessed locations
+    /// and `?Res`/`?Re*`/`?Unq`/`?Frz`/`?Dis` for unaccessed locations.
     fn print_perm(&self, perm: Option<LocationState>) -> String {
         if let Some(perm) = perm {
             format!(
                 "{ac}{st}",
-                ac = if perm.is_initialized() { self.accessed.yes } else { self.accessed.no },
+                ac = if perm.accessed() { self.accessed.yes } else { self.accessed.no },
                 st = perm.permission().short_name(),
             )
         } else {
@@ -533,6 +584,11 @@ impl DisplayFmt {
                 }
             })
             .unwrap_or("")
+    }
+
+    /// Print extra text if the tag is exposed.
+    fn print_exposed(&self, exposed: bool) -> S {
+        if exposed { " (exposed)" } else { "" }
     }
 }
 
@@ -580,23 +636,21 @@ fn char_repeat(c: char, n: usize) -> String {
 struct DisplayRepr {
     tag: BorTag,
     name: Option<String>,
+    exposed: bool,
     rperm: Vec<Option<LocationState>>,
     children: Vec<DisplayRepr>,
 }
 
 impl DisplayRepr {
-    fn from(tree: &Tree, show_unnamed: bool) -> Option<Self> {
+    fn from(tree: &Tree, root: UniIndex, show_unnamed: bool) -> Option<Self> {
         let mut v = Vec::new();
-        extraction_aux(tree, tree.root, show_unnamed, &mut v);
+        extraction_aux(tree, root, show_unnamed, &mut v);
         let Some(root) = v.pop() else {
             if show_unnamed {
                 unreachable!(
                     "This allocation contains no tags, not even a root. This should not happen."
                 );
             }
-            eprintln!(
-                "This allocation does not contain named tags. Use `miri_print_borrow_state(_, true)` to also print unnamed tags."
-            );
             return None;
         };
         assert!(v.is_empty());
@@ -610,6 +664,7 @@ impl DisplayRepr {
         ) {
             let node = tree.nodes.get(idx).unwrap();
             let name = node.debug_info.name.clone();
+            let exposed = node.is_exposed;
             let children_sorted = {
                 let mut children = node.children.iter().cloned().collect::<Vec<_>>();
                 children.sort_by_key(|idx| tree.nodes.get(*idx).unwrap().tag);
@@ -623,10 +678,10 @@ impl DisplayRepr {
             } else {
                 // We take this node
                 let rperm = tree
-                    .rperms
+                    .locations
                     .iter_all()
-                    .map(move |(_offset, perms)| {
-                        let perm = perms.get(idx);
+                    .map(move |(_offset, loc)| {
+                        let perm = loc.perms.get(idx);
                         perm.cloned()
                     })
                     .collect::<Vec<_>>();
@@ -634,12 +689,13 @@ impl DisplayRepr {
                 for child_idx in children_sorted {
                     extraction_aux(tree, child_idx, show_unnamed, &mut children);
                 }
-                acc.push(DisplayRepr { tag: node.tag, name, rperm, children });
+                acc.push(DisplayRepr { tag: node.tag, name, rperm, children, exposed });
             }
         }
     }
     fn print(
-        &self,
+        main_root: &Option<DisplayRepr>,
+        wildcard_subtrees: &[DisplayRepr],
         fmt: &DisplayFmt,
         indenter: &mut DisplayIndent,
         protected_tags: &FxHashMap<BorTag, ProtectorKind>,
@@ -676,15 +732,41 @@ impl DisplayRepr {
             block.push(s);
         }
         // This is the actual work
-        print_aux(
-            self,
-            &range_padding,
-            fmt,
-            indenter,
-            protected_tags,
-            true, /* root _is_ the last child */
-            &mut block,
-        );
+        if let Some(root) = main_root {
+            print_aux(
+                root,
+                &range_padding,
+                fmt,
+                indenter,
+                protected_tags,
+                true,  /* root _is_ the last child */
+                false, /* not a wildcard_root*/
+                &mut block,
+            );
+        }
+        for tree in wildcard_subtrees.iter() {
+            let mut gap_line = String::new();
+            gap_line.push_str(fmt.perm.open);
+            for (i, &pad) in range_padding.iter().enumerate() {
+                if i > 0 {
+                    gap_line.push_str(fmt.perm.sep);
+                }
+                gap_line.push_str(&format!("{}{}", char_repeat(' ', pad), "     "));
+            }
+            gap_line.push_str(fmt.perm.close);
+            block.push(gap_line);
+
+            print_aux(
+                tree,
+                &range_padding,
+                fmt,
+                indenter,
+                protected_tags,
+                true, /* root _is_ the last child */
+                true, /* wildcard_root*/
+                &mut block,
+            );
+        }
         // Then it's just prettifying it with a border of dashes.
         {
             let wr = &fmt.wrapper;
@@ -714,11 +796,12 @@ impl DisplayRepr {
             indent: &mut DisplayIndent,
             protected_tags: &FxHashMap<BorTag, ProtectorKind>,
             is_last_child: bool,
+            is_wildcard_root: bool,
             acc: &mut Vec<String>,
         ) {
             let mut line = String::new();
             // Format the permissions on each range.
-            // Looks like `| Act| Res| Res| Act|`.
+            // Looks like `| Unq| Res| Res| Unq|`.
             line.push_str(fmt.perm.open);
             for (i, (perm, &pad)) in tree.rperm.iter().zip(padding.iter()).enumerate() {
                 if i > 0 {
@@ -733,7 +816,9 @@ impl DisplayRepr {
             indent.write(&mut line);
             {
                 // padding
-                line.push_str(if is_last_child {
+                line.push_str(if is_wildcard_root {
+                    fmt.padding.wildcard_root
+                } else if is_last_child {
                     fmt.padding.join_last
                 } else {
                     fmt.padding.join_middle
@@ -750,12 +835,22 @@ impl DisplayRepr {
             line.push_str(&fmt.print_tag(tree.tag, &tree.name));
             let protector = protected_tags.get(&tree.tag);
             line.push_str(fmt.print_protector(protector));
+            line.push_str(fmt.print_exposed(tree.exposed));
             // Push the line to the accumulator then recurse.
             acc.push(line);
             let nb_children = tree.children.len();
             for (i, child) in tree.children.iter().enumerate() {
                 indent.increment(fmt, is_last_child);
-                print_aux(child, padding, fmt, indent, protected_tags, i + 1 == nb_children, acc);
+                print_aux(
+                    child,
+                    padding,
+                    fmt,
+                    indent,
+                    protected_tags,
+                    /* is_last_child */ i + 1 == nb_children,
+                    /* is_wildcard_root */ false,
+                    acc,
+                );
                 indent.decrement(fmt);
             }
         }
@@ -776,6 +871,7 @@ const DEFAULT_FORMATTER: DisplayFmt = DisplayFmt {
         indent_last: "  ",
         join_haschild: "┬",
         join_default: "─",
+        wildcard_root: "*",
     },
     accessed: DisplayFmtAccess { yes: " ", no: "?", meh: "-" },
 };
@@ -788,16 +884,28 @@ impl<'tcx> Tree {
         show_unnamed: bool,
     ) -> InterpResult<'tcx> {
         let mut indenter = DisplayIndent::new();
-        let ranges = self.rperms.iter_all().map(|(range, _perms)| range).collect::<Vec<_>>();
-        if let Some(repr) = DisplayRepr::from(self, show_unnamed) {
-            repr.print(
-                &DEFAULT_FORMATTER,
-                &mut indenter,
-                protected_tags,
-                ranges,
-                /* print warning message about tags not shown */ !show_unnamed,
+        let ranges = self.locations.iter_all().map(|(range, _loc)| range).collect::<Vec<_>>();
+        let main_tree = DisplayRepr::from(self, self.roots[0], show_unnamed);
+        let wildcard_subtrees = self.roots[1..]
+            .iter()
+            .filter_map(|root| DisplayRepr::from(self, *root, show_unnamed))
+            .collect::<Vec<_>>();
+
+        if main_tree.is_none() && wildcard_subtrees.is_empty() {
+            eprintln!(
+                "This allocation does not contain named tags. Use `miri_print_borrow_state(_, true)` to also print unnamed tags."
             );
         }
+
+        DisplayRepr::print(
+            &main_tree,
+            wildcard_subtrees.as_slice(),
+            &DEFAULT_FORMATTER,
+            &mut indenter,
+            protected_tags,
+            ranges,
+            /* print warning message about tags not shown */ !show_unnamed,
+        );
         interp_ok(())
     }
 }

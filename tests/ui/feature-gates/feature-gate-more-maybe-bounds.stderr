@@ -1,71 +1,54 @@
-error[E0658]: `?Trait` is not permitted in supertraits
-  --> $DIR/feature-gate-more-maybe-bounds.rs:5:15
+error: relaxed bounds are not permitted in supertrait bounds
+  --> $DIR/feature-gate-more-maybe-bounds.rs:6:15
+   |
+LL | trait Trait3: ?Trait1 {}
+   |               ^^^^^^^
+
+error: relaxed bounds are not permitted in trait object types
+  --> $DIR/feature-gate-more-maybe-bounds.rs:12:28
+   |
+LL | fn foo(_: Box<dyn Trait1 + ?Trait2>) {}
+   |                            ^^^^^^^
+
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:6:15
+   |
+LL | trait Trait3: ?Trait1 {}
+   |               ^^^^^^^
+
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:6:15
    |
 LL | trait Trait3: ?Trait1 {}
    |               ^^^^^^^
    |
-   = note: traits are `?Trait1` by default
-   = help: add `#![feature(more_maybe_bounds)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
-error[E0658]: `?Trait` is not permitted in trait object types
-  --> $DIR/feature-gate-more-maybe-bounds.rs:10:28
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:6:15
+   |
+LL | trait Trait3: ?Trait1 {}
+   |               ^^^^^^^
+   |
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:12:28
    |
 LL | fn foo(_: Box<dyn Trait1 + ?Trait2>) {}
    |                            ^^^^^^^
-   |
-   = help: add `#![feature(more_maybe_bounds)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
 
-error[E0658]: `?Trait` bounds are only permitted at the point where a type parameter is declared
-  --> $DIR/feature-gate-more-maybe-bounds.rs:7:26
-   |
-LL | trait Trait4 where Self: ?Trait1 {}
-   |                          ^^^^^^^
-   |
-   = help: add `#![feature(more_maybe_bounds)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0203]: type parameter has more than one relaxed default bound, only one is supported
-  --> $DIR/feature-gate-more-maybe-bounds.rs:12:11
-   |
-LL | fn bar<T: ?Trait1 + ?Trait2>(_: T) {}
-   |           ^^^^^^^   ^^^^^^^
-   |
-   = help: add `#![feature(more_maybe_bounds)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error: relaxing a default bound only does something for `?Sized`; all other traits are not bound by default
-  --> $DIR/feature-gate-more-maybe-bounds.rs:12:11
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:15:11
    |
 LL | fn bar<T: ?Trait1 + ?Trait2>(_: T) {}
    |           ^^^^^^^
 
-error: relaxing a default bound only does something for `?Sized`; all other traits are not bound by default
-  --> $DIR/feature-gate-more-maybe-bounds.rs:12:21
+error: bound modifier `?` can only be applied to `Sized`
+  --> $DIR/feature-gate-more-maybe-bounds.rs:15:21
    |
 LL | fn bar<T: ?Trait1 + ?Trait2>(_: T) {}
    |                     ^^^^^^^
 
-error[E0203]: type parameter has more than one relaxed default bound, only one is supported
-  --> $DIR/feature-gate-more-maybe-bounds.rs:19:11
-   |
-LL | fn baz<T: ?Trait + ?Trait>(_ : T) {}
-   |           ^^^^^^   ^^^^^^
+error: aborting due to 8 previous errors
 
-error: relaxing a default bound only does something for `?Sized`; all other traits are not bound by default
-  --> $DIR/feature-gate-more-maybe-bounds.rs:19:11
-   |
-LL | fn baz<T: ?Trait + ?Trait>(_ : T) {}
-   |           ^^^^^^
-
-error: relaxing a default bound only does something for `?Sized`; all other traits are not bound by default
-  --> $DIR/feature-gate-more-maybe-bounds.rs:19:20
-   |
-LL | fn baz<T: ?Trait + ?Trait>(_ : T) {}
-   |                    ^^^^^^
-
-error: aborting due to 9 previous errors
-
-Some errors have detailed explanations: E0203, E0658.
-For more information about an error, try `rustc --explain E0203`.

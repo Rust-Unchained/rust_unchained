@@ -12,11 +12,11 @@
 //! "pinned," in that it has been permanently (until the end of its lifespan) attached to its
 //! location in memory, as though pinned to a pinboard. Pinning a value is an incredibly useful
 //! building block for [`unsafe`] code to be able to reason about whether a raw pointer to the
-//! pinned value is still valid. [As we'll see later][drop-guarantee], this is necessarily from the
-//! time the value is first pinned until the end of its lifespan. This concept of "pinning" is
-//! necessary to implement safe interfaces on top of things like self-referential types and
-//! intrusive data structures which cannot currently be modeled in fully safe Rust using only
-//! borrow-checked [references][reference].
+//! pinned value is still valid. [As we'll see later][drop-guarantee], once a value is pinned,
+//! it is necessarily valid at its memory location until the end of its lifespan. This concept
+//! of "pinning" is necessary to implement safe interfaces on top of things like self-referential
+//! types and intrusive data structures which cannot currently be modeled in fully safe Rust using
+//! only borrow-checked [references][reference].
 //!
 //! "Pinning" allows us to put a *value* which exists at some location in memory into a state where
 //! safe code cannot *move* that value to a different location in memory or otherwise invalidate it
@@ -137,10 +137,10 @@
 //! 2. An operation causes the value to depend on its own address not changing
 //!     * e.g. calling [`poll`] for the first time on the produced [`Future`]
 //! 3. Further pieces of the safe interface of the type use internal [`unsafe`] operations which
-//! assume that the address of the value is stable
+//!    assume that the address of the value is stable
 //!     * e.g. subsequent calls to [`poll`]
 //! 4. Before the value is invalidated (e.g. deallocated), it is *dropped*, giving it a chance to
-//! notify anything with pointers to itself that those pointers will be invalidated
+//!    notify anything with pointers to itself that those pointers will be invalidated
 //!     * e.g. [`drop`]ping the [`Future`] [^pin-drop-future]
 //!
 //! There are two possible ways to ensure the invariants required for 2. and 3. above (which
@@ -148,8 +148,8 @@
 //!
 //! 1. Have the value detect when it is moved and update all the pointers that point to itself.
 //! 2. Guarantee that the address of the value does not change (and that memory is not re-used
-//! for anything else) during the time that the pointers to it are expected to be valid to
-//! dereference.
+//!    for anything else) during the time that the pointers to it are expected to be valid to
+//!    dereference.
 //!
 //! Since, as we discussed, Rust can move values without notifying them that they have moved, the
 //! first option is ruled out.
@@ -160,11 +160,11 @@
 //! be able to enforce this invariant in Rust:
 //!
 //! 1. Offer a wholly `unsafe` API to interact with the object, thus requiring every caller to
-//! uphold the invariant themselves
+//!    uphold the invariant themselves
 //! 2. Store the value that must not be moved behind a carefully managed pointer internal to
-//! the object
+//!    the object
 //! 3. Leverage the type system to encode and enforce this invariant by presenting a restricted
-//! API surface to interact with *any* object that requires these invariants
+//!    API surface to interact with *any* object that requires these invariants
 //!
 //! The first option is quite obviously undesirable, as the [`unsafe`]ty of the interface will
 //! become viral throughout all code that interacts with the object.
@@ -474,9 +474,9 @@
 //!
 //! In an intrusive doubly-linked list, the collection itself does not own the memory in which
 //! each of its elements is stored. Instead, each client is free to allocate space for elements it
-//! adds to the list in whichever manner it likes, including on the stack! Elements can live on a
-//! stack frame that lives shorter than the collection does provided the elements that live in a
-//! given stack frame are removed from the list before going out of scope.
+//! adds to the list in whichever manner it likes, including on the stack! Elements can be stored
+//! in a stack frame shorter-lived than the collection, provided they are removed from the list
+//! before that frame goes out of scope.
 //!
 //! To make such an intrusive data structure work, every element stores pointers to its predecessor
 //! and successor within its own data, rather than having the list structure itself managing those
@@ -530,7 +530,7 @@
 //! but it also implies that,
 //!
 //! 2. The memory location that stores the value must not get invalidated or otherwise repurposed
-//! during the lifespan of the pinned value until its [`drop`] returns or panics
+//!    during the lifespan of the pinned value until its [`drop`] returns or panics
 //!
 //! This point is subtle but required for intrusive data structures to be implemented soundly.
 //!
@@ -600,7 +600,7 @@
 //! automatically called [`Pin::get_unchecked_mut`].
 //!
 //! This can never cause a problem in purely safe code because creating a pinning pointer to
-//! a type which has an address-sensitive (thus does not implement `Unpin`) requires `unsafe`,
+//! a type which has address-sensitive states (and thus does not implement `Unpin`) requires `unsafe`,
 //! but it is important to note that choosing to take advantage of pinning-related guarantees
 //! to justify validity in the implementation of your type has consequences for that type's
 //! [`Drop`][Drop] implementation as well: if an element of your type could have been pinned,
@@ -740,7 +740,7 @@
 //!
 //! While counter-intuitive, it's often the easier choice: if you do not expose a
 //! <code>[Pin]<[&mut] Field></code>, you do not need to be careful about other code
-//! moving out of that field, you just have to ensure is that you never create pinning
+//! moving out of that field, you just have to ensure that you never create a pinning
 //! reference to that field. This does of course also mean that if you decide a field does not
 //! have structural pinning, you must not write [`unsafe`] code that assumes (invalidly) that the
 //! field *is* structurally pinned!
@@ -792,7 +792,7 @@
 //!
 //! 1.  *Structural [`Unpin`].* A struct can be [`Unpin`] only if all of its
 //!     structurally-pinned fields are, too. This is [`Unpin`]'s behavior by default.
-//!     However, as a libray author, it is your responsibility not to write something like
+//!     However, as a library author, it is your responsibility not to write something like
 //!     <code>impl\<T> [Unpin] for Struct\<T> {}</code> and then offer a method that provides
 //!     structural pinning to an inner field of `T`, which may not be [`Unpin`]! (Adding *any*
 //!     projection operation requires unsafe code, so the fact that [`Unpin`] is a safe trait does
@@ -831,15 +831,13 @@
 //!     <code>fn get_pin_mut(self: [Pin]<[`&mut Self`]>) -> [Pin]<[`&mut T`]></code>.
 //!     Then we could do the following:
 //!     ```compile_fail
-//!     # use std::cell::RefCell;
-//!     # use std::pin::Pin;
-//!     fn exploit_ref_cell<T>(rc: Pin<&mut RefCell<T>>) {
+//!     fn exploit_ref_cell<T>(mut rc: Pin<&mut RefCell<T>>) {
 //!         // Here we get pinned access to the `T`.
 //!         let _: Pin<&mut T> = rc.as_mut().get_pin_mut();
 //!
 //!         // And here we have `&mut T` to the same data.
 //!         let shared: &RefCell<T> = rc.into_ref().get_ref();
-//!         let borrow = shared.borrow_mut();
+//!         let mut borrow = shared.borrow_mut();
 //!         let content = &mut *borrow;
 //!     }
 //!     ```
@@ -1092,10 +1090,6 @@ pub use self::unsafe_pinned::UnsafePinned;
 #[rustc_pub_transparent]
 #[derive(Copy, Clone)]
 pub struct Pin<Ptr> {
-    /// Only public for bootstrap.
-    #[cfg(bootstrap)]
-    pub pointer: Ptr,
-    #[cfg(not(bootstrap))]
     pointer: Ptr,
 }
 
@@ -1363,7 +1357,11 @@ impl<Ptr: Deref> Pin<Ptr> {
     /// ruled out by the contract of `Pin::new_unchecked`.
     #[stable(feature = "pin", since = "1.33.0")]
     #[inline(always)]
-    pub fn as_ref(&self) -> Pin<&Ptr::Target> {
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_ref(&self) -> Pin<&Ptr::Target>
+    where
+        Ptr: [const] Deref,
+    {
         // SAFETY: see documentation on this function
         unsafe { Pin::new_unchecked(&*self.pointer) }
     }
@@ -1407,7 +1405,11 @@ impl<Ptr: DerefMut> Pin<Ptr> {
     /// ```
     #[stable(feature = "pin", since = "1.33.0")]
     #[inline(always)]
-    pub fn as_mut(&mut self) -> Pin<&mut Ptr::Target> {
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_mut(&mut self) -> Pin<&mut Ptr::Target>
+    where
+        Ptr: [const] DerefMut,
+    {
         // SAFETY: see documentation on this function
         unsafe { Pin::new_unchecked(&mut *self.pointer) }
     }
@@ -1422,7 +1424,11 @@ impl<Ptr: DerefMut> Pin<Ptr> {
     #[stable(feature = "pin_deref_mut", since = "1.84.0")]
     #[must_use = "`self` will be dropped if the result is not used"]
     #[inline(always)]
-    pub fn as_deref_mut(self: Pin<&mut Pin<Ptr>>) -> Pin<&mut Ptr::Target> {
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_deref_mut(self: Pin<&mut Self>) -> Pin<&mut Ptr::Target>
+    where
+        Ptr: [const] DerefMut,
+    {
         // SAFETY: What we're asserting here is that going from
         //
         //     Pin<&mut Pin<Ptr>>
@@ -1673,15 +1679,97 @@ impl<T: ?Sized> Pin<&'static mut T> {
 }
 
 #[stable(feature = "pin", since = "1.33.0")]
-impl<Ptr: Deref> Deref for Pin<Ptr> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<Ptr: [const] Deref> Deref for Pin<Ptr> {
     type Target = Ptr::Target;
     fn deref(&self) -> &Ptr::Target {
         Pin::get_ref(Pin::as_ref(self))
     }
 }
 
+mod helper {
+    /// Helper that prevents downstream crates from implementing `DerefMut` for `Pin`.
+    ///
+    /// The `Pin` type implements the unsafe trait `PinCoerceUnsized`, which essentially requires
+    /// that the type does not have a malicious `Deref` or `DerefMut` impl. However, without this
+    /// helper module, downstream crates are able to write `impl DerefMut for Pin<LocalType>` as
+    /// long as it does not overlap with the impl provided by stdlib. This is because `Pin` is
+    /// `#[fundamental]`, so stdlib promises to never implement traits for `Pin` that it does not
+    /// implement today.
+    ///
+    /// However, this is problematic. Downstream crates could implement `DerefMut` for
+    /// `Pin<&LocalType>`, and they could do so maliciously. To prevent this, the implementation for
+    /// `Pin` delegates to this helper module. Since `helper::Pin` is not `#[fundamental]`, the
+    /// orphan rules assume that stdlib might implement `helper::DerefMut` for `helper::Pin<&_>` in
+    /// the future. Because of this, downstream crates can no longer provide an implementation of
+    /// `DerefMut` for `Pin<&_>`, as it might overlap with a trait impl that, according to the
+    /// orphan rules, the stdlib could introduce without a breaking change in a future release.
+    ///
+    /// See <https://github.com/rust-lang/rust/issues/85099> for the issue this fixes.
+    #[repr(transparent)]
+    #[unstable(feature = "pin_derefmut_internals", issue = "none")]
+    #[allow(missing_debug_implementations)]
+    pub struct PinHelper<Ptr> {
+        pointer: Ptr,
+    }
+
+    #[unstable(feature = "pin_derefmut_internals", issue = "none")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    #[rustc_diagnostic_item = "PinDerefMutHelper"]
+    pub const trait PinDerefMutHelper {
+        type Target: ?Sized;
+        fn deref_mut(&mut self) -> &mut Self::Target;
+    }
+
+    #[unstable(feature = "pin_derefmut_internals", issue = "none")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    const impl<Ptr: [const] super::DerefMut> PinDerefMutHelper for PinHelper<Ptr>
+    where
+        Ptr::Target: crate::marker::Unpin,
+    {
+        type Target = Ptr::Target;
+
+        #[inline(always)]
+        fn deref_mut(&mut self) -> &mut Ptr::Target {
+            &mut self.pointer
+        }
+    }
+}
+
 #[stable(feature = "pin", since = "1.33.0")]
-impl<Ptr: DerefMut<Target: Unpin>> DerefMut for Pin<Ptr> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+#[cfg(not(doc))]
+const impl<Ptr> DerefMut for Pin<Ptr>
+where
+    Ptr: [const] Deref,
+    helper::PinHelper<Ptr>: [const] helper::PinDerefMutHelper<Target = Self::Target>,
+{
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Ptr::Target {
+        // SAFETY: Pin and PinHelper have the same layout, so this is equivalent to
+        // `&mut self.pointer` which is safe because `Target: Unpin`.
+        helper::PinDerefMutHelper::deref_mut(unsafe {
+            &mut *(self as *mut Pin<Ptr> as *mut helper::PinHelper<Ptr>)
+        })
+    }
+}
+
+/// The `Target` type is restricted to `Unpin` types as it's not safe to obtain a mutable reference
+/// to a pinned value.
+///
+/// For soundness reasons, implementations of `DerefMut` for `Pin<T>` are rejected even when `T` is
+/// a local type not covered by this impl block. (Since `Pin` is [fundamental], such implementations
+/// would normally be possible.)
+///
+/// [fundamental]: ../../reference/items/implementations.html#r-items.impl.trait.fundamental
+#[stable(feature = "pin", since = "1.33.0")]
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+#[cfg(doc)]
+const impl<Ptr> DerefMut for Pin<Ptr>
+where
+    Ptr: [const] DerefMut,
+    <Ptr as Deref>::Target: Unpin,
+{
     fn deref_mut(&mut self) -> &mut Ptr::Target {
         Pin::get_mut(Pin::as_mut(self))
     }
@@ -1735,15 +1823,16 @@ where
 {
 }
 
-#[unstable(feature = "pin_coerce_unsized_trait", issue = "123430")]
+#[unstable(feature = "pin_coerce_unsized_trait", issue = "150112")]
 /// Trait that indicates that this is a pointer or a wrapper for one, where
 /// unsizing can be performed on the pointee when it is pinned.
 ///
 /// # Safety
 ///
-/// If this type implements `Deref`, then the concrete type returned by `deref`
-/// and `deref_mut` must not change without a modification. The following
-/// operations are not considered modifications:
+/// Given a pointer of this type, the concrete type returned by its
+/// `deref` method and (if it implements `DerefMut`) its `deref_mut` method
+/// must be the same type and must not change without a modification.
+/// The following operations are not considered modifications:
 ///
 /// * Moving the pointer.
 /// * Performing unsizing coercions on the pointer.
@@ -1754,7 +1843,7 @@ where
 /// to. The concrete type of a slice is an array of the same element type and
 /// the length specified in the metadata. The concrete type of a sized type
 /// is the type itself.
-pub unsafe trait PinCoerceUnsized {}
+pub unsafe trait PinCoerceUnsized: Deref {}
 
 #[stable(feature = "pin", since = "1.33.0")]
 unsafe impl<'a, T: ?Sized> PinCoerceUnsized for &'a T {}
@@ -1764,12 +1853,6 @@ unsafe impl<'a, T: ?Sized> PinCoerceUnsized for &'a mut T {}
 
 #[stable(feature = "pin", since = "1.33.0")]
 unsafe impl<T: PinCoerceUnsized> PinCoerceUnsized for Pin<T> {}
-
-#[stable(feature = "pin", since = "1.33.0")]
-unsafe impl<T: ?Sized> PinCoerceUnsized for *const T {}
-
-#[stable(feature = "pin", since = "1.33.0")]
-unsafe impl<T: ?Sized> PinCoerceUnsized for *mut T {}
 
 /// Constructs a <code>[Pin]<[&mut] T></code>, by pinning a `value: T` locally.
 ///
@@ -1936,22 +2019,84 @@ unsafe impl<T: ?Sized> PinCoerceUnsized for *mut T {}
 /// constructor.
 ///
 /// [`Box::pin`]: ../../std/boxed/struct.Box.html#method.pin
-#[cfg(not(bootstrap))]
 #[stable(feature = "pin_macro", since = "1.68.0")]
-#[rustc_macro_transparency = "semitransparent"]
-#[allow_internal_unstable(super_let)]
+#[rustc_macro_transparency = "semiopaque"]
+#[allow_internal_unstable(pin_macro_internals, super_let)]
+#[rustc_diagnostic_item = "pin_macro"]
+// `super` gets removed by rustfmt
+#[rustfmt::skip]
+#[diagnostic::opaque]
 pub macro pin($value:expr $(,)?) {
     {
-        super let mut pinned = $value;
+        super let mut pinned: $crate::pin::PinMacroHelper<_> = $crate::pin::PinMacroHelper { value: $value };
+
         // SAFETY: The value is pinned: it is the local above which cannot be named outside this macro.
-        unsafe { $crate::pin::Pin::new_unchecked(&mut pinned) }
+        //
+        // In order to make sure that the above local is passed to the below function call
+        // without any coercions in between, we wrap the user-provided value in the
+        // `PinMacroHelper` type, which we know doesn't implement `DerefMut`. Without such
+        // a wrapper, a user might cause a deref coercion on `&mut pinned`, causing the
+        // `Pin::new_unchecked` call to pin the wrong thing, which is unsound.
+        // See <https://github.com/rust-lang/rust/issues/153438>.
+        //
+        // To verify that there are no problematic coercions in the below line, we enumerate
+        // the list of all possible kinds of coercions that currently exist in the language,
+        // and verify that they can't be used to coerce a `&mut PinMacroHelper<T>` into a
+        // `&mut PinMacroHelper<U>` (as enforced by the above type annotation on `pinned`,
+        // and the type signature of `pin_new_unchecked_in_helper`), where `T` and `U` are
+        // different types:
+        //
+        // * Subtype coercions: `&mut` is invariant over the type being referenced, so subtype
+        //   coercion can only change the lifetime of the `&mut` reference itself, which poses
+        //   no problems.
+        // * Coercions that change the kind of references/pointers: We have the following kinds
+        //   of coercions, none of which can produce a `&mut`: `&mut`-to-`&`, `*mut`-to-`*const`,
+        //   `&`-to-`*const`, `&mut`-to-`*mut`.
+        // * Deref coercions: Does not apply here, since `PinMacroHelper` does not implement
+        //   `Deref` or `DerefMut`. And since `PinMacroHelper` is not a fundamental type, users
+        //   cannot add any such implementations to the type.
+        // * Unsize coercions: Does not apply here, since unsize coercions can only produce a
+        //   reference/pointer to an unsized type, and `PinMacroHelper` is always `Sized`.
+        // * Coercions from function items or non-capturing closures to function pointers:
+        //   Does not apply here. `&mut _` is not a function item or closure.
+        // * Never-to-any coercions: If this coercion applies, then we're in unreachable code,
+        //   so whatever we do can't possibly cause unsoundness.
+        //
+        // Furthermore, if we ever add more kinds of coercions to the language, it seems
+        // extremely unlikely that user code would be allowed to define new coercions
+        // on a stdlib-defined type such as `PinMacroHelper`.
+        //
+        // I have not verified whether it is possible to cause a coercion in the `let`
+        // statement above, before assigning to the `pinned` variable. However, even if
+        // such a coercion were possible, it would not affect the soundness of the macro,
+        // since the soundness argument only relies on the type of `pinned` being
+        // `PinMacroHelper<_>`, which is enforced by the type annotation.
+        unsafe { $crate::pin::pin_new_unchecked_in_helper(&mut pinned) }
     }
 }
 
-/// Only for bootstrap.
-#[cfg(bootstrap)]
-#[stable(feature = "pin_macro", since = "1.68.0")]
-#[rustc_macro_transparency = "semitransparent"]
-pub macro pin($value:expr $(,)?) {
-    $crate::pin::Pin::<&mut _> { pointer: &mut { $value } }
+/// Helper for `pin!` to enforce its type signature.
+/// See <https://github.com/rust-lang/rust/issues/153438>.
+#[unstable(feature = "pin_macro_internals", issue = "none")]
+#[doc(hidden)]
+#[expect(missing_debug_implementations, reason = "this type is only used by the `pin!` macro")]
+#[rustc_diagnostic_item = "PinMacroHelper"]
+pub struct PinMacroHelper<T> {
+    pub value: T,
+}
+
+/// Helper for `pin!` to enforce its type signature.
+/// See <https://github.com/rust-lang/rust/issues/153438>.
+///
+/// # Safety
+/// Calling this function has the same safety requirements as calling
+/// `Pin::new_unchecked` on `&mut pinned.value`
+#[unstable(feature = "pin_macro_internals", issue = "none")]
+#[doc(hidden)]
+#[inline]
+pub const unsafe fn pin_new_unchecked_in_helper<'a, T>(
+    pinned: &'a mut PinMacroHelper<T>,
+) -> Pin<&'a mut T> {
+    // SAFETY: Ensured by the caller.
+    unsafe { Pin::new_unchecked(&mut pinned.value) }
 }

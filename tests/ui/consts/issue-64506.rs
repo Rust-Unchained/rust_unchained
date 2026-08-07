@@ -14,7 +14,7 @@ const FOO: () = {
         b: (),
     }
     let x = unsafe { Foo { b: () }.a };
-    //~^ ERROR: evaluation of constant value failed
+    //~^ ERROR: value of zero-variant enum
     let x = &x.inner;
 };
 

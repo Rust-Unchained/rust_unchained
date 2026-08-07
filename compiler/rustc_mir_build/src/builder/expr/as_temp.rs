@@ -2,12 +2,12 @@
 
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::HirId;
-use rustc_middle::middle::region::{Scope, ScopeData};
+use rustc_middle::middle::region::{Scope, ScopeData, TempLifetime};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use tracing::{debug, instrument};
 
-use crate::builder::scope::DropKind;
+use crate::builder::scope::LintLevel;
 use crate::builder::{BlockAnd, BlockAndExtension, Builder};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
@@ -34,15 +34,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         expr_id: ExprId,
         mutability: Mutability,
     ) -> BlockAnd<Local> {
-        let this = self;
+        let this = self; // See "LET_THIS_SELF".
 
         let expr = &this.thir[expr_id];
         let expr_span = expr.span;
         let source_info = this.source_info(expr_span);
-        if let ExprKind::Scope { region_scope, lint_level, value } = expr.kind {
-            return this.in_scope((region_scope, source_info), lint_level, |this| {
-                this.as_temp(block, temp_lifetime, value, mutability)
-            });
+        if let ExprKind::Scope { region_scope, hir_id, value } = expr.kind {
+            return this.in_scope(
+                (region_scope, source_info),
+                LintLevel::Explicit(hir_id),
+                |this| this.as_temp(block, temp_lifetime, value, mutability),
+            );
         }
 
         let expr_ty = expr.ty;
@@ -102,8 +104,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 if let Block { expr: None, targeted_by_break: false, .. } = this.thir[block]
                     && expr_ty.is_never() => {}
             _ => {
-                this.cfg
-                    .push(block, Statement { source_info, kind: StatementKind::StorageLive(temp) });
+                this.cfg.push(block, Statement::new(source_info, StatementKind::StorageLive(temp)));
 
                 // In constants, `temp_lifetime` is `None` for temporaries that
                 // live for the `'static` lifetime. Thus we do not drop these
@@ -119,7 +120,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // `bar(&foo())` or anything within a block will keep the
                 // regular drops just like runtime code.
                 if let Some(temp_lifetime) = temp_lifetime.temp_lifetime {
-                    this.schedule_drop(expr_span, temp_lifetime, temp, DropKind::Storage);
+                    this.schedule_drop_storage(expr_span, temp_lifetime, temp);
                 }
             }
         }
@@ -127,7 +128,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         block = this.expr_into_dest(temp_place, block, expr_id).into_block();
 
         if let Some(temp_lifetime) = temp_lifetime.temp_lifetime {
-            this.schedule_drop(expr_span, temp_lifetime, temp, DropKind::Value);
+            this.schedule_drop_value(expr_span, temp_lifetime, temp);
         }
 
         if let Some(backwards_incompatible) = temp_lifetime.backwards_incompatible {

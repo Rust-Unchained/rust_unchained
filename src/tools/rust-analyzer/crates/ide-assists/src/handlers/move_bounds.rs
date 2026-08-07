@@ -1,13 +1,11 @@
+use either::Either;
 use syntax::{
-    ast::{
-        self,
-        edit_in_place::{GenericParamsOwnerEdit, Removable},
-        make, AstNode, HasName, HasTypeBounds,
-    },
+    ast::{self, AstNode, HasName, HasTypeBounds, syntax_factory::SyntaxFactory},
     match_ast,
+    syntax_editor::{GetOrCreateWhereClause, Removable},
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: move_bounds_to_where_clause
 //
@@ -26,14 +24,15 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn move_bounds_to_where_clause(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let type_param_list = ctx.find_node_at_offset::<ast::GenericParamList>()?;
 
-    let mut type_params = type_param_list.type_or_const_params();
+    let mut type_params = type_param_list.generic_params();
     if type_params.all(|p| match p {
-        ast::TypeOrConstParam::Type(t) => t.type_bound_list().is_none(),
-        ast::TypeOrConstParam::Const(_) => true,
+        ast::GenericParam::TypeParam(t) => t.type_bound_list().is_none(),
+        ast::GenericParam::LifetimeParam(l) => l.type_bound_list().is_none(),
+        ast::GenericParam::ConstParam(_) => true,
     }) {
         return None;
     }
@@ -42,44 +41,61 @@ pub(crate) fn move_bounds_to_where_clause(
 
     let target = type_param_list.syntax().text_range();
     acc.add(
-        AssistId("move_bounds_to_where_clause", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("move_bounds_to_where_clause"),
         "Move to where clause",
         target,
-        |edit| {
-            let type_param_list = edit.make_mut(type_param_list);
-            let parent = edit.make_syntax_mut(parent);
+        |builder| {
+            let editor = builder.make_editor(&parent);
 
-            let where_clause: ast::WhereClause = match_ast! {
-                match parent {
-                    ast::Fn(it) => it.get_or_create_where_clause(),
-                    ast::Trait(it) => it.get_or_create_where_clause(),
-                    ast::Impl(it) => it.get_or_create_where_clause(),
-                    ast::Enum(it) => it.get_or_create_where_clause(),
-                    ast::Struct(it) => it.get_or_create_where_clause(),
+            let new_preds: Vec<ast::WherePred> = type_param_list
+                .generic_params()
+                .filter_map(|param| build_predicate(param, editor.make()))
+                .collect();
+
+            match_ast! {
+                match (&parent) {
+                    ast::Fn(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
+                    ast::Trait(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
+                    ast::Impl(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
+                    ast::Enum(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
+                    ast::Struct(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
+                    ast::TypeAlias(it) => it.get_or_create_where_clause(&editor, new_preds.into_iter()),
                     _ => return,
                 }
             };
 
-            for toc_param in type_param_list.type_or_const_params() {
-                let type_param = match toc_param {
-                    ast::TypeOrConstParam::Type(x) => x,
-                    ast::TypeOrConstParam::Const(_) => continue,
+            for generic_param in type_param_list.generic_params() {
+                let param: &dyn HasTypeBounds = match &generic_param {
+                    ast::GenericParam::TypeParam(t) => t,
+                    ast::GenericParam::LifetimeParam(l) => l,
+                    ast::GenericParam::ConstParam(_) => continue,
                 };
-                if let Some(tbl) = type_param.type_bound_list() {
-                    if let Some(predicate) = build_predicate(type_param) {
-                        where_clause.add_predicate(predicate)
-                    }
-                    tbl.remove()
+                if let Some(tbl) = param.type_bound_list() {
+                    tbl.remove(&editor);
                 }
             }
+
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
-fn build_predicate(param: ast::TypeParam) -> Option<ast::WherePred> {
-    let path = make::ext::ident_path(&param.name()?.syntax().to_string());
-    let predicate = make::where_pred(make::ty_path(path), param.type_bound_list()?.bounds());
-    Some(predicate.clone_for_update())
+fn build_predicate(param: ast::GenericParam, make: &SyntaxFactory) -> Option<ast::WherePred> {
+    let target = match &param {
+        ast::GenericParam::TypeParam(t) => Either::Right(make.ty(&t.name()?.to_string())),
+        ast::GenericParam::LifetimeParam(l) => Either::Left(l.lifetime()?),
+        ast::GenericParam::ConstParam(_) => return None,
+    };
+    let predicate = make.where_pred(
+        target,
+        match param {
+            ast::GenericParam::TypeParam(t) => t.type_bound_list()?,
+            ast::GenericParam::LifetimeParam(l) => l.type_bound_list()?,
+            ast::GenericParam::ConstParam(_) => return None,
+        }
+        .bounds(),
+    );
+    Some(predicate)
 }
 
 #[cfg(test)]
@@ -121,6 +137,15 @@ mod tests {
             move_bounds_to_where_clause,
             r#"struct Pair<$0T: u32>(T, T);"#,
             r#"struct Pair<T>(T, T) where T: u32;"#,
+        );
+    }
+
+    #[test]
+    fn move_bounds_to_where_clause_trait() {
+        check_assist(
+            move_bounds_to_where_clause,
+            r#"trait T<'a: 'static, $0T: u32> {}"#,
+            r#"trait T<'a, T> where 'a: 'static, T: u32 {}"#,
         );
     }
 }

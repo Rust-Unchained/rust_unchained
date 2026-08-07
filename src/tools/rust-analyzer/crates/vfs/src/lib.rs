@@ -52,12 +52,12 @@ pub use crate::{
     anchored_path::{AnchoredPath, AnchoredPathBuf},
     vfs_path::VfsPath,
 };
-use indexmap::{map::Entry, IndexMap};
+use indexmap::{IndexMap, map::Entry};
 pub use paths::{AbsPath, AbsPathBuf};
 
 use rustc_hash::FxHasher;
 use stdx::hash_once;
-use tracing::{span, Level};
+use tracing::{Level, span};
 
 /// Handle to a file in [`Vfs`]
 ///
@@ -157,7 +157,7 @@ pub enum Change {
 }
 
 /// Kind of [file change](ChangedFile).
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChangeKind {
     /// The file was (re-)created
     Create,
@@ -211,7 +211,7 @@ impl Vfs {
     ///
     /// Returns `true` if the file was modified, and saves the [change](ChangedFile).
     ///
-    /// If the path does not currently exists in the `Vfs`, allocates a new
+    /// If the path does not currently exist in the `Vfs`, allocates a new
     /// [`FileId`] for it.
     pub fn set_file_contents(&mut self, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
         let _p = span!(Level::INFO, "Vfs::set_file_contents").entered();
@@ -280,7 +280,7 @@ impl Vfs {
         true
     }
 
-    /// Drain and returns all the changes in the `Vfs`.
+    /// Drains and returns all the changes in the `Vfs`.
     pub fn take_changes(&mut self) -> IndexMap<FileId, ChangedFile, BuildHasherDefault<FxHasher>> {
         mem::take(&mut self.changes)
     }
@@ -292,7 +292,7 @@ impl Vfs {
 
     /// Returns the id associated with `path`
     ///
-    /// - If `path` does not exists in the `Vfs`, allocate a new id for it, associated with a
+    /// - If `path` does not exist in the `Vfs`, allocates a new id for it, associated with a
     ///   deleted file;
     /// - Else, returns `path`'s id.
     ///

@@ -16,7 +16,7 @@ use crate::parse::parser::{
     Directory, DirectoryOwnership, ModError, ModulePathSuccess, Parser, ParserError,
 };
 use crate::parse::session::ParseSess;
-use crate::utils::{contains_skip, mk_sp};
+use crate::utils::{contains_custom_attributes, contains_skip, mk_sp};
 
 mod visitor;
 
@@ -26,7 +26,7 @@ type FileModMap<'ast> = BTreeMap<FileName, Module<'ast>>;
 #[derive(Debug, Clone)]
 pub(crate) struct Module<'a> {
     ast_mod_kind: Option<Cow<'a, ast::ModKind>>,
-    pub(crate) items: Cow<'a, ThinVec<rustc_ast::ptr::P<ast::Item>>>,
+    pub(crate) items: Cow<'a, ThinVec<Box<ast::Item>>>,
     inner_attr: ast::AttrVec,
     pub(crate) span: Span,
 }
@@ -35,7 +35,7 @@ impl<'a> Module<'a> {
     pub(crate) fn new(
         mod_span: Span,
         ast_mod_kind: Option<Cow<'a, ast::ModKind>>,
-        mod_items: Cow<'a, ThinVec<rustc_ast::ptr::P<ast::Item>>>,
+        mod_items: Cow<'a, ThinVec<Box<ast::Item>>>,
         mod_attrs: Cow<'a, ast::AttrVec>,
     ) -> Self {
         let inner_attr = mod_attrs
@@ -167,14 +167,41 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         Ok(())
     }
 
+    fn visit_cfg_select(
+        &mut self,
+        item: Cow<'ast, ast::Item>,
+    ) -> Result<(), ModuleResolutionError> {
+        let mut visitor = visitor::CfgSelectVisitor::new(self.psess);
+        visitor.visit_item(&item);
+        for module_item in visitor.mods() {
+            if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = module_item.item.kind {
+                self.visit_sub_mod(
+                    &module_item.item,
+                    Module::new(
+                        module_item.item.span,
+                        Some(Cow::Owned(sub_mod_kind.clone())),
+                        Cow::Owned(ThinVec::new()),
+                        Cow::Owned(ast::AttrVec::new()),
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Visit modules defined inside macro calls.
     fn visit_mod_outside_ast(
         &mut self,
-        items: ThinVec<rustc_ast::ptr::P<ast::Item>>,
+        items: ThinVec<Box<ast::Item>>,
     ) -> Result<(), ModuleResolutionError> {
         for item in items {
             if is_cfg_if(&item) {
-                self.visit_cfg_if(Cow::Owned(item.into_inner()))?;
+                self.visit_cfg_if(Cow::Owned(*item))?;
+                continue;
+            }
+
+            if is_cfg_select(&item) {
+                self.visit_cfg_select(Cow::Owned(*item))?;
                 continue;
             }
 
@@ -197,11 +224,15 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
     /// Visit modules from AST.
     fn visit_mod_from_ast(
         &mut self,
-        items: &'ast [rustc_ast::ptr::P<ast::Item>],
+        items: &'ast [Box<ast::Item>],
     ) -> Result<(), ModuleResolutionError> {
         for item in items {
             if is_cfg_if(item) {
                 self.visit_cfg_if(Cow::Borrowed(item))?;
+            }
+
+            if is_cfg_select(item) {
+                self.visit_cfg_select(Cow::Borrowed(item))?;
             }
 
             if let ast::ItemKind::Mod(_, _, ref sub_mod_kind) = item.kind {
@@ -316,11 +347,12 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             self.directory = directory;
         }
         match (sub_mod.ast_mod_kind, sub_mod.items) {
-            (Some(Cow::Borrowed(ast::ModKind::Loaded(items, _, _, _))), _) => {
+            (Some(Cow::Borrowed(ast::ModKind::Loaded(items, _, _))), _) => {
                 self.visit_mod_from_ast(items)
             }
-            (Some(Cow::Owned(ast::ModKind::Loaded(items, _, _, _))), _)
-            | (_, Cow::Owned(items)) => self.visit_mod_outside_ast(items),
+            (Some(Cow::Owned(ast::ModKind::Loaded(items, _, _))), _) | (_, Cow::Owned(items)) => {
+                self.visit_mod_outside_ast(items)
+            }
             (_, _) => Ok(()),
         }
     }
@@ -443,6 +475,16 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             }
             Err(e) => match e {
                 ModError::FileNotFound(_, default_path, _secondary_path) => {
+                    if contains_custom_attributes(attrs) {
+                        // It's possible that at least one of the attributes is a custom proc macro
+                        // that takes the module tokens as an input. It's hard to know for sure
+                        // since rustfmt only operates on the AST pre-expansion. In this case we'll
+                        // be overly permissive and just ignore the file not found error so rustfmt
+                        // can still try formatting the input.
+                        tracing::warn!("Couldn't find file for mod {};`", mod_name.to_string());
+                        return Ok(None);
+                    }
+
                     Err(ModuleResolutionError {
                         module: mod_name.to_string(),
                         kind: ModuleResolutionErrorKind::NotFound { file: default_path },
@@ -541,7 +583,7 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                     Cow::Owned(items),
                     Cow::Owned(attrs),
                 ),
-            ))
+            ));
         }
         result
     }
@@ -567,6 +609,20 @@ fn is_cfg_if(item: &ast::Item) -> bool {
         ast::ItemKind::MacCall(ref mac) => {
             if let Some(first_segment) = mac.path.segments.first() {
                 if first_segment.ident.name == Symbol::intern("cfg_if") {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn is_cfg_select(item: &ast::Item) -> bool {
+    match item.kind {
+        ast::ItemKind::MacCall(ref mac) => {
+            if let Some(last_segment) = mac.path.segments.last() {
+                if last_segment.ident.name == Symbol::intern("cfg_select") {
                     return true;
                 }
             }

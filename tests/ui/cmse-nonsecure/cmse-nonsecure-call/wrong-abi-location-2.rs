@@ -1,12 +1,13 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: --target thumbv8m.main-none-eabi --crate-type lib
 //@ needs-llvm-components: arm
-#![feature(abi_c_cmse_nonsecure_call, lang_items, no_core)]
+//@ ignore-backends: gcc
+#![feature(abi_cmse_nonsecure_call, lang_items, no_core)]
 #![no_core]
 
 extern crate minicore;
 use minicore::*;
 
-extern "C-cmse-nonsecure-call" { //~ ERROR [E0781]
+extern "cmse-nonsecure-call" { //~ ERROR [E0781]
     fn test();
 }

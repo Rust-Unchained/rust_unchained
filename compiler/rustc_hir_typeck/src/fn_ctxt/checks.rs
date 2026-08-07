@@ -1,45 +1,48 @@
-use std::{fmt, iter, mem};
+use std::ops::Deref;
+use std::{fmt, iter};
 
 use itertools::Itertools;
+use rustc_ast as ast;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, a_or_an, listify, pluralize};
-use rustc_hir::def::{CtorOf, DefKind, Res};
+use rustc_hir as hir;
+use rustc_hir::attrs::DivergingBlockBehavior;
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ExprKind, HirId, Node, QPath};
+use rustc_hir::{Expr, ExprKind, FnRetTy, HirId, LangItem, Node, QPath, is_range_literal};
 use rustc_hir_analysis::check::potentially_plural_count;
-use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
+use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, ResolvedStructPath};
 use rustc_index::IndexVec;
-use rustc_infer::infer::{DefineOpaqueTypes, InferOk, TypeTrace};
+use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::print::with_forced_trimmed_paths;
+use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_session::Session;
+use rustc_session::diagnostics::ExprParenthesesNeeded;
 use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
 use rustc_trait_selection::error_reporting::infer::{FailureCode, ObligationCauseExt};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt, SelectionContext};
 use smallvec::SmallVec;
 use tracing::debug;
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::Expectation::*;
 use crate::TupleArgumentsFlag::*;
 use crate::coercion::CoerceMany;
-use crate::errors::SuggestPtrNullMut;
+use crate::diagnostics::SuggestPtrNullMut;
 use crate::fn_ctxt::arg_matrix::{ArgMatrix, Compatibility, Error, ExpectedIdx, ProvidedIdx};
-use crate::fn_ctxt::infer::FnCall;
 use crate::gather_locals::Declaration;
 use crate::inline_asm::InlineAsmCtxt;
-use crate::method::MethodCallee;
 use crate::method::probe::IsSuggestion;
 use crate::method::probe::Mode::MethodCall;
 use crate::method::probe::ProbeScope::TraitsInScope;
 use crate::{
-    BreakableCtxt, Diverges, Expectation, FnCtxt, LoweredTy, Needs, TupleArgumentsFlag, errors,
-    struct_span_code_err,
+    BreakableCtxt, Diverges, Expectation, FnCtxt, GatherLocalsVisitor, LoweredTy, Needs,
+    TupleArgumentsFlag, diagnostics, struct_span_code_err,
 };
 
 rustc_index::newtype_index! {
@@ -48,48 +51,27 @@ rustc_index::newtype_index! {
     pub(crate) struct GenericIdx {}
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) enum DivergingBlockBehavior {
-    /// This is the current stable behavior:
-    ///
-    /// ```rust
-    /// {
-    ///     return;
-    /// } // block has type = !, even though we are supposedly dropping it with `;`
-    /// ```
-    #[default]
-    Never,
+/// Outcome of checking arguments that are tupled by "rust-call" or `#[rustc_splat]`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TupledArgCheckOutcome<'tcx> {
+    /// The error code to emit if the arguments are not compatible.
+    new_err_code: Option<ErrCode>,
 
-    /// Alternative behavior:
-    ///
-    /// ```ignore (very-unstable-new-attribute)
-    /// #![rustc_never_type_options(diverging_block_default = "unit")]
-    /// {
-    ///     return;
-    /// } // block has type = (), since we are dropping `!` from `return` with `;`
-    /// ```
-    Unit,
+    /// The formal input types after checking.
+    untupled_formal_input_tys: Vec<Ty<'tcx>>,
+
+    /// The expected input types after checking.
+    untupled_expected_input_tys: Option<Vec<Ty<'tcx>>>,
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_casts(&mut self) {
-        // don't hold the borrow to deferred_cast_checks while checking to avoid borrow checker errors
-        // when writing to `self.param_env`.
-        let mut deferred_cast_checks = mem::take(&mut *self.deferred_cast_checks.borrow_mut());
-
+        let mut deferred_cast_checks = self.root_ctxt.deferred_cast_checks.borrow_mut();
         debug!("FnCtxt::check_casts: {} deferred checks", deferred_cast_checks.len());
         for cast in deferred_cast_checks.drain(..) {
+            let body_def_id = std::mem::replace(&mut self.body_def_id, cast.body_def_id);
             cast.check(self);
-        }
-
-        *self.deferred_cast_checks.borrow_mut() = deferred_cast_checks;
-    }
-
-    pub(in super::super) fn check_transmutes(&self) {
-        let mut deferred_transmute_checks = self.deferred_transmute_checks.borrow_mut();
-        debug!("FnCtxt::check_transmutes: {} deferred checks", deferred_transmute_checks.len());
-        for (from, to, hir_id) in deferred_transmute_checks.drain(..) {
-            self.check_transmute(from, to, hir_id);
+            self.body_def_id = body_def_id;
         }
     }
 
@@ -105,81 +87,101 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_repeat_exprs(&self) {
         let mut deferred_repeat_expr_checks = self.deferred_repeat_expr_checks.borrow_mut();
         debug!("FnCtxt::check_repeat_exprs: {} deferred checks", deferred_repeat_expr_checks.len());
-        for (element, element_ty, count) in deferred_repeat_expr_checks.drain(..) {
-            // We want to emit an error if the const is not structurally resolveable as otherwise
-            // we can find up conservatively proving `Copy` which may infer the repeat expr count
-            // to something that never required `Copy` in the first place.
-            let count =
-                self.structurally_resolve_const(element.span, self.normalize(element.span, count));
 
-            // Avoid run on "`NotCopy: Copy` is not implemented" errors when the repeat expr count
-            // is erroneous/unknown. The user might wind up specifying a repeat count of 0/1.
-            if count.references_error() {
-                continue;
-            }
+        let deferred_repeat_expr_checks = deferred_repeat_expr_checks
+            .drain(..)
+            .flat_map(|(element, element_ty, count)| {
+                // Actual constants as the repeat element are inserted repeatedly instead
+                // of being copied via `Copy`, so we don't need to attempt to structurally
+                // resolve the repeat count which may unnecessarily error.
+                match &element.kind {
+                    hir::ExprKind::ConstBlock(..) => return None,
+                    hir::ExprKind::Path(qpath) => {
+                        let res = self.typeck_results.borrow().qpath_res(qpath, element.hir_id);
+                        if let Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _) = res
+                        {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
 
-            // If the length is 0, we don't create any elements, so we don't copy any.
-            // If the length is 1, we don't copy that one element, we move it. Only check
-            // for `Copy` if the length is larger.
-            if count.try_to_target_usize(self.tcx).is_none_or(|x| x > 1) {
-                self.enforce_repeat_element_needs_copy_bound(element, element_ty);
-            }
-        }
-    }
+                // We want to emit an error if the const is not structurally resolvable
+                // as otherwise we can wind up conservatively proving `Copy` which may
+                // infer the repeat expr count to something that never required `Copy` in
+                // the first place.
+                let count = self.structurally_resolve_const(
+                    element.span,
+                    self.normalize(element.span, Unnormalized::new_wip(count)),
+                );
 
-    pub(in super::super) fn check_method_argument_types(
-        &self,
-        sp: Span,
-        expr: &'tcx hir::Expr<'tcx>,
-        method: Result<MethodCallee<'tcx>, ErrorGuaranteed>,
-        args_no_rcvr: &'tcx [hir::Expr<'tcx>],
-        tuple_arguments: TupleArgumentsFlag,
-        expected: Expectation<'tcx>,
-    ) -> Ty<'tcx> {
-        let has_error = match method {
-            Ok(method) => method.args.error_reported().and(method.sig.error_reported()),
-            Err(guar) => Err(guar),
-        };
-        if let Err(guar) = has_error {
-            let err_inputs = self.err_args(
-                method.map_or(args_no_rcvr.len(), |method| method.sig.inputs().len() - 1),
-                guar,
-            );
-            let err_output = Ty::new_error(self.tcx, guar);
+                // Avoid run on "`NotCopy: Copy` is not implemented" errors when the
+                // repeat expr count is erroneous/unknown. The user might wind up
+                // specifying a repeat count of 0/1.
+                if count.references_error() {
+                    return None;
+                }
 
-            let err_inputs = match tuple_arguments {
-                DontTupleArguments => err_inputs,
-                TupleArguments => vec![Ty::new_tup(self.tcx, &err_inputs)],
+                Some((element, element_ty, count))
+            })
+            // We collect to force the side effects of structurally resolving the repeat
+            // count to happen in one go, to avoid side effects from proving `Copy`
+            // affecting whether repeat counts are known or not. If we did not do this we
+            // would get results that depend on the order that we evaluate each repeat
+            // expr's `Copy` check.
+            .collect::<Vec<_>>();
+
+        let enforce_copy_bound = |element: &hir::Expr<'_>, element_ty| {
+            // If someone calls a const fn or constructs a const value, they can extract that
+            // out into a separate constant (or a const block in the future), so we check that
+            // to tell them that in the diagnostic. Does not affect typeck.
+            let is_constable = match element.kind {
+                hir::ExprKind::Call(func, _args) => match *self.node_ty(func.hir_id).kind() {
+                    ty::FnDef(def_id, _) if self.tcx.is_stable_const_fn(def_id) => {
+                        traits::IsConstable::Fn
+                    }
+                    _ => traits::IsConstable::No,
+                },
+                hir::ExprKind::Path(qpath) => {
+                    match self.typeck_results.borrow().qpath_res(&qpath, element.hir_id) {
+                        Res::Def(DefKind::Ctor(_, CtorKind::Const), _) => traits::IsConstable::Ctor,
+                        _ => traits::IsConstable::No,
+                    }
+                }
+                _ => traits::IsConstable::No,
             };
 
-            self.check_argument_types(
-                sp,
-                expr,
-                &err_inputs,
-                err_output,
-                NoExpectation,
-                args_no_rcvr,
-                false,
-                tuple_arguments,
-                method.ok().map(|method| method.def_id),
-            );
-            return err_output;
+            let lang_item = self.tcx.require_lang_item(LangItem::Copy, element.span);
+            let code = traits::ObligationCauseCode::RepeatElementCopy {
+                is_constable,
+                elt_span: element.span,
+            };
+            self.require_type_meets(element_ty, element.span, code, lang_item);
+        };
+
+        for (element, element_ty, count) in deferred_repeat_expr_checks {
+            match count.kind() {
+                ty::ConstKind::Value(val) => {
+                    if val.try_to_target_usize(self.tcx).is_none_or(|count| count > 1) {
+                        enforce_copy_bound(element, element_ty)
+                    } else {
+                        // If the length is 0 or 1 we don't actually copy the element, we either don't create it
+                        // or we just use the one value.
+                    }
+                }
+
+                // If the length is a generic parameter or some rigid alias then conservatively
+                // require `element_ty: Copy` as it may wind up being `>1` after monomorphization.
+                ty::ConstKind::Param(_)
+                | ty::ConstKind::Expr(_)
+                | ty::ConstKind::Placeholder(_)
+                | ty::ConstKind::Alias(_, _) => enforce_copy_bound(element, element_ty),
+
+                ty::ConstKind::Bound(_, _) | ty::ConstKind::Infer(_) | ty::ConstKind::Error(_) => {
+                    unreachable!()
+                }
+            }
         }
-
-        let method = method.unwrap();
-        self.check_argument_types(
-            sp,
-            expr,
-            &method.sig.inputs()[1..],
-            method.sig.output(),
-            expected,
-            args_no_rcvr,
-            method.sig.c_variadic,
-            tuple_arguments,
-            Some(method.def_id),
-        );
-
-        method.sig.output()
     }
 
     /// Generic function that factors out common logic from function calls,
@@ -197,12 +199,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expectation: Expectation<'tcx>,
         // The expressions for each provided argument
         provided_args: &'tcx [hir::Expr<'tcx>],
-        // Whether the function is variadic, for example when imported from C
+        // Whether the function is variadic (e.g. from C)
         c_variadic: bool,
-        // Whether the arguments have been bundled in a tuple (ex: closures)
+        // Whether all the arguments have been bundled in a tuple (ex: closures), or one has been splatted
         tuple_arguments: TupleArgumentsFlag,
         // The DefId for the function being called, for better error messages
         fn_def_id: Option<DefId>,
+        // The generics of the function being called. Only used for splatting
+        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
     ) {
         let tcx = self.tcx;
 
@@ -226,16 +230,24 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 arg_expr.span,
                 ObligationCauseCode::WellFormed(None),
             );
+
+            self.check_place_expr_if_unsized(fn_input_ty, arg_expr);
         }
 
         // First, let's unify the formal method signature with the expectation eagerly.
-        // We use this to guide coercion inference; it's output is "fudged" which means
+        // We use this to guide coercion inference; its output is "fudged" which means
         // any remaining type variables are assigned to new, unrelated variables. This
         // is because the inference guidance here is only speculative.
-        let formal_output = self.resolve_vars_with_obligations(formal_output);
-        let expected_input_tys: Option<Vec<_>> = expectation
+        // FIXME(splat): do we need to splat arguments before this type inference?
+        let mut expected_input_tys: Option<Vec<_>> = expectation
             .only_has_type(self)
             .and_then(|expected_output| {
+                let formal_output = self.resolve_vars_with_obligations(formal_output);
+                // FIXME(#149379): This operation results in expected input
+                // types which are potentially not well-formed or for whom the
+                // function where-bounds don't actually hold. This results
+                // in weird bugs when later treating these expectations as if
+                // they were actually correct.
                 self.fudge_inference_if_ok(|| {
                     let ocx = ObligationCtxt::new(self);
 
@@ -245,7 +257,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // No argument expectations are produced if unification fails.
                     let origin = self.misc(call_span);
                     ocx.sup(&origin, self.param_env, expected_output, formal_output)?;
-                    if !ocx.select_where_possible().is_empty() {
+
+                    // Check the well-formedness of expected input tys, as using ill-formed
+                    // expectation may cause type inference errors, see #150316.
+                    for &ty in formal_input_tys {
+                        ocx.register_obligation(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(call_span),
+                            self.param_env,
+                            ty::ClauseKind::WellFormed(ty.into()),
+                        ));
+                    }
+
+                    if !ocx.try_evaluate_obligations().is_empty() {
                         return Err(TypeError::Mismatch);
                     }
 
@@ -264,45 +288,33 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let mut err_code = E0061;
 
-        // If the arguments should be wrapped in a tuple (ex: closures), unwrap them here
-        let (formal_input_tys, expected_input_tys) = if tuple_arguments == TupleArguments {
-            let tuple_type = self.structurally_resolve_type(call_span, formal_input_tys[0]);
-            match tuple_type.kind() {
-                // We expected a tuple and got a tuple
-                ty::Tuple(arg_types) => {
-                    // Argument length differs
-                    if arg_types.len() != provided_args.len() {
-                        err_code = E0057;
-                    }
-                    let expected_input_tys = match expected_input_tys {
-                        Some(expected_input_tys) => match expected_input_tys.get(0) {
-                            Some(ty) => match ty.kind() {
-                                ty::Tuple(tys) => Some(tys.iter().collect()),
-                                _ => None,
-                            },
-                            None => None,
-                        },
-                        None => None,
-                    };
-                    (arg_types.iter().collect(), expected_input_tys)
-                }
-                _ => {
-                    // Otherwise, there's a mismatch, so clear out what we're expecting, and set
-                    // our input types to err_args so we don't blow up the error messages
-                    let guar = struct_span_code_err!(
-                        self.dcx(),
-                        call_span,
-                        E0059,
-                        "cannot use call notation; the first type parameter \
-                         for the function trait is neither a tuple nor unit"
-                    )
-                    .emit();
-                    (self.err_args(provided_args.len(), guar), None)
-                }
+        let mut formal_input_tys = formal_input_tys.to_vec();
+
+        // If the arguments should be wrapped in a tuple (ex: closures, splats), unwrap them here
+        if tuple_arguments.is_tupled() {
+            // Caller arguments are tupled before typechecking, starting at the given index.
+            // Tupling makes the callee and caller argument counts match.
+            let outcome = self.check_tupled_arguments(
+                call_span,
+                call_expr,
+                formal_input_tys,
+                provided_args,
+                expected_input_tys,
+                tuple_arguments,
+                fn_def_id,
+                callee_generic_args,
+            );
+            let TupledArgCheckOutcome {
+                new_err_code,
+                untupled_formal_input_tys,
+                untupled_expected_input_tys,
+            } = outcome;
+            if let Some(new_err_code) = new_err_code {
+                err_code = new_err_code;
             }
-        } else {
-            (formal_input_tys.to_vec(), expected_input_tys)
-        };
+            formal_input_tys = untupled_formal_input_tys;
+            expected_input_tys = untupled_expected_input_tys;
+        }
 
         // If there are no external expectations at the call site, just use the types from the function defn
         let expected_input_tys = if let Some(expected_input_tys) = expected_input_tys {
@@ -321,7 +333,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let demand_compatible = |idx| {
             let formal_input_ty: Ty<'tcx> = formal_input_tys[idx];
             let expected_input_ty: Ty<'tcx> = expected_input_tys[idx];
-            let provided_arg = &provided_args[idx];
+            let provided_arg: &hir::Expr<'tcx> = &provided_args[idx];
 
             debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
@@ -330,7 +342,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // 1. Unify the provided argument with the expected type
             let expectation = Expectation::rvalue_hint(self, expected_input_ty);
 
-            let checked_ty = self.check_expr_with_expectation(provided_arg, expectation);
+            // If we are processing first arg of delegation then we could have adjusted it
+            // in `execute_delegation_aware_arguments_check`.
+            let checked_ty = self
+                .tcx
+                .hir_opt_delegation_info(self.body_def_id)
+                .and_then(|_| self.typeck_results.borrow().node_type_opt(provided_arg.hir_id))
+                .unwrap_or_else(|| self.check_expr_with_expectation(provided_arg, expectation));
 
             // 2. Coerce to the most detailed type that could be coerced
             //    to, which is `expected_ty` if `rvalue_hint` returns an
@@ -456,7 +474,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty: Ty<'tcx>,
                     cast_ty: &str,
                 ) {
-                    sess.dcx().emit_err(errors::PassToVariadicFunction {
+                    sess.dcx().emit_err(diagnostics::PassToVariadicFunction {
                         span,
                         ty,
                         cast_ty,
@@ -467,7 +485,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                 // There are a few types which get autopromoted when passed via varargs
                 // in C but we just error out instead and require explicit casts.
+                //
+                // We use implementations of VaArgSafe as the source of truth. On some embedded
+                // targets, c_double is f32 and c_int/c_uing are i16/u16, and these types implement
+                // VaArgSafe there. On all other targets, these types do not implement VaArgSafe.
+                //
+                // cfg(bootstrap): change the if let to an unwrap.
                 let arg_ty = self.structurally_resolve_type(arg.span, arg_ty);
+                if let Some(trait_def_id) = tcx.lang_items().va_arg_safe()
+                    && self
+                        .type_implements_trait(trait_def_id, [arg_ty], self.param_env)
+                        .must_apply_modulo_regions()
+                {
+                    continue;
+                }
+
                 match arg_ty.kind() {
                     ty::Float(ty::FloatTy::F32) => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_double");
@@ -483,7 +515,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let fn_ptr = self.resolve_vars_if_possible(fn_ptr).to_string();
 
                         let fn_item_spa = arg.span;
-                        tcx.sess.dcx().emit_err(errors::PassFnItemToVariadicFunction {
+                        tcx.sess.dcx().emit_err(diagnostics::PassFnItemToVariadicFunction {
                             span: fn_item_spa,
                             sugg_span: fn_item_spa.shrink_to_hi(),
                             replace: fn_ptr,
@@ -528,6 +560,273 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    /// Check arguments that are tupled by "rust-call" or `#[rustc_splat]`.
+    fn check_tupled_arguments(
+        &self,
+        // Span enclosing the call site
+        call_span: Span,
+        // Expression of the call site
+        call_expr: &'tcx hir::Expr<'tcx>,
+        // Types (as defined in the *signature* of the target function)
+        mut formal_input_tys: Vec<Ty<'tcx>>,
+        // The expressions for each provided argument
+        provided_args: &'tcx [hir::Expr<'tcx>],
+        // The expected input types from the context of the call site
+        mut expected_input_tys: Option<Vec<Ty<'tcx>>>,
+        // Whether all the arguments have been bundled in a tuple (ex: closures), or one has been splatted
+        tuple_arguments: TupleArgumentsFlag,
+        // The DefId for the function being called, for better error messages
+        fn_def_id: Option<DefId>,
+        // The generics of the function being called. Only used for splatting
+        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
+    ) -> TupledArgCheckOutcome<'tcx> {
+        let (first_tupled_arg_index, is_self_splatted) = tuple_arguments.tupled_arg_index();
+        let Some(first_tupled_arg_index) = first_tupled_arg_index else {
+            // If we're not tupling any of the current arguments, we're done.
+            return TupledArgCheckOutcome {
+                new_err_code: None,
+                untupled_formal_input_tys: formal_input_tys,
+                untupled_expected_input_tys: expected_input_tys,
+            };
+        };
+        let first_tupled_arg_index_usz = usize::from(first_tupled_arg_index);
+
+        // The argument difference can range from -1 to u16::MAX - 1, so we count the number
+        // of tupled arguments instead.
+        // (An empty argument list becomes a unit tuple in the callee.)
+        // 0: f() -> f(#[rustc_splat] _: ())
+        // 1: f(a) -> f(#[rustc_splat] _: (A,))
+        // 2: f(a, b) -> f(#[rustc_splat] _: (A, B))
+        // The Fn* traits ensure this by construction, and `#[rustc_splat]` can only be applied to
+        // an actual argument.
+        let tupled_args_count = (1 + provided_args.len()).checked_sub(formal_input_tys.len());
+        debug!(
+            ?first_tupled_arg_index, ?is_self_splatted,
+            ?tupled_args_count, ?tuple_arguments,
+            provided_args_len = ?provided_args.len(), formal_input_tys_len = ?formal_input_tys.len()
+        );
+
+        // If earlier code has modified the FnSig argument list without adjusting the splatted
+        // argument, indexing into the formal input types will panic.
+        if first_tupled_arg_index_usz >= formal_input_tys.len() {
+            span_bug!(
+                call_span,
+                "splatted argument index is out of bounds: {first_tupled_arg_index:?} >= {}, \
+                is_self_splatted = {is_self_splatted:?}, \
+                tupled_args_count = {tupled_args_count:?}, {tuple_arguments:?}, \
+                provided_args: {}",
+                formal_input_tys.len(),
+                provided_args.len(),
+            );
+        }
+
+        let formal_input_tupled_ty = formal_input_tys[first_tupled_arg_index_usz];
+        // Keep the type variable if the argument is splatted, so we can force it to be a tuple later.
+        let tuple_type = if tuple_arguments.is_splatted() {
+            let callee_tuple_type = self.resolve_vars_with_obligations(formal_input_tupled_ty);
+            if callee_tuple_type.is_ty_var()
+                && let Some(tupled_args_count) = tupled_args_count
+            {
+                // Make the original type variable resolve to a tuple containing new type variables
+                let ocx = ObligationCtxt::new(self);
+                let origin = self.misc(call_span);
+
+                let new_tupled_type = Ty::new_tup_from_iter(
+                    self.tcx,
+                    iter::repeat_with(|| self.next_ty_var(call_span)).take(tupled_args_count),
+                );
+
+                // FIXME(splat): should this be a sub/super type relationship?
+                let ocx_error = ocx.eq(&origin, self.param_env, callee_tuple_type, new_tupled_type);
+                if let Err(ocx_error) = ocx_error {
+                    // FIXME(splat): add a test for this error and the one below, if they are reachable
+                    struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        // FIXME(splat): add a new error code before stabilization (and below as well)
+                        E0277,
+                        "cannot resolve splatted arguments; splatted type parameters \
+                        must be a tuple or unit type: {:?}",
+                        ocx_error,
+                    )
+                    .emit();
+                }
+
+                let type_errors = ocx.try_evaluate_obligations();
+                if type_errors.is_empty() {
+                    new_tupled_type
+                } else {
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        E0277,
+                        "cannot resolve splatted arguments; splatted type parameters \
+                        must be a tuple or unit type: {:?}",
+                        type_errors,
+                    )
+                    .emit();
+                    Ty::new_error(self.tcx, guar)
+                }
+            } else {
+                // Otherwise, just let the argument type checker make a suggestion
+                callee_tuple_type
+            }
+        } else {
+            self.structurally_resolve_type(call_span, formal_input_tupled_ty)
+        };
+
+        // We expected a tuple and got a tuple (or made one ourselves).
+        // If it's not a tuple, we error out in the next block.
+        let mut err_code = None;
+        if let ty::Tuple(detup_formal_arg_tys) = tuple_type.kind() {
+            // Argument length differs
+            // FIXME(splat): update the error code E0057 docs when splat is stabilized
+            if Some(detup_formal_arg_tys.len()) != tupled_args_count {
+                err_code = Some(E0057);
+            }
+            if let Some(ref mut expected_input_tys) = expected_input_tys
+                && let Some(ty) = expected_input_tys.get(first_tupled_arg_index_usz)
+                && let ty::Tuple(detup_expected_arg_tys) = ty.kind()
+            {
+                let substitute_tys = if Some(detup_expected_arg_tys.len()) == tupled_args_count {
+                    detup_expected_arg_tys.iter()
+                } else {
+                    // Just fall back to the formal argument types
+                    detup_formal_arg_tys.iter()
+                };
+
+                expected_input_tys.splice(
+                    first_tupled_arg_index_usz..=first_tupled_arg_index_usz,
+                    substitute_tys,
+                );
+            } else {
+                expected_input_tys = None;
+            }
+            formal_input_tys.splice(
+                first_tupled_arg_index_usz..=first_tupled_arg_index_usz,
+                detup_formal_arg_tys.iter(),
+            );
+            if let Some(ref expected_input_tys) = expected_input_tys {
+                assert_eq!(
+                    formal_input_tys.len(),
+                    expected_input_tys.len(),
+                    "incorrectly constructed input type tuples, argument counts must match: \
+                    tuple_arguments: {tuple_arguments:?}, \
+                    first_tupled_arg_index: {first_tupled_arg_index}",
+                )
+            }
+        }
+
+        // Otherwise, there's a mismatch during splatting or a rust-call.
+        // So clear out what we're expecting, and set our input types to err_args so we don't
+        // blow up the error messages.
+        let guar =
+            if tuple_arguments == TupleAllCallArgs && !matches!(tuple_type.kind(), ty::Tuple(_)) {
+                let guar = struct_span_code_err!(
+                    self.dcx(),
+                    call_span,
+                    E0059,
+                    "cannot use call notation; the first type parameter \
+                    for the function trait is neither a tuple nor unit"
+                )
+                .emit();
+
+                Some(guar)
+            } else if tuple_arguments.is_splatted() {
+                // If we don't check argument counts here, and there's a subtle bug in the code above,
+                // later compilation stages can fail in unrelated places with confusing errors.
+                if !matches!(tuple_type.kind(), ty::Tuple(_)) {
+                    let spans = if let Some(def_id) = fn_def_id
+                        && let Some(hir_node) = self.tcx.hir_get_if_local(def_id)
+                        && let Some(fn_decl) = hir_node.fn_decl()
+                        && let Some(arg_ty) = fn_decl.inputs.get(first_tupled_arg_index_usz)
+                    {
+                        let arg_def_span = arg_ty.span;
+                        vec![call_span, arg_def_span]
+                    } else {
+                        vec![call_span]
+                    };
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        spans,
+                        // FIXME(splat): add a new error code before stabilization
+                        E0277,
+                        "cannot use `rustc_splat` attribute; the splatted argument type \
+                        must be a tuple or unit, not a {:?} ({:?})",
+                        tuple_type.kind(),
+                        self.structurally_resolve_type(
+                            call_span,
+                            formal_input_tys[first_tupled_arg_index_usz]
+                        )
+                        .kind(),
+                    )
+                    .emit();
+
+                    Some(guar)
+                } else if formal_input_tys.len() != provided_args.len() {
+                    // FIXME(splat): suggest alternative argument counts, if there are any
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        E0057,
+                        "this splatted function takes {} arguments, but {} {} provided",
+                        formal_input_tys.len(),
+                        provided_args.len(),
+                        if provided_args.len() == 1 { "was" } else { "were" },
+                    )
+                    .emit();
+
+                    Some(guar)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(guar) = guar {
+            TupledArgCheckOutcome {
+                new_err_code: err_code,
+                untupled_formal_input_tys: self.err_args(provided_args.len(), guar),
+                untupled_expected_input_tys: None,
+            }
+        } else {
+            // If splatting, record this call in a side-table, so MIR lowering can tuple the caller's arguments
+            if tuple_arguments.is_splatted() {
+                // FIXME(const_trait_impl): does not enforce constness yet
+                self.write_splatted_call(
+                    call_expr.hir_id,
+                    call_span,
+                    fn_def_id,
+                    callee_generic_args,
+                    first_tupled_arg_index,
+                    tupled_args_count.unwrap().try_into().unwrap(),
+                );
+            }
+
+            TupledArgCheckOutcome {
+                new_err_code: err_code,
+                untupled_formal_input_tys: formal_input_tys,
+                untupled_expected_input_tys: expected_input_tys,
+            }
+        }
+    }
+
+    /// If `unsized_fn_params` is active, check that unsized values are place expressions. Since
+    /// the removal of `unsized_locals` in <https://github.com/rust-lang/rust/pull/142911> we can't
+    /// store them in MIR locals as temporaries.
+    ///
+    /// If `unsized_fn_params` is inactive, this will be checked in borrowck instead.
+    fn check_place_expr_if_unsized(&self, ty: Ty<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
+        if self.tcx.features().unsized_fn_params() && !expr.is_syntactic_place_expr() {
+            self.require_type_is_sized(
+                ty,
+                expr.span,
+                ObligationCauseCode::UnsizedNonPlaceExpr(expr.span),
+            );
+        }
+    }
+
     fn report_arg_errors(
         &self,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
@@ -538,357 +837,31 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         fn_def_id: Option<DefId>,
         call_span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
+        // FIXME(splat): when the feature design is settled, improve the errors here
         tuple_arguments: TupleArgumentsFlag,
     ) -> ErrorGuaranteed {
         // Next, let's construct the error
-        let (error_span, call_ident, full_call_span, call_name, is_method) = match &call_expr.kind {
-            hir::ExprKind::Call(
-                hir::Expr { hir_id, span, kind: hir::ExprKind::Path(qpath), .. },
-                _,
-            ) => {
-                if let Res::Def(DefKind::Ctor(of, _), _) =
-                    self.typeck_results.borrow().qpath_res(qpath, *hir_id)
-                {
-                    let name = match of {
-                        CtorOf::Struct => "struct",
-                        CtorOf::Variant => "enum variant",
-                    };
-                    (call_span, None, *span, name, false)
-                } else {
-                    (call_span, None, *span, "function", false)
-                }
-            }
-            hir::ExprKind::Call(hir::Expr { span, .. }, _) => {
-                (call_span, None, *span, "function", false)
-            }
-            hir::ExprKind::MethodCall(path_segment, _, _, span) => {
-                let ident_span = path_segment.ident.span;
-                let ident_span = if let Some(args) = path_segment.args {
-                    ident_span.with_hi(args.span_ext.hi())
-                } else {
-                    ident_span
-                };
-                (*span, Some(path_segment.ident), ident_span, "method", true)
-            }
-            k => span_bug!(call_span, "checking argument types on a non-call: `{:?}`", k),
-        };
-        let args_span = error_span.trim_start(full_call_span).unwrap_or(error_span);
 
-        // Don't print if it has error types or is just plain `_`
-        fn has_error_or_infer<'tcx>(tys: impl IntoIterator<Item = Ty<'tcx>>) -> bool {
-            tys.into_iter().any(|ty| ty.references_error() || ty.is_ty_var())
-        }
-
-        let tcx = self.tcx;
-
-        // Get the argument span in the context of the call span so that
-        // suggestions and labels are (more) correct when an arg is a
-        // macro invocation.
-        let normalize_span = |span: Span| -> Span {
-            let normalized_span = span.find_ancestor_inside_same_ctxt(error_span).unwrap_or(span);
-            // Sometimes macros mess up the spans, so do not normalize the
-            // arg span to equal the error span, because that's less useful
-            // than pointing out the arg expr in the wrong context.
-            if normalized_span.source_equal(error_span) { span } else { normalized_span }
-        };
-
-        // Precompute the provided types and spans, since that's all we typically need for below
-        let provided_arg_tys: IndexVec<ProvidedIdx, (Ty<'tcx>, Span)> = provided_args
-            .iter()
-            .map(|expr| {
-                let ty = self
-                    .typeck_results
-                    .borrow()
-                    .expr_ty_adjusted_opt(*expr)
-                    .unwrap_or_else(|| Ty::new_misc_error(tcx));
-                (self.resolve_vars_if_possible(ty), normalize_span(expr.span))
-            })
-            .collect();
-        let callee_expr = match &call_expr.peel_blocks().kind {
-            hir::ExprKind::Call(callee, _) => Some(*callee),
-            hir::ExprKind::MethodCall(_, receiver, ..) => {
-                if let Some((DefKind::AssocFn, def_id)) =
-                    self.typeck_results.borrow().type_dependent_def(call_expr.hir_id)
-                    && let Some(assoc) = tcx.opt_associated_item(def_id)
-                    && assoc.is_method()
-                {
-                    Some(*receiver)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        let callee_ty = callee_expr
-            .and_then(|callee_expr| self.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr));
-
-        // Obtain another method on `Self` that have similar name.
-        let similar_assoc = |call_name: Ident| -> Option<(ty::AssocItem, ty::FnSig<'_>)> {
-            if let Some(callee_ty) = callee_ty
-                && let Ok(Some(assoc)) = self.probe_op(
-                    call_name.span,
-                    MethodCall,
-                    Some(call_name),
-                    None,
-                    IsSuggestion(true),
-                    callee_ty.peel_refs(),
-                    callee_expr.unwrap().hir_id,
-                    TraitsInScope,
-                    |mut ctxt| ctxt.probe_for_similar_candidate(),
-                )
-                && assoc.is_method()
-            {
-                let args = self.infcx.fresh_args_for_item(call_name.span, assoc.def_id);
-                let fn_sig = tcx.fn_sig(assoc.def_id).instantiate(tcx, args);
-
-                self.instantiate_binder_with_fresh_vars(call_name.span, FnCall, fn_sig);
-            }
-            None
-        };
-
-        let suggest_confusable = |err: &mut Diag<'_>| {
-            let Some(call_name) = call_ident else {
-                return;
-            };
-            let Some(callee_ty) = callee_ty else {
-                return;
-            };
-            let input_types: Vec<Ty<'_>> = provided_arg_tys.iter().map(|(ty, _)| *ty).collect();
-            // Check for other methods in the following order
-            //  - methods marked as `rustc_confusables` with the provided arguments
-            //  - methods with the same argument type/count and short levenshtein distance
-            //  - methods marked as `rustc_confusables` (done)
-            //  - methods with short levenshtein distance
-
-            // Look for commonly confusable method names considering arguments.
-            if let Some(_name) = self.confusable_method_name(
-                err,
-                callee_ty.peel_refs(),
-                call_name,
-                Some(input_types.clone()),
-            ) {
-                return;
-            }
-            // Look for method names with short levenshtein distance, considering arguments.
-            if let Some((assoc, fn_sig)) = similar_assoc(call_name)
-                && fn_sig.inputs()[1..]
-                    .iter()
-                    .zip(input_types.iter())
-                    .all(|(expected, found)| self.may_coerce(*expected, *found))
-                && fn_sig.inputs()[1..].len() == input_types.len()
-            {
-                let assoc_name = assoc.name();
-                err.span_suggestion_verbose(
-                    call_name.span,
-                    format!("you might have meant to use `{}`", assoc_name),
-                    assoc_name,
-                    Applicability::MaybeIncorrect,
-                );
-                return;
-            }
-            // Look for commonly confusable method names disregarding arguments.
-            if let Some(_name) =
-                self.confusable_method_name(err, callee_ty.peel_refs(), call_name, None)
-            {
-                return;
-            }
-            // Look for similarly named methods with levenshtein distance with the right
-            // number of arguments.
-            if let Some((assoc, fn_sig)) = similar_assoc(call_name)
-                && fn_sig.inputs()[1..].len() == input_types.len()
-            {
-                err.span_note(
-                    tcx.def_span(assoc.def_id),
-                    format!(
-                        "there's is a method with similar name `{}`, but the arguments don't match",
-                        assoc.name(),
-                    ),
-                );
-                return;
-            }
-            // Fallthrough: look for similarly named methods with levenshtein distance.
-            if let Some((assoc, _)) = similar_assoc(call_name) {
-                err.span_note(
-                    tcx.def_span(assoc.def_id),
-                    format!(
-                        "there's is a method with similar name `{}`, but their argument count \
-                         doesn't match",
-                        assoc.name(),
-                    ),
-                );
-                return;
-            }
-        };
-        // A "softer" version of the `demand_compatible`, which checks types without persisting them,
-        // and treats error types differently
-        // This will allow us to "probe" for other argument orders that would likely have been correct
-        let check_compatible = |provided_idx: ProvidedIdx, expected_idx: ExpectedIdx| {
-            if provided_idx.as_usize() == expected_idx.as_usize() {
-                return compatibility_diagonal[provided_idx].clone();
-            }
-
-            let (formal_input_ty, expected_input_ty) = formal_and_expected_inputs[expected_idx];
-            // If either is an error type, we defy the usual convention and consider them to *not* be
-            // coercible. This prevents our error message heuristic from trying to pass errors into
-            // every argument.
-            if (formal_input_ty, expected_input_ty).references_error() {
-                return Compatibility::Incompatible(None);
-            }
-
-            let (arg_ty, arg_span) = provided_arg_tys[provided_idx];
-
-            let expectation = Expectation::rvalue_hint(self, expected_input_ty);
-            let coerced_ty = expectation.only_has_type(self).unwrap_or(formal_input_ty);
-            let can_coerce = self.may_coerce(arg_ty, coerced_ty);
-            if !can_coerce {
-                return Compatibility::Incompatible(Some(ty::error::TypeError::Sorts(
-                    ty::error::ExpectedFound::new(coerced_ty, arg_ty),
-                )));
-            }
-
-            // Using probe here, since we don't want this subtyping to affect inference.
-            let subtyping_error = self.probe(|_| {
-                self.at(&self.misc(arg_span), self.param_env)
-                    .sup(DefineOpaqueTypes::Yes, formal_input_ty, coerced_ty)
-                    .err()
-            });
-
-            // Same as above: if either the coerce type or the checked type is an error type,
-            // consider them *not* compatible.
-            let references_error = (coerced_ty, arg_ty).references_error();
-            match (references_error, subtyping_error) {
-                (false, None) => Compatibility::Compatible,
-                (_, subtyping_error) => Compatibility::Incompatible(subtyping_error),
-            }
-        };
-
-        let mk_trace = |span, (formal_ty, expected_ty), provided_ty| {
-            let mismatched_ty = if expected_ty == provided_ty {
-                // If expected == provided, then we must have failed to sup
-                // the formal type. Avoid printing out "expected Ty, found Ty"
-                // in that case.
-                formal_ty
-            } else {
-                expected_ty
-            };
-            TypeTrace::types(&self.misc(span), mismatched_ty, provided_ty)
-        };
-
-        // The algorithm here is inspired by levenshtein distance and longest common subsequence.
-        // We'll try to detect 4 different types of mistakes:
-        // - An extra parameter has been provided that doesn't satisfy *any* of the other inputs
-        // - An input is missing, which isn't satisfied by *any* of the other arguments
-        // - Some number of arguments have been provided in the wrong order
-        // - A type is straight up invalid
-
-        // First, let's find the errors
-        let (mut errors, matched_inputs) =
-            ArgMatrix::new(provided_args.len(), formal_and_expected_inputs.len(), check_compatible)
-                .find_errors();
+        let mut fn_call_diag_ctxt = FnCallDiagCtxt::new(
+            self,
+            compatibility_diagonal,
+            formal_and_expected_inputs,
+            provided_args,
+            c_variadic,
+            err_code,
+            fn_def_id,
+            call_span,
+            call_expr,
+            tuple_arguments,
+        );
 
         // First, check if we just need to wrap some arguments in a tuple.
-        if let Some((mismatch_idx, terr)) =
-            compatibility_diagonal.iter_enumerated().find_map(|(i, c)| {
-                if let Compatibility::Incompatible(Some(terr)) = c {
-                    Some((i, *terr))
-                } else {
-                    None
-                }
-            })
-        {
-            // Is the first bad expected argument a tuple?
-            // Do we have as many extra provided arguments as the tuple's length?
-            // If so, we might have just forgotten to wrap some args in a tuple.
-            if let Some(ty::Tuple(tys)) =
-                formal_and_expected_inputs.get(mismatch_idx.to_expected_idx()).map(|tys| tys.1.kind())
-                // If the tuple is unit, we're not actually wrapping any arguments.
-                && !tys.is_empty()
-                && provided_arg_tys.len() == formal_and_expected_inputs.len() - 1 + tys.len()
-            {
-                // Wrap up the N provided arguments starting at this position in a tuple.
-                let provided_args_to_tuple = &provided_arg_tys[mismatch_idx..];
-                let (provided_args_to_tuple, provided_args_after_tuple) =
-                    provided_args_to_tuple.split_at(tys.len());
-                let provided_as_tuple =
-                    Ty::new_tup_from_iter(tcx, provided_args_to_tuple.iter().map(|&(ty, _)| ty));
+        if let Some(err) = fn_call_diag_ctxt.check_wrap_args_in_tuple() {
+            return err;
+        }
 
-                let mut satisfied = true;
-                // Check if the newly wrapped tuple + rest of the arguments are compatible.
-                for ((_, expected_ty), provided_ty) in std::iter::zip(
-                    formal_and_expected_inputs[mismatch_idx.to_expected_idx()..].iter(),
-                    [provided_as_tuple]
-                        .into_iter()
-                        .chain(provided_args_after_tuple.iter().map(|&(ty, _)| ty)),
-                ) {
-                    if !self.may_coerce(provided_ty, *expected_ty) {
-                        satisfied = false;
-                        break;
-                    }
-                }
-
-                // If they're compatible, suggest wrapping in an arg, and we're done!
-                // Take some care with spans, so we don't suggest wrapping a macro's
-                // innards in parenthesis, for example.
-                if satisfied
-                    && let &[(_, hi @ lo)] | &[(_, lo), .., (_, hi)] = provided_args_to_tuple
-                {
-                    let mut err;
-                    if tys.len() == 1 {
-                        // A tuple wrap suggestion actually occurs within,
-                        // so don't do anything special here.
-                        err = self.err_ctxt().report_and_explain_type_error(
-                            mk_trace(
-                                lo,
-                                formal_and_expected_inputs[mismatch_idx.to_expected_idx()],
-                                provided_arg_tys[mismatch_idx].0,
-                            ),
-                            self.param_env,
-                            terr,
-                        );
-                        err.span_label(
-                            full_call_span,
-                            format!("arguments to this {call_name} are incorrect"),
-                        );
-                    } else {
-                        err = self.dcx().struct_span_err(
-                            full_call_span,
-                            format!(
-                                "{call_name} takes {}{} but {} {} supplied",
-                                if c_variadic { "at least " } else { "" },
-                                potentially_plural_count(
-                                    formal_and_expected_inputs.len(),
-                                    "argument"
-                                ),
-                                potentially_plural_count(provided_args.len(), "argument"),
-                                pluralize!("was", provided_args.len())
-                            ),
-                        );
-                        err.code(err_code.to_owned());
-                        err.multipart_suggestion_verbose(
-                            "wrap these arguments in parentheses to construct a tuple",
-                            vec![
-                                (lo.shrink_to_lo(), "(".to_string()),
-                                (hi.shrink_to_hi(), ")".to_string()),
-                            ],
-                            Applicability::MachineApplicable,
-                        );
-                    };
-                    self.label_fn_like(
-                        &mut err,
-                        fn_def_id,
-                        callee_ty,
-                        call_expr,
-                        None,
-                        Some(mismatch_idx.as_usize()),
-                        &matched_inputs,
-                        &formal_and_expected_inputs,
-                        is_method,
-                        tuple_arguments,
-                    );
-                    suggest_confusable(&mut err);
-                    return err.emit();
-                }
-            }
+        if let Some(fallback_error) = fn_call_diag_ctxt.ensure_has_errors() {
+            return fallback_error;
         }
 
         // Okay, so here's where it gets complicated in regards to what errors
@@ -898,608 +871,47 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         //   2) Valid but incorrect arguments
         //   3) Invalid arguments
         //      - Currently I think this only comes up with `CyclicTy`
-        //
+
         // We first need to go through, remove those from (3) and emit those
         // as their own error, particularly since they're error code and
         // message is special. From what I can tell, we *must* emit these
         // here (vs somewhere prior to this function) since the arguments
         // become invalid *because* of how they get used in the function.
         // It is what it is.
-
-        if errors.is_empty() {
-            if cfg!(debug_assertions) {
-                span_bug!(error_span, "expected errors from argument matrix");
-            } else {
-                let mut err =
-                    self.dcx().create_err(errors::ArgMismatchIndeterminate { span: error_span });
-                suggest_confusable(&mut err);
-                return err.emit();
-            }
-        }
-
-        let detect_dotdot = |err: &mut Diag<'_>, ty: Ty<'_>, expr: &hir::Expr<'_>| {
-            if let ty::Adt(adt, _) = ty.kind()
-                && self.tcx().is_lang_item(adt.did(), hir::LangItem::RangeFull)
-                && let hir::ExprKind::Struct(
-                    hir::QPath::LangItem(hir::LangItem::RangeFull, _),
-                    [],
-                    _,
-                ) = expr.kind
-            {
-                // We have `Foo(a, .., c)`, where the user might be trying to use the "rest" syntax
-                // from default field values, which is not supported on tuples.
-                let explanation = if self.tcx.features().default_field_values() {
-                    "this is only supported on non-tuple struct literals"
-                } else if self.tcx.sess.is_nightly_build() {
-                    "this is only supported on non-tuple struct literals when \
-                     `#![feature(default_field_values)]` is enabled"
-                } else {
-                    "this is not supported"
-                };
-                let msg = format!(
-                    "you might have meant to use `..` to skip providing a value for \
-                     expected fields, but {explanation}; it is instead interpreted as a \
-                     `std::ops::RangeFull` literal",
-                );
-                err.span_help(expr.span, msg);
-            }
-        };
-
-        let mut reported = None;
-        errors.retain(|error| {
-            let Error::Invalid(provided_idx, expected_idx, Compatibility::Incompatible(Some(e))) =
-                error
-            else {
-                return true;
-            };
-            let (provided_ty, provided_span) = provided_arg_tys[*provided_idx];
-            let trace =
-                mk_trace(provided_span, formal_and_expected_inputs[*expected_idx], provided_ty);
-            if !matches!(trace.cause.as_failure_code(*e), FailureCode::Error0308) {
-                let mut err =
-                    self.err_ctxt().report_and_explain_type_error(trace, self.param_env, *e);
-                suggest_confusable(&mut err);
-                reported = Some(err.emit());
-                return false;
-            }
-            true
-        });
-
-        // We're done if we found errors, but we already emitted them.
-        if let Some(reported) = reported
-            && errors.is_empty()
+        if let Some(err) = fn_call_diag_ctxt.filter_out_invalid_arguments()
+            && fn_call_diag_ctxt.errors.is_empty()
         {
-            return reported;
+            // We're done if we found errors, but we already emitted them.
+            return err;
         }
-        assert!(!errors.is_empty());
+
+        assert!(!fn_call_diag_ctxt.errors.is_empty());
+
+        // Last special case: if there is only one "Incompatible" error, just emit that
+        if let Some(err) = fn_call_diag_ctxt.check_single_incompatible() {
+            return err;
+        }
 
         // Okay, now that we've emitted the special errors separately, we
         // are only left missing/extra/swapped and mismatched arguments, both
         // can be collated pretty easily if needed.
 
-        // Next special case: if there is only one "Incompatible" error, just emit that
-        if let &[
-            Error::Invalid(provided_idx, expected_idx, Compatibility::Incompatible(Some(err))),
-        ] = &errors[..]
-        {
-            let (formal_ty, expected_ty) = formal_and_expected_inputs[expected_idx];
-            let (provided_ty, provided_arg_span) = provided_arg_tys[provided_idx];
-            let trace = mk_trace(provided_arg_span, (formal_ty, expected_ty), provided_ty);
-            let mut err = self.err_ctxt().report_and_explain_type_error(trace, self.param_env, err);
-            self.emit_coerce_suggestions(
-                &mut err,
-                provided_args[provided_idx],
-                provided_ty,
-                Expectation::rvalue_hint(self, expected_ty)
-                    .only_has_type(self)
-                    .unwrap_or(formal_ty),
-                None,
-                None,
-            );
-            err.span_label(full_call_span, format!("arguments to this {call_name} are incorrect"));
-
-            self.label_generic_mismatches(
-                &mut err,
-                fn_def_id,
-                &matched_inputs,
-                &provided_arg_tys,
-                &formal_and_expected_inputs,
-                is_method,
-            );
-
-            if let hir::ExprKind::MethodCall(_, rcvr, _, _) = call_expr.kind
-                && provided_idx.as_usize() == expected_idx.as_usize()
-            {
-                self.note_source_of_type_mismatch_constraint(
-                    &mut err,
-                    rcvr,
-                    crate::demand::TypeMismatchSource::Arg {
-                        call_expr,
-                        incompatible_arg: provided_idx.as_usize(),
-                    },
-                );
-            }
-
-            self.suggest_ptr_null_mut(
-                expected_ty,
-                provided_ty,
-                provided_args[provided_idx],
-                &mut err,
-            );
-
-            self.suggest_deref_unwrap_or(
-                &mut err,
-                callee_ty,
-                call_ident,
-                expected_ty,
-                provided_ty,
-                provided_args[provided_idx],
-                is_method,
-            );
-
-            // Call out where the function is defined
-            self.label_fn_like(
-                &mut err,
-                fn_def_id,
-                callee_ty,
-                call_expr,
-                Some(expected_ty),
-                Some(expected_idx.as_usize()),
-                &matched_inputs,
-                &formal_and_expected_inputs,
-                is_method,
-                tuple_arguments,
-            );
-            suggest_confusable(&mut err);
-            detect_dotdot(&mut err, provided_ty, provided_args[provided_idx]);
-            return err.emit();
-        }
-
         // Special case, we found an extra argument is provided, which is very common in practice.
         // but there is a obviously better removing suggestion compared to the current one,
         // try to find the argument with Error type, if we removed it all the types will become good,
         // then we will replace the current suggestion.
-        if let [Error::Extra(provided_idx)] = &errors[..] {
-            let remove_idx_is_perfect = |idx: usize| -> bool {
-                let removed_arg_tys = provided_arg_tys
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(j, arg)| if idx == j { None } else { Some(arg) })
-                    .collect::<IndexVec<ProvidedIdx, _>>();
-                std::iter::zip(formal_and_expected_inputs.iter(), removed_arg_tys.iter()).all(
-                    |((expected_ty, _), (provided_ty, _))| {
-                        !provided_ty.references_error()
-                            && self.may_coerce(*provided_ty, *expected_ty)
-                    },
-                )
-            };
+        fn_call_diag_ctxt.maybe_optimize_extra_arg_suggestion();
 
-            if !remove_idx_is_perfect(provided_idx.as_usize()) {
-                if let Some(i) = (0..provided_args.len()).find(|&i| remove_idx_is_perfect(i)) {
-                    errors = vec![Error::Extra(ProvidedIdx::from_usize(i))];
-                }
-            }
-        }
+        let mut err = fn_call_diag_ctxt.initial_final_diagnostic();
+        fn_call_diag_ctxt.suggest_confusable(&mut err);
 
-        let mut err = if formal_and_expected_inputs.len() == provided_args.len() {
-            struct_span_code_err!(
-                self.dcx(),
-                full_call_span,
-                E0308,
-                "arguments to this {} are incorrect",
-                call_name,
-            )
-        } else {
-            self.dcx()
-                .struct_span_err(
-                    full_call_span,
-                    format!(
-                        "this {} takes {}{} but {} {} supplied",
-                        call_name,
-                        if c_variadic { "at least " } else { "" },
-                        potentially_plural_count(formal_and_expected_inputs.len(), "argument"),
-                        potentially_plural_count(provided_args.len(), "argument"),
-                        pluralize!("was", provided_args.len())
-                    ),
-                )
-                .with_code(err_code.to_owned())
-        };
+        // As we encounter issues, keep track of what we want to provide for the suggestion.
 
-        suggest_confusable(&mut err);
-        // As we encounter issues, keep track of what we want to provide for the suggestion
-        let mut labels = vec![];
-        // If there is a single error, we give a specific suggestion; otherwise, we change to
-        // "did you mean" with the suggested function call
-        enum SuggestionText {
-            None,
-            Provide(bool),
-            Remove(bool),
-            Swap,
-            Reorder,
-            DidYouMean,
-        }
-        let mut suggestion_text = SuggestionText::None;
+        let (mut suggestions, labels, suggestion_text) =
+            fn_call_diag_ctxt.labels_and_suggestion_text(&mut err);
 
-        let ty_to_snippet = |ty: Ty<'tcx>, expected_idx: ExpectedIdx| {
-            if ty.is_unit() {
-                "()".to_string()
-            } else if ty.is_suggestable(tcx, false) {
-                format!("/* {ty} */")
-            } else if let Some(fn_def_id) = fn_def_id
-                && self.tcx.def_kind(fn_def_id).is_fn_like()
-                && let self_implicit =
-                    matches!(call_expr.kind, hir::ExprKind::MethodCall(..)) as usize
-                && let Some(Some(arg)) =
-                    self.tcx.fn_arg_idents(fn_def_id).get(expected_idx.as_usize() + self_implicit)
-                && arg.name != kw::SelfLower
-            {
-                format!("/* {} */", arg.name)
-            } else {
-                "/* value */".to_string()
-            }
-        };
-
-        let mut errors = errors.into_iter().peekable();
-        let mut only_extras_so_far = errors
-            .peek()
-            .is_some_and(|first| matches!(first, Error::Extra(arg_idx) if arg_idx.index() == 0));
-        let mut prev_extra_idx = None;
-        let mut suggestions = vec![];
-        while let Some(error) = errors.next() {
-            only_extras_so_far &= matches!(error, Error::Extra(_));
-
-            match error {
-                Error::Invalid(provided_idx, expected_idx, compatibility) => {
-                    let (formal_ty, expected_ty) = formal_and_expected_inputs[expected_idx];
-                    let (provided_ty, provided_span) = provided_arg_tys[provided_idx];
-                    if let Compatibility::Incompatible(error) = compatibility {
-                        let trace = mk_trace(provided_span, (formal_ty, expected_ty), provided_ty);
-                        if let Some(e) = error {
-                            self.err_ctxt().note_type_err(
-                                &mut err,
-                                &trace.cause,
-                                None,
-                                Some(self.param_env.and(trace.values)),
-                                e,
-                                true,
-                                None,
-                            );
-                        }
-                    }
-
-                    self.emit_coerce_suggestions(
-                        &mut err,
-                        provided_args[provided_idx],
-                        provided_ty,
-                        Expectation::rvalue_hint(self, expected_ty)
-                            .only_has_type(self)
-                            .unwrap_or(formal_ty),
-                        None,
-                        None,
-                    );
-                    detect_dotdot(&mut err, provided_ty, provided_args[provided_idx]);
-                }
-                Error::Extra(arg_idx) => {
-                    let (provided_ty, provided_span) = provided_arg_tys[arg_idx];
-                    let provided_ty_name = if !has_error_or_infer([provided_ty]) {
-                        // FIXME: not suggestable, use something else
-                        format!(" of type `{provided_ty}`")
-                    } else {
-                        "".to_string()
-                    };
-                    let idx = if provided_arg_tys.len() == 1 {
-                        "".to_string()
-                    } else {
-                        format!(" #{}", arg_idx.as_usize() + 1)
-                    };
-                    labels.push((
-                        provided_span,
-                        format!("unexpected argument{idx}{provided_ty_name}"),
-                    ));
-                    let mut span = provided_span;
-                    if span.can_be_used_for_suggestions()
-                        && error_span.can_be_used_for_suggestions()
-                    {
-                        if arg_idx.index() > 0
-                            && let Some((_, prev)) =
-                                provided_arg_tys.get(ProvidedIdx::from_usize(arg_idx.index() - 1))
-                        {
-                            // Include previous comma
-                            span = prev.shrink_to_hi().to(span);
-                        }
-
-                        // Is last argument for deletion in a row starting from the 0-th argument?
-                        // Then delete the next comma, so we are not left with `f(, ...)`
-                        //
-                        //     fn f() {}
-                        //   - f(0, 1,)
-                        //   + f()
-                        let trim_next_comma = match errors.peek() {
-                            Some(Error::Extra(provided_idx))
-                                if only_extras_so_far
-                                    && provided_idx.index() > arg_idx.index() + 1 =>
-                            // If the next Error::Extra ("next") doesn't next to current ("current"),
-                            // fn foo(_: (), _: u32) {}
-                            // - foo("current", (), 1u32, "next")
-                            // + foo((), 1u32)
-                            // If the previous error is not a `Error::Extra`, then do not trim the next comma
-                            // - foo((), "current", 42u32, "next")
-                            // + foo((), 42u32)
-                            {
-                                prev_extra_idx.is_none_or(|prev_extra_idx| {
-                                    prev_extra_idx + 1 == arg_idx.index()
-                                })
-                            }
-                            // If no error left, we need to delete the next comma
-                            None if only_extras_so_far => true,
-                            // Not sure if other error type need to be handled as well
-                            _ => false,
-                        };
-
-                        if trim_next_comma {
-                            let next = provided_arg_tys
-                                .get(arg_idx + 1)
-                                .map(|&(_, sp)| sp)
-                                .unwrap_or_else(|| {
-                                    // Try to move before `)`. Note that `)` here is not necessarily
-                                    // the latin right paren, it could be a Unicode-confusable that
-                                    // looks like a `)`, so we must not use `- BytePos(1)`
-                                    // manipulations here.
-                                    self.tcx().sess.source_map().end_point(call_expr.span)
-                                });
-
-                            // Include next comma
-                            span = span.until(next);
-                        }
-
-                        suggestions.push((span, String::new()));
-
-                        suggestion_text = match suggestion_text {
-                            SuggestionText::None => SuggestionText::Remove(false),
-                            SuggestionText::Remove(_) => SuggestionText::Remove(true),
-                            _ => SuggestionText::DidYouMean,
-                        };
-                        prev_extra_idx = Some(arg_idx.index())
-                    }
-                    detect_dotdot(&mut err, provided_ty, provided_args[arg_idx]);
-                }
-                Error::Missing(expected_idx) => {
-                    // If there are multiple missing arguments adjacent to each other,
-                    // then we can provide a single error.
-
-                    let mut missing_idxs = vec![expected_idx];
-                    while let Some(e) = errors.next_if(|e| {
-                        matches!(e, Error::Missing(next_expected_idx)
-                            if *next_expected_idx == *missing_idxs.last().unwrap() + 1)
-                    }) {
-                        match e {
-                            Error::Missing(expected_idx) => missing_idxs.push(expected_idx),
-                            _ => unreachable!(
-                                "control flow ensures that we should always get an `Error::Missing`"
-                            ),
-                        }
-                    }
-
-                    // NOTE: Because we might be re-arranging arguments, might have extra
-                    // arguments, etc. it's hard to *really* know where we should provide
-                    // this error label, so as a heuristic, we point to the provided arg, or
-                    // to the call if the missing inputs pass the provided args.
-                    match &missing_idxs[..] {
-                        &[expected_idx] => {
-                            let (_, input_ty) = formal_and_expected_inputs[expected_idx];
-                            let span = if let Some((_, arg_span)) =
-                                provided_arg_tys.get(expected_idx.to_provided_idx())
-                            {
-                                *arg_span
-                            } else {
-                                args_span
-                            };
-                            let rendered = if !has_error_or_infer([input_ty]) {
-                                format!(" of type `{input_ty}`")
-                            } else {
-                                "".to_string()
-                            };
-                            labels.push((
-                                span,
-                                format!(
-                                    "argument #{}{rendered} is missing",
-                                    expected_idx.as_usize() + 1
-                                ),
-                            ));
-
-                            suggestion_text = match suggestion_text {
-                                SuggestionText::None => SuggestionText::Provide(false),
-                                SuggestionText::Provide(_) => SuggestionText::Provide(true),
-                                _ => SuggestionText::DidYouMean,
-                            };
-                        }
-                        &[first_idx, second_idx] => {
-                            let (_, first_expected_ty) = formal_and_expected_inputs[first_idx];
-                            let (_, second_expected_ty) = formal_and_expected_inputs[second_idx];
-                            let span = if let (Some((_, first_span)), Some((_, second_span))) = (
-                                provided_arg_tys.get(first_idx.to_provided_idx()),
-                                provided_arg_tys.get(second_idx.to_provided_idx()),
-                            ) {
-                                first_span.to(*second_span)
-                            } else {
-                                args_span
-                            };
-                            let rendered =
-                                if !has_error_or_infer([first_expected_ty, second_expected_ty]) {
-                                    format!(
-                                        " of type `{first_expected_ty}` and `{second_expected_ty}`"
-                                    )
-                                } else {
-                                    "".to_string()
-                                };
-                            labels.push((span, format!("two arguments{rendered} are missing")));
-                            suggestion_text = match suggestion_text {
-                                SuggestionText::None | SuggestionText::Provide(_) => {
-                                    SuggestionText::Provide(true)
-                                }
-                                _ => SuggestionText::DidYouMean,
-                            };
-                        }
-                        &[first_idx, second_idx, third_idx] => {
-                            let (_, first_expected_ty) = formal_and_expected_inputs[first_idx];
-                            let (_, second_expected_ty) = formal_and_expected_inputs[second_idx];
-                            let (_, third_expected_ty) = formal_and_expected_inputs[third_idx];
-                            let span = if let (Some((_, first_span)), Some((_, third_span))) = (
-                                provided_arg_tys.get(first_idx.to_provided_idx()),
-                                provided_arg_tys.get(third_idx.to_provided_idx()),
-                            ) {
-                                first_span.to(*third_span)
-                            } else {
-                                args_span
-                            };
-                            let rendered = if !has_error_or_infer([
-                                first_expected_ty,
-                                second_expected_ty,
-                                third_expected_ty,
-                            ]) {
-                                format!(
-                                    " of type `{first_expected_ty}`, `{second_expected_ty}`, and `{third_expected_ty}`"
-                                )
-                            } else {
-                                "".to_string()
-                            };
-                            labels.push((span, format!("three arguments{rendered} are missing")));
-                            suggestion_text = match suggestion_text {
-                                SuggestionText::None | SuggestionText::Provide(_) => {
-                                    SuggestionText::Provide(true)
-                                }
-                                _ => SuggestionText::DidYouMean,
-                            };
-                        }
-                        missing_idxs => {
-                            let first_idx = *missing_idxs.first().unwrap();
-                            let last_idx = *missing_idxs.last().unwrap();
-                            // NOTE: Because we might be re-arranging arguments, might have extra arguments, etc.
-                            // It's hard to *really* know where we should provide this error label, so this is a
-                            // decent heuristic
-                            let span = if let (Some((_, first_span)), Some((_, last_span))) = (
-                                provided_arg_tys.get(first_idx.to_provided_idx()),
-                                provided_arg_tys.get(last_idx.to_provided_idx()),
-                            ) {
-                                first_span.to(*last_span)
-                            } else {
-                                args_span
-                            };
-                            labels.push((span, "multiple arguments are missing".to_string()));
-                            suggestion_text = match suggestion_text {
-                                SuggestionText::None | SuggestionText::Provide(_) => {
-                                    SuggestionText::Provide(true)
-                                }
-                                _ => SuggestionText::DidYouMean,
-                            };
-                        }
-                    }
-                }
-                Error::Swap(
-                    first_provided_idx,
-                    second_provided_idx,
-                    first_expected_idx,
-                    second_expected_idx,
-                ) => {
-                    let (first_provided_ty, first_span) = provided_arg_tys[first_provided_idx];
-                    let (_, first_expected_ty) = formal_and_expected_inputs[first_expected_idx];
-                    let first_provided_ty_name = if !has_error_or_infer([first_provided_ty]) {
-                        format!(", found `{first_provided_ty}`")
-                    } else {
-                        String::new()
-                    };
-                    labels.push((
-                        first_span,
-                        format!("expected `{first_expected_ty}`{first_provided_ty_name}"),
-                    ));
-
-                    let (second_provided_ty, second_span) = provided_arg_tys[second_provided_idx];
-                    let (_, second_expected_ty) = formal_and_expected_inputs[second_expected_idx];
-                    let second_provided_ty_name = if !has_error_or_infer([second_provided_ty]) {
-                        format!(", found `{second_provided_ty}`")
-                    } else {
-                        String::new()
-                    };
-                    labels.push((
-                        second_span,
-                        format!("expected `{second_expected_ty}`{second_provided_ty_name}"),
-                    ));
-
-                    suggestion_text = match suggestion_text {
-                        SuggestionText::None => SuggestionText::Swap,
-                        _ => SuggestionText::DidYouMean,
-                    };
-                }
-                Error::Permutation(args) => {
-                    for (dst_arg, dest_input) in args {
-                        let (_, expected_ty) = formal_and_expected_inputs[dst_arg];
-                        let (provided_ty, provided_span) = provided_arg_tys[dest_input];
-                        let provided_ty_name = if !has_error_or_infer([provided_ty]) {
-                            format!(", found `{provided_ty}`")
-                        } else {
-                            String::new()
-                        };
-                        labels.push((
-                            provided_span,
-                            format!("expected `{expected_ty}`{provided_ty_name}"),
-                        ));
-                    }
-
-                    suggestion_text = match suggestion_text {
-                        SuggestionText::None => SuggestionText::Reorder,
-                        _ => SuggestionText::DidYouMean,
-                    };
-                }
-            }
-        }
-
-        self.label_generic_mismatches(
-            &mut err,
-            fn_def_id,
-            &matched_inputs,
-            &provided_arg_tys,
-            &formal_and_expected_inputs,
-            is_method,
-        );
-
-        // Incorporate the argument changes in the removal suggestion.
-        // When a type is *missing*, and the rest are additional, we want to suggest these with a
-        // multipart suggestion, but in order to do so we need to figure out *where* the arg that
-        // was provided but had the wrong type should go, because when looking at `expected_idx`
-        // that is the position in the argument list in the definition, while `provided_idx` will
-        // not be present. So we have to look at what the *last* provided position was, and point
-        // one after to suggest the replacement. FIXME(estebank): This is hacky, and there's
-        // probably a better more involved change we can make to make this work.
-        // For example, if we have
-        // ```
-        // fn foo(i32, &'static str) {}
-        // foo((), (), ());
-        // ```
-        // what should be suggested is
-        // ```
-        // foo(/* i32 */, /* &str */);
-        // ```
-        // which includes the replacement of the first two `()` for the correct type, and the
-        // removal of the last `()`.
-        let mut prev = -1;
-        for (expected_idx, provided_idx) in matched_inputs.iter_enumerated() {
-            // We want to point not at the *current* argument expression index, but rather at the
-            // index position where it *should have been*, which is *after* the previous one.
-            if let Some(provided_idx) = provided_idx {
-                prev = provided_idx.index() as i64;
-                continue;
-            }
-            let idx = ProvidedIdx::from_usize((prev + 1) as usize);
-            if let Some((_, arg_span)) = provided_arg_tys.get(idx) {
-                prev += 1;
-                // There is a type that was *not* found anywhere, so it isn't a move, but a
-                // replacement and we look at what type it should have been. This will allow us
-                // To suggest a multipart suggestion when encountering `foo(1, "")` where the def
-                // was `fn foo(())`.
-                let (_, expected_ty) = formal_and_expected_inputs[expected_idx];
-                suggestions.push((*arg_span, ty_to_snippet(expected_ty, expected_idx)));
-            }
-        }
+        fn_call_diag_ctxt.label_generic_mismatches(&mut err);
+        fn_call_diag_ctxt.append_arguments_changes(&mut suggestions);
 
         // If we have less than 5 things to say, it would be useful to call out exactly what's wrong
         if labels.len() <= 5 {
@@ -1509,80 +921,30 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         // Call out where the function is defined
-        self.label_fn_like(
+        fn_call_diag_ctxt.label_fn_like(
             &mut err,
             fn_def_id,
-            callee_ty,
+            fn_call_diag_ctxt.callee_ty,
             call_expr,
             None,
             None,
-            &matched_inputs,
-            &formal_and_expected_inputs,
-            is_method,
+            &fn_call_diag_ctxt.matched_inputs,
+            &fn_call_diag_ctxt.formal_and_expected_inputs,
+            fn_call_diag_ctxt.call_metadata.is_method,
             tuple_arguments,
         );
 
         // And add a suggestion block for all of the parameters
-        let suggestion_text = match suggestion_text {
-            SuggestionText::None => None,
-            SuggestionText::Provide(plural) => {
-                Some(format!("provide the argument{}", if plural { "s" } else { "" }))
-            }
-            SuggestionText::Remove(plural) => {
-                err.multipart_suggestion_verbose(
-                    format!("remove the extra argument{}", if plural { "s" } else { "" }),
-                    suggestions,
-                    Applicability::HasPlaceholders,
-                );
-                None
-            }
-            SuggestionText::Swap => Some("swap these arguments".to_string()),
-            SuggestionText::Reorder => Some("reorder these arguments".to_string()),
-            SuggestionText::DidYouMean => Some("did you mean".to_string()),
-        };
-        if let Some(suggestion_text) = suggestion_text {
-            let source_map = self.sess().source_map();
-            let (mut suggestion, suggestion_span) = if let Some(call_span) =
-                full_call_span.find_ancestor_inside_same_ctxt(error_span)
-            {
-                ("(".to_string(), call_span.shrink_to_hi().to(error_span.shrink_to_hi()))
-            } else {
-                (
-                    format!(
-                        "{}(",
-                        source_map.span_to_snippet(full_call_span).unwrap_or_else(|_| {
-                            fn_def_id.map_or("".to_string(), |fn_def_id| {
-                                tcx.item_name(fn_def_id).to_string()
-                            })
-                        })
-                    ),
-                    error_span,
-                )
-            };
-            let mut needs_comma = false;
-            for (expected_idx, provided_idx) in matched_inputs.iter_enumerated() {
-                if needs_comma {
-                    suggestion += ", ";
-                } else {
-                    needs_comma = true;
-                }
-                let suggestion_text = if let Some(provided_idx) = provided_idx
-                    && let (_, provided_span) = provided_arg_tys[*provided_idx]
-                    && let Ok(arg_text) = source_map.span_to_snippet(provided_span)
-                {
-                    arg_text
-                } else {
-                    // Propose a placeholder of the correct type
-                    let (_, expected_ty) = formal_and_expected_inputs[expected_idx];
-                    ty_to_snippet(expected_ty, expected_idx)
-                };
-                suggestion += &suggestion_text;
-            }
-            suggestion += ")";
+        if let Some(suggestion_message) =
+            FnCallDiagCtxt::format_suggestion_text(&mut err, suggestions, suggestion_text)
+            && !fn_call_diag_ctxt.call_is_in_macro()
+        {
+            let (suggestion_span, suggestion_code) = fn_call_diag_ctxt.suggestion_code();
+
             err.span_suggestion_verbose(
                 suggestion_span,
-                suggestion_text,
-                suggestion,
+                suggestion_message,
+                suggestion_code,
                 Applicability::HasPlaceholders,
             );
         }
@@ -1614,6 +976,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_expr_lit(
         &self,
         lit: &hir::Lit,
+        lint_id: HirId,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let tcx = self.tcx;
@@ -1623,12 +986,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ast::LitKind::ByteStr(ref v, _) => Ty::new_imm_ref(
                 tcx,
                 tcx.lifetimes.re_static,
-                Ty::new_array(tcx, tcx.types.u8, v.len() as u64),
+                Ty::new_array(tcx, tcx.types.u8, v.as_byte_str().len() as u64),
             ),
             ast::LitKind::Byte(_) => tcx.types.u8,
             ast::LitKind::Char(_) => tcx.types.char,
-            ast::LitKind::Int(_, ast::LitIntType::Signed(t)) => Ty::new_int(tcx, ty::int_ty(t)),
-            ast::LitKind::Int(_, ast::LitIntType::Unsigned(t)) => Ty::new_uint(tcx, ty::uint_ty(t)),
+            ast::LitKind::Int(_, ast::LitIntType::Signed(t)) => Ty::new_int(tcx, t),
+            ast::LitKind::Int(_, ast::LitIntType::Unsigned(t)) => Ty::new_uint(tcx, t),
             ast::LitKind::Int(i, ast::LitIntType::Unsuffixed) => {
                 let opt_ty = expected.to_option(self).and_then(|ty| match ty.kind() {
                     ty::Int(_) | ty::Uint(_) => Some(ty),
@@ -1655,22 +1018,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 });
                 opt_ty.unwrap_or_else(|| self.next_int_var())
             }
-            ast::LitKind::Float(_, ast::LitFloatType::Suffixed(t)) => {
-                Ty::new_float(tcx, ty::float_ty(t))
-            }
+            ast::LitKind::Float(_, ast::LitFloatType::Suffixed(t)) => Ty::new_float(tcx, t),
             ast::LitKind::Float(_, ast::LitFloatType::Unsuffixed) => {
                 let opt_ty = expected.to_option(self).and_then(|ty| match ty.kind() {
                     ty::Float(_) => Some(ty),
                     _ => None,
                 });
-                opt_ty.unwrap_or_else(|| self.next_float_var())
+                opt_ty.unwrap_or_else(|| self.next_float_var(lit.span, Some(lint_id)))
             }
             ast::LitKind::Bool(_) => tcx.types.bool,
             ast::LitKind::CStr(_, _) => Ty::new_imm_ref(
                 tcx,
                 tcx.lifetimes.re_static,
-                tcx.type_of(tcx.require_lang_item(hir::LangItem::CStr, Some(lit.span)))
-                    .skip_binder(),
+                tcx.type_of(tcx.require_lang_item(hir::LangItem::CStr, lit.span)).skip_binder(),
             ),
             ast::LitKind::Err(guar) => Ty::new_error(tcx, guar),
         }
@@ -1696,10 +1056,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
                 _ => bug!("unexpected type: {:?}", ty.normalized),
             },
-            Res::Def(
-                DefKind::Struct | DefKind::Union | DefKind::TyAlias { .. } | DefKind::AssocTy,
-                _,
-            )
+            Res::Def(DefKind::Struct | DefKind::Union | DefKind::TyAlias | DefKind::AssocTy, _)
             | Res::SelfTyParam { .. }
             | Res::SelfTyAlias { .. } => match ty.normalized.ty_adt_def() {
                 Some(adt) if !adt.is_enum() => {
@@ -1787,7 +1144,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let decl_ty = self.local_ty(decl.span, decl.hir_id);
 
         // Type check the initializer.
-        if let Some(ref init) = decl.init {
+        if let Some(init) = decl.init {
             let init_ty = self.check_decl_initializer(decl.hir_id, decl.pat, init);
             self.overwrite_local_ty_if_err(decl.hir_id, decl.pat, init_ty);
         }
@@ -1821,6 +1178,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Type check a `let` statement.
     fn check_decl_local(&self, local: &'tcx hir::LetStmt<'tcx>) {
+        GatherLocalsVisitor::gather_from_local(self, local);
+
         let ty = self.check_decl(local.into());
         self.write_ty(local.hir_id, ty);
         if local.pat.is_never_pattern() {
@@ -1849,16 +1208,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             // Ignore for now.
             hir::StmtKind::Item(_) => {}
-            hir::StmtKind::Expr(ref expr) => {
+            hir::StmtKind::Expr(expr) => {
                 // Check with expected type of `()`.
                 self.check_expr_has_type_or_error(expr, self.tcx.types.unit, |err| {
-                    if expr.can_have_side_effects() {
+                    if self.is_next_stmt_expr_continuation(stmt.hir_id)
+                        && let hir::ExprKind::Match(..) | hir::ExprKind::If(..) = expr.kind
+                    {
+                        // We have something like `match () { _ => true } && true`. Suggest
+                        // wrapping in parentheses. We find the statement or expression
+                        // following the `match` (`&& true`) and see if it is something that
+                        // can reasonably be interpreted as a binop following an expression.
+                        err.subdiagnostic(ExprParenthesesNeeded::surrounding(expr.span));
+                    } else if expr.can_have_side_effects() {
                         self.suggest_semicolon_at_end(expr.span, err);
                     }
                 });
             }
             hir::StmtKind::Semi(expr) => {
-                self.check_expr(expr);
+                let ty = self.check_expr(expr);
+                self.check_place_expr_if_unsized(ty, expr);
             }
         }
 
@@ -1899,11 +1267,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // break 'a 22; }` would not force the type of the block
         // to be `()`).
         let coerce_to_ty = expected.coercion_target_type(self, blk.span);
-        let coerce = if blk.targeted_by_break {
-            CoerceMany::new(coerce_to_ty)
-        } else {
-            CoerceMany::with_coercion_sites(coerce_to_ty, blk.expr.as_slice())
-        };
+        let coerce = CoerceMany::new(coerce_to_ty);
 
         let prev_diverges = self.diverges.get();
         let ctxt = BreakableCtxt { coerce: Some(coerce), may_break: false };
@@ -2010,8 +1374,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                                 hir::Stmt {
                                                     kind:
                                                         hir::StmtKind::Let(hir::LetStmt {
-                                                            source:
-                                                                hir::LocalSource::AssignDesugar(_),
+                                                            source: hir::LocalSource::AssignDesugar,
                                                             ..
                                                         }),
                                                     ..
@@ -2103,10 +1466,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             )
         };
 
-        if let hir::ExprKind::If(_, _, Some(el)) = expr.kind {
-            if let Some(rslt) = check_in_progress(el) {
-                return rslt;
-            }
+        if let hir::ExprKind::If(_, _, Some(el)) = expr.kind
+            && let Some(rslt) = check_in_progress(el)
+        {
+            return rslt;
         }
 
         if let hir::ExprKind::Match(_, arms, _) = expr.kind {
@@ -2156,32 +1519,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         path_span: Span,
         hir_id: HirId,
     ) -> (Res, LoweredTy<'tcx>) {
+        let ResolvedStructPath { res: result, ty } =
+            self.lowerer().lower_path_for_struct_expr(*qpath, path_span, hir_id);
         match *qpath {
-            QPath::Resolved(ref maybe_qself, path) => {
-                let self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself).raw);
-                let ty = self.lowerer().lower_path(self_ty, path, hir_id, true);
-                (path.res, LoweredTy::from_raw(self, path_span, ty))
-            }
-            QPath::TypeRelative(qself, segment) => {
-                let ty = self.lower_ty(qself);
-
-                let result = self
-                    .lowerer()
-                    .lower_assoc_path_ty(hir_id, path_span, ty.raw, qself, segment, true);
-                let ty = result
-                    .map(|(ty, _, _)| ty)
-                    .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar));
+            QPath::Resolved(_, path) => (path.res, LoweredTy::from_raw(self, path_span, ty)),
+            QPath::TypeRelative(_, _) => {
                 let ty = LoweredTy::from_raw(self, path_span, ty);
-                let result = result.map(|(_, kind, def_id)| (kind, def_id));
+                let resolution =
+                    result.map(|res: Res| (self.tcx().def_kind(res.def_id()), res.def_id()));
 
                 // Write back the new resolution.
-                self.write_resolution(hir_id, result);
+                self.write_resolution(hir_id, resolution);
 
-                (result.map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)), ty)
-            }
-            QPath::LangItem(lang_item, span) => {
-                let (res, ty) = self.resolve_lang_item_path(lang_item, span, hir_id);
-                (res, LoweredTy::from_raw(self, path_span, ty))
+                (result.unwrap_or(Res::Err), ty)
             }
         }
     }
@@ -2261,14 +1611,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // If we're calling a method of a Fn/FnMut/FnOnce trait object implicitly
         // (eg invoking a closure) we want to point at the underlying callable,
         // not the method implicitly invoked (eg call_once).
-        // TupleArguments is set only when this is an implicit call (my_closure(...)) rather than explicit (my_closure.call(...))
-        if tuple_arguments == TupleArguments
+        // TupleAllCallArgs is set only when this is an implicit call `my_closure(...)` rather
+        // than explicit `my_closure.call(...)`.
+        if tuple_arguments == TupleAllCallArgs
             && let Some(assoc_item) = self.tcx.opt_associated_item(def_id)
             // Since this is an associated item, it might point at either an impl or a trait item.
             // We want it to always point to the trait item.
             // If we're pointing at an inherent function, we don't need to do anything,
             // so we fetch the parent and verify if it's a trait item.
-            && let maybe_trait_item_def_id = assoc_item.trait_item_def_id.unwrap_or(def_id)
+            && let Ok(maybe_trait_item_def_id) = assoc_item.trait_item_or_self()
             && let maybe_trait_def_id = self.tcx.parent(maybe_trait_item_def_id)
             // Just an easy way to check "trait_def_id == Fn/FnMut/FnOnce"
             && let Some(call_kind) = self.tcx.fn_trait_kind_from_def_id(maybe_trait_def_id)
@@ -2277,7 +1628,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let callee_ty = callee_ty.peel_refs();
             match *callee_ty.kind() {
                 ty::Param(param) => {
-                    let param = self.tcx.generics_of(self.body_id).type_param(param, self.tcx);
+                    let param = self.tcx.generics_of(self.body_def_id).type_param(param, self.tcx);
                     if param.kind.is_synthetic() {
                         // if it's `impl Fn() -> ..` then just fall down to the def-id based logic
                         def_id = param.def_id;
@@ -2286,13 +1637,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // and point at that.
                         let instantiated = self
                             .tcx
-                            .explicit_predicates_of(self.body_id)
+                            .explicit_clauses_of(self.body_def_id)
                             .instantiate_identity(self.tcx);
                         // FIXME(compiler-errors): This could be problematic if something has two
                         // fn-like predicates with different args, but callable types really never
                         // do that, so it's OK.
-                        for (predicate, span) in instantiated {
-                            if let ty::ClauseKind::Trait(pred) = predicate.kind().skip_binder()
+                        for (clause, span) in instantiated {
+                            if let ty::ClauseKind::Trait(pred) =
+                                clause.skip_norm_wip().kind().skip_binder()
                                 && pred.self_ty().peel_refs() == callee_ty
                                 && self.tcx.is_fn_trait(pred.def_id())
                             {
@@ -2302,7 +1654,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                 }
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: new_def_id, .. })
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: new_def_id }, .. })
                 | ty::Closure(new_def_id, _)
                 | ty::FnDef(new_def_id, _) => {
                     def_id = new_def_id;
@@ -2328,11 +1680,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             _ => None,
                         }
                     });
-                    if let Some(new_def_id) = new_def_id {
-                        def_id = new_def_id;
-                    } else {
-                        return;
-                    }
+                    let Some(new_def_id) = new_def_id else { return };
+                    def_id = new_def_id;
                 }
             }
         }
@@ -2351,25 +1700,44 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     deps: SmallVec<[ExpectedIdx; 4]>,
                 }
 
-                debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+                // FIXME(splat): fix the generic mismatch earlier, so it doesn't reach here
+                if !tuple_arguments.is_splatted() {
+                    debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+                }
                 // Gather all mismatched parameters with generics.
                 let mut mismatched_params = Vec::<MismatchedParam<'_>>::new();
+                let mut use_splat_fallback = false;
                 if let Some(expected_idx) = expected_idx {
                     let expected_idx = ExpectedIdx::from_usize(expected_idx);
-                    let &(expected_generic, ref expected_param) =
-                        &params_with_generics[expected_idx];
-                    if let Some(expected_generic) = expected_generic {
-                        mismatched_params.push(MismatchedParam {
-                            idx: expected_idx,
-                            generic: expected_generic,
-                            param: expected_param,
-                            deps: SmallVec::new(),
-                        });
-                    } else {
-                        // Still mark the mismatched parameter
-                        spans.push_span_label(expected_param.span(), "");
-                    }
-                } else {
+                    match params_with_generics.get(expected_idx) {
+                        Some(&(Some(expected_generic), ref expected_param)) => mismatched_params
+                            .push(MismatchedParam {
+                                idx: expected_idx,
+                                generic: expected_generic,
+                                param: expected_param,
+                                deps: SmallVec::new(),
+                            }),
+                        Some((None, expected_param)) => {
+                            // Still mark the mismatched parameter
+                            spans.push_span_label(expected_param.span(), "");
+                        }
+                        None => {
+                            if tuple_arguments.is_splatted() {
+                                // FIXME(splat): when the arg is splatted, adjust its index, to handle the type mismatch properly
+                                use_splat_fallback = true;
+                            } else {
+                                span_bug!(
+                                    self.tcx.def_span(def_id),
+                                    "arg index {} out of bounds for method with {} inputs",
+                                    expected_idx.as_usize(),
+                                    params_with_generics.len(),
+                                );
+                            }
+                        }
+                    };
+                }
+
+                if expected_idx.is_none() || use_splat_fallback {
                     mismatched_params.extend(
                         params_with_generics.iter_enumerated().zip(matched_inputs).filter_map(
                             |((idx, &(generic, ref param)), matched_idx)| {
@@ -2393,7 +1761,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
 
                 if !mismatched_params.is_empty() {
-                    // For each mismatched paramter, create a two-way link to each matched parameter
+                    // For each mismatched parameter, create a two-way link to each matched parameter
                     // of the same type.
                     let mut dependants = IndexVec::<ExpectedIdx, _>::from_fn_n(
                         |_| SmallVec::<[u32; 4]>::new(),
@@ -2436,7 +1804,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             spans.push_span_label(param.param.span(), "");
                         }
                     }
-                    // Highligh each parameter being depended on for a generic type.
+                    // Highlight each parameter being depended on for a generic type.
                     for ((&(_, param), deps), &(_, expected_ty)) in
                         params_with_generics.iter().zip(&dependants).zip(formal_and_expected_inputs)
                     {
@@ -2475,6 +1843,45 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
             }
             err.span_note(spans, format!("{} defined here", self.tcx.def_descr(def_id)));
+            if let DefKind::Fn | DefKind::AssocFn = self.tcx.def_kind(def_id)
+                && let ty::Param(_) =
+                    self.tcx.fn_sig(def_id).instantiate_identity().skip_binder().output().kind()
+                && let parent = self.tcx.hir_get_parent_item(call_expr.hir_id).def_id
+                && let Some((output, body_id)) = match self.tcx.hir_node_by_def_id(parent) {
+                    hir::Node::Item(hir::Item {
+                        kind: hir::ItemKind::Fn { sig, body, .. },
+                        ..
+                    })
+                    | hir::Node::TraitItem(hir::TraitItem {
+                        kind: hir::TraitItemKind::Fn(sig, hir::TraitFn::Provided(body)),
+                        ..
+                    })
+                    | hir::Node::ImplItem(hir::ImplItem {
+                        kind: hir::ImplItemKind::Fn(sig, body),
+                        ..
+                    }) => Some((sig.decl.output, body)),
+                    _ => None,
+                }
+                && let expr = self.tcx.hir_body(*body_id).value
+                && (expr.peel_blocks().span == call_expr.span
+                    || matches!(
+                        self.tcx.parent_hir_node(call_expr.hir_id),
+                        hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Ret(_), .. })
+                    ))
+            {
+                err.span_label(
+                    output.span(),
+                    match output {
+                        FnRetTy::DefaultReturn(_) => format!(
+                            "this implicit `()` return type influences the call expression's return type"
+                        ),
+                        FnRetTy::Return(_) => {
+                            "this return type influences the call expression's return type"
+                                .to_string()
+                        }
+                    },
+                );
+            }
         } else if let Some(hir::Node::Expr(e)) = self.tcx.hir_get_if_local(def_id)
             && let hir::ExprKind::Closure(hir::Closure { body, .. }) = &e.kind
         {
@@ -2541,15 +1948,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         provided_arg_tys: &IndexVec<ProvidedIdx, (Ty<'tcx>, Span)>,
         formal_and_expected_inputs: &IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         is_method: bool,
+        is_splat: bool,
     ) {
         let Some(def_id) = callable_def_id else {
             return;
         };
 
         if let Some((params_with_generics, _)) = self.get_hir_param_info(def_id, is_method) {
-            debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+            // FIXME(splat): fix the generic mismatch earlier, so it doesn't reach here
+            if !is_splat {
+                debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+            }
             for (idx, (generic_param, _)) in params_with_generics.iter_enumerated() {
-                if matched_inputs[idx].is_none() {
+                if matched_inputs.get(idx).flatten_ref().is_none() {
                     continue;
                 }
 
@@ -2571,7 +1982,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let Some(other_generic_param) = other_generic_param else {
                             return false;
                         };
-                        if matched_inputs[other_idx].is_some() {
+                        if matched_inputs.get(other_idx).flatten_ref().is_some() {
                             return false;
                         }
                         other_generic_param == generic_param
@@ -2659,17 +2070,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             (Some(_), Some(_)) | (None, None) => unreachable!(),
             (Some(body), None) => {
                 let params = self.tcx.hir_body(body).params;
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
-                Some((
-                    fn_inputs.zip(params.iter().map(|param| FnParam::Param(param))).collect(),
-                    generics,
-                ))
+                Some((fn_inputs.zip(params.iter().map(FnParam::Param)).collect(), generics))
             }
             (None, Some(params)) => {
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((
                     fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect(),
@@ -2749,4 +2157,1366 @@ impl FnParam<'_> {
         }
         D(*self, idx)
     }
+}
+
+struct FnCallDiagCtxt<'a, 'tcx> {
+    arg_matching_ctxt: ArgMatchingCtxt<'a, 'tcx>,
+    errors: Vec<Error<'tcx>>,
+    matched_inputs: IndexVec<ExpectedIdx, Option<ProvidedIdx>>,
+}
+
+impl<'a, 'tcx> Deref for FnCallDiagCtxt<'a, 'tcx> {
+    type Target = ArgMatchingCtxt<'a, 'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.arg_matching_ctxt
+    }
+}
+
+// Controls how the arguments should be listed in the suggestion.
+enum ArgumentsFormatting {
+    SingleLine,
+    Multiline { fallback_indent: String, brace_indent: String },
+}
+
+impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
+    fn new(
+        arg: &'a FnCtxt<'a, 'tcx>,
+        compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
+        formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
+        provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
+        c_variadic: bool,
+        err_code: ErrCode,
+        fn_def_id: Option<DefId>,
+        call_span: Span,
+        call_expr: &'tcx Expr<'tcx>,
+        tuple_arguments: TupleArgumentsFlag,
+    ) -> Self {
+        let arg_matching_ctxt = ArgMatchingCtxt::new(
+            arg,
+            compatibility_diagonal,
+            formal_and_expected_inputs,
+            provided_args,
+            c_variadic,
+            err_code,
+            fn_def_id,
+            call_span,
+            call_expr,
+            tuple_arguments,
+        );
+
+        // The algorithm here is inspired by levenshtein distance and longest common subsequence.
+        // We'll try to detect 4 different types of mistakes:
+        // - An extra parameter has been provided that doesn't satisfy *any* of the other inputs
+        // - An input is missing, which isn't satisfied by *any* of the other arguments
+        // - Some number of arguments have been provided in the wrong order
+        // - A type is straight up invalid
+        let (errors, matched_inputs) = ArgMatrix::new(
+            arg_matching_ctxt.provided_args.len(),
+            arg_matching_ctxt.formal_and_expected_inputs.len(),
+            |provided, expected| arg_matching_ctxt.check_compatible(provided, expected),
+        )
+        .find_errors();
+
+        FnCallDiagCtxt { arg_matching_ctxt, errors, matched_inputs }
+    }
+
+    fn check_wrap_args_in_tuple(&self) -> Option<ErrorGuaranteed> {
+        if let Some((mismatch_idx, terr)) = self.first_incompatible_error() {
+            // Is the first bad expected argument a tuple?
+            // Do we have as many extra provided arguments as the tuple's length?
+            // If so, we might have just forgotten to wrap some args in a tuple.
+            if let Some(ty::Tuple(tys)) =
+               self.formal_and_expected_inputs.get(mismatch_idx.to_expected_idx()).map(|tys| tys.1.kind())
+                // If the tuple is unit, we're not actually wrapping any arguments.
+                && !tys.is_empty()
+                && self.provided_arg_tys.len() == self.formal_and_expected_inputs.len() - 1 + tys.len()
+            {
+                // Wrap up the N provided arguments starting at this position in a tuple.
+                let provided_args_to_tuple = &self.provided_arg_tys[mismatch_idx..];
+                let (provided_args_to_tuple, provided_args_after_tuple) =
+                    provided_args_to_tuple.split_at(tys.len());
+                let provided_as_tuple = Ty::new_tup_from_iter(
+                    self.tcx,
+                    provided_args_to_tuple.iter().map(|&(ty, _)| ty),
+                );
+
+                let mut satisfied = true;
+                // Check if the newly wrapped tuple + rest of the arguments are compatible.
+                for ((_, expected_ty), provided_ty) in std::iter::zip(
+                    self.formal_and_expected_inputs[mismatch_idx.to_expected_idx()..].iter(),
+                    [provided_as_tuple]
+                        .into_iter()
+                        .chain(provided_args_after_tuple.iter().map(|&(ty, _)| ty)),
+                ) {
+                    if !self.may_coerce(provided_ty, *expected_ty) {
+                        satisfied = false;
+                        break;
+                    }
+                }
+
+                // If they're compatible, suggest wrapping in an arg, and we're done!
+                // Take some care with spans, so we don't suggest wrapping a macro's
+                // innards in parenthesis, for example.
+                if satisfied
+                    && let &[(_, hi @ lo)] | &[(_, lo), .., (_, hi)] = provided_args_to_tuple
+                {
+                    let mut err;
+                    if tys.len() == 1 {
+                        // A tuple wrap suggestion actually occurs within,
+                        // so don't do anything special here.
+                        err = self.err_ctxt().report_and_explain_type_error(
+                            self.arg_matching_ctxt.args_ctxt.call_ctxt.mk_trace(
+                                lo,
+                                self.formal_and_expected_inputs[mismatch_idx.to_expected_idx()],
+                                self.provided_arg_tys[mismatch_idx].0,
+                            ),
+                            self.param_env,
+                            terr,
+                        );
+                        let call_name = self.call_metadata.call_name;
+                        err.span_label(
+                            self.call_metadata.full_call_span,
+                            format!("arguments to this {call_name} are incorrect"),
+                        );
+                    } else {
+                        let call_name = self.call_metadata.call_name;
+                        err = self.dcx().struct_span_err(
+                            self.arg_matching_ctxt.args_ctxt.call_metadata.full_call_span,
+                            format!(
+                                "{call_name} takes {}{} but {} {} supplied",
+                                if self.arg_matching_ctxt.args_ctxt.c_variadic {
+                                    "at least "
+                                } else {
+                                    ""
+                                },
+                                potentially_plural_count(
+                                    self.formal_and_expected_inputs.len(),
+                                    "argument"
+                                ),
+                                potentially_plural_count(self.provided_args.len(), "argument"),
+                                pluralize!("was", self.provided_args.len())
+                            ),
+                        );
+                        err.code(self.err_code.to_owned());
+                        err.multipart_suggestion(
+                            "wrap these arguments in parentheses to construct a tuple",
+                            vec![
+                                (lo.shrink_to_lo(), "(".to_string()),
+                                (hi.shrink_to_hi(), ")".to_string()),
+                            ],
+                            Applicability::MachineApplicable,
+                        );
+                    };
+                    self.arg_matching_ctxt.args_ctxt.call_ctxt.fn_ctxt.label_fn_like(
+                        &mut err,
+                        self.fn_def_id,
+                        self.callee_ty,
+                        self.call_expr,
+                        None,
+                        Some(mismatch_idx.as_usize()),
+                        &self.matched_inputs,
+                        &self.formal_and_expected_inputs,
+                        self.call_metadata.is_method,
+                        self.tuple_arguments,
+                    );
+                    self.suggest_confusable(&mut err);
+                    Some(err.emit())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn ensure_has_errors(&self) -> Option<ErrorGuaranteed> {
+        if self.errors.is_empty() {
+            if cfg!(debug_assertions) {
+                span_bug!(self.call_metadata.error_span, "expected errors from argument matrix");
+            } else {
+                let mut err = self.dcx().create_err(diagnostics::ArgMismatchIndeterminate {
+                    span: self.call_metadata.error_span,
+                });
+                self.arg_matching_ctxt.suggest_confusable(&mut err);
+                return Some(err.emit());
+            }
+        }
+
+        None
+    }
+
+    fn detect_dotdot(&self, err: &mut Diag<'_>, ty: Ty<'tcx>, expr: &hir::Expr<'tcx>) {
+        if let ty::Adt(adt, _) = ty.kind()
+            && self.tcx().is_lang_item(adt.did(), hir::LangItem::RangeFull)
+            && is_range_literal(expr)
+            && let hir::ExprKind::Struct(&path, [], _) = expr.kind
+            && self.tcx().qpath_is_lang_item(path, hir::LangItem::RangeFull)
+        {
+            // We have `Foo(a, .., c)`, where the user might be trying to use the "rest" syntax
+            // from default field values, which is not supported on tuples.
+            let explanation = if self.tcx.features().default_field_values() {
+                "this is only supported on non-tuple struct literals"
+            } else if self.tcx.sess.is_nightly_build() {
+                "this is only supported on non-tuple struct literals when \
+                 `#![feature(default_field_values)]` is enabled"
+            } else {
+                "this is not supported"
+            };
+            let msg = format!(
+                "you might have meant to use `..` to skip providing a value for \
+                 expected fields, but {explanation}; it is instead interpreted as a \
+                 `std::ops::RangeFull` literal",
+            );
+            err.span_help(expr.span, msg);
+        }
+    }
+
+    fn filter_out_invalid_arguments(&mut self) -> Option<ErrorGuaranteed> {
+        let mut reported = None;
+
+        self.errors.retain(|error| {
+            let Error::Invalid(provided_idx, expected_idx, Compatibility::Incompatible(Some(e))) =
+                error
+            else {
+                return true;
+            };
+            let (provided_ty, provided_span) =
+                self.arg_matching_ctxt.provided_arg_tys[*provided_idx];
+            let trace = self.arg_matching_ctxt.mk_trace(
+                provided_span,
+                self.arg_matching_ctxt.formal_and_expected_inputs[*expected_idx],
+                provided_ty,
+            );
+            if !matches!(trace.cause.as_failure_code(*e), FailureCode::Error0308) {
+                let mut err = self.arg_matching_ctxt.err_ctxt().report_and_explain_type_error(
+                    trace,
+                    self.arg_matching_ctxt.param_env,
+                    *e,
+                );
+                self.arg_matching_ctxt.suggest_confusable(&mut err);
+                reported = Some(err.emit());
+                return false;
+            }
+            true
+        });
+
+        reported
+    }
+
+    fn check_single_incompatible(&self) -> Option<ErrorGuaranteed> {
+        if let &[
+            Error::Invalid(provided_idx, expected_idx, Compatibility::Incompatible(Some(err))),
+        ] = &self.errors[..]
+        {
+            let (formal_ty, expected_ty) = self.formal_and_expected_inputs[expected_idx];
+            let (provided_ty, provided_arg_span) = self.provided_arg_tys[provided_idx];
+            let trace = self.mk_trace(provided_arg_span, (formal_ty, expected_ty), provided_ty);
+            let mut err = self.err_ctxt().report_and_explain_type_error(trace, self.param_env, err);
+            self.emit_coerce_suggestions(
+                &mut err,
+                self.provided_args[provided_idx],
+                provided_ty,
+                Expectation::rvalue_hint(self.fn_ctxt, expected_ty)
+                    .only_has_type(self.fn_ctxt)
+                    .unwrap_or(formal_ty),
+                None,
+                None,
+            );
+            let call_name = self.call_metadata.call_name;
+            err.span_label(
+                self.call_metadata.full_call_span,
+                format!("arguments to this {call_name} are incorrect"),
+            );
+
+            self.label_generic_mismatches(&mut err);
+
+            if let hir::ExprKind::MethodCall(_, rcvr, _, _) =
+                self.arg_matching_ctxt.args_ctxt.call_ctxt.call_expr.kind
+                && provided_idx.as_usize() == expected_idx.as_usize()
+            {
+                self.note_source_of_type_mismatch_constraint(
+                    &mut err,
+                    rcvr,
+                    crate::demand::TypeMismatchSource::Arg {
+                        call_expr: self.call_expr,
+                        incompatible_arg: provided_idx.as_usize(),
+                    },
+                );
+            }
+
+            self.suggest_ptr_null_mut(
+                expected_ty,
+                provided_ty,
+                self.provided_args[provided_idx],
+                &mut err,
+            );
+
+            self.suggest_deref_unwrap_or(
+                &mut err,
+                self.callee_ty,
+                self.call_metadata.call_ident,
+                expected_ty,
+                provided_ty,
+                self.provided_args[provided_idx],
+                self.call_metadata.is_method,
+            );
+
+            // Call out where the function is defined
+            self.label_fn_like(
+                &mut err,
+                self.fn_def_id,
+                self.callee_ty,
+                self.call_expr,
+                Some(expected_ty),
+                Some(expected_idx.as_usize()),
+                &self.matched_inputs,
+                &self.formal_and_expected_inputs,
+                self.call_metadata.is_method,
+                self.tuple_arguments,
+            );
+            self.arg_matching_ctxt.suggest_confusable(&mut err);
+            self.detect_dotdot(&mut err, provided_ty, self.provided_args[provided_idx]);
+            return Some(err.emit());
+        }
+
+        None
+    }
+
+    fn maybe_optimize_extra_arg_suggestion(&mut self) {
+        if let [Error::Extra(provided_idx)] = &self.errors[..] {
+            if !self.remove_idx_is_perfect(provided_idx.as_usize()) {
+                if let Some(i) = (0..self.args_ctxt.call_ctxt.provided_args.len())
+                    .find(|&i| self.remove_idx_is_perfect(i))
+                {
+                    self.errors = vec![Error::Extra(ProvidedIdx::from_usize(i))];
+                }
+            }
+        }
+    }
+
+    fn initial_final_diagnostic(&self) -> Diag<'_> {
+        if self.formal_and_expected_inputs.len() == self.provided_args.len() {
+            struct_span_code_err!(
+                self.dcx(),
+                self.call_metadata.full_call_span,
+                E0308,
+                "arguments to this {} are incorrect",
+                self.call_metadata.call_name,
+            )
+        } else {
+            self.arg_matching_ctxt
+                .dcx()
+                .struct_span_err(
+                    self.call_metadata.full_call_span,
+                    format!(
+                        "this {} takes {}{} but {} {} supplied",
+                        self.call_metadata.call_name,
+                        if self.arg_matching_ctxt.args_ctxt.c_variadic { "at least " } else { "" },
+                        potentially_plural_count(self.formal_and_expected_inputs.len(), "argument"),
+                        potentially_plural_count(self.provided_args.len(), "argument"),
+                        pluralize!("was", self.provided_args.len())
+                    ),
+                )
+                .with_code(self.err_code.to_owned())
+        }
+    }
+
+    fn labels_and_suggestion_text(
+        &self,
+        err: &mut Diag<'_>,
+    ) -> (Vec<(Span, String)>, Vec<(Span, String)>, SuggestionText) {
+        // Don't print if it has error types or is just plain `_`
+        fn has_error_or_infer<'tcx>(tys: impl IntoIterator<Item = Ty<'tcx>>) -> bool {
+            tys.into_iter().any(|ty| ty.references_error() || ty.is_ty_var())
+        }
+
+        let mut labels = Vec::new();
+        let mut suggestion_text = SuggestionText::None;
+
+        let mut errors = self.errors.iter().peekable();
+        let mut only_extras_so_far = errors
+            .peek()
+            .is_some_and(|first| matches!(first, Error::Extra(arg_idx) if arg_idx.index() == 0));
+        let mut prev_extra_idx = None;
+        let mut suggestions = vec![];
+        while let Some(error) = errors.next() {
+            only_extras_so_far &= matches!(error, Error::Extra(_));
+
+            match error {
+                Error::Invalid(provided_idx, expected_idx, compatibility) => {
+                    let (formal_ty, expected_ty) =
+                        self.arg_matching_ctxt.args_ctxt.call_ctxt.formal_and_expected_inputs
+                            [*expected_idx];
+                    let (provided_ty, provided_span) =
+                        self.arg_matching_ctxt.provided_arg_tys[*provided_idx];
+                    if let Compatibility::Incompatible(error) = compatibility {
+                        let trace = self.arg_matching_ctxt.args_ctxt.call_ctxt.mk_trace(
+                            provided_span,
+                            (formal_ty, expected_ty),
+                            provided_ty,
+                        );
+                        if let Some(e) = error {
+                            self.err_ctxt().note_type_err(
+                                err,
+                                &trace.cause,
+                                None,
+                                Some(self.param_env.and(trace.values)),
+                                *e,
+                                true,
+                                None,
+                            );
+                        }
+                    }
+
+                    self.emit_coerce_suggestions(
+                        err,
+                        self.provided_args[*provided_idx],
+                        provided_ty,
+                        Expectation::rvalue_hint(self.fn_ctxt, expected_ty)
+                            .only_has_type(self.fn_ctxt)
+                            .unwrap_or(formal_ty),
+                        None,
+                        None,
+                    );
+                    self.detect_dotdot(err, provided_ty, self.provided_args[*provided_idx]);
+                }
+                Error::Extra(arg_idx) => {
+                    let (provided_ty, provided_span) = self.provided_arg_tys[*arg_idx];
+                    let provided_ty_name = if !has_error_or_infer([provided_ty]) {
+                        // FIXME: not suggestable, use something else
+                        format!(" of type `{provided_ty}`")
+                    } else {
+                        "".to_string()
+                    };
+                    let idx = if self.provided_arg_tys.len() == 1 {
+                        "".to_string()
+                    } else {
+                        format!(" #{}", arg_idx.as_usize() + 1)
+                    };
+                    labels.push((
+                        provided_span,
+                        format!("unexpected argument{idx}{provided_ty_name}"),
+                    ));
+                    if self.provided_arg_tys.len() == 1
+                        && let Some(span) = self.maybe_suggest_expect_for_unwrap(provided_ty)
+                    {
+                        err.span_suggestion_verbose(
+                            span,
+                            "did you mean to use `expect`?",
+                            "expect",
+                            Applicability::MaybeIncorrect,
+                        );
+                        continue;
+                    }
+                    let mut span = provided_span;
+                    if span.can_be_used_for_suggestions()
+                        && self.call_metadata.error_span.can_be_used_for_suggestions()
+                    {
+                        if arg_idx.index() > 0
+                            && let Some((_, prev)) = self
+                                .provided_arg_tys
+                                .get(ProvidedIdx::from_usize(arg_idx.index() - 1))
+                        {
+                            // Include previous comma
+                            span = prev.shrink_to_hi().to(span);
+                        }
+
+                        // Is last argument for deletion in a row starting from the 0-th argument?
+                        // Then delete the next comma, so we are not left with `f(, ...)`
+                        //
+                        //     fn f() {}
+                        //   - f(0, 1,)
+                        //   + f()
+                        let trim_next_comma = match errors.peek() {
+                            Some(Error::Extra(provided_idx))
+                                if only_extras_so_far
+                                    && provided_idx.index() > arg_idx.index() + 1 =>
+                            // If the next Error::Extra ("next") doesn't next to current ("current"),
+                            // fn foo(_: (), _: u32) {}
+                            // - foo("current", (), 1u32, "next")
+                            // + foo((), 1u32)
+                            // If the previous error is not a `Error::Extra`, then do not trim the next comma
+                            // - foo((), "current", 42u32, "next")
+                            // + foo((), 42u32)
+                            {
+                                prev_extra_idx.is_none_or(|prev_extra_idx| {
+                                    prev_extra_idx + 1 == arg_idx.index()
+                                })
+                            }
+                            // If no error left, we need to delete the next comma
+                            None if only_extras_so_far => true,
+                            // Not sure if other error type need to be handled as well
+                            _ => false,
+                        };
+
+                        if trim_next_comma {
+                            let next = self
+                                .provided_arg_tys
+                                .get(*arg_idx + 1)
+                                .map(|&(_, sp)| sp)
+                                .unwrap_or_else(|| {
+                                    // Try to move before `)`. Note that `)` here is not necessarily
+                                    // the latin right paren, it could be a Unicode-confusable that
+                                    // looks like a `)`, so we must not use `- BytePos(1)`
+                                    // manipulations here.
+                                    self.arg_matching_ctxt
+                                        .tcx()
+                                        .sess
+                                        .source_map()
+                                        .end_point(self.call_expr.span)
+                                });
+
+                            // Include next comma
+                            span = span.until(next);
+                        }
+
+                        suggestions.push((span, String::new()));
+
+                        suggestion_text = match suggestion_text {
+                            SuggestionText::None => SuggestionText::Remove(false),
+                            SuggestionText::Remove(_) => SuggestionText::Remove(true),
+                            _ => SuggestionText::DidYouMean,
+                        };
+                        prev_extra_idx = Some(arg_idx.index())
+                    }
+                    self.detect_dotdot(err, provided_ty, self.provided_args[*arg_idx]);
+                }
+                Error::Missing(expected_idx) => {
+                    // If there are multiple missing arguments adjacent to each other,
+                    // then we can provide a single error.
+
+                    let mut missing_idxs = vec![*expected_idx];
+                    while let Some(e) = errors.next_if(|e| {
+                        matches!(e, Error::Missing(next_expected_idx)
+                            if *next_expected_idx == *missing_idxs.last().unwrap() + 1)
+                    }) {
+                        match e {
+                            Error::Missing(expected_idx) => missing_idxs.push(*expected_idx),
+                            _ => unreachable!(
+                                "control flow ensures that we should always get an `Error::Missing`"
+                            ),
+                        }
+                    }
+
+                    // NOTE: Because we might be re-arranging arguments, might have extra
+                    // arguments, etc. it's hard to *really* know where we should provide
+                    // this error label, so as a heuristic, we point to the provided arg, or
+                    // to the call if the missing inputs pass the provided args.
+                    match &missing_idxs[..] {
+                        &[expected_idx] => {
+                            let (_, input_ty) = self.formal_and_expected_inputs[expected_idx];
+                            let span = if let Some((_, arg_span)) =
+                                self.provided_arg_tys.get(expected_idx.to_provided_idx())
+                            {
+                                *arg_span
+                            } else {
+                                self.args_span
+                            };
+                            let rendered = if !has_error_or_infer([input_ty]) {
+                                format!(" of type `{input_ty}`")
+                            } else {
+                                "".to_string()
+                            };
+                            labels.push((
+                                span,
+                                format!(
+                                    "argument #{}{rendered} is missing",
+                                    expected_idx.as_usize() + 1
+                                ),
+                            ));
+
+                            suggestion_text = match suggestion_text {
+                                SuggestionText::None => SuggestionText::Provide(false),
+                                SuggestionText::Provide(_) => SuggestionText::Provide(true),
+                                _ => SuggestionText::DidYouMean,
+                            };
+                        }
+                        &[first_idx, second_idx] => {
+                            let (_, first_expected_ty) = self.formal_and_expected_inputs[first_idx];
+                            let (_, second_expected_ty) =
+                                self.formal_and_expected_inputs[second_idx];
+                            let span = if let (Some((_, first_span)), Some((_, second_span))) = (
+                                self.provided_arg_tys.get(first_idx.to_provided_idx()),
+                                self.provided_arg_tys.get(second_idx.to_provided_idx()),
+                            ) {
+                                first_span.to(*second_span)
+                            } else {
+                                self.args_span
+                            };
+                            let rendered =
+                                if !has_error_or_infer([first_expected_ty, second_expected_ty]) {
+                                    format!(
+                                        " of type `{first_expected_ty}` and `{second_expected_ty}`"
+                                    )
+                                } else {
+                                    "".to_string()
+                                };
+                            labels.push((span, format!("two arguments{rendered} are missing")));
+                            suggestion_text = match suggestion_text {
+                                SuggestionText::None | SuggestionText::Provide(_) => {
+                                    SuggestionText::Provide(true)
+                                }
+                                _ => SuggestionText::DidYouMean,
+                            };
+                        }
+                        &[first_idx, second_idx, third_idx] => {
+                            let (_, first_expected_ty) = self.formal_and_expected_inputs[first_idx];
+                            let (_, second_expected_ty) =
+                                self.formal_and_expected_inputs[second_idx];
+                            let (_, third_expected_ty) = self.formal_and_expected_inputs[third_idx];
+                            let span = if let (Some((_, first_span)), Some((_, third_span))) = (
+                                self.provided_arg_tys.get(first_idx.to_provided_idx()),
+                                self.provided_arg_tys.get(third_idx.to_provided_idx()),
+                            ) {
+                                first_span.to(*third_span)
+                            } else {
+                                self.args_span
+                            };
+                            let rendered = if !has_error_or_infer([
+                                first_expected_ty,
+                                second_expected_ty,
+                                third_expected_ty,
+                            ]) {
+                                format!(
+                                    " of type `{first_expected_ty}`, `{second_expected_ty}`, and `{third_expected_ty}`"
+                                )
+                            } else {
+                                "".to_string()
+                            };
+                            labels.push((span, format!("three arguments{rendered} are missing")));
+                            suggestion_text = match suggestion_text {
+                                SuggestionText::None | SuggestionText::Provide(_) => {
+                                    SuggestionText::Provide(true)
+                                }
+                                _ => SuggestionText::DidYouMean,
+                            };
+                        }
+                        missing_idxs => {
+                            let first_idx = *missing_idxs.first().unwrap();
+                            let last_idx = *missing_idxs.last().unwrap();
+                            // NOTE: Because we might be re-arranging arguments, might have extra arguments, etc.
+                            // It's hard to *really* know where we should provide this error label, so this is a
+                            // decent heuristic
+                            let span = if let (Some((_, first_span)), Some((_, last_span))) = (
+                                self.provided_arg_tys.get(first_idx.to_provided_idx()),
+                                self.provided_arg_tys.get(last_idx.to_provided_idx()),
+                            ) {
+                                first_span.to(*last_span)
+                            } else {
+                                self.args_span
+                            };
+                            labels.push((span, "multiple arguments are missing".to_string()));
+                            suggestion_text = match suggestion_text {
+                                SuggestionText::None | SuggestionText::Provide(_) => {
+                                    SuggestionText::Provide(true)
+                                }
+                                _ => SuggestionText::DidYouMean,
+                            };
+                        }
+                    }
+                }
+                Error::Swap(
+                    first_provided_idx,
+                    second_provided_idx,
+                    first_expected_idx,
+                    second_expected_idx,
+                ) => {
+                    let (first_provided_ty, first_span) =
+                        self.provided_arg_tys[*first_provided_idx];
+                    let (_, first_expected_ty) =
+                        self.formal_and_expected_inputs[*first_expected_idx];
+                    let first_provided_ty_name = if !has_error_or_infer([first_provided_ty]) {
+                        format!(", found `{first_provided_ty}`")
+                    } else {
+                        String::new()
+                    };
+                    labels.push((
+                        first_span,
+                        format!("expected `{first_expected_ty}`{first_provided_ty_name}"),
+                    ));
+
+                    let (second_provided_ty, second_span) =
+                        self.provided_arg_tys[*second_provided_idx];
+                    let (_, second_expected_ty) =
+                        self.formal_and_expected_inputs[*second_expected_idx];
+                    let second_provided_ty_name = if !has_error_or_infer([second_provided_ty]) {
+                        format!(", found `{second_provided_ty}`")
+                    } else {
+                        String::new()
+                    };
+                    labels.push((
+                        second_span,
+                        format!("expected `{second_expected_ty}`{second_provided_ty_name}"),
+                    ));
+
+                    suggestion_text = match suggestion_text {
+                        SuggestionText::None => SuggestionText::Swap,
+                        _ => SuggestionText::DidYouMean,
+                    };
+                }
+                Error::Permutation(args) => {
+                    for (dst_arg, dest_input) in args {
+                        let (_, expected_ty) = self.formal_and_expected_inputs[*dst_arg];
+                        let (provided_ty, provided_span) = self.provided_arg_tys[*dest_input];
+                        let provided_ty_name = if !has_error_or_infer([provided_ty]) {
+                            format!(", found `{provided_ty}`")
+                        } else {
+                            String::new()
+                        };
+                        labels.push((
+                            provided_span,
+                            format!("expected `{expected_ty}`{provided_ty_name}"),
+                        ));
+                    }
+
+                    suggestion_text = match suggestion_text {
+                        SuggestionText::None => SuggestionText::Reorder,
+                        _ => SuggestionText::DidYouMean,
+                    };
+                }
+            }
+        }
+
+        (suggestions, labels, suggestion_text)
+    }
+
+    fn label_generic_mismatches(&self, err: &mut Diag<'a>) {
+        self.fn_ctxt.label_generic_mismatches(
+            err,
+            self.fn_def_id,
+            &self.matched_inputs,
+            &self.provided_arg_tys,
+            &self.formal_and_expected_inputs,
+            self.call_metadata.is_method,
+            self.arg_matching_ctxt.tuple_arguments.is_splatted(),
+        );
+    }
+
+    /// Incorporate the argument changes in the removal suggestion.
+    ///
+    /// When a type is *missing*, and the rest are additional, we want to suggest these with a
+    /// multipart suggestion, but in order to do so we need to figure out *where* the arg that
+    /// was provided but had the wrong type should go, because when looking at `expected_idx`
+    /// that is the position in the argument list in the definition, while `provided_idx` will
+    /// not be present. So we have to look at what the *last* provided position was, and point
+    /// one after to suggest the replacement.
+    fn append_arguments_changes(&self, suggestions: &mut Vec<(Span, String)>) {
+        // FIXME(estebank): This is hacky, and there's
+        // probably a better more involved change we can make to make this work.
+        // For example, if we have
+        // ```
+        // fn foo(i32, &'static str) {}
+        // foo((), (), ());
+        // ```
+        // what should be suggested is
+        // ```
+        // foo(/* i32 */, /* &str */);
+        // ```
+        // which includes the replacement of the first two `()` for the correct type, and the
+        // removal of the last `()`.
+
+        let mut prev = -1;
+        for (expected_idx, provided_idx) in self.matched_inputs.iter_enumerated() {
+            // We want to point not at the *current* argument expression index, but rather at the
+            // index position where it *should have been*, which is *after* the previous one.
+            if let Some(provided_idx) = provided_idx {
+                prev = provided_idx.index() as i64;
+                continue;
+            }
+            let idx = ProvidedIdx::from_usize((prev + 1) as usize);
+            if let Some((_, arg_span)) = self.provided_arg_tys.get(idx) {
+                prev += 1;
+                // There is a type that was *not* found anywhere, so it isn't a move, but a
+                // replacement and we look at what type it should have been. This will allow us
+                // To suggest a multipart suggestion when encountering `foo(1, "")` where the def
+                // was `fn foo(())`.
+                let (_, expected_ty) = self.formal_and_expected_inputs[expected_idx];
+                // Check if the new suggestion would overlap with any existing suggestion.
+                // This can happen when we have both removal suggestions (which may include
+                // adjacent commas) and type replacement suggestions for the same span.
+                let dominated = suggestions
+                    .iter()
+                    .any(|(span, _)| span.contains(*arg_span) || arg_span.overlaps(*span));
+                if !dominated {
+                    suggestions.push((*arg_span, self.ty_to_snippet(expected_ty, expected_idx)));
+                }
+            }
+        }
+    }
+
+    fn format_suggestion_text(
+        err: &mut Diag<'_>,
+        suggestions: Vec<(Span, String)>,
+        suggestion_text: SuggestionText,
+    ) -> Option<String> {
+        match suggestion_text {
+            SuggestionText::None => None,
+            SuggestionText::Provide(plural) => {
+                Some(format!("provide the argument{}", if plural { "s" } else { "" }))
+            }
+            SuggestionText::Remove(plural) => {
+                err.multipart_suggestion(
+                    format!("remove the extra argument{}", if plural { "s" } else { "" }),
+                    suggestions,
+                    Applicability::HasPlaceholders,
+                );
+                None
+            }
+            SuggestionText::Swap => Some("swap these arguments".to_string()),
+            SuggestionText::Reorder => Some("reorder these arguments".to_string()),
+            SuggestionText::DidYouMean => Some("did you mean".to_string()),
+        }
+    }
+
+    fn arguments_formatting(&self, suggestion_span: Span) -> ArgumentsFormatting {
+        let source_map = self.sess().source_map();
+        let mut provided_inputs = self.matched_inputs.iter().filter_map(|a| *a);
+        if let Some(brace_indent) = source_map.indentation_before(suggestion_span)
+            && let Some(first_idx) = provided_inputs.by_ref().next()
+            && let Some(last_idx) = provided_inputs.by_ref().next()
+            && let (_, first_span) = self.provided_arg_tys[first_idx]
+            && let (_, last_span) = self.provided_arg_tys[last_idx]
+            && source_map.is_multiline(first_span.to(last_span))
+            && let Some(fallback_indent) = source_map.indentation_before(first_span)
+        {
+            ArgumentsFormatting::Multiline { fallback_indent, brace_indent }
+        } else {
+            ArgumentsFormatting::SingleLine
+        }
+    }
+
+    fn suggestion_code(&self) -> (Span, String) {
+        let source_map = self.sess().source_map();
+        let suggestion_span = if let Some(args_span) =
+            self.call_metadata.error_span.trim_start(self.call_metadata.full_call_span)
+        {
+            // Span of the braces, e.g. `(a, b, c)`.
+            args_span
+        } else {
+            // The arg span of a function call that wasn't even given braces
+            // like what might happen with delegation reuse.
+            // e.g. `reuse HasSelf::method;` should suggest `reuse HasSelf::method($args);`.
+            self.call_metadata.full_call_span.shrink_to_hi()
+        };
+
+        let arguments_formatting = self.arguments_formatting(suggestion_span);
+
+        let mut suggestion = "(".to_owned();
+        let mut needs_comma = false;
+        for (expected_idx, provided_idx) in self.matched_inputs.iter_enumerated() {
+            if needs_comma {
+                suggestion += ",";
+            }
+            match &arguments_formatting {
+                ArgumentsFormatting::SingleLine if needs_comma => suggestion += " ",
+                ArgumentsFormatting::SingleLine => {}
+                ArgumentsFormatting::Multiline { .. } => suggestion += "\n",
+            }
+            needs_comma = true;
+            let (suggestion_span, suggestion_text) = if let Some(provided_idx) = provided_idx
+                && let (_, provided_span) = self.provided_arg_tys[*provided_idx]
+                && let Ok(arg_text) = source_map.span_to_snippet(provided_span)
+            {
+                (Some(provided_span), arg_text)
+            } else {
+                // Propose a placeholder of the correct type
+                let (_, expected_ty) = self.formal_and_expected_inputs[expected_idx];
+                (None, self.ty_to_snippet(expected_ty, expected_idx))
+            };
+            if let ArgumentsFormatting::Multiline { fallback_indent, .. } = &arguments_formatting {
+                let indent = suggestion_span
+                    .and_then(|span| source_map.indentation_before(span))
+                    .unwrap_or_else(|| fallback_indent.clone());
+                suggestion += &indent;
+            }
+            suggestion += &suggestion_text;
+        }
+        if let ArgumentsFormatting::Multiline { brace_indent, .. } = arguments_formatting {
+            suggestion += ",\n";
+            suggestion += &brace_indent;
+        }
+        suggestion += ")";
+
+        (suggestion_span, suggestion)
+    }
+
+    fn maybe_suggest_expect_for_unwrap(&self, provided_ty: Ty<'tcx>) -> Option<Span> {
+        let tcx = self.tcx();
+        if let Some(call_ident) = self.call_metadata.call_ident
+            && call_ident.name == sym::unwrap
+            && let Some(callee_ty) = self.callee_ty
+            && let ty::Adt(adt, _) = callee_ty.peel_refs().kind()
+            && (tcx.is_diagnostic_item(sym::Option, adt.did())
+                || tcx.is_diagnostic_item(sym::Result, adt.did()))
+            && self.may_coerce(provided_ty, Ty::new_static_str(tcx))
+        {
+            Some(call_ident.span)
+        } else {
+            None
+        }
+    }
+}
+
+struct ArgMatchingCtxt<'a, 'tcx> {
+    args_ctxt: ArgsCtxt<'a, 'tcx>,
+    provided_arg_tys: IndexVec<ProvidedIdx, (Ty<'tcx>, Span)>,
+}
+
+impl<'a, 'tcx> Deref for ArgMatchingCtxt<'a, 'tcx> {
+    type Target = ArgsCtxt<'a, 'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.args_ctxt
+    }
+}
+
+impl<'a, 'tcx> ArgMatchingCtxt<'a, 'tcx> {
+    fn new(
+        arg: &'a FnCtxt<'a, 'tcx>,
+        compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
+        formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
+        provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
+        c_variadic: bool,
+        err_code: ErrCode,
+        fn_def_id: Option<DefId>,
+        call_span: Span,
+        call_expr: &'tcx Expr<'tcx>,
+        tuple_arguments: TupleArgumentsFlag,
+    ) -> Self {
+        let args_ctxt = ArgsCtxt::new(
+            arg,
+            compatibility_diagonal,
+            formal_and_expected_inputs,
+            provided_args,
+            c_variadic,
+            err_code,
+            fn_def_id,
+            call_span,
+            call_expr,
+            tuple_arguments,
+        );
+        let provided_arg_tys = args_ctxt.provided_arg_tys();
+
+        ArgMatchingCtxt { args_ctxt, provided_arg_tys }
+    }
+
+    fn suggest_confusable(&self, err: &mut Diag<'_>) {
+        let Some(call_name) = self.call_metadata.call_ident else {
+            return;
+        };
+        let Some(callee_ty) = self.callee_ty else {
+            return;
+        };
+        let input_types: Vec<Ty<'_>> = self.provided_arg_tys.iter().map(|(ty, _)| *ty).collect();
+
+        // Check for other methods in the following order
+        //  - methods marked as `rustc_confusables` with the provided arguments
+        //  - methods with the same argument type/count and short levenshtein distance
+        //  - methods marked as `rustc_confusables` (done)
+        //  - methods with short levenshtein distance
+
+        // Look for commonly confusable method names considering arguments.
+        if let Some(_name) = self.confusable_method_name(
+            err,
+            callee_ty.peel_refs(),
+            call_name,
+            Some(input_types.clone()),
+        ) {
+            return;
+        }
+        // Look for method names with short levenshtein distance, considering arguments.
+        if let Some((assoc, fn_sig)) = self.similar_assoc(call_name)
+            && fn_sig.inputs()[1..]
+                .iter()
+                .eq_by(input_types, |expected, found| self.may_coerce(*expected, found))
+        {
+            let assoc_name = assoc.name();
+            err.span_suggestion_verbose(
+                call_name.span,
+                format!("you might have meant to use `{}`", assoc_name),
+                assoc_name,
+                Applicability::MaybeIncorrect,
+            );
+            return;
+        }
+    }
+
+    /// A "softer" version of the `demand_compatible`, which checks types without persisting them,
+    /// and treats error types differently
+    /// This will allow us to "probe" for other argument orders that would likely have been correct
+    fn check_compatible(
+        &self,
+        provided_idx: ProvidedIdx,
+        expected_idx: ExpectedIdx,
+    ) -> Compatibility<'tcx> {
+        if provided_idx.as_usize() == expected_idx.as_usize() {
+            return self.compatibility_diagonal[provided_idx].clone();
+        }
+
+        let (formal_input_ty, expected_input_ty) = self.formal_and_expected_inputs[expected_idx];
+        // If either is an error type, we defy the usual convention and consider them to *not* be
+        // coercible. This prevents our error message heuristic from trying to pass errors into
+        // every argument.
+        if (formal_input_ty, expected_input_ty).references_error() {
+            return Compatibility::Incompatible(None);
+        }
+
+        let (arg_ty, arg_span) = self.provided_arg_tys[provided_idx];
+
+        let expectation = Expectation::rvalue_hint(self.fn_ctxt, expected_input_ty);
+        let coerced_ty = expectation.only_has_type(self.fn_ctxt).unwrap_or(formal_input_ty);
+        let can_coerce = self.may_coerce(arg_ty, coerced_ty);
+        if !can_coerce {
+            return Compatibility::Incompatible(Some(ty::error::TypeError::Sorts(
+                ty::error::ExpectedFound::new(coerced_ty, arg_ty),
+            )));
+        }
+
+        // Using probe here, since we don't want this subtyping to affect inference.
+        let subtyping_error = self.probe(|_| {
+            self.at(&self.misc(arg_span), self.param_env)
+                .sup(DefineOpaqueTypes::Yes, formal_input_ty, coerced_ty)
+                .err()
+        });
+
+        // Same as above: if either the coerce type or the checked type is an error type,
+        // consider them *not* compatible.
+        let references_error = (coerced_ty, arg_ty).references_error();
+        match (references_error, subtyping_error) {
+            (false, None) => Compatibility::Compatible,
+            (_, subtyping_error) => Compatibility::Incompatible(subtyping_error),
+        }
+    }
+
+    fn remove_idx_is_perfect(&self, idx: usize) -> bool {
+        let removed_arg_tys = self
+            .provided_arg_tys
+            .iter()
+            .enumerate()
+            .filter_map(|(j, arg)| if idx == j { None } else { Some(arg) })
+            .collect::<IndexVec<ProvidedIdx, _>>();
+        std::iter::zip(self.formal_and_expected_inputs.iter(), removed_arg_tys.iter()).all(
+            |((expected_ty, _), (provided_ty, _))| {
+                !provided_ty.references_error() && self.may_coerce(*provided_ty, *expected_ty)
+            },
+        )
+    }
+}
+
+struct ArgsCtxt<'a, 'tcx> {
+    call_ctxt: CallCtxt<'a, 'tcx>,
+    call_metadata: CallMetadata,
+    args_span: Span,
+}
+
+impl<'a, 'tcx> Deref for ArgsCtxt<'a, 'tcx> {
+    type Target = CallCtxt<'a, 'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.call_ctxt
+    }
+}
+
+impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
+    fn new(
+        arg: &'a FnCtxt<'a, 'tcx>,
+        compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
+        formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
+        provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
+        c_variadic: bool,
+        err_code: ErrCode,
+        fn_def_id: Option<DefId>,
+        call_span: Span,
+        call_expr: &'tcx Expr<'tcx>,
+        tuple_arguments: TupleArgumentsFlag,
+    ) -> Self {
+        let call_ctxt: CallCtxt<'_, '_> = CallCtxt::new(
+            arg,
+            compatibility_diagonal,
+            formal_and_expected_inputs,
+            provided_args,
+            c_variadic,
+            err_code,
+            fn_def_id,
+            call_span,
+            call_expr,
+            tuple_arguments,
+        );
+
+        let call_metadata = call_ctxt.call_metadata();
+        let args_span = call_metadata
+            .error_span
+            .trim_start(call_metadata.full_call_span)
+            .unwrap_or(call_metadata.error_span);
+
+        ArgsCtxt { args_span, call_metadata, call_ctxt }
+    }
+
+    /// Get the argument span in the context of the call span so that
+    /// suggestions and labels are (more) correct when an arg is a
+    /// macro invocation.
+    fn normalize_span(&self, span: Span) -> Span {
+        let normalized_span =
+            span.find_ancestor_inside_same_ctxt(self.call_metadata.error_span).unwrap_or(span);
+        // Sometimes macros mess up the spans, so do not normalize the
+        // arg span to equal the error span, because that's less useful
+        // than pointing out the arg expr in the wrong context.
+        if normalized_span.source_equal(self.call_metadata.error_span) {
+            span
+        } else {
+            normalized_span
+        }
+    }
+
+    /// Computes the provided types and spans.
+    fn provided_arg_tys(&self) -> IndexVec<ProvidedIdx, (Ty<'tcx>, Span)> {
+        self.call_ctxt
+            .provided_args
+            .iter()
+            .map(|expr| {
+                let ty = self
+                    .call_ctxt
+                    .fn_ctxt
+                    .typeck_results
+                    .borrow()
+                    .expr_ty_adjusted_opt(expr)
+                    .unwrap_or_else(|| Ty::new_misc_error(self.call_ctxt.fn_ctxt.tcx));
+                (
+                    self.call_ctxt.fn_ctxt.resolve_vars_if_possible(ty),
+                    self.normalize_span(expr.span),
+                )
+            })
+            .collect()
+    }
+
+    // Obtain another method on `Self` that have similar name.
+    fn similar_assoc(&self, call_name: Ident) -> Option<(ty::AssocItem, ty::FnSig<'tcx>)> {
+        if let Some(callee_ty) = self.call_ctxt.callee_ty
+            && let Ok(Some(assoc)) = self.call_ctxt.fn_ctxt.probe_op(
+                call_name.span,
+                MethodCall,
+                Some(call_name),
+                None,
+                IsSuggestion(true),
+                callee_ty.peel_refs(),
+                self.call_ctxt.callee_expr.unwrap().hir_id,
+                TraitsInScope,
+                |mut ctxt| ctxt.probe_for_similar_candidate(),
+            )
+            && assoc.is_method()
+        {
+            let args =
+                self.call_ctxt.fn_ctxt.infcx.fresh_args_for_item(call_name.span, assoc.def_id);
+            let fn_sig = self
+                .call_ctxt
+                .fn_ctxt
+                .tcx
+                .fn_sig(assoc.def_id)
+                .instantiate(self.call_ctxt.fn_ctxt.tcx, args)
+                .skip_norm_wip();
+
+            self.call_ctxt.fn_ctxt.instantiate_binder_with_fresh_vars(
+                call_name.span,
+                BoundRegionConversionTime::FnCall,
+                fn_sig,
+            );
+        }
+        None
+    }
+
+    fn call_is_in_macro(&self) -> bool {
+        self.call_metadata.full_call_span.in_external_macro(self.sess().source_map())
+    }
+}
+
+struct CallMetadata {
+    error_span: Span,
+    call_ident: Option<Ident>,
+    full_call_span: Span,
+    call_name: &'static str,
+    is_method: bool,
+}
+
+struct CallCtxt<'a, 'tcx> {
+    fn_ctxt: &'a FnCtxt<'a, 'tcx>,
+    compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
+    formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
+    provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
+    c_variadic: bool,
+    err_code: ErrCode,
+    fn_def_id: Option<DefId>,
+    call_span: Span,
+    call_expr: &'tcx hir::Expr<'tcx>,
+    tuple_arguments: TupleArgumentsFlag,
+    callee_expr: Option<&'tcx Expr<'tcx>>,
+    callee_ty: Option<Ty<'tcx>>,
+}
+
+impl<'a, 'tcx> Deref for CallCtxt<'a, 'tcx> {
+    type Target = &'a FnCtxt<'a, 'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fn_ctxt
+    }
+}
+
+impl<'a, 'tcx> CallCtxt<'a, 'tcx> {
+    fn new(
+        fn_ctxt: &'a FnCtxt<'a, 'tcx>,
+        compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
+        formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
+        provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
+        c_variadic: bool,
+        err_code: ErrCode,
+        fn_def_id: Option<DefId>,
+        call_span: Span,
+        call_expr: &'tcx hir::Expr<'tcx>,
+        tuple_arguments: TupleArgumentsFlag,
+    ) -> CallCtxt<'a, 'tcx> {
+        let callee_expr = match &call_expr.peel_blocks().kind {
+            hir::ExprKind::Call(callee, _) => Some(*callee),
+            hir::ExprKind::MethodCall(_, receiver, ..) => {
+                if let Some((DefKind::AssocFn, def_id)) =
+                    fn_ctxt.typeck_results.borrow().type_dependent_def(call_expr.hir_id)
+                    && let Some(assoc) = fn_ctxt.tcx.opt_associated_item(def_id)
+                    && assoc.is_method()
+                {
+                    Some(*receiver)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let callee_ty = callee_expr.and_then(|callee_expr| {
+            fn_ctxt.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr)
+        });
+
+        CallCtxt {
+            fn_ctxt,
+            compatibility_diagonal,
+            formal_and_expected_inputs,
+            provided_args,
+            c_variadic,
+            err_code,
+            fn_def_id,
+            call_span,
+            call_expr,
+            tuple_arguments,
+            callee_expr,
+            callee_ty,
+        }
+    }
+
+    fn call_metadata(&self) -> CallMetadata {
+        match &self.call_expr.kind {
+            hir::ExprKind::Call(
+                hir::Expr { hir_id, span, kind: hir::ExprKind::Path(qpath), .. },
+                _,
+            ) => {
+                if let Res::Def(DefKind::Ctor(of, _), _) =
+                    self.typeck_results.borrow().qpath_res(qpath, *hir_id)
+                {
+                    let name = match of {
+                        CtorOf::Struct => "struct",
+                        CtorOf::Variant => "enum variant",
+                    };
+                    CallMetadata {
+                        error_span: self.call_span,
+                        call_ident: None,
+                        full_call_span: *span,
+                        call_name: name,
+                        is_method: false,
+                    }
+                } else {
+                    CallMetadata {
+                        error_span: self.call_span,
+                        call_ident: None,
+                        full_call_span: *span,
+                        call_name: "function",
+                        is_method: false,
+                    }
+                }
+            }
+            hir::ExprKind::Call(hir::Expr { span, .. }, _) => CallMetadata {
+                error_span: self.call_span,
+                call_ident: None,
+                full_call_span: *span,
+                call_name: "function",
+                is_method: false,
+            },
+            hir::ExprKind::MethodCall(path_segment, _, _, span) => {
+                let ident_span = path_segment.ident.span;
+                let ident_span = if let Some(args) = path_segment.args {
+                    ident_span.with_hi(args.span_ext.hi())
+                } else {
+                    ident_span
+                };
+                CallMetadata {
+                    error_span: *span,
+                    call_ident: Some(path_segment.ident),
+                    full_call_span: ident_span,
+                    call_name: "method",
+                    is_method: true,
+                }
+            }
+            k => span_bug!(self.call_span, "checking argument types on a non-call: `{:?}`", k),
+        }
+    }
+
+    fn mk_trace(
+        &self,
+        span: Span,
+        (formal_ty, expected_ty): (Ty<'tcx>, Ty<'tcx>),
+        provided_ty: Ty<'tcx>,
+    ) -> TypeTrace<'tcx> {
+        let mismatched_ty = if expected_ty == provided_ty {
+            // If expected == provided, then we must have failed to sup
+            // the formal type. Avoid printing out "expected Ty, found Ty"
+            // in that case.
+            formal_ty
+        } else {
+            expected_ty
+        };
+        TypeTrace::types(&self.misc(span), mismatched_ty, provided_ty)
+    }
+
+    fn ty_to_snippet(&self, ty: Ty<'tcx>, expected_idx: ExpectedIdx) -> String {
+        if ty.is_unit() {
+            "()".to_string()
+        } else if ty.is_suggestable(self.tcx, false) {
+            with_forced_trimmed_paths!(format!("/* {ty} */"))
+        } else if let Some(fn_def_id) = self.fn_def_id
+            && self.tcx.def_kind(fn_def_id).is_fn_like()
+            && let self_implicit =
+                matches!(self.call_expr.kind, hir::ExprKind::MethodCall(..)) as usize
+            && let Some(Some(arg)) =
+                self.tcx.fn_arg_idents(fn_def_id).get(expected_idx.as_usize() + self_implicit)
+            && arg.name != kw::SelfLower
+        {
+            format!("/* {} */", arg.name)
+        } else {
+            "/* value */".to_string()
+        }
+    }
+
+    fn first_incompatible_error(&self) -> Option<(ProvidedIdx, TypeError<'tcx>)> {
+        self.compatibility_diagonal.iter_enumerated().find_map(|(i, c)| {
+            if let Compatibility::Incompatible(Some(terr)) = c { Some((i, *terr)) } else { None }
+        })
+    }
+}
+
+enum SuggestionText {
+    None,
+    Provide(bool),
+    Remove(bool),
+    Swap,
+    Reorder,
+    DidYouMean,
 }

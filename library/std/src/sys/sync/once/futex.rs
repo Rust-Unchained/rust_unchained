@@ -1,23 +1,25 @@
 use crate::cell::Cell;
 use crate::sync as public;
 use crate::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use crate::sync::poison::once::ExclusiveState;
-use crate::sys::futex::{Futex, Primitive, futex_wait, futex_wake_all};
+use crate::sync::once::OnceExclusiveState;
+use crate::sys::sync::futex::{Futex, Primitive, futex_wait, futex_wake_all};
 
 // On some platforms, the OS is very nice and handles the waiter queue for us.
 // This means we only need one atomic value with 4 states:
 
 /// No initialization has run yet, and no thread is currently using the Once.
-const INCOMPLETE: Primitive = 0;
+const INCOMPLETE: Primitive = 3;
 /// Some thread has previously attempted to initialize the Once, but it panicked,
 /// so the Once is now poisoned. There are no other threads currently accessing
 /// this Once.
-const POISONED: Primitive = 1;
+const POISONED: Primitive = 2;
 /// Some thread is currently attempting to run initialization. It may succeed,
 /// so all future threads need to wait for it to finish.
-const RUNNING: Primitive = 2;
+const RUNNING: Primitive = 1;
 /// Initialization has completed and all future calls should finish immediately.
-const COMPLETE: Primitive = 3;
+/// By choosing this state as the all-zero state the `is_completed` check can be
+/// a bit faster on some platforms.
+const COMPLETE: Primitive = 0;
 
 // An additional bit indicates whether there are waiting threads:
 
@@ -74,6 +76,11 @@ impl Once {
     }
 
     #[inline]
+    pub const fn new_complete() -> Once {
+        Once { state_and_queued: Futex::new(COMPLETE) }
+    }
+
+    #[inline]
     pub fn is_completed(&self) -> bool {
         // Use acquire ordering to make all initialization changes visible to the
         // current thread.
@@ -81,21 +88,21 @@ impl Once {
     }
 
     #[inline]
-    pub(crate) fn state(&mut self) -> ExclusiveState {
+    pub(crate) fn state(&mut self) -> OnceExclusiveState {
         match *self.state_and_queued.get_mut() {
-            INCOMPLETE => ExclusiveState::Incomplete,
-            POISONED => ExclusiveState::Poisoned,
-            COMPLETE => ExclusiveState::Complete,
+            INCOMPLETE => OnceExclusiveState::Incomplete,
+            POISONED => OnceExclusiveState::Poisoned,
+            COMPLETE => OnceExclusiveState::Complete,
             _ => unreachable!("invalid Once state"),
         }
     }
 
     #[inline]
-    pub(crate) fn set_state(&mut self, new_state: ExclusiveState) {
+    pub(crate) fn set_state(&mut self, new_state: OnceExclusiveState) {
         *self.state_and_queued.get_mut() = match new_state {
-            ExclusiveState::Incomplete => INCOMPLETE,
-            ExclusiveState::Poisoned => POISONED,
-            ExclusiveState::Complete => COMPLETE,
+            OnceExclusiveState::Incomplete => INCOMPLETE,
+            OnceExclusiveState::Poisoned => POISONED,
+            OnceExclusiveState::Complete => COMPLETE,
         };
     }
 

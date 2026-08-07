@@ -7,23 +7,34 @@ mod returning;
 use std::borrow::Cow;
 use std::mem;
 
-use cranelift_codegen::ir::{ArgumentPurpose, SigRef};
+use cranelift_codegen::ir::{
+    ArgumentPurpose, BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag, SigRef,
+};
 use cranelift_codegen::isa::CallConv;
 use cranelift_module::ModuleError;
-use rustc_abi::ExternAbi;
+use rustc_abi::{CanonAbi, ExternAbi, X86Call};
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
-use rustc_codegen_ssa::errors::CompilerBuiltinsCannotCall;
+use rustc_codegen_ssa::diagnostics::CompilerBuiltinsCannotCall;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::layout::FnAbiOf;
 use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_middle::ty::{ShimKind, TypeVisitableExt};
 use rustc_session::Session;
-use rustc_span::source_map::Spanned;
-use rustc_target::callconv::{Conv, FnAbi, PassMode};
+use rustc_span::Spanned;
+use rustc_target::callconv::{FnAbi, PassMode};
+use rustc_target::spec::Arch;
+use smallvec::{SmallVec, smallvec};
 
 use self::pass_mode::*;
 pub(crate) use self::returning::codegen_return;
+use crate::base::codegen_unwind_terminate;
+use crate::debuginfo::EXCEPTION_HANDLER_CLEANUP;
 use crate::prelude::*;
+
+struct ArgValue<'tcx> {
+    value: CValue<'tcx>,
+    is_underaligned_pointee: bool,
+}
 
 fn clif_sig_from_fn_abi<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -41,32 +52,35 @@ fn clif_sig_from_fn_abi<'tcx>(
     Signature { params, returns, call_conv }
 }
 
-pub(crate) fn conv_to_call_conv(sess: &Session, c: Conv, default_call_conv: CallConv) -> CallConv {
+pub(crate) fn conv_to_call_conv(
+    sess: &Session,
+    c: CanonAbi,
+    default_call_conv: CallConv,
+) -> CallConv {
     match c {
-        Conv::Rust | Conv::C => default_call_conv,
-        Conv::Cold | Conv::PreserveMost | Conv::PreserveAll => CallConv::Cold,
-        Conv::X86_64SysV => CallConv::SystemV,
-        Conv::X86_64Win64 => CallConv::WindowsFastcall,
+        CanonAbi::Rust | CanonAbi::RustCold | CanonAbi::C => default_call_conv,
 
-        // Should already get a back compat warning
-        Conv::X86Fastcall | Conv::X86Stdcall | Conv::X86ThisCall | Conv::X86VectorCall => {
-            default_call_conv
+        CanonAbi::RustPreserveNone | CanonAbi::RustTail => {
+            sess.dcx().fatal(format!("call conv {c:?} is LLVM-specific"))
         }
 
-        Conv::X86Intr | Conv::RiscvInterrupt { .. } => {
-            sess.dcx().fatal(format!("interrupt call conv {c:?} not yet implemented"))
-        }
+        // Functions with this calling convention can only be called from assembly, but it is
+        // possible to declare an `extern "custom"` block, so the backend still needs a calling
+        // convention for declaring foreign functions.
+        CanonAbi::Custom => default_call_conv,
 
-        Conv::ArmAapcs => sess.dcx().fatal("aapcs call conv not yet implemented"),
-        Conv::CCmseNonSecureCall => {
-            sess.dcx().fatal("C-cmse-nonsecure-call call conv is not yet implemented");
-        }
-        Conv::CCmseNonSecureEntry => {
-            sess.dcx().fatal("C-cmse-nonsecure-entry call conv is not yet implemented");
-        }
+        CanonAbi::X86(x86_call) => match x86_call {
+            X86Call::SysV64 => CallConv::SystemV,
+            X86Call::Win64 => CallConv::WindowsFastcall,
+            // Should already get a back compat warning
+            _ => default_call_conv,
+        },
 
-        Conv::Msp430Intr | Conv::GpuKernel | Conv::AvrInterrupt | Conv::AvrNonBlockingInterrupt => {
-            unreachable!("tried to use {c:?} call conv which only exists on an unsupported target");
+        CanonAbi::Interrupt(_) | CanonAbi::Arm(_) | CanonAbi::Swift => {
+            sess.dcx().fatal(format!("call conv {c:?} is not yet implemented"))
+        }
+        CanonAbi::GpuKernel => {
+            unreachable!("tried to use {c:?} call conv which only exists on an unsupported target")
         }
     }
 }
@@ -80,7 +94,7 @@ pub(crate) fn get_function_sig<'tcx>(
     clif_sig_from_fn_abi(
         tcx,
         default_call_conv,
-        &FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
+        FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
     )
 }
 
@@ -109,7 +123,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     /// Instance must be monomorphized
     pub(crate) fn get_function_ref(&mut self, inst: Instance<'tcx>) -> FuncRef {
         let func_id = import_function(self.tcx, self.module, inst);
-        let func_ref = self.module.declare_func_in_func(func_id, &mut self.bcx.func);
+        let func_ref = self.module.declare_func_in_func(func_id, self.bcx.func);
 
         if self.clif_comments.enabled() {
             self.add_comment(func_ref, format!("{:?}", inst));
@@ -125,50 +139,60 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         mut returns: Vec<AbiParam>,
         args: &[Value],
     ) -> Cow<'_, [Value]> {
-        // Pass i128 arguments by-ref on Windows.
-        let (params, args): (Vec<_>, Cow<'_, [_]>) = if self.tcx.sess.target.is_like_windows {
-            let (params, args): (Vec<_>, Vec<_>) = params
-                .into_iter()
-                .zip(args)
-                .map(|(param, &arg)| {
-                    if param.value_type == types::I128 {
-                        let arg_ptr = self.create_stack_slot(16, 16);
-                        arg_ptr.store(self, arg, MemFlags::trusted());
-                        (AbiParam::new(self.pointer_type), arg_ptr.get_addr(self))
-                    } else {
-                        (param, arg)
-                    }
-                })
-                .unzip();
+        // FIXME any way to reuse the abi adjustment code in rustc_target?
 
-            (params, args.into())
-        } else {
-            (params, args.into())
-        };
+        // Pass and return f128 indirectly on s390x and x86_64 Windows.
+        let indirect_f128 = self.tcx.sess.target.arch == Arch::S390x
+            || (self.tcx.sess.target.is_like_windows && self.tcx.sess.target.arch == Arch::X86_64);
 
-        let ret_single_i128 = returns.len() == 1 && returns[0].value_type == types::I128;
+        // Pass i128 arguments by-ref on s390x and Windows.
+        let (params, args): (Vec<_>, Cow<'_, [_]>) =
+            if self.tcx.sess.target.is_like_windows || self.tcx.sess.target.arch == Arch::S390x {
+                let (params, args): (Vec<_>, Vec<_>) = params
+                    .into_iter()
+                    .zip(args)
+                    .map(|(param, &arg)| {
+                        if param.value_type == types::I128
+                            || (indirect_f128 && param.value_type == types::F128)
+                        {
+                            let arg_ptr = self.create_stack_slot(16, 16);
+                            arg_ptr.store(self, arg, MemFlagsData::trusted());
+                            (AbiParam::new(self.pointer_type), arg_ptr.get_addr(self))
+                        } else {
+                            (param, arg)
+                        }
+                    })
+                    .unzip();
+
+                (params, args.into())
+            } else {
+                (params, args.into())
+            };
+
+        let ret_single_i128 = matches!(*returns, [AbiParam { value_type: types::I128, .. }]);
+        let ret_single_f128 = matches!(*returns, [AbiParam { value_type: types::F128, .. }]);
         if ret_single_i128 && self.tcx.sess.target.is_like_windows {
             // Return i128 using the vector ABI on Windows
             returns[0].value_type = types::I64X2;
 
             let ret = self.lib_call_unadjusted(name, params, returns, &args)[0];
 
-            // FIXME(bytecodealliance/wasmtime#6104) use bitcast instead of store to get from i64x2 to i128
-            let ret_ptr = self.create_stack_slot(16, 16);
-            ret_ptr.store(self, ret, MemFlags::trusted());
-            Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())])
-        } else if ret_single_i128 && self.tcx.sess.target.arch == "s390x" {
-            // Return i128 using a return area pointer on s390x.
+            Cow::Owned(vec![codegen_bitcast(self, types::I128, ret)])
+        } else if (ret_single_i128 && self.tcx.sess.target.arch == Arch::S390x)
+            || (ret_single_f128 && indirect_f128)
+        {
+            // Return x86_64 Windows f128 and s390x i128 indirectly (sret in LLVM terminology).
+            let ret_ty = returns[0].value_type;
             let mut params = params;
             let mut args = args.to_vec();
 
-            params.insert(0, AbiParam::new(self.pointer_type));
+            params.insert(0, AbiParam::special(self.pointer_type, ArgumentPurpose::StructReturn));
             let ret_ptr = self.create_stack_slot(16, 16);
             args.insert(0, ret_ptr.get_addr(self));
 
             self.lib_call_unadjusted(name, params, vec![], &args);
 
-            Cow::Owned(vec![ret_ptr.load(self, types::I128, MemFlags::trusted())])
+            Cow::Owned(vec![ret_ptr.load(self, ret_ty, MemFlagsData::trusted())])
         } else {
             Cow::Borrowed(self.lib_call_unadjusted(name, params, returns, &args))
         }
@@ -183,12 +207,10 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     ) -> &[Value] {
         let sig = Signature { params, returns, call_conv: self.target_config.default_call_conv };
         let func_id = self.module.declare_function(name, Linkage::Import, &sig).unwrap();
-        let func_ref = self.module.declare_func_in_func(func_id, &mut self.bcx.func);
-        if self.clif_comments.enabled() {
-            self.add_comment(func_ref, format!("{:?}", name));
-        }
+        let func_ref = self.module.declare_func_in_func(func_id, self.bcx.func);
         let call_inst = self.bcx.ins().call(func_ref, args);
         if self.clif_comments.enabled() {
+            self.add_comment(func_ref, format!("{:?}", name));
             self.add_comment(call_inst, format!("lib_call {}", name));
         }
         let results = self.bcx.inst_results(call_inst);
@@ -211,7 +233,7 @@ fn make_local_place<'tcx>(
         );
     }
     let place = if is_ssa {
-        if let BackendRepr::ScalarPair(_, _) = layout.backend_repr {
+        if let BackendRepr::ScalarPair { .. } = layout.backend_repr {
             CPlace::new_var_pair(fx, local, layout)
         } else {
             CPlace::new_var(fx, local, layout)
@@ -242,8 +264,8 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
 
     // None means pass_mode == NoPass
     enum ArgKind<'tcx> {
-        Normal(Option<CValue<'tcx>>),
-        Spread(Vec<Option<CValue<'tcx>>>),
+        Normal(Option<ArgValue<'tcx>>),
+        Spread(Vec<Option<ArgValue<'tcx>>>),
     }
 
     // FIXME implement variadics in cranelift
@@ -262,6 +284,7 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
         .map(|local| {
             let arg_ty = fx.monomorphize(fx.mir.local_decls[local].ty);
 
+            // FIXME(splat): un-tuple splatted arguments in codegen, for performance
             // Adapted from https://github.com/rust-lang/rust/blob/145155dc96757002c7b2e9de8489416e2fdbbd57/src/librustc_codegen_llvm/mir/mod.rs#L442-L482
             if Some(local) == fx.mir.spread_arg {
                 // This argument (e.g. the last argument in the "rust-call" ABI)
@@ -270,7 +293,7 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
                 // individual function arguments.
 
                 let tupled_arg_tys = match arg_ty.kind() {
-                    ty::Tuple(ref tys) => tys,
+                    ty::Tuple(tys) => tys,
                     _ => bug!("spread argument isn't a tuple?! but {:?}", arg_ty),
                 };
 
@@ -296,11 +319,15 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
     if fx.instance.def.requires_caller_location(fx.tcx) {
         // Store caller location for `#[track_caller]`.
         let arg_abi = arg_abis_iter.next().unwrap();
-        fx.caller_location =
-            Some(cvalue_for_param(fx, None, None, arg_abi, &mut block_params_iter).unwrap());
+        let param = cvalue_for_param(fx, None, None, arg_abi, &mut block_params_iter).unwrap();
+        assert!(
+            !param.is_underaligned_pointee,
+            "caller location argument should not be underaligned",
+        );
+        fx.caller_location = Some(param.value);
     }
 
-    assert!(arg_abis_iter.next().is_none(), "ArgAbi left behind");
+    assert_eq!(arg_abis_iter.next(), None, "ArgAbi left behind for {:?}", fx.fn_abi);
     assert!(block_params_iter.next().is_none(), "arg_value left behind");
 
     self::comments::add_locals_header_comment(fx);
@@ -308,23 +335,24 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
     for (local, arg_kind, ty) in func_params {
         // While this is normally an optimization to prevent an unnecessary copy when an argument is
         // not mutated by the current function, this is necessary to support unsized arguments.
-        if let ArgKind::Normal(Some(val)) = arg_kind {
-            if let Some((addr, meta)) = val.try_to_ptr() {
-                // Ownership of the value at the backing storage for an argument is passed to the
-                // callee per the ABI, so it is fine to borrow the backing storage of this argument
-                // to prevent a copy.
+        if let ArgKind::Normal(Some(ArgValue { value: val, is_underaligned_pointee: false })) =
+            arg_kind
+            && let Some((addr, meta)) = val.try_to_ptr()
+        {
+            // Ownership of the value at the backing storage for an argument is passed to the
+            // callee per the ABI, so it is fine to borrow the backing storage of this argument
+            // to prevent a copy.
 
-                let place = if let Some(meta) = meta {
-                    CPlace::for_ptr_with_extra(addr, meta, val.layout())
-                } else {
-                    CPlace::for_ptr(addr, val.layout())
-                };
+            let place = if let Some(meta) = meta {
+                CPlace::for_ptr_with_extra(addr, meta, val.layout())
+            } else {
+                CPlace::for_ptr(addr, val.layout())
+            };
 
-                self::comments::add_local_place_comments(fx, place, local);
+            self::comments::add_local_place_comments(fx, place, local);
 
-                assert_eq!(fx.local_map.push(place), local);
-                continue;
-            }
+            assert_eq!(fx.local_map.push(place), local);
+            continue;
         }
 
         let layout = fx.layout_of(ty);
@@ -335,13 +363,22 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
         match arg_kind {
             ArgKind::Normal(param) => {
                 if let Some(param) = param {
-                    place.write_cvalue(fx, param);
+                    if param.is_underaligned_pointee {
+                        place.write_cvalue_transmute(fx, param.value);
+                    } else {
+                        place.write_cvalue(fx, param.value);
+                    }
                 }
             }
             ArgKind::Spread(params) => {
                 for (i, param) in params.into_iter().enumerate() {
                     if let Some(param) = param {
-                        place.place_field(fx, FieldIdx::new(i)).write_cvalue(fx, param);
+                        let field_place = place.place_field(fx, FieldIdx::new(i));
+                        if param.is_underaligned_pointee {
+                            field_place.write_cvalue_transmute(fx, param.value);
+                        } else {
+                            field_place.write_cvalue(fx, param.value);
+                        }
                     }
                 }
             }
@@ -384,6 +421,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: Place<'tcx>,
     target: Option<BasicBlock>,
+    unwind: UnwindAction,
 ) {
     let func = codegen_operand(fx, func);
     let fn_sig = func.layout().ty.fn_sig(fx.tcx);
@@ -396,7 +434,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
             fx.tcx,
             ty::TypingEnv::fully_monomorphized(),
             def_id,
-            fn_args,
+            fn_args.no_bound_vars().unwrap(),
             source_info.span,
         );
 
@@ -415,18 +453,6 @@ pub(crate) fn codegen_terminator_call<'tcx>(
             }
         }
 
-        if fx.tcx.symbol_name(instance).name.starts_with("llvm.") {
-            crate::intrinsics::codegen_llvm_intrinsic_call(
-                fx,
-                &fx.tcx.symbol_name(instance).name,
-                args,
-                ret_place,
-                target,
-                source_info.span,
-            );
-            return;
-        }
-
         match instance.def {
             InstanceKind::Intrinsic(_) => {
                 match crate::intrinsics::codegen_intrinsic_call(
@@ -441,7 +467,20 @@ pub(crate) fn codegen_terminator_call<'tcx>(
                     Err(instance) => Some(instance),
                 }
             }
-            InstanceKind::DropGlue(_, None) | ty::InstanceKind::AsyncDropGlueCtorShim(_, None) => {
+            InstanceKind::LlvmIntrinsic(_) => {
+                crate::intrinsics::codegen_llvm_intrinsic_call(
+                    fx,
+                    fx.tcx.symbol_name(instance).name,
+                    args,
+                    ret_place,
+                    target,
+                    source_info.span,
+                );
+                return;
+            }
+            // We don't need AsyncDropGlueCtorShim here because it is not `noop func`,
+            // it is `func returning noop future`
+            InstanceKind::Shim(ShimKind::DropGlue(_, None)) => {
                 // empty drop glue - a nop.
                 let dest = target.expect("Non terminating drop_in_place_real???");
                 let ret_block = fx.get_block(dest);
@@ -468,7 +507,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         true
     } else {
         instance.is_some_and(|inst| {
-            fx.tcx.codegen_fn_attrs(inst.def_id()).flags.contains(CodegenFnAttrFlags::COLD)
+            fx.tcx.codegen_instance_attrs(inst.def).flags.contains(CodegenFnAttrFlags::COLD)
         })
     };
     if is_cold {
@@ -490,7 +529,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         };
 
         let tupled_arguments = match pack_arg.value.layout().ty.kind() {
-            ty::Tuple(ref tupled_arguments) => tupled_arguments,
+            ty::Tuple(tupled_arguments) => tupled_arguments,
             _ => bug!("argument to function with \"rust-call\" ABI is not a tuple"),
         };
 
@@ -516,18 +555,12 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     let args = args;
     assert_eq!(fn_abi.args.len(), args.len());
 
-    #[derive(Copy, Clone)]
-    enum CallTarget {
-        Direct(FuncRef),
-        Indirect(SigRef, Value),
-    }
-
     let (func_ref, first_arg_override) = match instance {
         // Trait object call
         Some(Instance { def: InstanceKind::Virtual(_, idx), .. }) => {
             if fx.clif_comments.enabled() {
                 let nop_inst = fx.bcx.ins().nop();
-                fx.add_comment(
+                fx.add_post_comment(
                     nop_inst,
                     with_no_trimmed_paths!(format!(
                         "virtual call; self arg pass mode: {:?}",
@@ -537,7 +570,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
             }
 
             let (ptr, method) = crate::vtable::get_ptr_and_method_ref(fx, args[0].value, idx);
-            let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
+            let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, fn_abi);
             let sig = fx.bcx.import_signature(sig);
 
             (CallTarget::Indirect(sig, method), Some(ptr.get_addr(fx)))
@@ -553,11 +586,11 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         None => {
             if fx.clif_comments.enabled() {
                 let nop_inst = fx.bcx.ins().nop();
-                fx.add_comment(nop_inst, "indirect call");
+                fx.add_post_comment(nop_inst, "indirect call");
             }
 
             let func = func.load_scalar(fx);
-            let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
+            let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, fn_abi);
             let sig = fx.bcx.import_signature(sig);
 
             (CallTarget::Indirect(sig, func), None)
@@ -567,7 +600,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     self::returning::codegen_with_call_return_arg(fx, &fn_abi.ret, ret_place, |fx, return_ptr| {
         let mut call_args = return_ptr
             .into_iter()
-            .chain(first_arg_override.into_iter())
+            .chain(first_arg_override)
             .chain(
                 args.into_iter()
                     .enumerate()
@@ -580,20 +613,15 @@ pub(crate) fn codegen_terminator_call<'tcx>(
 
         // FIXME: Find a cleaner way to support varargs.
         if fn_abi.c_variadic {
-            adjust_call_for_c_variadic(fx, &fn_abi, source_info, func_ref, &mut call_args);
+            adjust_call_for_c_variadic(fx, fn_abi, source_info, func_ref, &mut call_args);
         }
 
         if fx.clif_comments.enabled() {
             let nop_inst = fx.bcx.ins().nop();
-            with_no_trimmed_paths!(fx.add_comment(nop_inst, format!("abi: {:?}", fn_abi)));
+            with_no_trimmed_paths!(fx.add_post_comment(nop_inst, format!("abi: {:?}", fn_abi)));
         }
 
-        match func_ref {
-            CallTarget::Direct(func_ref) => fx.bcx.ins().call(func_ref, &call_args),
-            CallTarget::Indirect(sig, func_ptr) => {
-                fx.bcx.ins().call_indirect(sig, func_ptr, &call_args)
-            }
-        }
+        codegen_call_with_unwind_action(fx, source_info.span, func_ref, unwind, &call_args, None)
     });
 
     if let Some(dest) = target {
@@ -610,7 +638,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
         target: CallTarget,
         call_args: &mut Vec<Value>,
     ) {
-        if fn_abi.conv != Conv::C {
+        if fn_abi.conv != CanonAbi::C {
             fx.tcx.dcx().span_fatal(
                 source_info.span,
                 format!("Variadic call for non-C abi {:?}", fn_abi.conv),
@@ -641,7 +669,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
                 .flat_map(|arg_abi| arg_abi.get_abi_param(fx.tcx).into_iter()),
         );
 
-        if fx.tcx.sess.target.is_like_darwin && fx.tcx.sess.target.arch == "aarch64" {
+        if fx.tcx.sess.target.is_like_darwin && fx.tcx.sess.target.arch == Arch::AArch64 {
             // Add any padding arguments needed for Apple AArch64.
             // There's no need to pad the argument list unless variadic arguments are actually being
             // passed.
@@ -703,17 +731,19 @@ pub(crate) fn codegen_drop<'tcx>(
     source_info: mir::SourceInfo,
     drop_place: CPlace<'tcx>,
     target: BasicBlock,
+    unwind: UnwindAction,
 ) {
     let ty = drop_place.layout().ty;
-    let drop_instance = Instance::resolve_drop_in_place(fx.tcx, ty);
+    let drop_instance = Instance::resolve_drop_glue(fx.tcx, ty);
+    let ret_block = fx.get_block(target);
 
-    if let ty::InstanceKind::DropGlue(_, None) | ty::InstanceKind::AsyncDropGlueCtorShim(_, None) =
-        drop_instance.def
-    {
+    // AsyncDropGlueCtorShim can't be here
+    if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)) = drop_instance.def {
         // we don't actually need to drop anything
+        fx.bcx.ins().jump(ret_block, &[]);
     } else {
         match ty.kind() {
-            ty::Dynamic(_, _, ty::Dyn) => {
+            ty::Dynamic(_, _) => {
                 // IN THIS ARM, WE HAVE:
                 // ty = *mut (dyn Trait)
                 // which is: exists<T> ( *mut T,    Vtable<T: Trait> )
@@ -730,14 +760,14 @@ pub(crate) fn codegen_drop<'tcx>(
                 let ptr = ptr.get_addr(fx);
                 let drop_fn = crate::vtable::drop_fn_of_obj(fx, vtable);
 
-                let is_null = fx.bcx.ins().icmp_imm(IntCC::Equal, drop_fn, 0);
+                let is_null = fx.bcx.ins().icmp_imm_u(IntCC::Equal, drop_fn, 0);
                 let target_block = fx.get_block(target);
                 let continued = fx.bcx.create_block();
                 fx.bcx.ins().brif(is_null, target_block, &[], continued, &[]);
                 fx.bcx.switch_to_block(continued);
 
                 // FIXME(eddyb) perhaps move some of this logic into
-                // `Instance::resolve_drop_in_place`?
+                // `Instance::resolve_drop_glue`?
                 let virtual_drop = Instance {
                     def: ty::InstanceKind::Virtual(drop_instance.def_id(), 0),
                     args: drop_instance.args,
@@ -745,52 +775,16 @@ pub(crate) fn codegen_drop<'tcx>(
                 let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
                     .fn_abi_of_instance(virtual_drop, ty::List::empty());
 
-                let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
+                let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, fn_abi);
                 let sig = fx.bcx.import_signature(sig);
-                fx.bcx.ins().call_indirect(sig, drop_fn, &[ptr]);
-            }
-            ty::Dynamic(_, _, ty::DynStar) => {
-                // IN THIS ARM, WE HAVE:
-                // ty = *mut (dyn* Trait)
-                // which is: *mut exists<T: sizeof(T) == sizeof(usize)> (T, Vtable<T: Trait>)
-                //
-                // args = [ * ]
-                //          |
-                //          v
-                //      ( Data, Vtable )
-                //                |
-                //                v
-                //              /-------\
-                //              | ...   |
-                //              \-------/
-                //
-                //
-                // WE CAN CONVERT THIS INTO THE ABOVE LOGIC BY DOING
-                //
-                // data = &(*args[0]).0    // gives a pointer to Data above (really the same pointer)
-                // vtable = (*args[0]).1   // loads the vtable out
-                // (data, vtable)          // an equivalent Rust `*mut dyn Trait`
-                //
-                // SO THEN WE CAN USE THE ABOVE CODE.
-                let (data, vtable) = drop_place.to_cvalue(fx).dyn_star_force_data_on_stack(fx);
-                let drop_fn = crate::vtable::drop_fn_of_obj(fx, vtable);
-
-                let is_null = fx.bcx.ins().icmp_imm(IntCC::Equal, drop_fn, 0);
-                let target_block = fx.get_block(target);
-                let continued = fx.bcx.create_block();
-                fx.bcx.ins().brif(is_null, target_block, &[], continued, &[]);
-                fx.bcx.switch_to_block(continued);
-
-                let virtual_drop = Instance {
-                    def: ty::InstanceKind::Virtual(drop_instance.def_id(), 0),
-                    args: drop_instance.args,
-                };
-                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
-                    .fn_abi_of_instance(virtual_drop, ty::List::empty());
-
-                let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, &fn_abi);
-                let sig = fx.bcx.import_signature(sig);
-                fx.bcx.ins().call_indirect(sig, drop_fn, &[data]);
+                codegen_call_with_unwind_action(
+                    fx,
+                    source_info.span,
+                    CallTarget::Indirect(sig, drop_fn),
+                    unwind,
+                    &[ptr],
+                    Some(ret_block),
+                );
             }
             _ => {
                 assert!(!matches!(drop_instance.def, InstanceKind::Virtual(_, _)));
@@ -809,17 +803,175 @@ pub(crate) fn codegen_drop<'tcx>(
                 if drop_instance.def.requires_caller_location(fx.tcx) {
                     // Pass the caller location for `#[track_caller]`.
                     let caller_location = fx.get_caller_location(source_info);
-                    call_args.extend(
-                        adjust_arg_for_abi(fx, caller_location, &fn_abi.args[1], false).into_iter(),
-                    );
+                    call_args.extend(adjust_arg_for_abi(
+                        fx,
+                        caller_location,
+                        &fn_abi.args[1],
+                        false,
+                    ));
                 }
 
                 let func_ref = fx.get_function_ref(drop_instance);
-                fx.bcx.ins().call(func_ref, &call_args);
+                codegen_call_with_unwind_action(
+                    fx,
+                    source_info.span,
+                    CallTarget::Direct(func_ref),
+                    unwind,
+                    &call_args,
+                    Some(ret_block),
+                );
             }
         }
     }
+}
 
-    let target_block = fx.get_block(target);
-    fx.bcx.ins().jump(target_block, &[]);
+#[derive(Copy, Clone)]
+pub(crate) enum CallTarget {
+    Direct(FuncRef),
+    Indirect(SigRef, Value),
+}
+
+pub(crate) fn codegen_call_with_unwind_action(
+    fx: &mut FunctionCx<'_, '_, '_>,
+    span: Span,
+    func_ref: CallTarget,
+    mut unwind: UnwindAction,
+    call_args: &[Value],
+    target_block: Option<Block>,
+) -> SmallVec<[Value; 2]> {
+    let sig_ref = match func_ref {
+        CallTarget::Direct(func_ref) => fx.bcx.func.dfg.ext_funcs[func_ref].signature,
+        CallTarget::Indirect(sig_ref, _func_ptr) => sig_ref,
+    };
+
+    if target_block.is_some() {
+        assert!(fx.bcx.func.dfg.signatures[sig_ref].returns.is_empty());
+    }
+
+    if cfg!(not(feature = "unwinding")) {
+        unwind = UnwindAction::Unreachable;
+    }
+
+    match unwind {
+        UnwindAction::Continue | UnwindAction::Unreachable => {
+            let call_inst = match func_ref {
+                CallTarget::Direct(func_ref) => fx.bcx.ins().call(func_ref, call_args),
+                CallTarget::Indirect(sig, func_ptr) => {
+                    fx.bcx.ins().call_indirect(sig, func_ptr, call_args)
+                }
+            };
+
+            if let Some(target_block) = target_block {
+                fx.bcx.ins().jump(target_block, &[]);
+                smallvec![]
+            } else {
+                fx.bcx
+                    .func
+                    .dfg
+                    .inst_results(call_inst)
+                    .iter()
+                    .copied()
+                    .collect::<SmallVec<[Value; 2]>>()
+            }
+        }
+        UnwindAction::Cleanup(_) | UnwindAction::Terminate(_) => {
+            let returns_types = fx.bcx.func.dfg.signatures[sig_ref]
+                .returns
+                .iter()
+                .map(|return_param| return_param.value_type)
+                .collect::<Vec<_>>();
+
+            let fallthrough_block = fx.bcx.create_block();
+            let fallthrough_block_call_args = returns_types
+                .iter()
+                .enumerate()
+                .map(|(i, _)| BlockArg::TryCallRet(i.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let fallthrough_block_call = fx.bcx.func.dfg.block_call(
+                target_block.unwrap_or(fallthrough_block),
+                &fallthrough_block_call_args,
+            );
+            let pre_cleanup_block = fx.bcx.create_block();
+            let pre_cleanup_block_call =
+                fx.bcx.func.dfg.block_call(pre_cleanup_block, &[BlockArg::TryCallExn(0)]);
+            let exception_table = fx.bcx.func.dfg.exception_tables.push(ExceptionTableData::new(
+                sig_ref,
+                fallthrough_block_call,
+                [ExceptionTableItem::Tag(
+                    ExceptionTag::with_number(EXCEPTION_HANDLER_CLEANUP).unwrap(),
+                    pre_cleanup_block_call,
+                )],
+            ));
+
+            match func_ref {
+                CallTarget::Direct(func_ref) => {
+                    fx.bcx.ins().try_call(func_ref, call_args, exception_table);
+                }
+                CallTarget::Indirect(_sig, func_ptr) => {
+                    fx.bcx.ins().try_call_indirect(func_ptr, call_args, exception_table);
+                }
+            }
+
+            fx.bcx.seal_block(pre_cleanup_block);
+            fx.bcx.switch_to_block(pre_cleanup_block);
+            fx.bcx.set_cold_block(pre_cleanup_block);
+            match unwind {
+                UnwindAction::Continue | UnwindAction::Unreachable => unreachable!(),
+                UnwindAction::Cleanup(cleanup) => {
+                    let exception_ptr =
+                        fx.bcx.append_block_param(pre_cleanup_block, fx.pointer_type);
+                    fx.bcx.def_var(fx.exception_slot, exception_ptr);
+                    let cleanup_block = fx.get_block(cleanup);
+                    fx.bcx.ins().jump(cleanup_block, &[]);
+                }
+                UnwindAction::Terminate(reason) => {
+                    // FIXME dedup terminate blocks
+                    fx.bcx.append_block_param(pre_cleanup_block, fx.pointer_type);
+
+                    codegen_unwind_terminate(fx, span, reason);
+                }
+            }
+
+            if target_block.is_none() {
+                fx.bcx.seal_block(fallthrough_block);
+                fx.bcx.switch_to_block(fallthrough_block);
+                let returns = returns_types
+                    .into_iter()
+                    .map(|ty| fx.bcx.append_block_param(fallthrough_block, ty))
+                    .collect();
+                fx.bcx.ins().nop();
+                returns
+            } else {
+                smallvec![]
+            }
+        }
+    }
+}
+
+pub(crate) fn lib_call_arg_param(tcx: TyCtxt<'_>, ty: Type, is_signed: bool) -> AbiParam {
+    let param = AbiParam::new(ty);
+    if ty.is_int() && u64::from(ty.bits()) < tcx.data_layout.pointer_size().bits() {
+        match (&tcx.sess.target.arch, tcx.sess.target.is_like_darwin) {
+            (Arch::X86_64, _) | (Arch::AArch64, true) => match (ty, is_signed) {
+                (types::I8 | types::I16, true) => param.sext(),
+                (types::I8 | types::I16, false) => param.uext(),
+                _ => param,
+            },
+            (Arch::AArch64, _) => param,
+            (Arch::RiscV64, _) => match (ty, is_signed) {
+                (types::I32, _) | (_, true) => param.sext(),
+                _ => param.uext(),
+            },
+            (Arch::S390x, _) => {
+                if is_signed {
+                    param.sext()
+                } else {
+                    param.uext()
+                }
+            }
+            (arch, _) => unimplemented!("{arch:?}"),
+        }
+    } else {
+        param
+    }
 }

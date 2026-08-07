@@ -1,10 +1,10 @@
 //@ aux-build:common.rs
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
 //@ only-x86_64
 //@ run-pass
 //@ needs-unwind Asserting on contents of error message
 
-#![feature(core_intrinsics, generic_assert)]
+#![feature(generic_assert)]
 
 extern crate common;
 

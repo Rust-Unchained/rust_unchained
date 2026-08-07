@@ -1,20 +1,23 @@
-use hir::{ExprKind, Node, is_range_literal};
+use hir::{ExprKind, Node};
 use rustc_abi::{Integer, Size};
-use rustc_hir::HirId;
+use rustc_apfloat::Float;
+use rustc_apfloat::ieee::{DoubleS, HalfS, IeeeFloat, QuadS, Semantics, SingleS};
+use rustc_ast as ast;
+use rustc_hir as hir;
+use rustc_hir::{HirId, attrs};
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::{bug, ty};
-use rustc_span::Span;
-use {rustc_ast as ast, rustc_attr_parsing as attr, rustc_hir as hir};
+use rustc_span::{Span, Symbol};
 
 use crate::LateContext;
 use crate::context::LintContext;
 use crate::lints::{
     OnlyCastu8ToChar, OverflowingBinHex, OverflowingBinHexSign, OverflowingBinHexSignBitSub,
     OverflowingBinHexSub, OverflowingInt, OverflowingIntHelp, OverflowingLiteral, OverflowingUInt,
-    RangeEndpointOutOfRange, UseInclusiveRange,
+    RangeEndpointOutOfRange, SurrogateCharCast, TooLargeCharCast, UseInclusiveRange,
 };
-use crate::types::{OVERFLOWING_LITERALS, TypeLimits};
+use crate::types::OVERFLOWING_LITERALS;
 
 /// Attempts to special-case the overflowing literal lint when it occurs as a range endpoint (`expr..MAX+1`).
 /// Returns `true` iff the lint was emitted.
@@ -38,12 +41,18 @@ fn lint_overflowing_range_endpoint<'tcx>(
 
     // We only want to handle exclusive (`..`) ranges,
     // which are represented as `ExprKind::Struct`.
-    let Node::ExprField(field) = cx.tcx.parent_hir_node(hir_id) else { return false };
-    let Node::Expr(struct_expr) = cx.tcx.parent_hir_node(field.hir_id) else { return false };
-    if !is_range_literal(struct_expr) {
+    let Node::ExprField(field) = cx.tcx.parent_hir_node(hir_id) else {
         return false;
     };
-    let ExprKind::Struct(_, [start, end], _) = &struct_expr.kind else { return false };
+    let Node::Expr(struct_expr) = cx.tcx.parent_hir_node(field.hir_id) else {
+        return false;
+    };
+    let Some(range_span) = struct_expr.range_span() else {
+        return false;
+    };
+    let ExprKind::Struct(_, [start, end], _) = &struct_expr.kind else {
+        return false;
+    };
 
     // We can suggest using an inclusive range
     // (`..=`) instead only if it is the `end` that is
@@ -61,9 +70,11 @@ fn lint_overflowing_range_endpoint<'tcx>(
     };
 
     let sub_sugg = if span.lo() == lit_span.lo() {
-        let Ok(start) = cx.sess().source_map().span_to_snippet(start.span) else { return false };
+        let Ok(start) = cx.sess().source_map().span_to_snippet(start.span) else {
+            return false;
+        };
         UseInclusiveRange::WithoutParen {
-            sugg: struct_expr.span.shrink_to_lo().to(lit_span.shrink_to_hi()),
+            sugg: range_span.shrink_to_lo().to(lit_span.shrink_to_hi()),
             start,
             literal: lit_val - 1,
             suffix,
@@ -79,7 +90,7 @@ fn lint_overflowing_range_endpoint<'tcx>(
 
     cx.emit_span_lint(
         OVERFLOWING_LITERALS,
-        struct_expr.span,
+        range_span,
         RangeEndpointOutOfRange { ty, sub: sub_sugg },
     );
 
@@ -131,24 +142,37 @@ fn report_bin_hex_error(
     cx: &LateContext<'_>,
     hir_id: HirId,
     span: Span,
-    ty: attr::IntType,
+    ty: attrs::IntType,
     size: Size,
     repr_str: String,
     val: u128,
     negative: bool,
 ) {
     let (t, actually) = match ty {
-        attr::IntType::SignedInt(t) => {
+        attrs::IntType::SignedInt(t) => {
             let actually = if negative { -(size.sign_extend(val)) } else { size.sign_extend(val) };
             (t.name_str(), actually.to_string())
         }
-        attr::IntType::UnsignedInt(t) => {
+        attrs::IntType::UnsignedInt(t) => {
             let actually = size.truncate(val);
             (t.name_str(), actually.to_string())
         }
     };
-    let sign =
-        if negative { OverflowingBinHexSign::Negative } else { OverflowingBinHexSign::Positive };
+    let sign = if negative {
+        OverflowingBinHexSign::Negative {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    } else {
+        OverflowingBinHexSign::Positive {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    };
     let sub = get_type_suggestion(cx.typeck_results().node_type(hir_id), val, negative).map(
         |suggestion_ty| {
             if let Some(pos) = repr_str.chars().position(|c| c == 'i' || c == 'u') {
@@ -181,28 +205,32 @@ fn report_bin_hex_error(
                     &repr_str
                 };
 
-            Some(OverflowingBinHexSignBitSub {
-                span,
-                lit_no_suffix,
-                negative_val: actually.clone(),
-                int_ty: int_ty.name_str(),
-                uint_ty: Integer::fit_unsigned(val).uint_ty_str(),
-            })
+            let uint_ty = Integer::fit_unsigned(val);
+            // `cast_signed` only supports equal-width integer casts.
+            if uint_ty.size() == size {
+                Some(OverflowingBinHexSignBitSub::CastSigned {
+                    span,
+                    lit_no_suffix,
+                    negative_val: actually,
+                    uint_ty: uint_ty.uint_ty_str(),
+                    int_ty: int_ty.name_str(),
+                })
+            } else {
+                Some(OverflowingBinHexSignBitSub::AsCast {
+                    span,
+                    lit_no_suffix,
+                    negative_val: actually,
+                    uint_ty: uint_ty.uint_ty_str(),
+                    int_ty: int_ty.name_str(),
+                })
+            }
         })
         .flatten();
 
     cx.emit_span_lint(
         OVERFLOWING_LITERALS,
         span,
-        OverflowingBinHex {
-            ty: t,
-            lit: repr_str.clone(),
-            dec: val,
-            actually,
-            sign,
-            sub,
-            sign_bit_sub,
-        },
+        OverflowingBinHex { ty: t, sign, sub, sign_bit_sub },
     )
 }
 
@@ -244,17 +272,17 @@ fn literal_to_i128(val: u128, negative: bool) -> Option<i128> {
 
 fn lint_int_literal<'tcx>(
     cx: &LateContext<'tcx>,
-    type_limits: &TypeLimits,
     hir_id: HirId,
     span: Span,
     lit: &hir::Lit,
     t: ty::IntTy,
     v: u128,
+    surrounding_negation: Option<Span>,
 ) {
     let int_type = t.normalize(cx.sess().target.pointer_width);
     let (min, max) = int_ty_range(int_type);
     let max = max as u128;
-    let negative = type_limits.negated_expr_id == Some(hir_id);
+    let negative = surrounding_negation.is_some();
 
     // Detect literal value out of range [min, max] inclusive
     // avoiding use of -min to prevent overflow/panic
@@ -264,7 +292,7 @@ fn lint_int_literal<'tcx>(
                 cx,
                 hir_id,
                 span,
-                attr::IntType::SignedInt(ty::ast_int_ty(t)),
+                attrs::IntType::SignedInt(t),
                 Integer::from_int_ty(cx, t).size(),
                 repr_str,
                 v,
@@ -278,7 +306,7 @@ fn lint_int_literal<'tcx>(
             return;
         }
 
-        let span = if negative { type_limits.negated_expr_span.unwrap() } else { span };
+        let span = surrounding_negation.unwrap_or(span);
         let lit = cx
             .sess()
             .source_map()
@@ -316,11 +344,25 @@ fn lint_uint_literal<'tcx>(
             match par_e.kind {
                 hir::ExprKind::Cast(..) => {
                     if let ty::Char = cx.typeck_results().expr_ty(par_e).kind() {
-                        cx.emit_span_lint(
-                            OVERFLOWING_LITERALS,
-                            par_e.span,
-                            OnlyCastu8ToChar { span: par_e.span, literal: lit_val },
-                        );
+                        if lit_val > 0x10FFFF {
+                            cx.emit_span_lint(
+                                OVERFLOWING_LITERALS,
+                                par_e.span,
+                                TooLargeCharCast { literal: lit_val },
+                            );
+                        } else if (0xD800..=0xDFFF).contains(&lit_val) {
+                            cx.emit_span_lint(
+                                OVERFLOWING_LITERALS,
+                                par_e.span,
+                                SurrogateCharCast { literal: lit_val },
+                            );
+                        } else {
+                            cx.emit_span_lint(
+                                OVERFLOWING_LITERALS,
+                                par_e.span,
+                                OnlyCastu8ToChar { span: par_e.span, literal: lit_val },
+                            );
+                        }
                         return;
                     }
                 }
@@ -336,7 +378,7 @@ fn lint_uint_literal<'tcx>(
                 cx,
                 hir_id,
                 span,
-                attr::IntType::UnsignedInt(ty::ast_uint_ty(t)),
+                attrs::IntType::UnsignedInt(t),
                 Integer::from_uint_ty(cx, t).size(),
                 repr_str,
                 lit_val,
@@ -361,40 +403,46 @@ fn lint_uint_literal<'tcx>(
     }
 }
 
+/// `None` if `v` does not parse as the float type, otherwise indicates whether a literal rounds
+/// to infinity.
+fn float_is_infinite<S: Semantics>(v: Symbol) -> Option<bool> {
+    let x: IeeeFloat<S> = v.as_str().parse().ok()?;
+    Some(x.is_infinite())
+}
+
 pub(crate) fn lint_literal<'tcx>(
     cx: &LateContext<'tcx>,
-    type_limits: &TypeLimits,
     hir_id: HirId,
     span: Span,
     lit: &hir::Lit,
-    negated: bool,
+    surrounding_negation: Option<Span>,
 ) {
     match *cx.typeck_results().node_type(hir_id).kind() {
         ty::Int(t) => {
             match lit.node {
                 ast::LitKind::Int(v, ast::LitIntType::Signed(_) | ast::LitIntType::Unsuffixed) => {
-                    lint_int_literal(cx, type_limits, hir_id, span, lit, t, v.get())
+                    lint_int_literal(cx, hir_id, span, lit, t, v.get(), surrounding_negation)
                 }
                 _ => bug!(),
             };
         }
         ty::Uint(t) => {
-            assert!(!negated);
+            assert!(surrounding_negation.is_none());
             lint_uint_literal(cx, hir_id, span, lit, t)
         }
         ty::Float(t) => {
-            let (is_infinite, sym) = match lit.node {
-                ast::LitKind::Float(v, _) => match t {
-                    // FIXME(f16_f128): add this check once `is_infinite` is reliable (ABI
-                    // issues resolved).
-                    ty::FloatTy::F16 => (Ok(false), v),
-                    ty::FloatTy::F32 => (v.as_str().parse().map(f32::is_infinite), v),
-                    ty::FloatTy::F64 => (v.as_str().parse().map(f64::is_infinite), v),
-                    ty::FloatTy::F128 => (Ok(false), v),
-                },
-                _ => bug!(),
+            let ast::LitKind::Float(v, _) = lit.node else {
+                bug!();
             };
-            if is_infinite == Ok(true) {
+
+            let is_infinite = match t {
+                ty::FloatTy::F16 => float_is_infinite::<HalfS>(v),
+                ty::FloatTy::F32 => float_is_infinite::<SingleS>(v),
+                ty::FloatTy::F64 => float_is_infinite::<DoubleS>(v),
+                ty::FloatTy::F128 => float_is_infinite::<QuadS>(v),
+            };
+
+            if is_infinite == Some(true) {
                 cx.emit_span_lint(
                     OVERFLOWING_LITERALS,
                     span,
@@ -404,7 +452,7 @@ pub(crate) fn lint_literal<'tcx>(
                             .sess()
                             .source_map()
                             .span_to_snippet(lit.span)
-                            .unwrap_or_else(|_| sym.to_string()),
+                            .unwrap_or_else(|_| v.to_string()),
                     },
                 );
             }

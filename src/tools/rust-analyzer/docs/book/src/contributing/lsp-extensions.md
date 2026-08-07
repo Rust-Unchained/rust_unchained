@@ -1,5 +1,5 @@
 <!---
-lsp/ext.rs hash: af70cce5d6905e39
+lsp/ext.rs hash: 98191ad3d886c851
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -19,11 +19,9 @@ Requests, which are likely to always remain specific to `rust-analyzer` are unde
 
 If you want to be notified about the changes to this document, subscribe to [#4604](https://github.com/rust-lang/rust-analyzer/issues/4604).
 
-<!-- toc -->
-
 ## Configuration in `initializationOptions`
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/567
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/567>
 
 The `initializationOptions` field of the `InitializeParams` of the initialization request should contain the `"rust-analyzer"` section of the configuration.
 
@@ -33,13 +31,14 @@ At the same time some essential configuration parameters are needed early on, be
 For this reason, we ask that `initializationOptions` contains the configuration, as if the server did make a `"workspace/configuration"` request.
 
 If a language client does not know about `rust-analyzer`'s configuration options it can get sensible defaults by doing any of the following:
- * Not sending `initializationOptions`
- * Sending `"initializationOptions": null`
- * Sending `"initializationOptions": {}`
+
+* Not sending `initializationOptions`
+* Sending `"initializationOptions": null`
+* Sending `"initializationOptions": {}`
 
 ## Snippet `TextEdit`
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/724
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/724>
 
 **Experimental Client Capability:** `{ "snippetTextEdit": boolean }`
 
@@ -74,7 +73,7 @@ Any additional `TextDocumentEdit`s will only have edits which are `InsertTextFor
 
 ## `CodeAction` Groups
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/994
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/994>
 
 **Experimental Client Capability:** `{ "codeActionGroup": boolean }`
 
@@ -121,7 +120,7 @@ Invoking code action at this position will yield two code actions for importing 
 
 ## Parent Module
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/1002
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/1002>
 
 **Experimental Server Capability:** `{ "parentModule": boolean }`
 
@@ -132,7 +131,6 @@ This request is sent from client to server to handle "Goto Parent Module" editor
 **Request:** `TextDocumentPositionParams`
 
 **Response:** `Location | Location[] | LocationLink[] | null`
-
 
 ### Example
 
@@ -155,7 +153,7 @@ mod foo;
 
 ## Join Lines
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/992
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/992>
 
 **Experimental Server Capability:** `{ "joinLines": boolean }`
 
@@ -202,7 +200,7 @@ fn main() {
 
 ## On Enter
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/1001
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/1001>
 
 **Experimental Server Capability:** `{ "onEnter": boolean }`
 
@@ -238,7 +236,7 @@ fn main() {
 ```
 
 The primary goal of `onEnter` is to handle automatic indentation when opening a new line.
-This is not yet implemented.
+This is partially implemented for single-line brace-delimited contents, in addition to comment continuation.
 The secondary goal is to handle fixing up syntax, like continuing doc strings and comments, and escaping `\n` in string literals.
 
 As proper cursor positioning is raison d'être for `onEnter`, it uses `SnippetTextEdit`.
@@ -297,7 +295,7 @@ SSR with query `foo($a, $b) ==>> ($a).foo($b)` will transform, eg `foo(y + 5, z)
 
 ## Matching Brace
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/999
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/999>
 
 **Experimental Server Capability:** `{ "matchingBrace": boolean }`
 
@@ -342,7 +340,7 @@ Moreover, it would be cool if editors didn't need to implement even basic langua
 
 ## Runnables
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/944
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/944>
 
 **Experimental Server Capability:** `{ "runnables": { "kinds": string[] } }`
 
@@ -455,7 +453,7 @@ interface TestItem {
     // A human readable name for this test
     label: string;
     // The kind of this test item. Based on the kind,
-	// an icon is chosen by the editor.
+    // an icon is chosen by the editor.
     kind: "package" | "module" | "test";
     // True if this test may have children not available eagerly
     canResolveChildren: boolean;
@@ -467,7 +465,7 @@ interface TestItem {
     // like debugging, this field is useful.
     // Note that this field includes some information about label and location as well, but
     // those exist just for keeping things in sync with other methods of running runnables
-    // (for example using one consistent name in the vscode's launch.json) so for any propose
+    // (for example using one consistent name in the vscode's launch.json) so for any purpose
     // other than running tests this field should not be used.
     runnable?: Runnable | undefined;
 };
@@ -475,11 +473,11 @@ interface TestItem {
 interface DiscoverTestResults {
     // The discovered tests.
     tests: TestItem[];
-    // For each test which its id is in this list, the response
+    // For each test whose id is in this list, the response
     // contains all tests that are children of this test, and
     // client should remove old tests not included in the response.
     scope: string[] | undefined;
-    // For each file which its uri is in this list, the response
+    // For each file whose uri is in this list, the response
     // contains all tests that are located in this file, and
     // client should remove old tests not included in the response.
     scopeFile: lc.TextDocumentIdentifier[] | undefined;
@@ -491,7 +489,7 @@ interface DiscoverTestResults {
 **Notification:** `DiscoverTestResults`
 
 This notification is sent from the server to the client when the
-server detect changes in the existing tests. The `DiscoverTestResults` is
+server detects changes in the existing tests. The `DiscoverTestResults` is
 the same as the one in `experimental/discoverTest` response.
 
 **Method:** `experimental/runTest`
@@ -527,7 +525,7 @@ after this.
 
 This notification is sent from the client to the server when the user is no longer
 interested in the test results. The server should clean up its resources and send
-a `experimental/endRunTest` when is done.
+a `experimental/endRunTest` when it is done.
 
 **Method:** `experimental/changeTestState`
 
@@ -648,14 +646,14 @@ interface ServerStatusParams {
 ```
 
 This notification is sent from server to client.
-The client can use it to display *persistent* status to the user (in modline).
-It is similar to the `showMessage`, but is intended for stares rather than point-in-time events.
+The client can use it to display *persistent* status to the user (in the mode line).
+It is similar to the `showMessage`, but is intended for status rather than point-in-time events.
 
 Note that this functionality is intended primarily to inform the end user about the state of the server.
 In particular, it's valid for the client to completely ignore this extension.
 Clients are discouraged from but are allowed to use the `health` status to decide if it's worth sending a request to the server.
 
-### Controlling Flycheck
+## Controlling Flycheck
 
 The flycheck/checkOnSave feature can be controlled via notifications sent by the client to the server.
 
@@ -672,7 +670,6 @@ interface RunFlycheckParams {
 ```
 
 Triggers the flycheck processes.
-
 
 **Method:** `rust-analyzer/clearFlycheck`
 
@@ -693,24 +690,6 @@ interface CancelFlycheckParams {}
 ```
 
 Cancels all running flycheck processes.
-
-## Syntax Tree
-
-**Method:** `rust-analyzer/syntaxTree`
-
-**Request:**
-
-```typescript
-interface SyntaxTreeParams {
-    textDocument: TextDocumentIdentifier,
-    range?: Range,
-}
-```
-
-**Response:** `string`
-
-Returns textual representation of a parse tree for the file/selected region.
-Primarily for debugging, but very useful for all people working on rust-analyzer itself.
 
 ## View Syntax Tree
 
@@ -749,6 +728,17 @@ For debugging or when working on rust-analyzer itself.
 **Response:** `string`
 
 Returns a textual representation of the MIR of the function containing the cursor.
+For debugging or when working on rust-analyzer itself.
+
+## Get Failed Obligations
+
+**Method:** `rust-analyzer/getFailedObligations`
+
+**Request:** `TextDocumentPositionParams`
+
+**Response:** `string`
+
+Returns information about failed trait obligations at the given position.
 For debugging or when working on rust-analyzer itself.
 
 ## Interpret Function
@@ -858,6 +848,7 @@ interface CommandLinkGroup {
 ```
 
 Such actions on the client side are appended to a hover bottom as command links:
+
 ```
   +-----------------------------+
   | Hover content               |
@@ -872,7 +863,7 @@ Such actions on the client side are appended to a hover bottom as command links:
 
 ## Open Cargo.toml
 
-**Upstream Issue:** https://github.com/rust-lang/rust-analyzer/issues/6462
+**Upstream Issue:** <https://github.com/rust-lang/rust-analyzer/issues/6462>
 
 **Experimental Server Capability:** `{ "openCargoToml": boolean }`
 
@@ -883,7 +874,6 @@ This request is sent from client to server to open the current project's Cargo.t
 **Request:** `OpenCargoTomlParams`
 
 **Response:** `Location | null`
-
 
 ### Example
 
@@ -915,7 +905,7 @@ interface TestInfo {
 
 ## Hover Range
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/377
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/377>
 
 **Experimental Server Capability:** { "hoverRange": boolean }
 
@@ -928,6 +918,7 @@ interface HoverParams extends WorkDoneProgressParams {
     position: Range | Position;
 }
 ```
+
 Whenever the client sends a `Range`, it is understood as the current selection and any hover included in the range will show the type of the expression if possible.
 
 ### Example
@@ -942,7 +933,7 @@ Triggering a hover inside the selection above will show a result of `i32`.
 
 ## Move Item
 
-**Upstream Issue:** https://github.com/rust-lang/rust-analyzer/issues/6823
+**Upstream Issue:** <https://github.com/rust-lang/rust-analyzer/issues/6823>
 
 This request is sent from client to server to move item under cursor or selection in some direction.
 
@@ -967,13 +958,12 @@ export const enum Direction {
 
 ## Workspace Symbols Filtering
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/941
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/941>
 
 **Experimental Server Capability:** `{ "workspaceSymbolScopeKindFiltering": boolean }`
 
 Extends the existing `workspace/symbol` request with ability to filter symbols by broad scope and kind of symbol.
 If this capability is set, `workspace/symbol` parameter gains two new optional fields:
-
 
 ```typescript
 interface WorkspaceSymbolParams {
@@ -1001,7 +991,7 @@ const enum WorkspaceSymbolSearchKind {
 
 ## Client Commands
 
-**Upstream Issue:** https://github.com/microsoft/language-server-protocol/issues/642
+**Upstream Issue:** <https://github.com/microsoft/language-server-protocol/issues/642>
 
 **Experimental Client Capability:** `{ "commands?": ClientCommandOptions }`
 
@@ -1010,7 +1000,6 @@ Commands can be serviced either by the server or by the client.
 However, the server doesn't know which commands are available on the client.
 
 This extensions allows the client to communicate this info.
-
 
 ```typescript
 export interface ClientCommandOptions {
@@ -1059,6 +1048,7 @@ export interface FetchDependencyListParams {}
 ```
 
 **Response:**
+
 ```typescript
 export interface FetchDependencyListResult {
     crates: {
@@ -1068,6 +1058,7 @@ export interface FetchDependencyListResult {
     }[];
 }
 ```
+
 Returns all crates from this workspace, so it can be used create a viewTree to help navigate the dependency tree.
 
 ## View Recursive Memory Layout
@@ -1088,13 +1079,13 @@ export interface RecursiveMemoryLayoutNode = {
     size: number;
     /// Alignment of the type in bytes
     alignment: number;
-    /// Offset of the type relative to its parent (or 0 if its the root)
+    /// Offset of the type relative to its parent (or 0 if it's the root)
     offset: number;
-    /// Index of the node's parent (or -1 if its the root)
+    /// Index of the node's parent (or -1 if it's the root)
     parent_idx: number;
     /// Index of the node's children (or -1 if it does not have children)
     children_start: number;
-    /// Number of child nodes (unspecified it does not have children)
+    /// Number of child nodes (unspecified if it does not have children)
     children_len: number;
 };
 
@@ -1109,8 +1100,8 @@ If `RecursiveMemoryLayout::nodes::length == 0` we could not find a suitable type
 
 Generic Types do not give anything because they are incomplete. Fully specified generic types do not give anything if they are selected directly but do work when a child of other types [this is consistent with other behavior](https://github.com/rust-lang/rust-analyzer/issues/15010).
 
-### Unresolved questions:
+### Unresolved questions
 
-- How should enums/unions be represented? currently they do not produce any children because they have multiple distinct sets of children.
-- Should niches be represented? currently they are not reported.
-- A visual representation of the memory layout is not specified, see the provided implementation for an example, however it may not translate well to terminal based editors or other such things.
+* How should enums/unions be represented? currently they do not produce any children because they have multiple distinct sets of children.
+* Should niches be represented? currently they are not reported.
+* A visual representation of the memory layout is not specified, see the provided implementation for an example, however it may not translate well to terminal based editors or other such things.

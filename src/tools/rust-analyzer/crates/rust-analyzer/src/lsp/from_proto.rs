@@ -1,7 +1,8 @@
 //! Conversion lsp_types types to rust-analyzer specific ones.
+
 use anyhow::format_err;
 use ide::{Annotation, AnnotationKind, AssistKind, LineCol};
-use ide_db::{line_index::WideLineCol, FileId, FilePosition, FileRange};
+use ide_db::{FileId, FilePosition, FileRange, line_index::WideLineCol};
 use paths::Utf8PathBuf;
 use syntax::{TextRange, TextSize};
 use vfs::AbsPathBuf;
@@ -12,12 +13,12 @@ use crate::{
     lsp_ext, try_default,
 };
 
-pub(crate) fn abs_path(url: &lsp_types::Url) -> anyhow::Result<AbsPathBuf> {
+pub(crate) fn abs_path(url: &lsp_types::Uri) -> anyhow::Result<AbsPathBuf> {
     let path = url.to_file_path().map_err(|()| anyhow::format_err!("url is not a file"))?;
     Ok(AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).unwrap()).unwrap())
 }
 
-pub(crate) fn vfs_path(url: &lsp_types::Url) -> anyhow::Result<vfs::VfsPath> {
+pub(crate) fn vfs_path(url: &lsp_types::Uri) -> anyhow::Result<vfs::VfsPath> {
     abs_path(url).map(vfs::VfsPath::from)
 }
 
@@ -40,12 +41,13 @@ pub(crate) fn offset(
     })?;
     let col = TextSize::from(line_col.col);
     let clamped_len = col.min(line_range.len());
-    if clamped_len < col {
-        tracing::error!(
-            "Position {line_col:?} column exceeds line length {}, clamping it",
-            u32::from(line_range.len()),
-        );
-    }
+    // FIXME: The cause for this is likely our request retrying. Commented out as this log is just too chatty and very easy to trigger.
+    // if clamped_len < col {
+    //     tracing::error!(
+    //         "Position {line_col:?} column exceeds line length {}, clamping it",
+    //         u32::from(line_range.len()),
+    //     );
+    // }
     Ok(line_range.start() + clamped_len)
 }
 
@@ -64,7 +66,7 @@ pub(crate) fn text_range(
 /// Returns `None` if the file was excluded.
 pub(crate) fn file_id(
     snap: &GlobalStateSnapshot,
-    url: &lsp_types::Url,
+    url: &lsp_types::Uri,
 ) -> anyhow::Result<Option<FileId>> {
     snap.url_to_file_id(url)
 }
@@ -72,7 +74,7 @@ pub(crate) fn file_id(
 /// Returns `None` if the file was excluded.
 pub(crate) fn file_position(
     snap: &GlobalStateSnapshot,
-    tdpp: lsp_types::TextDocumentPositionParams,
+    tdpp: &lsp_types::TextDocumentPositionParams,
 ) -> anyhow::Result<Option<FilePosition>> {
     let file_id = try_default!(file_id(snap, &tdpp.text_document.uri)?);
     let line_index = snap.file_line_index(file_id)?;
@@ -92,7 +94,7 @@ pub(crate) fn file_range(
 /// Returns `None` if the file was excluded.
 pub(crate) fn file_range_uri(
     snap: &GlobalStateSnapshot,
-    document: &lsp_types::Url,
+    document: &lsp_types::Uri,
     range: lsp_types::Range,
 ) -> anyhow::Result<Option<FileRange>> {
     let file_id = try_default!(file_id(snap, document)?);
@@ -103,12 +105,12 @@ pub(crate) fn file_range_uri(
 
 pub(crate) fn assist_kind(kind: lsp_types::CodeActionKind) -> Option<AssistKind> {
     let assist_kind = match &kind {
-        k if k == &lsp_types::CodeActionKind::EMPTY => AssistKind::None,
-        k if k == &lsp_types::CodeActionKind::QUICKFIX => AssistKind::QuickFix,
-        k if k == &lsp_types::CodeActionKind::REFACTOR => AssistKind::Refactor,
-        k if k == &lsp_types::CodeActionKind::REFACTOR_EXTRACT => AssistKind::RefactorExtract,
-        k if k == &lsp_types::CodeActionKind::REFACTOR_INLINE => AssistKind::RefactorInline,
-        k if k == &lsp_types::CodeActionKind::REFACTOR_REWRITE => AssistKind::RefactorRewrite,
+        k if k == &lsp_types::CodeActionKind::Empty => AssistKind::Generate,
+        k if k == &lsp_types::CodeActionKind::QuickFix => AssistKind::QuickFix,
+        k if k == &lsp_types::CodeActionKind::Refactor => AssistKind::Refactor,
+        k if k == &lsp_types::CodeActionKind::RefactorExtract => AssistKind::RefactorExtract,
+        k if k == &lsp_types::CodeActionKind::RefactorInline => AssistKind::RefactorInline,
+        k if k == &lsp_types::CodeActionKind::RefactorRewrite => AssistKind::RefactorRewrite,
         _ => return None,
     };
 
@@ -129,7 +131,7 @@ pub(crate) fn annotation(
                 return Ok(None);
             }
             let pos @ FilePosition { file_id, .. } =
-                try_default!(file_position(snap, params.text_document_position_params)?);
+                try_default!(file_position(snap, &params.text_document_position_params)?);
             let line_index = snap.file_line_index(file_id)?;
 
             Ok(Annotation {
@@ -141,7 +143,7 @@ pub(crate) fn annotation(
             if snap.url_file_version(&params.text_document.uri) != Some(data.version) {
                 return Ok(None);
             }
-            let pos @ FilePosition { file_id, .. } = try_default!(file_position(snap, params)?);
+            let pos @ FilePosition { file_id, .. } = try_default!(file_position(snap, &params)?);
             let line_index = snap.file_line_index(file_id)?;
 
             Ok(Annotation {

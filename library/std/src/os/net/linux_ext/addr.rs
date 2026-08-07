@@ -1,11 +1,10 @@
 //! Linux and Android-specific extensions to socket addresses.
 
 use crate::os::unix::net::SocketAddr;
-use crate::sealed::Sealed;
 
 /// Platform-specific extensions to [`SocketAddr`].
 #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
-pub trait SocketAddrExt: Sealed {
+pub impl(in crate::os) trait SocketAddrExt {
     /// Creates a Unix socket address in the abstract namespace.
     ///
     /// The abstract namespace is a Linux-specific extension that allows Unix
@@ -21,9 +20,19 @@ pub trait SocketAddrExt: Sealed {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "cygwin")),
+        doc = "```ignore (needs linux)"
+    )]
     /// use std::os::unix::net::{UnixListener, SocketAddr};
+    /// #[cfg(target_os = "linux")]
     /// use std::os::linux::net::SocketAddrExt;
+    /// #[cfg(target_os = "android")]
+    /// use std::os::android::net::SocketAddrExt;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let addr = SocketAddr::from_abstract_name(b"hidden")?;
@@ -46,9 +55,19 @@ pub trait SocketAddrExt: Sealed {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "cygwin")),
+        doc = "```ignore (needs linux)"
+    )]
     /// use std::os::unix::net::{UnixListener, SocketAddr};
+    /// #[cfg(target_os = "linux")]
     /// use std::os::linux::net::SocketAddrExt;
+    /// #[cfg(target_os = "android")]
+    /// use std::os::android::net::SocketAddrExt;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let name = b"hidden";

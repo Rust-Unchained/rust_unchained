@@ -2,7 +2,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 
 // Diagnostic: unreachable-label
 pub(crate) fn unreachable_label(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::UnreachableLabel,
 ) -> Diagnostic {
     let name = &d.name;
@@ -12,6 +12,7 @@ pub(crate) fn unreachable_label(
         format!("use of unreachable label `{}`", name.display(ctx.sema.db, ctx.edition)),
         d.node.map(|it| it.into()),
     )
+    .stable()
 }
 
 #[cfg(test)]

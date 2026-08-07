@@ -1,64 +1,122 @@
-// ignore-tidy-linelength
+// Check that every malformed `on` filter warns without stopping compilation.
 
+//@ check-pass
+
+#![crate_type = "lib"]
 #![feature(rustc_attrs)]
-
 #![allow(unused)]
 
-#[rustc_on_unimplemented = "test error `{Self}` with `{Bar}` `{Baz}` `{Quux}`"]
-trait Foo<Bar, Baz, Quux>
-{}
+#[rustc_on_unimplemented(label = "test error `{Self}` with `{Bar}` `{Baz}` `{Quux}`")]
+trait Foo<Bar, Baz, Quux> {}
 
-#[rustc_on_unimplemented="a collection of type `{Self}` cannot be built from an iterator over elements of type `{A}`"]
+#[rustc_on_unimplemented(label = "a collection of type `{Self}` cannot \
+ be built from an iterator over elements of type `{A}`")]
 trait MyFromIterator<A> {
     /// Builds a container with elements from an external iterator.
-    fn my_from_iter<T: Iterator<Item=A>>(iterator: T) -> Self;
+    fn my_from_iter<T: Iterator<Item = A>>(iterator: T) -> Self;
 }
 
 #[rustc_on_unimplemented]
-//~^ ERROR malformed `rustc_on_unimplemented` attribute
-trait BadAnnotation1
-{}
+//~^ WARN missing options for `rustc_on_unimplemented` attribute
+//~| NOTE part of
+trait NoContent {}
 
-#[rustc_on_unimplemented = "Unimplemented trait error on `{Self}` with params `<{A},{B},{C}>`"]
-//~^ ERROR cannot find parameter C on this trait
-trait BadAnnotation2<A,B>
-{}
+#[rustc_on_unimplemented(label = "Unimplemented error on `{Self}` with params `<{A},{B},{C}>`")]
+//~^ WARN there is no parameter `C` on trait `ParameterNotPresent`
+//~| NOTE part of
+trait ParameterNotPresent<A, B> {}
 
-#[rustc_on_unimplemented = "Unimplemented trait error on `{Self}` with params `<{A},{B},{}>`"]
-//~^ ERROR positional format arguments are not allowed here
-trait BadAnnotation3<A,B>
-{}
+#[rustc_on_unimplemented(label = "Unimplemented error on `{Self}` with params `<{A},{B},{}>`")]
+//~^ WARN positional arguments are not permitted in diagnostic attributes
+//~| NOTE remove this format argument
+trait NoPositionalArgs<A, B> {}
 
-#[rustc_on_unimplemented(lorem="")]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation4 {}
+#[rustc_on_unimplemented(lorem = "")]
+//~^WARN malformed `rustc_on_unimplemented` attribute
+//~|NOTE invalid option found here
+trait EmptyMessage {}
 
 #[rustc_on_unimplemented(lorem(ipsum(dolor)))]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation5 {}
+//~^WARN malformed `rustc_on_unimplemented` attribute
+//~|NOTE invalid option found here
+trait Invalid {}
 
-#[rustc_on_unimplemented(message="x", message="y")]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation6 {}
+#[rustc_on_unimplemented(message = "x", message = "y")]
+//~^WARN `message` is ignored due to previous definition of `message`
+//~|NOTE `message` is first declared here
+//~|NOTE `message` is later redundantly declared here
+trait DuplicateMessage {}
 
-#[rustc_on_unimplemented(message="x", on(desugared, message="y"))]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation7 {}
+#[rustc_on_unimplemented(message = "x", on(desugared, message = "y"))]
+//~^ WARN invalid flag in `on`-clause
+//~| NOTE expected one of the `crate_local`, `direct` or `from_desugaring` flags, not `desugared`
+//~| NOTE `#[warn(malformed_diagnostic_filters)]` on by default
+trait OnInWrongPosition {}
 
-#[rustc_on_unimplemented(on(), message="y")]
-//~^ ERROR empty `on`-clause
-trait BadAnnotation8 {}
+#[rustc_on_unimplemented(on(), message = "y")]
+//~^ WARN empty `on`-clause
+//~^^ NOTE empty `on`-clause here
+trait EmptyOn {}
 
-#[rustc_on_unimplemented(on="x", message="y")]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation9 {}
+#[rustc_on_unimplemented(on = "x", message = "y")]
+//~^WARN malformed `rustc_on_unimplemented` attribute
+//~|NOTE invalid option found here
+trait ExpectedPredicateInOn {}
 
-#[rustc_on_unimplemented(on(x="y"), message="y")]
-trait BadAnnotation10 {}
+#[rustc_on_unimplemented(on(Self = "y"), message = "y")]
+//~^WARN malformed `rustc_on_unimplemented` attribute
+//~|NOTE invalid option found here
+trait OnWithoutDirectives {}
 
-#[rustc_on_unimplemented(on(desugared, on(desugared, message="x")), message="y")]
-//~^ ERROR this attribute must have a valid
-trait BadAnnotation11 {}
+#[rustc_on_unimplemented(on(from_desugaring, on(from_desugaring, message = "x")), message = "y")]
+//~^WARN malformed `rustc_on_unimplemented` attribute
+//~|NOTE invalid option found here
+trait NestedOn {}
 
-pub fn main() {
-}
+#[rustc_on_unimplemented(on("y", message = "y"))]
+//~^ WARN literals inside `on`-clauses are not supported
+//~^^ NOTE unexpected literal here
+trait UnsupportedLiteral {}
+
+#[rustc_on_unimplemented(on(42, message = "y"))]
+//~^ WARN literals inside `on`-clauses are not supported
+//~^^ NOTE unexpected literal here
+trait UnsupportedLiteral2 {}
+
+#[rustc_on_unimplemented(on(not(a, b), message = "y"))]
+//~^ WARN expected a single predicate in `not(..)`
+//~^^ NOTE unexpected quantity of predicates here
+trait ExpectedOnePattern {}
+
+#[rustc_on_unimplemented(on(not(), message = "y"))]
+//~^ WARN expected a single predicate in `not(..)`
+//~^^ NOTE unexpected quantity of predicates here
+trait ExpectedOnePattern2 {}
+
+#[rustc_on_unimplemented(on(thing::What, message = "y"))]
+//~^ WARN expected an identifier inside this `on`-clause
+//~^^ NOTE expected an identifier here, not `thing::What`
+trait KeyMustBeIdentifier {}
+
+#[rustc_on_unimplemented(on(thing::What = "value", message = "y"))]
+//~^ WARN expected an identifier inside this `on`-clause
+//~^^ NOTE expected an identifier here, not `thing::What`
+trait KeyMustBeIdentifier2 {}
+
+#[rustc_on_unimplemented(on(aaaaaaaaaaaaaa(a, b), message = "y"))]
+//~^ WARN this predicate is invalid
+//~^^ NOTE expected one of `any`, `all` or `not` here, not `aaaaaaaaaaaaaa`
+trait InvalidPredicate {}
+
+#[rustc_on_unimplemented(on(something, message = "y"))]
+//~^ WARN invalid flag in `on`-clause
+//~^^ NOTE expected one of the `crate_local`, `direct` or `from_desugaring` flags, not `something`
+trait InvalidFlag {}
+
+#[rustc_on_unimplemented(on(_Self = "y", message = "y"))]
+//~^ WARN there is no parameter `_Self` on trait `InvalidName`
+trait InvalidName {}
+
+#[rustc_on_unimplemented(on(abc = "y", message = "y"))]
+//~^ WARN there is no parameter `abc` on trait `InvalidName2`
+trait InvalidName2 {}

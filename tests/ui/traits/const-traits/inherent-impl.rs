@@ -1,13 +1,13 @@
 #![feature(const_trait_impl)]
 #![allow(bare_trait_objects)]
 
+//@ check-pass
+
 struct S;
 trait T {}
 
-impl const S {}
-//~^ ERROR inherent impls cannot be `const`
+const impl S {}
 
-impl const T {}
-//~^ ERROR inherent impls cannot be `const`
+const impl dyn T {}
 
 fn main() {}

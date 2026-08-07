@@ -1,27 +1,14 @@
 use clippy_utils::ty::{EnumValue, read_explicit_enum_value};
 use rustc_middle::ty::{self, AdtDef, IntTy, Ty, TyCtxt, UintTy, VariantDiscr};
 
-/// Returns the size in bits of an integral type.
-/// Will return 0 if the type is not an int or uint variant
-pub(super) fn int_ty_to_nbits(typ: Ty<'_>, tcx: TyCtxt<'_>) -> u64 {
-    match typ.kind() {
-        ty::Int(i) => match i {
-            IntTy::Isize => tcx.data_layout.pointer_size.bits(),
-            IntTy::I8 => 8,
-            IntTy::I16 => 16,
-            IntTy::I32 => 32,
-            IntTy::I64 => 64,
-            IntTy::I128 => 128,
-        },
-        ty::Uint(i) => match i {
-            UintTy::Usize => tcx.data_layout.pointer_size.bits(),
-            UintTy::U8 => 8,
-            UintTy::U16 => 16,
-            UintTy::U32 => 32,
-            UintTy::U64 => 64,
-            UintTy::U128 => 128,
-        },
-        _ => 0,
+/// Returns the size in bits of an integral type, or `None` if `ty` is not an
+/// integral type.
+pub(super) fn int_ty_to_nbits(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<u64> {
+    match ty.kind() {
+        ty::Int(IntTy::Isize) | ty::Uint(UintTy::Usize) => Some(tcx.data_layout.pointer_size().bits()),
+        ty::Int(i) => i.bit_width(),
+        ty::Uint(i) => i.bit_width(),
+        _ => None,
     }
 }
 
@@ -71,5 +58,20 @@ pub(super) fn enum_ty_to_nbits(adt: AdtDef<'_>, tcx: TyCtxt<'_>) -> u64 {
         };
         let pos_bits = if end > 0 { 128 - end.leading_zeros() } else { 0 };
         neg_bits.max(pos_bits).into()
+    }
+}
+
+pub(super) enum CastTo {
+    Signed,
+    Unsigned,
+}
+/// Returns `Some` if the type cast is between 2 integral types that differ
+/// only in signedness, otherwise `None`. The value of `Some` is which
+/// signedness is cast to.
+pub(super) fn is_signedness_cast(cast_from: Ty<'_>, cast_to: Ty<'_>) -> Option<CastTo> {
+    match (cast_from.kind(), cast_to.kind()) {
+        (ty::Int(from), ty::Uint(to)) if from.to_unsigned() == *to => Some(CastTo::Unsigned),
+        (ty::Uint(from), ty::Int(to)) if *from == to.to_unsigned() => Some(CastTo::Signed),
+        _ => None,
     }
 }

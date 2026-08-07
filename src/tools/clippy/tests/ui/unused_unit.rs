@@ -1,4 +1,6 @@
-
+//@revisions: edition2021 edition2024
+//@[edition2021] edition:2021
+//@[edition2024] edition:2024
 
 // The output for humans should just highlight the whole span without showing
 // the suggested replacement, but we also want to test that suggested
@@ -118,5 +120,50 @@ mod issue9949 {
     fn main() {
         #[doc = "documentation"]
         ()
+    }
+}
+
+mod issue14577 {
+    trait Unit {}
+    impl Unit for () {}
+
+    #[allow(dependency_on_unit_never_type_fallback)]
+    fn bar() -> () {
+        //~[edition2021]^ unused_unit
+        panic!()
+    }
+
+    struct UnitStruct;
+    impl UnitStruct {
+        fn apply<F: for<'c> Fn(&'c mut Self)>(&mut self, f: F) {
+            todo!()
+        }
+    }
+}
+
+mod pr14962 {
+    #[allow(unused_parens)]
+    type UnusedParensButNoUnit = Box<dyn (Fn())>;
+}
+
+
+mod issue15035 {
+
+    trait Convert<T> {
+        fn from(value: T) -> Self;
+    }
+
+    impl Convert<u64> for () {
+        fn from(_value: u64) -> Self {}
+    }
+
+    fn handle<T: Convert<u64>>(value: u64) -> T {
+        Convert::from(value)
+    }
+
+    pub fn f() -> Option<bool> {
+        let result: Result<bool, u64> = Err(42);
+        // the `-> ()` is required for the inference of `handle`'s return type
+        result.map_err(|err| -> () { handle(err) }).ok()
     }
 }

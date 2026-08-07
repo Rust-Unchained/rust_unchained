@@ -14,7 +14,7 @@
 use crate::convert::FloatToInt;
 use crate::num::FpCategory;
 use crate::panic::const_assert;
-use crate::{cfg_match, intrinsics, mem};
+use crate::{cfg_select, intrinsics, mem};
 
 /// The radix or base of the internal representation of `f32`.
 /// Use [`f32::RADIX`] instead.
@@ -23,14 +23,17 @@ use crate::{cfg_match, intrinsics, mem};
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let r = std::f32::RADIX;
 ///
 /// // intended way
 /// let r = f32::RADIX;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `RADIX` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `RADIX` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_radix"]
 pub const RADIX: u32 = f32::RADIX;
 
@@ -41,7 +44,7 @@ pub const RADIX: u32 = f32::RADIX;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let d = std::f32::MANTISSA_DIGITS;
 ///
 /// // intended way
@@ -49,7 +52,7 @@ pub const RADIX: u32 = f32::RADIX;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[deprecated(
-    since = "TBD",
+    since = "CURRENT_RUSTC_VERSION",
     note = "replaced by the `MANTISSA_DIGITS` associated constant on `f32`"
 )]
 #[rustc_diagnostic_item = "f32_legacy_const_mantissa_dig"]
@@ -62,14 +65,17 @@ pub const MANTISSA_DIGITS: u32 = f32::MANTISSA_DIGITS;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let d = std::f32::DIGITS;
 ///
 /// // intended way
 /// let d = f32::DIGITS;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `DIGITS` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `DIGITS` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_digits"]
 pub const DIGITS: u32 = f32::DIGITS;
 
@@ -84,14 +90,17 @@ pub const DIGITS: u32 = f32::DIGITS;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let e = std::f32::EPSILON;
 ///
 /// // intended way
 /// let e = f32::EPSILON;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `EPSILON` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `EPSILON` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_epsilon"]
 pub const EPSILON: f32 = f32::EPSILON;
 
@@ -102,14 +111,17 @@ pub const EPSILON: f32 = f32::EPSILON;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let min = std::f32::MIN;
 ///
 /// // intended way
 /// let min = f32::MIN;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MIN` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MIN` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_min"]
 pub const MIN: f32 = f32::MIN;
 
@@ -120,14 +132,17 @@ pub const MIN: f32 = f32::MIN;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let min = std::f32::MIN_POSITIVE;
 ///
 /// // intended way
 /// let min = f32::MIN_POSITIVE;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MIN_POSITIVE` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MIN_POSITIVE` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_min_positive"]
 pub const MIN_POSITIVE: f32 = f32::MIN_POSITIVE;
 
@@ -138,14 +153,17 @@ pub const MIN_POSITIVE: f32 = f32::MIN_POSITIVE;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let max = std::f32::MAX;
 ///
 /// // intended way
 /// let max = f32::MAX;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MAX` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MAX` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_max"]
 pub const MAX: f32 = f32::MAX;
 
@@ -156,14 +174,17 @@ pub const MAX: f32 = f32::MAX;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let min = std::f32::MIN_EXP;
 ///
 /// // intended way
 /// let min = f32::MIN_EXP;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MIN_EXP` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MIN_EXP` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_min_exp"]
 pub const MIN_EXP: i32 = f32::MIN_EXP;
 
@@ -174,14 +195,17 @@ pub const MIN_EXP: i32 = f32::MIN_EXP;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let max = std::f32::MAX_EXP;
 ///
 /// // intended way
 /// let max = f32::MAX_EXP;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MAX_EXP` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MAX_EXP` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_max_exp"]
 pub const MAX_EXP: i32 = f32::MAX_EXP;
 
@@ -192,14 +216,17 @@ pub const MAX_EXP: i32 = f32::MAX_EXP;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let min = std::f32::MIN_10_EXP;
 ///
 /// // intended way
 /// let min = f32::MIN_10_EXP;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MIN_10_EXP` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MIN_10_EXP` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_min_10_exp"]
 pub const MIN_10_EXP: i32 = f32::MIN_10_EXP;
 
@@ -210,14 +237,17 @@ pub const MIN_10_EXP: i32 = f32::MIN_10_EXP;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let max = std::f32::MAX_10_EXP;
 ///
 /// // intended way
 /// let max = f32::MAX_10_EXP;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `MAX_10_EXP` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `MAX_10_EXP` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_max_10_exp"]
 pub const MAX_10_EXP: i32 = f32::MAX_10_EXP;
 
@@ -228,14 +258,17 @@ pub const MAX_10_EXP: i32 = f32::MAX_10_EXP;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let nan = std::f32::NAN;
 ///
 /// // intended way
 /// let nan = f32::NAN;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `NAN` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `NAN` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_nan"]
 pub const NAN: f32 = f32::NAN;
 
@@ -246,14 +279,17 @@ pub const NAN: f32 = f32::NAN;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let inf = std::f32::INFINITY;
 ///
 /// // intended way
 /// let inf = f32::INFINITY;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `INFINITY` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `INFINITY` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_infinity"]
 pub const INFINITY: f32 = f32::INFINITY;
 
@@ -264,19 +300,23 @@ pub const INFINITY: f32 = f32::INFINITY;
 ///
 /// ```rust
 /// // deprecated way
-/// # #[allow(deprecated, deprecated_in_future)]
+/// # #[allow(deprecated)]
 /// let ninf = std::f32::NEG_INFINITY;
 ///
 /// // intended way
 /// let ninf = f32::NEG_INFINITY;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "TBD", note = "replaced by the `NEG_INFINITY` associated constant on `f32`")]
+#[deprecated(
+    since = "CURRENT_RUSTC_VERSION",
+    note = "replaced by the `NEG_INFINITY` associated constant on `f32`"
+)]
 #[rustc_diagnostic_item = "f32_legacy_const_neg_infinity"]
 pub const NEG_INFINITY: f32 = f32::NEG_INFINITY;
 
 /// Basic mathematical constants.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "f32_consts_mod"]
 pub mod consts {
     // FIXME: replace with mathematical constants from cmath.
 
@@ -291,12 +331,13 @@ pub mod consts {
     pub const TAU: f32 = 6.28318530717958647692528676655900577_f32;
 
     /// The golden ratio (φ)
-    #[unstable(feature = "more_float_constants", issue = "103883")]
-    pub const PHI: f32 = 1.618033988749894848204586834365638118_f32;
+    #[doc(alias = "phi")]
+    #[stable(feature = "euler_gamma_golden_ratio", since = "1.94.0")]
+    pub const GOLDEN_RATIO: f32 = 1.618033988749894848204586834365638118_f32;
 
     /// The Euler-Mascheroni constant (γ)
-    #[unstable(feature = "more_float_constants", issue = "103883")]
-    pub const EGAMMA: f32 = 0.577215664901532860606512090082402431_f32;
+    #[stable(feature = "euler_gamma_golden_ratio", since = "1.94.0")]
+    pub const EULER_GAMMA: f32 = 0.577215664901532860606512090082402431_f32;
 
     /// π/2
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -323,12 +364,12 @@ pub mod consts {
     pub const FRAC_1_PI: f32 = 0.318309886183790671537767526745028724_f32;
 
     /// 1/sqrt(π)
-    #[unstable(feature = "more_float_constants", issue = "103883")]
+    #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const FRAC_1_SQRT_PI: f32 = 0.564189583547756286948079451560772586_f32;
 
     /// 1/sqrt(2π)
     #[doc(alias = "FRAC_1_SQRT_TAU")]
-    #[unstable(feature = "more_float_constants", issue = "103883")]
+    #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const FRAC_1_SQRT_2PI: f32 = 0.398942280401432677939946059934381868_f32;
 
     /// 2/π
@@ -348,12 +389,20 @@ pub mod consts {
     pub const FRAC_1_SQRT_2: f32 = 0.707106781186547524400844362104849039_f32;
 
     /// sqrt(3)
-    #[unstable(feature = "more_float_constants", issue = "103883")]
+    #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const SQRT_3: f32 = 1.732050807568877293527446341505872367_f32;
 
     /// 1/sqrt(3)
-    #[unstable(feature = "more_float_constants", issue = "103883")]
+    #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const FRAC_1_SQRT_3: f32 = 0.577350269189625764509148780501957456_f32;
+
+    /// sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    pub const SQRT_5: f32 = 2.23606797749978969640917366873127623_f32;
+
+    /// 1/sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    pub const FRAC_1_SQRT_5: f32 = 0.44721359549995793928183473374625524_f32;
 
     /// Euler's number (e)
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -384,10 +433,15 @@ pub mod consts {
     pub const LN_10: f32 = 2.30258509299404568401799145468436421_f32;
 }
 
+#[doc(test(attr(allow(unused_features))))]
 impl f32 {
     /// The radix or base of the internal representation of `f32`.
     #[stable(feature = "assoc_int_consts", since = "1.43.0")]
     pub const RADIX: u32 = 2;
+
+    /// The size of this float type in bits.
+    #[unstable(feature = "float_bits_const", issue = "151073")]
+    pub const BITS: u32 = 32;
 
     /// Number of significant digits in base 2.
     ///
@@ -500,14 +554,127 @@ impl f32 {
     #[stable(feature = "assoc_int_consts", since = "1.43.0")]
     pub const NEG_INFINITY: f32 = -1.0_f32 / 0.0_f32;
 
-    /// Sign bit
-    pub(crate) const SIGN_MASK: u32 = 0x8000_0000;
+    /// Maximum integer that can be represented exactly in an [`f32`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i32`] and [`f32`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f32`] and back to
+    /// [`i32`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f32`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f32::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f32::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// let max_exact_int = f32::MAX_EXACT_INTEGER;
+    /// assert_eq!(max_exact_int, max_exact_int as f32 as i32);
+    /// assert_eq!(max_exact_int + 1, (max_exact_int + 1) as f32 as i32);
+    /// assert_ne!(max_exact_int + 2, (max_exact_int + 2) as f32 as i32);
+    ///
+    /// // Beyond `f32::MAX_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((max_exact_int + 1) as f32, (max_exact_int + 2) as f32);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MAX_EXACT_INTEGER: i32 = (1 << Self::MANTISSA_DIGITS) - 1;
 
-    /// Exponent mask
-    pub(crate) const EXP_MASK: u32 = 0x7f80_0000;
+    /// Minimum integer that can be represented exactly in an [`f32`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i32`] and [`f32`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f32`] and back to
+    /// [`i32`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f32`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// This constant is equivalent to `-MAX_EXACT_INTEGER`.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f32::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f32::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// let min_exact_int = f32::MIN_EXACT_INTEGER;
+    /// assert_eq!(min_exact_int, min_exact_int as f32 as i32);
+    /// assert_eq!(min_exact_int - 1, (min_exact_int - 1) as f32 as i32);
+    /// assert_ne!(min_exact_int - 2, (min_exact_int - 2) as f32 as i32);
+    ///
+    /// // Below `f32::MIN_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((min_exact_int - 1) as f32, (min_exact_int - 2) as f32);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MIN_EXACT_INTEGER: i32 = -Self::MAX_EXACT_INTEGER;
 
-    /// Mantissa mask
-    pub(crate) const MAN_MASK: u32 = 0x007f_ffff;
+    /// The mask of the bit used to encode the sign of an [`f32`].
+    ///
+    /// This bit is set when the sign is negative and unset when the sign is
+    /// positive.
+    /// If you only need to check whether a value is positive or negative,
+    /// [`is_sign_positive`] or [`is_sign_negative`] can be used.
+    ///
+    /// [`is_sign_positive`]: f32::is_sign_positive
+    /// [`is_sign_negative`]: f32::is_sign_negative
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// let sign_mask = f32::SIGN_MASK;
+    /// let a = 1.6552f32;
+    /// let a_bits = a.to_bits();
+    ///
+    /// assert_eq!(a_bits & sign_mask, 0x0);
+    /// assert_eq!(f32::from_bits(a_bits ^ sign_mask), -a);
+    /// assert_eq!(sign_mask, (-0.0f32).to_bits());
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const SIGN_MASK: u32 = 0x8000_0000;
+
+    /// The mask of the bits used to encode the exponent of an [`f32`].
+    ///
+    /// Note that the exponent is stored as a biased value, with a bias of 127 for `f32`.
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// fn get_exp(a: f32) -> i32 {
+    ///     let bias = 127;
+    ///     let biased = a.to_bits() & f32::EXPONENT_MASK;
+    ///     (biased >> (f32::MANTISSA_DIGITS - 1)).cast_signed() - bias
+    /// }
+    ///
+    /// assert_eq!(get_exp(0.5), -1);
+    /// assert_eq!(get_exp(1.0), 0);
+    /// assert_eq!(get_exp(2.0), 1);
+    /// assert_eq!(get_exp(4.0), 2);
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const EXPONENT_MASK: u32 = 0x7f80_0000;
+
+    /// The mask of the bits used to encode the mantissa of an [`f32`].
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// let mantissa_mask = f32::MANTISSA_MASK;
+    ///
+    /// assert_eq!(0f32.to_bits() & mantissa_mask, 0x0);
+    /// assert_eq!(1f32.to_bits() & mantissa_mask, 0x0);
+    ///
+    /// // multiplying a finite value by a power of 2 doesn't change its mantissa
+    /// // unless the result or initial value is not normal.
+    /// let a = 1.6552f32;
+    /// let b = 4.0 * a;
+    /// assert_eq!(a.to_bits() & mantissa_mask, b.to_bits() & mantissa_mask);
+    ///
+    /// // The maximum and minimum values have a saturated significand
+    /// assert_eq!(f32::MAX.to_bits() & f32::MANTISSA_MASK, f32::MANTISSA_MASK);
+    /// assert_eq!(f32::MIN.to_bits() & f32::MANTISSA_MASK, f32::MANTISSA_MASK);
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const MANTISSA_MASK: u32 = 0x007f_ffff;
 
     /// Minimum representable positive value (min subnormal)
     const TINY_BITS: u32 = 0x1;
@@ -651,6 +818,7 @@ impl f32 {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_float_classify", since = "1.83.0")]
+    #[must_use]
     pub const fn classify(self) -> FpCategory {
         // We used to have complicated logic here that avoids the simple bit-based tests to work
         // around buggy codegen for x87 targets (see
@@ -658,9 +826,9 @@ impl f32 {
         // of our tests is able to find any difference between the complicated and the naive
         // version, so now we are back to the naive version.
         let b = self.to_bits();
-        match (b & Self::MAN_MASK, b & Self::EXP_MASK) {
-            (0, Self::EXP_MASK) => FpCategory::Infinite,
-            (_, Self::EXP_MASK) => FpCategory::Nan,
+        match (b & Self::MANTISSA_MASK, b & Self::EXPONENT_MASK) {
+            (0, Self::EXPONENT_MASK) => FpCategory::Infinite,
+            (_, Self::EXPONENT_MASK) => FpCategory::Nan,
             (0, 0) => FpCategory::Zero,
             (_, 0) => FpCategory::Subnormal,
             _ => FpCategory::Normal,
@@ -750,6 +918,7 @@ impl f32 {
     #[doc(alias = "nextUp")]
     #[stable(feature = "float_next_up_down", since = "1.86.0")]
     #[rustc_const_stable(feature = "float_next_up_down", since = "1.86.0")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_up(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -801,6 +970,7 @@ impl f32 {
     #[doc(alias = "nextDown")]
     #[stable(feature = "float_next_up_down", since = "1.86.0")]
     #[rustc_const_stable(feature = "float_next_up_down", since = "1.86.0")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_down(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -839,6 +1009,13 @@ impl f32 {
 
     /// Converts radians to degrees.
     ///
+    /// # Unspecified precision
+    ///
+    /// The precision of this function is non-deterministic. This means it varies by platform,
+    /// Rust version, and can even differ within the same execution from one invocation to the next.
+    ///
+    /// # Examples
+    ///
     /// ```
     /// let angle = std::f32::consts::PI;
     ///
@@ -852,12 +1029,20 @@ impl f32 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn to_degrees(self) -> f32 {
-        // Use a constant for better precision.
+        // Use a literal to avoid double rounding, consts::PI is already rounded,
+        // and dividing would round again.
         const PIS_IN_180: f32 = 57.2957795130823208767981548141051703_f32;
         self * PIS_IN_180
     }
 
     /// Converts degrees to radians.
+    ///
+    /// # Unspecified precision
+    ///
+    /// The precision of this function is non-deterministic. This means it varies by platform,
+    /// Rust version, and can even differ within the same execution from one invocation to the next.
+    ///
+    /// # Examples
     ///
     /// ```
     /// let angle = 180.0f32;
@@ -872,58 +1057,78 @@ impl f32 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn to_radians(self) -> f32 {
+        // The division here is correctly rounded with respect to the true value of π/180.
+        // Although π is irrational and already rounded, the double rounding happens
+        // to produce correct result for f32.
         const RADS_PER_DEG: f32 = consts::PI / 180.0;
         self * RADS_PER_DEG
     }
 
     /// Returns the maximum of the two numbers, ignoring NaN.
     ///
-    /// If one of the arguments is NaN, then the other argument is returned.
-    /// This follows the IEEE 754-2008 semantics for maxNum, except for handling of signaling NaNs;
-    /// this function handles all NaNs the same way and avoids maxNum's problems with associativity.
-    /// This also matches the behavior of libm’s fmax. In particular, if the inputs compare equal
-    /// (such as for the case of `+0.0` and `-0.0`), either input may be returned non-deterministically.
+    /// If exactly one of the arguments is NaN (quiet or signaling), then the other argument is
+    /// returned. If both arguments are NaN, the return value is NaN, with the bit pattern picked
+    /// using the usual [rules for arithmetic operations](f32#nan-bit-patterns). If the inputs
+    /// compare equal (such as for the case of `+0.0` and `-0.0`), either input may be returned
+    /// non-deterministically.
+    ///
+    /// The handling of NaNs follows the IEEE 754-2019 semantics for `maximumNumber`, treating all
+    /// NaNs the same way to ensure the operation is associative. The handling of signed zeros
+    /// follows the IEEE 754-2008 semantics for `maxNum`.
     ///
     /// ```
     /// let x = 1.0f32;
     /// let y = 2.0f32;
     ///
     /// assert_eq!(x.max(y), y);
+    /// assert_eq!(x.max(f32::NAN), x);
     /// ```
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn max(self, other: f32) -> f32 {
-        intrinsics::maxnumf32(self, other)
+        intrinsics::maximum_number_nsz_f32(self, other)
     }
 
     /// Returns the minimum of the two numbers, ignoring NaN.
     ///
-    /// If one of the arguments is NaN, then the other argument is returned.
-    /// This follows the IEEE 754-2008 semantics for minNum, except for handling of signaling NaNs;
-    /// this function handles all NaNs the same way and avoids minNum's problems with associativity.
-    /// This also matches the behavior of libm’s fmin. In particular, if the inputs compare equal
-    /// (such as for the case of `+0.0` and `-0.0`), either input may be returned non-deterministically.
+    /// If exactly one of the arguments is NaN (quiet or signaling), then the other argument is
+    /// returned. If both arguments are NaN, the return value is NaN, with the bit pattern picked
+    /// using the usual [rules for arithmetic operations](f32#nan-bit-patterns). If the inputs
+    /// compare equal (such as for the case of `+0.0` and `-0.0`), either input may be returned
+    /// non-deterministically.
+    ///
+    /// The handling of NaNs follows the IEEE 754-2019 semantics for `minimumNumber`, treating all
+    /// NaNs the same way to ensure the operation is associative. The handling of signed zeros
+    /// follows the IEEE 754-2008 semantics for `minNum`.
     ///
     /// ```
     /// let x = 1.0f32;
     /// let y = 2.0f32;
     ///
     /// assert_eq!(x.min(y), x);
+    /// assert_eq!(x.min(f32::NAN), x);
     /// ```
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn min(self, other: f32) -> f32 {
-        intrinsics::minnumf32(self, other)
+        intrinsics::minimum_number_nsz_f32(self, other)
     }
 
     /// Returns the maximum of the two numbers, propagating NaN.
     ///
-    /// This returns NaN when *either* argument is NaN, as opposed to
-    /// [`f32::max`] which only returns NaN when *both* arguments are NaN.
+    /// If at least one of the arguments is NaN, the return value is NaN, with the bit pattern
+    /// picked using the usual [rules for arithmetic operations](f32#nan-bit-patterns). Furthermore,
+    /// `-0.0` is considered to be less than `+0.0`, making this function fully deterministic for
+    /// non-NaN inputs.
+    ///
+    /// This is in contrast to [`f32::max`] which only returns NaN when *both* arguments are NaN,
+    /// and which does not reliably order `-0.0` and `+0.0`.
+    ///
+    /// This follows the IEEE 754-2019 semantics for `maximum`.
     ///
     /// ```
     /// #![feature(float_minimum_maximum)]
@@ -933,32 +1138,24 @@ impl f32 {
     /// assert_eq!(x.maximum(y), y);
     /// assert!(x.maximum(f32::NAN).is_nan());
     /// ```
-    ///
-    /// If one of the arguments is NaN, then NaN is returned. Otherwise this returns the greater
-    /// of the two numbers. For this operation, -0.0 is considered to be less than +0.0.
-    /// Note that this follows the semantics specified in IEEE 754-2019.
-    ///
-    /// Also note that "propagation" of NaNs here doesn't necessarily mean that the bitpattern of a NaN
-    /// operand is conserved; see the [specification of NaN bit patterns](f32#nan-bit-patterns) for more info.
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[unstable(feature = "float_minimum_maximum", issue = "91079")]
     #[inline]
     pub const fn maximum(self, other: f32) -> f32 {
-        if self > other {
-            self
-        } else if other > self {
-            other
-        } else if self == other {
-            if self.is_sign_positive() && other.is_sign_negative() { self } else { other }
-        } else {
-            self + other
-        }
+        intrinsics::maximumf32(self, other)
     }
 
     /// Returns the minimum of the two numbers, propagating NaN.
     ///
-    /// This returns NaN when *either* argument is NaN, as opposed to
-    /// [`f32::min`] which only returns NaN when *both* arguments are NaN.
+    /// If at least one of the arguments is NaN, the return value is NaN, with the bit pattern
+    /// picked using the usual [rules for arithmetic operations](f32#nan-bit-patterns). Furthermore,
+    /// `-0.0` is considered to be less than `+0.0`, making this function fully deterministic for
+    /// non-NaN inputs.
+    ///
+    /// This is in contrast to [`f32::min`] which only returns NaN when *both* arguments are NaN,
+    /// and which does not reliably order `-0.0` and `+0.0`.
+    ///
+    /// This follows the IEEE 754-2019 semantics for `minimum`.
     ///
     /// ```
     /// #![feature(float_minimum_maximum)]
@@ -968,27 +1165,11 @@ impl f32 {
     /// assert_eq!(x.minimum(y), x);
     /// assert!(x.minimum(f32::NAN).is_nan());
     /// ```
-    ///
-    /// If one of the arguments is NaN, then NaN is returned. Otherwise this returns the lesser
-    /// of the two numbers. For this operation, -0.0 is considered to be less than +0.0.
-    /// Note that this follows the semantics specified in IEEE 754-2019.
-    ///
-    /// Also note that "propagation" of NaNs here doesn't necessarily mean that the bitpattern of a NaN
-    /// operand is conserved; see the [specification of NaN bit patterns](f32#nan-bit-patterns) for more info.
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[unstable(feature = "float_minimum_maximum", issue = "91079")]
     #[inline]
     pub const fn minimum(self, other: f32) -> f32 {
-        if self < other {
-            self
-        } else if other < self {
-            other
-        } else if self == other {
-            if self.is_sign_negative() && other.is_sign_positive() { self } else { other }
-        } else {
-            // At least one input is NaN. Use `+` to perform NaN propagation and quieting.
-            self + other
-        }
+        intrinsics::minimumf32(self, other)
     }
 
     /// Calculates the midpoint (average) between `self` and `rhs`.
@@ -1006,8 +1187,10 @@ impl f32 {
     #[doc(alias = "average")]
     #[stable(feature = "num_midpoint", since = "1.85.0")]
     #[rustc_const_stable(feature = "num_midpoint", since = "1.85.0")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
     pub const fn midpoint(self, other: f32) -> f32 {
-        cfg_match! {
+        cfg_select! {
             // Allow faster implementation that have known good 64-bit float
             // implementations. Falling back to the branchy code on targets that don't
             // have 64-bit hardware floats or buggy implementations.
@@ -1016,15 +1199,15 @@ impl f32 {
                 target_arch = "x86_64",
                 target_arch = "aarch64",
                 all(any(target_arch = "riscv32", target_arch = "riscv64"), target_feature = "d"),
+                all(target_arch = "loongarch64", target_feature = "d"),
                 all(target_arch = "arm", target_feature = "vfp2"),
                 target_arch = "wasm32",
                 target_arch = "wasm64",
             ) => {
-                ((self as f64 + other as f64) / 2.0) as f32
+                ((self as f64 + other as f64) * 0.5) as f32
             }
             _ => {
-                const LO: f32 = f32::MIN_POSITIVE * 2.;
-                const HI: f32 = f32::MAX / 2.;
+                const HI: f32 = f32::MAX * 0.5;
 
                 let (a, b) = (self, other);
                 let abs_a = a.abs();
@@ -1032,16 +1215,9 @@ impl f32 {
 
                 if abs_a <= HI && abs_b <= HI {
                     // Overflow is impossible
-                    (a + b) / 2.
-                } else if abs_a < LO {
-                    // Not safe to halve `a` (would underflow)
-                    a + (b / 2.)
-                } else if abs_b < LO {
-                    // Not safe to halve `b` (would underflow)
-                    (a / 2.) + b
+                    (a + b) * 0.5
                 } else {
-                    // Safe to halve `a` and `b`
-                    (a / 2.) + (b / 2.)
+                    (a * 0.5) + (b * 0.5)
                 }
             }
         }
@@ -1102,7 +1278,7 @@ impl f32 {
     #[stable(feature = "float_bits_conv", since = "1.20.0")]
     #[rustc_const_stable(feature = "const_float_bits_conv", since = "1.83.0")]
     #[inline]
-    #[cfg_attr(not(bootstrap), allow(unnecessary_transmutes))]
+    #[allow(unnecessary_transmutes)]
     pub const fn to_bits(self) -> u32 {
         // SAFETY: `u32` is a plain old datatype so we can always transmute to it.
         unsafe { mem::transmute(self) }
@@ -1148,7 +1324,7 @@ impl f32 {
     #[rustc_const_stable(feature = "const_float_bits_conv", since = "1.83.0")]
     #[must_use]
     #[inline]
-    #[cfg_attr(not(bootstrap), allow(unnecessary_transmutes))]
+    #[allow(unnecessary_transmutes)]
     pub const fn from_bits(v: u32) -> Self {
         // It turns out the safety issues with sNaN were overblown! Hooray!
         // SAFETY: `u32` is a plain old datatype so we can always transmute from it.
@@ -1359,9 +1535,10 @@ impl f32 {
     /// }
     /// ```
     #[stable(feature = "total_cmp", since = "1.62.0")]
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
     #[must_use]
     #[inline]
-    pub fn total_cmp(&self, other: &Self) -> crate::cmp::Ordering {
+    pub const fn total_cmp(&self, other: &Self) -> crate::cmp::Ordering {
         let mut left = self.to_bits() as i32;
         let mut right = other.to_bits() as i32;
 
@@ -1399,7 +1576,8 @@ impl f32 {
     /// less than `min`. Otherwise this returns `self`.
     ///
     /// Note that this function returns NaN if the initial value was NaN as
-    /// well.
+    /// well. If the result is zero and among the three inputs `self`, `min`, and `max` there are
+    /// zeros with different sign, either `0.0` or `-0.0` is returned non-deterministically.
     ///
     /// # Panics
     ///
@@ -1412,6 +1590,12 @@ impl f32 {
     /// assert!((0.0f32).clamp(-2.0, 1.0) == 0.0);
     /// assert!((2.0f32).clamp(-2.0, 1.0) == 1.0);
     /// assert!((f32::NAN).clamp(-2.0, 1.0).is_nan());
+    ///
+    /// // These always returns zero, but the sign (which is ignored by `==`) is non-deterministic.
+    /// assert!((0.0f32).clamp(-0.0, -0.0) == 0.0);
+    /// assert!((1.0f32).clamp(-0.0, 0.0) == 0.0);
+    /// // This is definitely a negative zero.
+    /// assert!((-1.0f32).clamp(-0.0, 1.0).is_sign_negative());
     /// ```
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "clamp", since = "1.50.0")]
@@ -1435,6 +1619,35 @@ impl f32 {
         self
     }
 
+    /// Clamps this number to a symmetric range centered around zero.
+    ///
+    /// The method clamps the number's magnitude (absolute value) to be at most `limit`.
+    ///
+    /// This is functionally equivalent to `self.clamp(-limit, limit)`, but is more
+    /// explicit about the intent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is negative or NaN, as this indicates a logic error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(clamp_magnitude)]
+    /// assert_eq!(5.0f32.clamp_magnitude(3.0), 3.0);
+    /// assert_eq!((-5.0f32).clamp_magnitude(3.0), -3.0);
+    /// assert_eq!(2.0f32.clamp_magnitude(3.0), 2.0);
+    /// assert_eq!((-2.0f32).clamp_magnitude(3.0), -2.0);
+    /// ```
+    #[must_use = "this returns the clamped value and does not modify the original"]
+    #[unstable(feature = "clamp_magnitude", issue = "148519")]
+    #[inline]
+    pub fn clamp_magnitude(self, limit: f32) -> f32 {
+        assert!(limit >= 0.0, "limit must be non-negative");
+        let limit = limit.abs(); // Canonicalises -0.0 to 0.0
+        self.clamp(-limit, limit)
+    }
+
     /// Computes the absolute value of `self`.
     ///
     /// This function always returns the precise result.
@@ -1455,8 +1668,7 @@ impl f32 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn abs(self) -> f32 {
-        // SAFETY: this is actually a safe intrinsic
-        unsafe { intrinsics::fabsf32(self) }
+        intrinsics::fabs(self)
     }
 
     /// Returns a number that represents the sign of `self`.
@@ -1514,16 +1726,15 @@ impl f32 {
     #[stable(feature = "copysign", since = "1.35.0")]
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     pub const fn copysign(self, sign: f32) -> f32 {
-        // SAFETY: this is actually a safe intrinsic
-        unsafe { intrinsics::copysignf32(self, sign) }
+        intrinsics::copysignf32(self, sign)
     }
 
     /// Float addition that allows optimizations based on algebraic rules.
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "1.98.0")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "1.98.0")]
     #[inline]
     pub const fn algebraic_add(self, rhs: f32) -> f32 {
         intrinsics::fadd_algebraic(self, rhs)
@@ -1533,8 +1744,8 @@ impl f32 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "1.98.0")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "1.98.0")]
     #[inline]
     pub const fn algebraic_sub(self, rhs: f32) -> f32 {
         intrinsics::fsub_algebraic(self, rhs)
@@ -1544,8 +1755,8 @@ impl f32 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "1.98.0")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "1.98.0")]
     #[inline]
     pub const fn algebraic_mul(self, rhs: f32) -> f32 {
         intrinsics::fmul_algebraic(self, rhs)
@@ -1555,8 +1766,8 @@ impl f32 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "1.98.0")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "1.98.0")]
     #[inline]
     pub const fn algebraic_div(self, rhs: f32) -> f32 {
         intrinsics::fdiv_algebraic(self, rhs)
@@ -1566,10 +1777,443 @@ impl f32 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "1.98.0")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "1.98.0")]
     #[inline]
     pub const fn algebraic_rem(self, rhs: f32) -> f32 {
         intrinsics::frem_algebraic(self, rhs)
+    }
+}
+
+/// Experimental implementations of floating point functions in `core`.
+///
+/// _The standalone functions in this module are for testing only.
+/// They will be stabilized as inherent methods._
+#[unstable(feature = "core_float_math", issue = "137578")]
+pub mod math {
+    use crate::intrinsics;
+    use crate::num::imp::libm;
+
+    /// Experimental version of `floor` in `core`. See [`f32::floor`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let f = 3.7_f32;
+    /// let g = 3.0_f32;
+    /// let h = -3.7_f32;
+    ///
+    /// assert_eq!(f32::math::floor(f), 3.0);
+    /// assert_eq!(f32::math::floor(g), 3.0);
+    /// assert_eq!(f32::math::floor(h), -4.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::floor`]: ../../../std/primitive.f32.html#method.floor
+    #[inline]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn floor(x: f32) -> f32 {
+        intrinsics::floorf32(x)
+    }
+
+    /// Experimental version of `ceil` in `core`. See [`f32::ceil`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let f = 3.01_f32;
+    /// let g = 4.0_f32;
+    ///
+    /// assert_eq!(f32::math::ceil(f), 4.0);
+    /// assert_eq!(f32::math::ceil(g), 4.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::ceil`]: ../../../std/primitive.f32.html#method.ceil
+    #[inline]
+    #[doc(alias = "ceiling")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    pub const fn ceil(x: f32) -> f32 {
+        intrinsics::ceilf32(x)
+    }
+
+    /// Experimental version of `round` in `core`. See [`f32::round`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let f = 3.3_f32;
+    /// let g = -3.3_f32;
+    /// let h = -3.7_f32;
+    /// let i = 3.5_f32;
+    /// let j = 4.5_f32;
+    ///
+    /// assert_eq!(f32::math::round(f), 3.0);
+    /// assert_eq!(f32::math::round(g), -3.0);
+    /// assert_eq!(f32::math::round(h), -4.0);
+    /// assert_eq!(f32::math::round(i), 4.0);
+    /// assert_eq!(f32::math::round(j), 5.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::round`]: ../../../std/primitive.f32.html#method.round
+    #[inline]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn round(x: f32) -> f32 {
+        intrinsics::roundf32(x)
+    }
+
+    /// Experimental version of `round_ties_even` in `core`. See [`f32::round_ties_even`] for
+    /// details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let f = 3.3_f32;
+    /// let g = -3.3_f32;
+    /// let h = 3.5_f32;
+    /// let i = 4.5_f32;
+    ///
+    /// assert_eq!(f32::math::round_ties_even(f), 3.0);
+    /// assert_eq!(f32::math::round_ties_even(g), -3.0);
+    /// assert_eq!(f32::math::round_ties_even(h), 4.0);
+    /// assert_eq!(f32::math::round_ties_even(i), 4.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::round_ties_even`]: ../../../std/primitive.f32.html#method.round_ties_even
+    #[inline]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn round_ties_even(x: f32) -> f32 {
+        intrinsics::round_ties_even_f32(x)
+    }
+
+    /// Experimental version of `trunc` in `core`. See [`f32::trunc`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let f = 3.7_f32;
+    /// let g = 3.0_f32;
+    /// let h = -3.7_f32;
+    ///
+    /// assert_eq!(f32::math::trunc(f), 3.0);
+    /// assert_eq!(f32::math::trunc(g), 3.0);
+    /// assert_eq!(f32::math::trunc(h), -3.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::trunc`]: ../../../std/primitive.f32.html#method.trunc
+    #[inline]
+    #[doc(alias = "truncate")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    pub const fn trunc(x: f32) -> f32 {
+        intrinsics::truncf32(x)
+    }
+
+    /// Experimental version of `fract` in `core`. See [`f32::fract`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let x = 3.6_f32;
+    /// let y = -3.6_f32;
+    /// let abs_difference_x = (f32::math::fract(x) - 0.6).abs();
+    /// let abs_difference_y = (f32::math::fract(y) - (-0.6)).abs();
+    ///
+    /// assert!(abs_difference_x <= f32::EPSILON);
+    /// assert!(abs_difference_y <= f32::EPSILON);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::fract`]: ../../../std/primitive.f32.html#method.fract
+    #[inline]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn fract(x: f32) -> f32 {
+        x - trunc(x)
+    }
+
+    /// Experimental version of `mul_add` in `core`. See [`f32::mul_add`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![allow(unused_features)]
+    /// #![feature(core_float_math)]
+    ///
+    /// # // FIXME(#140515): mingw has an incorrect fma
+    /// # // https://sourceforge.net/p/mingw-w64/bugs/848/
+    /// # #[cfg(all(target_os = "windows", target_env = "gnu", not(target_abi = "llvm")))] {
+    /// use core::f32;
+    ///
+    /// let m = 10.0_f32;
+    /// let x = 4.0_f32;
+    /// let b = 60.0_f32;
+    ///
+    /// assert_eq!(f32::math::mul_add(m, x, b), 100.0);
+    /// assert_eq!(m * x + b, 100.0);
+    ///
+    /// let one_plus_eps = 1.0_f32 + f32::EPSILON;
+    /// let one_minus_eps = 1.0_f32 - f32::EPSILON;
+    /// let minus_one = -1.0_f32;
+    ///
+    /// // The exact result (1 + eps) * (1 - eps) = 1 - eps * eps.
+    /// assert_eq!(
+    ///     f32::math::mul_add(one_plus_eps, one_minus_eps, minus_one),
+    ///     -f32::EPSILON * f32::EPSILON
+    /// );
+    /// // Different rounding with the non-fused multiply and add.
+    /// assert_eq!(one_plus_eps * one_minus_eps + minus_one, 0.0);
+    /// # }
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::mul_add`]: ../../../std/primitive.f32.html#method.mul_add
+    #[inline]
+    #[doc(alias = "fmaf", alias = "fusedMultiplyAdd")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    pub const fn mul_add(x: f32, y: f32, z: f32) -> f32 {
+        intrinsics::fmaf32(x, y, z)
+    }
+
+    /// Experimental version of `div_euclid` in `core`. See [`f32::div_euclid`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let a: f32 = 7.0;
+    /// let b = 4.0;
+    /// assert_eq!(f32::math::div_euclid(a, b), 1.0); // 7.0 > 4.0 * 1.0
+    /// assert_eq!(f32::math::div_euclid(-a, b), -2.0); // -7.0 >= 4.0 * -2.0
+    /// assert_eq!(f32::math::div_euclid(a, -b), -1.0); // 7.0 >= -4.0 * -1.0
+    /// assert_eq!(f32::math::div_euclid(-a, -b), 2.0); // -7.0 >= -4.0 * 2.0
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::div_euclid`]: ../../../std/primitive.f32.html#method.div_euclid
+    #[inline]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub fn div_euclid(x: f32, rhs: f32) -> f32 {
+        let q = trunc(x / rhs);
+        if x % rhs < 0.0 {
+            return if rhs > 0.0 { q - 1.0 } else { q + 1.0 };
+        }
+        q
+    }
+
+    /// Experimental version of `rem_euclid` in `core`. See [`f32::rem_euclid`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let a: f32 = 7.0;
+    /// let b = 4.0;
+    /// assert_eq!(f32::math::rem_euclid(a, b), 3.0);
+    /// assert_eq!(f32::math::rem_euclid(-a, b), 1.0);
+    /// assert_eq!(f32::math::rem_euclid(a, -b), 3.0);
+    /// assert_eq!(f32::math::rem_euclid(-a, -b), 1.0);
+    /// // limitation due to round-off error
+    /// assert!(f32::math::rem_euclid(-f32::EPSILON, 3.0) != 0.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::rem_euclid`]: ../../../std/primitive.f32.html#method.rem_euclid
+    #[inline]
+    #[doc(alias = "modulo", alias = "mod")]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub fn rem_euclid(x: f32, rhs: f32) -> f32 {
+        let r = x % rhs;
+        if r < 0.0 { r + rhs.abs() } else { r }
+    }
+
+    /// Experimental version of `powi` in `core`. See [`f32::powi`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let x = 2.0_f32;
+    /// let abs_difference = (f32::math::powi(x, 2) - (x * x)).abs();
+    /// assert!(abs_difference <= 1e-5);
+    ///
+    /// assert_eq!(f32::math::powi(f32::NAN, 0), 1.0);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::powi`]: ../../../std/primitive.f32.html#method.powi
+    #[inline]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    pub fn powi(x: f32, n: i32) -> f32 {
+        intrinsics::powif32(x, n)
+    }
+
+    /// Experimental version of `sqrt` in `core`. See [`f32::sqrt`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let positive = 4.0_f32;
+    /// let negative = -4.0_f32;
+    /// let negative_zero = -0.0_f32;
+    ///
+    /// assert_eq!(f32::math::sqrt(positive), 2.0);
+    /// assert!(f32::math::sqrt(negative).is_nan());
+    /// assert_eq!(f32::math::sqrt(negative_zero), negative_zero);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::sqrt`]: ../../../std/primitive.f32.html#method.sqrt
+    #[inline]
+    #[doc(alias = "squareRoot")]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub fn sqrt(x: f32) -> f32 {
+        intrinsics::sqrtf32(x)
+    }
+
+    /// Experimental version of `abs_sub` in `core`. See [`f32::abs_sub`] for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let x = 3.0f32;
+    /// let y = -3.0f32;
+    ///
+    /// let abs_difference_x = (f32::math::abs_sub(x, 1.0) - 2.0).abs();
+    /// let abs_difference_y = (f32::math::abs_sub(y, 1.0) - 0.0).abs();
+    ///
+    /// assert!(abs_difference_x <= 1e-6);
+    /// assert!(abs_difference_y <= 1e-6);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::abs_sub`]: ../../../std/primitive.f32.html#method.abs_sub
+    #[inline]
+    #[stable(feature = "rust1", since = "1.0.0")]
+    #[deprecated(
+        since = "1.10.0",
+        note = "you probably meant `(self - other).abs()`: \
+            this operation is `(self - other).max(0.0)` \
+            except that `abs_sub` also propagates NaNs (also \
+            known as `fdimf` in C). If you truly need the positive \
+            difference, consider using that expression or the C function \
+            `fdimf`, depending on how you wish to handle NaN (please consider \
+            filing an issue describing your use-case too)."
+    )]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub fn abs_sub(x: f32, other: f32) -> f32 {
+        libm::fdimf(x, other)
+    }
+
+    /// Experimental version of `cbrt` in `core`. See [`f32::cbrt`] for details.
+    ///
+    /// # Unspecified precision
+    ///
+    /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
+    /// can even differ within the same execution from one invocation to the next.
+    /// This function currently corresponds to the `cbrtf` from libc on Unix
+    /// and Windows. Note that this might change in the future.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_float_math)]
+    ///
+    /// use core::f32;
+    ///
+    /// let x = 8.0f32;
+    ///
+    /// // x^(1/3) - 2 == 0
+    /// let abs_difference = (f32::math::cbrt(x) - 2.0).abs();
+    ///
+    /// assert!(abs_difference <= 1e-6);
+    /// ```
+    ///
+    /// _This standalone function is for testing only.
+    /// It will be stabilized as an inherent method._
+    ///
+    /// [`f32::cbrt`]: ../../../std/primitive.f32.html#method.cbrt
+    #[inline]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "core_float_math", issue = "137578")]
+    pub fn cbrt(x: f32) -> f32 {
+        libm::cbrtf(x)
     }
 }

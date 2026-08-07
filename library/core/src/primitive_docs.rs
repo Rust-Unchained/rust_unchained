@@ -146,7 +146,7 @@ mod prim_bool {}
 ///
 /// ```ignore (hypothetical-example)
 /// loop {
-///     let (client, request) = get_request().expect("disconnected");
+///     let (client, request) = get_request().expect("server should stay connected");
 ///     let response = request.process();
 ///     response.send(client);
 /// }
@@ -271,6 +271,7 @@ mod prim_bool {}
 /// When the compiler sees a value of type `!` in a [coercion site], it implicitly inserts a
 /// coercion to allow the type checker to infer any type:
 ///
+// FIXME: use `core::convert::absurd` here instead, once it's merged
 /// ```rust,ignore (illustrative-and-has-placeholders)
 /// // this
 /// let x: u8 = panic!();
@@ -281,7 +282,6 @@ mod prim_bool {}
 /// // where absurd is a function with the following signature
 /// // (it's sound, because `!` always marks unreachable code):
 /// fn absurd<T>(_: !) -> T { ... }
-// FIXME: use `core::convert::absurd` here instead, once it's merged
 /// ```
 ///
 /// This can lead to compilation errors if the type cannot be inferred:
@@ -304,17 +304,20 @@ mod prim_bool {}
 /// This is what is known as "never type fallback".
 ///
 /// Historically, the fallback type was [`()`], causing confusing behavior where `!` spontaneously
-/// coerced to `()`, even when it would not infer `()` without the fallback. There are plans to
-/// change it in the [2024 edition] (and possibly in all editions on a later date); see
-/// [Tracking Issue for making `!` fall back to `!`][fallback-ti].
+/// coerced to `()`, even when it would not infer `()` without the fallback. The fallback was changed
+/// to `!` in the [2024 edition], and will be changed in all editions at a later date.
 ///
 /// [coercion site]: <https://doc.rust-lang.org/reference/type-coercions.html#coercion-sites>
 /// [`()`]: prim@unit
-/// [fallback-ti]: <https://github.com/rust-lang/rust/issues/123748>
-/// [2024 edition]: <https://doc.rust-lang.org/nightly/edition-guide/rust-2024/index.html>
+/// [2024 edition]: <https://doc.rust-lang.org/edition-guide/rust-2024/never-type-fallback.html>
 ///
 #[unstable(feature = "never_type", issue = "35121")]
 mod prim_never {}
+
+// Required to make auto trait impls render.
+// See src/librustdoc/passes/collect_trait_impls.rs:collect_trait_impls
+#[doc(hidden)]
+impl ! {}
 
 #[rustc_doc_primitive = "char"]
 #[allow(rustdoc::invalid_rust_codeblocks)]
@@ -588,7 +591,7 @@ impl () {}
 /// # pub unsafe fn malloc(_size: usize) -> *mut core::ffi::c_void { core::ptr::NonNull::dangling().as_ptr() }
 /// # pub unsafe fn free(_ptr: *mut core::ffi::c_void) {}
 /// # }
-/// # #[cfg(any())]
+/// # #[cfg(false)]
 /// #[allow(unused_extern_crates)]
 /// extern crate libc;
 ///
@@ -1330,15 +1333,16 @@ mod prim_f16 {}
 /// such as NaN, +/-Inf, or -0.0 may behave in unexpected ways, but these operations
 /// will never cause undefined behavior.
 ///
-/// Because of the unpredictable nature of compiler optimizations, the same inputs may produce
-/// different results even within a single program run. **Unsafe code must not rely on any property
-/// of the return value for soundness.** However, implementations will generally do their best to
-/// pick a reasonable tradeoff between performance and accuracy of the result.
+/// Algebraic operations are non-deterministic. This means that two invocations of such an operation
+/// with the same inputs may produce different results even within a single program run. No
+/// guarantees are made about the results of individual operations, except that they produce *some*
+/// valid floating-point value. **Unsafe code must not rely on any property of the return value for
+/// soundness.** However, implementations will generally do their best to pick a reasonable tradeoff
+/// between performance and accuracy of the result.
 ///
 /// For example:
 ///
 /// ```
-/// # #![feature(float_algebraic)]
 /// # #![allow(unused_assignments)]
 /// # let mut x: f32 = 0.0;
 /// # let a: f32 = 1.0;
@@ -1357,10 +1361,24 @@ mod prim_f16 {}
 /// # let b: f32 = 2.0;
 /// # let c: f32 = 3.0;
 /// # let d: f32 = 4.0;
-/// x = a + b + c + d; // As written
+/// x = ((a + b) + c) + d; // As written
 /// x = (a + c) + (b + d); // Reordered to shorten critical path and enable vectorization
 /// ```
-
+///
+/// The following example demonstrates the non-determinism:
+///
+/// ```
+/// # #![allow(unused_assignments)]
+/// # let a: f32 = 1.0;
+/// # let b: f32 = 2.0;
+/// let x1 = a.algebraic_add(b);
+/// let x2 = a.algebraic_add(b);
+/// assert_eq!(x1.to_bits(), x1.to_bits()); // this is guaranteed
+/// # if false {
+/// assert_eq!(x1.to_bits(), x2.to_bits()); // but this may fail
+/// assert!(!x2.is_nan()); // this may also fail, even if there was no NaN input
+/// # }
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 mod prim_f32 {}
 
@@ -1428,6 +1446,18 @@ mod prim_i64 {}
 #[rustc_doc_primitive = "i128"]
 //
 /// The 128-bit signed integer type.
+///
+/// # ABI compatibility
+///
+/// Rust's `i128` is expected to be ABI-compatible with C's `__int128` on platforms where the type
+/// is available, which includes most 64-bit architectures. If any platforms that do not specify
+/// `__int128` are updated to introduce it, the Rust `i128` ABI on relevant targets will be changed
+/// to match.
+///
+/// It is important to note that in C, `__int128` is _not_ the same as `_BitInt(128)`, and the two
+/// types are allowed to have different ABIs. In particular, on x86, `__int128` and `_BitInt(128)`
+/// do not use the same alignment. `i128` is intended to always match `__int128` and does not
+/// attempt to match `_BitInt(128)` on platforms without `__int128`.
 #[stable(feature = "i128", since = "1.26.0")]
 mod prim_i128 {}
 
@@ -1458,6 +1488,8 @@ mod prim_u64 {}
 #[rustc_doc_primitive = "u128"]
 //
 /// The 128-bit unsigned integer type.
+///
+/// Please see [the documentation for `i128`](prim@i128) for information on ABI compatibility.
 #[stable(feature = "i128", since = "1.26.0")]
 mod prim_u128 {}
 
@@ -1515,9 +1547,8 @@ mod prim_usize {}
 /// `&mut T` references can be freely coerced into `&T` references with the same referent type, and
 /// references with longer lifetimes can be freely coerced into references with shorter ones.
 ///
-/// Reference equality by address, instead of comparing the values pointed to, is accomplished via
-/// implicit reference-pointer coercion and raw pointer equality via [`ptr::eq`], while
-/// [`PartialEq`] compares values.
+/// [`PartialEq`] will compare referenced values. It is possible to compare the reference address
+/// using reference-pointer coercion and raw pointer equality via [`ptr::eq`].
 ///
 /// ```
 /// use std::ptr;
@@ -1623,7 +1654,7 @@ mod prim_usize {}
 /// * if `size_of_val(t) > 0`, then `t` is dereferenceable for `size_of_val(t)` many bytes
 ///
 /// If `t` points at address `a`, being "dereferenceable" for N bytes means that the memory range
-/// `[a, a + N)` is all contained within a single [allocated object].
+/// `[a, a + N)` is all contained within a single [allocation].
 ///
 /// For instance, this means that unsafe code in a safe function may assume these invariants are
 /// ensured of arguments passed by the caller, and it may assume that these invariants are ensured
@@ -1632,14 +1663,14 @@ mod prim_usize {}
 /// For the other direction, things are more complicated: when unsafe code passes arguments
 /// to safe functions or returns values from safe functions, they generally must *at least*
 /// not violate these invariants. The full requirements are stronger, as the reference generally
-/// must point to data that is safe to use at type `T`.
+/// must point to data that is safe to use as type `T`.
 ///
 /// It is not decided yet whether unsafe code may violate these invariants temporarily on internal
 /// data. As a consequence, unsafe code which violates these invariants temporarily on internal data
 /// may be unsound or become unsound in future versions of Rust depending on how this question is
 /// decided.
 ///
-/// [allocated object]: ptr#allocated-object
+/// [allocation]: ptr#allocation
 #[stable(feature = "rust1", since = "1.0.0")]
 mod prim_ref {}
 
@@ -1762,7 +1793,7 @@ mod prim_ref {}
 /// However, a direct cast back is not possible. You need to use `transmute`:
 ///
 /// ```rust
-/// # #[cfg(not(miri))] { // FIXME: use strict provenance APIs once they are stable, then remove this `cfg`
+/// # #[cfg(not(miri))] { // disabled because it fails with -Zmiri-strict-provenance
 /// # let fnptr: fn(i32) -> i32 = |x| x+2;
 /// # let fnptr_addr = fnptr as usize;
 /// let fnptr = fnptr_addr as *const ();
@@ -1779,6 +1810,7 @@ mod prim_ref {}
 /// have different sizes.
 ///
 /// ### ABI compatibility
+/// [ABI compatibility]: #abi-compatibility
 ///
 /// Generally, when a function is declared with one signature and called via a function pointer with
 /// a different signature, the two signatures must be *ABI-compatible* or else calling the function
@@ -1816,7 +1848,7 @@ mod prim_ref {}
 /// - `*const T`, `*mut T`, `&T`, `&mut T`, `Box<T>` (specifically, only `Box<T, Global>`), and
 ///   `NonNull<T>` are all ABI-compatible with each other for all `T`. They are also ABI-compatible
 ///   with each other for _different_ `T` if they have the same metadata type (`<T as
-///   Pointee>::Metadata`).
+///   Pointee>::Metadata`). However, see the [Control Flow Integrity][cfi-docs] docs for caveats.
 /// - `usize` is ABI-compatible with the `uN` integer type of the same size, and likewise `isize` is
 ///   ABI-compatible with the `iN` integer type of the same size.
 /// - `char` is ABI-compatible with `u32`.
@@ -1833,6 +1865,8 @@ mod prim_ref {}
 /// - If `T` is guaranteed to be subject to the [null pointer
 ///   optimization](option/index.html#representation), and `E` is an enum satisfying the following
 ///   requirements, then `T` and `E` are ABI-compatible. Such an enum `E` is called "option-like".
+///   - The enum `E` uses the [`Rust` representation], and is not modified by the `align` or
+///     `packed` representation modifiers.
 ///   - The enum `E` has exactly two variants.
 ///   - One variant has exactly one field, of type `T`.
 ///   - All fields of the other variant are zero-sized with 1-byte alignment.
@@ -1873,6 +1907,8 @@ mod prim_ref {}
 /// Behavior since transmuting `None::<NonZero<i32>>` to `NonZero<i32>` violates the non-zero
 /// requirement.
 ///
+/// [cfi-docs]: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html#controlflowintegrity
+///
 /// ### Trait implementations
 ///
 /// In this documentation the shorthand `fn(T₁, T₂, …, Tₙ)` is used to represent non-variadic
@@ -1906,6 +1942,7 @@ mod prim_ref {}
 /// [`Pointer`]: fmt::Pointer
 /// [`UnwindSafe`]: panic::UnwindSafe
 /// [`RefUnwindSafe`]: panic::RefUnwindSafe
+/// [`Rust` representation]: <https://doc.rust-lang.org/reference/type-layout.html#the-rust-representation>
 ///
 /// In addition, all *safe* function pointers implement [`Fn`], [`FnMut`], and [`FnOnce`], because
 /// these traits are specially known to the compiler.

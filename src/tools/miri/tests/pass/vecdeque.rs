@@ -1,8 +1,7 @@
-//@revisions: stack tree tree_uniq
+//@revisions: stack tree tree_implicit_writes
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-implicit-writes
 //@compile-flags: -Zmiri-strict-provenance
 //@[tree]compile-flags: -Zmiri-tree-borrows
-//@[tree_uniq]compile-flags: -Zmiri-tree-borrows -Zmiri-unique-is-unique
-
 use std::collections::VecDeque;
 
 fn test_all_refs<'a, T: 'a>(dummy: &mut T, iter: impl Iterator<Item = &'a mut T>) {

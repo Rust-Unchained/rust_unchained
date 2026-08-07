@@ -40,6 +40,10 @@ fn g() {}
 //~^ ERROR suffixes on string literals are invalid
 extern "C" {}
 
-#[rustc_layout_scalar_valid_range_start(0suffix)]
-//~^ ERROR invalid suffix `suffix` for number literal
 struct S;
+
+impl S {
+    #[rustc_confusables("blah"suffix)]
+    //~^ ERROR suffixes on string literals are invalid
+    fn woof() { }
+}

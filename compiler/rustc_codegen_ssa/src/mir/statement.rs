@@ -1,24 +1,42 @@
 use rustc_middle::mir::{self, NonDivergingIntrinsic};
-use rustc_middle::span_bug;
+use rustc_middle::{bug, span_bug, ty};
 use tracing::instrument;
 
 use super::{FunctionCx, LocalRef};
+use crate::mir::retag;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     #[instrument(level = "debug", skip(self, bx))]
     pub(crate) fn codegen_statement(&mut self, bx: &mut Bx, statement: &mir::Statement<'tcx>) {
+        self.codegen_stmt_debuginfos(bx, &statement.debuginfos);
         self.set_debug_loc(bx, statement.source_info);
         match statement.kind {
-            mir::StatementKind::Assign(box (ref place, ref rvalue)) => {
+            mir::StatementKind::Assign((ref place, ref rvalue)) => {
+                let needs_retag = bx.tcx().sess.opts.unstable_opts.codegen_emit_retag.is_some()
+                    && retag::rvalue_needs_retag(rvalue);
+
                 if let Some(index) = place.as_local() {
                     match self.locals[index] {
-                        LocalRef::Place(cg_dest) => self.codegen_rvalue(bx, cg_dest, rvalue),
+                        LocalRef::Place(cg_dest) => {
+                            self.codegen_rvalue(bx, cg_dest, rvalue);
+                            if needs_retag {
+                                self.codegen_retag_place(bx, cg_dest, false);
+                            }
+                        }
                         LocalRef::UnsizedPlace(cg_indirect_dest) => {
-                            self.codegen_rvalue_unsized(bx, cg_indirect_dest, rvalue)
+                            let ty = cg_indirect_dest.layout.ty;
+                            span_bug!(
+                                statement.source_info.span,
+                                "cannot reallocate from `UnsizedPlace({ty})` \
+                                into `{rvalue:?}`; dynamic alloca is not supported",
+                            );
                         }
                         LocalRef::PendingOperand => {
-                            let operand = self.codegen_rvalue_operand(bx, rvalue);
+                            let mut operand = self.codegen_rvalue_operand(bx, rvalue);
+                            if needs_retag {
+                                operand = self.codegen_retag_operand(bx, operand, false);
+                            }
                             self.overwrite_local(index, LocalRef::Operand(operand));
                             self.debug_introduce_local(bx, index);
                         }
@@ -33,21 +51,23 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                             // If the type is zero-sized, it's already been set here,
                             // but we still need to make sure we codegen the operand
-                            self.codegen_rvalue_operand(bx, rvalue);
+                            // and emit a retag.
+                            let operand = self.codegen_rvalue_operand(bx, rvalue);
+                            if needs_retag {
+                                self.codegen_retag_operand(bx, operand, false);
+                            }
                         }
                     }
                 } else {
                     let cg_dest = self.codegen_place(bx, place.as_ref());
                     self.codegen_rvalue(bx, cg_dest, rvalue);
+                    if needs_retag {
+                        self.codegen_retag_place(bx, cg_dest, false);
+                    }
                 }
             }
-            mir::StatementKind::SetDiscriminant { box ref place, variant_index } => {
-                self.codegen_place(bx, place.as_ref()).codegen_set_discr(bx, variant_index);
-            }
-            mir::StatementKind::Deinit(..) => {
-                // For now, don't codegen this to anything. In the future it may be worth
-                // experimenting with what kind of information we can emit to LLVM without hurting
-                // perf here
+            mir::StatementKind::SetDiscriminant { ref place, variant_index } => {
+                self.codegen_place(bx, (**place).as_ref()).codegen_set_discr(bx, variant_index);
             }
             mir::StatementKind::StorageLive(local) => {
                 if let LocalRef::Place(cg_place) = self.locals[local] {
@@ -66,29 +86,34 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             mir::StatementKind::Coverage(ref kind) => {
                 self.codegen_coverage(bx, kind, statement.source_info.scope);
             }
-            mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(ref op)) => {
+            mir::StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(ref op)) => {
                 let op_val = self.codegen_operand(bx, op);
                 bx.assume(op_val.immediate());
             }
-            mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
+            mir::StatementKind::Intrinsic(NonDivergingIntrinsic::CopyNonOverlapping(
                 mir::CopyNonOverlapping { ref count, ref src, ref dst },
             )) => {
                 let dst_val = self.codegen_operand(bx, dst);
                 let src_val = self.codegen_operand(bx, src);
                 let count = self.codegen_operand(bx, count).immediate();
-                let pointee_layout = dst_val
-                    .layout
-                    .pointee_info_at(bx, rustc_abi::Size::ZERO)
-                    .expect("Expected pointer");
-                let bytes = bx.mul(count, bx.const_usize(pointee_layout.size.bytes()));
 
-                let align = pointee_layout.align;
+                let &ty::RawPtr(pointee, _) = dst_val.layout.ty.kind() else {
+                    bug!("expected pointer")
+                };
+                let pointee_layout = bx
+                    .tcx()
+                    .layout_of(bx.typing_env().as_query_input(pointee))
+                    .expect("expected pointee to have a layout");
+                let elem_size = pointee_layout.layout.size().bytes();
+                let bytes = bx.unchecked_sumul(count, bx.const_usize(elem_size));
+
+                let align = pointee_layout.layout.align.abi;
                 let dst = dst_val.immediate();
                 let src = src_val.immediate();
-                bx.memcpy(dst, align, src, align, bytes, crate::MemFlags::empty());
+
+                bx.memcpy(dst, align, src, align, bytes, crate::MemFlags::empty(), None);
             }
             mir::StatementKind::FakeRead(..)
-            | mir::StatementKind::Retag { .. }
             | mir::StatementKind::AscribeUserType(..)
             | mir::StatementKind::ConstEvalCounter
             | mir::StatementKind::PlaceMention(..)

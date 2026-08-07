@@ -1,21 +1,21 @@
 //! Renderer for patterns.
 
-use hir::{db::HirDatabase, Name, StructKind};
-use ide_db::{documentation::HasDocs, SnippetCap};
+use hir::{Name, StructKind, db::HirDatabase};
+use ide_db::{SnippetCap, documentation::HasDocs};
 use itertools::Itertools;
 use syntax::{Edition, SmolStr, ToSmolStr};
 
 use crate::{
+    CompletionItem, CompletionItemKind,
     context::{ParamContext, ParamKind, PathCompletionCtx, PatternContext},
     render::{
-        variant::{format_literal_label, format_literal_lookup, visible_fields},
         RenderContext,
+        variant::{format_literal_label, format_literal_lookup, visible_fields},
     },
-    CompletionItem, CompletionItemKind,
 };
 
 pub(crate) fn render_struct_pat(
-    ctx: RenderContext<'_>,
+    ctx: RenderContext<'_, '_>,
     pattern_ctx: &PatternContext,
     strukt: hir::Struct,
     local_name: Option<Name>,
@@ -44,10 +44,10 @@ pub(crate) fn render_struct_pat(
 }
 
 pub(crate) fn render_variant_pat(
-    ctx: RenderContext<'_>,
+    ctx: RenderContext<'_, '_>,
     pattern_ctx: &PatternContext,
-    path_ctx: Option<&PathCompletionCtx>,
-    variant: hir::Variant,
+    path_ctx: Option<&PathCompletionCtx<'_>>,
+    variant: hir::EnumVariant,
     local_name: Option<Name>,
     path: Option<&hir::ModPath>,
 ) -> Option<CompletionItem> {
@@ -64,11 +64,11 @@ pub(crate) fn render_variant_pat(
         ),
         None => {
             let name = local_name.unwrap_or_else(|| variant.name(ctx.db()));
-            let it = (
+
+            (
                 name.as_str().to_smolstr(),
                 name.display(ctx.db(), ctx.completion.edition).to_smolstr(),
-            );
-            it
+            )
         }
     };
 
@@ -103,21 +103,21 @@ pub(crate) fn render_variant_pat(
     ))
 }
 
-fn build_completion(
-    ctx: RenderContext<'_>,
+fn build_completion<'db>(
+    ctx: RenderContext<'_, 'db>,
     label: SmolStr,
     lookup: SmolStr,
     pat: String,
-    def: impl HasDocs + Copy,
-    adt_ty: hir::Type,
+    def: impl HasDocs,
+    adt_ty: hir::Type<'db>,
     // Missing in context of match statement completions
     is_variant_missing: bool,
 ) -> CompletionItem {
     let mut relevance = ctx.completion_relevance();
+    let adt_ty = ctx.completion.rebase_ty(&adt_ty);
 
-    if is_variant_missing {
-        relevance.type_match = super::compute_type_match(ctx.completion, &adt_ty);
-    }
+    relevance.type_match = super::compute_type_match(ctx.completion, &adt_ty);
+    relevance.is_missing = is_variant_missing;
 
     let mut item = CompletionItem::new(
         CompletionItemKind::Binding,
@@ -126,7 +126,9 @@ fn build_completion(
         ctx.completion.edition,
     );
     item.set_documentation(ctx.docs(def))
-        .set_deprecated(ctx.is_deprecated(def))
+        .set_deprecated(
+            ctx.is_deprecated(def, None /* the two current `def` arguments to this function, `Struct` and `EnumVariant`, both can't be assoc items */),
+        )
         .detail(&pat)
         .lookup_by(lookup)
         .set_relevance(relevance);
@@ -138,7 +140,7 @@ fn build_completion(
 }
 
 fn render_pat(
-    ctx: &RenderContext<'_>,
+    ctx: &RenderContext<'_, '_>,
     pattern_ctx: &PatternContext,
     name: &str,
     kind: StructKind,
@@ -163,6 +165,7 @@ fn render_pat(
         PatternContext {
             param_ctx: Some(ParamContext { kind: ParamKind::Function(_), .. }),
             has_type_ascription: false,
+            parent_pat: None,
             ..
         }
     );
@@ -191,7 +194,7 @@ fn render_record_as_pat(
             format!(
                 "{name} {{ {}{} }}",
                 fields.enumerate().format_with(", ", |(idx, field), f| {
-                    f(&format_args!("{}${}", field.name(db).display(db.upcast(), edition), idx + 1))
+                    f(&format_args!("{}${}", field.name(db).display(db, edition), idx + 1))
                 }),
                 if fields_omitted { ", .." } else { "" },
                 name = name

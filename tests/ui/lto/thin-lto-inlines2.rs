@@ -4,11 +4,14 @@
 //@ aux-build:thin-lto-inlines-aux.rs
 //@ no-prefer-dynamic
 //@ ignore-emscripten can't inspect instructions on emscripten
+//@ ignore-backends: gcc
 
 // We want to assert here that ThinLTO will inline across codegen units. There's
 // not really a great way to do that in general so we sort of hack around it by
 // praying two functions go into separate codegen units and then assuming that
 // if inlining *doesn't* happen the first byte of the functions will differ.
+
+#![allow(function_casts_as_integer)]
 
 extern crate thin_lto_inlines_aux as bar;
 

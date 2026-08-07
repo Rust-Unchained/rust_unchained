@@ -1,5 +1,27 @@
 #![warn(clippy::manual_div_ceil)]
 
+macro_rules! y {
+    () => {
+        let x = 33u32;
+        let _ = (x + 7) / 8;
+        //~^ manual_div_ceil
+        let _ = (7 + x) / 8;
+        //~^ manual_div_ceil
+    };
+}
+
+macro_rules! eight {
+    () => {
+        8
+    };
+}
+
+macro_rules! plus_one {
+    ($val:expr) => {
+        ($val + 1)
+    };
+}
+
 fn main() {
     let x = 7_u32;
     let y = 4_u32;
@@ -32,6 +54,16 @@ fn main() {
     let _ = (z as i32 + (y_i - 1)) / y_i;
     let _ = (7_u32 as i32 + (y_i - 1)) / y_i;
     let _ = (7_u32 as i32 + (4 - 1)) / 4;
+
+    // Test lint with macro
+    y!();
+
+    // Also test if RHS should be result of macro expansion
+    let _ = (33u32 + 7) / eight!();
+    //~^ manual_div_ceil
+
+    let _ = (plus_one!(x) + (y - 1)) / y;
+    //~^ manual_div_ceil
 }
 
 fn issue_13843() {
@@ -76,4 +108,38 @@ fn issue_13950() {
     let _ = (y + -8) / -7;
     let _ = (-8 + y) / -7;
     let _ = (y - 8) / -7;
+}
+
+fn issue_15705(size: u64, c: &u64) {
+    let _ = (size + c - 1) / c;
+    //~^ manual_div_ceil
+}
+
+struct MyStruct(u32);
+impl MyStruct {
+    // Method matching name on different type should not trigger lint
+    fn next_multiple_of(self, y: u32) -> u32 {
+        self.0.next_multiple_of(y)
+    }
+}
+
+fn issue_16219() {
+    let x = 33u32;
+
+    // Lint.
+    let _ = x.next_multiple_of(8) / 8;
+    //~^ manual_div_ceil
+    let _ = u32::next_multiple_of(x, 8) / 8;
+    //~^ manual_div_ceil
+
+    let y = &x;
+    let _ = y.next_multiple_of(8) / 8;
+    //~^ manual_div_ceil
+
+    // No lint.
+    let _ = x.next_multiple_of(8) / 7;
+    let _ = x.next_multiple_of(7) / 8;
+
+    let z = MyStruct(x);
+    let _ = z.next_multiple_of(8) / 8;
 }

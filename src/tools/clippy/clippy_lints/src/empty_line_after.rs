@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::{SpanRangeExt, snippet_indent};
+use clippy_utils::source::{SpanExt, snippet_indent};
 use clippy_utils::tokenize_with_text;
 use itertools::Itertools;
 use rustc_ast::token::CommentKind;
@@ -10,42 +10,7 @@ use rustc_errors::{Applicability, Diag, SuggestionStyle};
 use rustc_lexer::TokenKind;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_session::impl_lint_pass;
-use rustc_span::{BytePos, ExpnKind, Ident, InnerSpan, Span, SpanData, Symbol, kw};
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for empty lines after outer attributes
-    ///
-    /// ### Why is this bad?
-    /// The attribute may have meant to be an inner attribute (`#![attr]`). If
-    /// it was meant to be an outer attribute (`#[attr]`) then the empty line
-    /// should be removed
-    ///
-    /// ### Example
-    /// ```no_run
-    /// #[allow(dead_code)]
-    ///
-    /// fn not_quite_good_code() {}
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// // Good (as inner attribute)
-    /// #![allow(dead_code)]
-    ///
-    /// fn this_is_fine() {}
-    ///
-    /// // or
-    ///
-    /// // Good (as outer attribute)
-    /// #[allow(dead_code)]
-    /// fn this_is_fine_too() {}
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub EMPTY_LINE_AFTER_OUTER_ATTR,
-    suspicious,
-    "empty line after outer attribute"
-}
+use rustc_span::{BytePos, ExpnKind, Ident, InnerSpan, Span, SpanData, Symbol, kw, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -88,22 +53,91 @@ declare_clippy_lint! {
     "empty line after doc comments"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for empty lines after outer attributes
+    ///
+    /// ### Why is this bad?
+    /// The attribute may have meant to be an inner attribute (`#![attr]`). If
+    /// it was meant to be an outer attribute (`#[attr]`) then the empty line
+    /// should be removed
+    ///
+    /// ### Example
+    /// ```no_run
+    /// #[allow(dead_code)]
+    ///
+    /// fn not_quite_good_code() {}
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// // Good (as inner attribute)
+    /// #![allow(dead_code)]
+    ///
+    /// fn this_is_fine() {}
+    ///
+    /// // or
+    ///
+    /// // Good (as outer attribute)
+    /// #[allow(dead_code)]
+    /// fn this_is_fine_too() {}
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub EMPTY_LINE_AFTER_OUTER_ATTR,
+    suspicious,
+    "empty line after outer attribute"
+}
+
+impl_lint_pass!(EmptyLineAfter => [
+    EMPTY_LINE_AFTER_DOC_COMMENTS,
+    EMPTY_LINE_AFTER_OUTER_ATTR,
+]);
+
+/// The kind of the item a doc comment or attribute applies to. Used in lint messages and to
+/// detect the first item of a module or crate. `Other` holds the description string from
+/// `ItemKind::descr` or `assoc_item_descr`.
+#[derive(Debug, Clone, Copy)]
+enum ItemKindDescr {
+    Crate,
+    Module,
+    Other(&'static str),
+}
+
+impl ItemKindDescr {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Crate => "crate",
+            Self::Module => "module",
+            Self::Other(descr) => descr,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ItemInfo {
-    kind: &'static str,
+    kind: ItemKindDescr,
     name: Option<Symbol>,
     span: Span,
     mod_items: Option<NodeId>,
 }
 
+impl ItemInfo {
+    fn new(kind: ItemKindDescr, ident: Option<Ident>, span: Span, mod_items: Option<NodeId>) -> Self {
+        Self {
+            kind,
+            name: ident.map(|ident| ident.name),
+            span: match ident {
+                Some(ident) => span.with_hi(ident.span.hi()),
+                None => span.shrink_to_lo(),
+            },
+            mod_items,
+        }
+    }
+}
+
 pub struct EmptyLineAfter {
     items: Vec<ItemInfo>,
 }
-
-impl_lint_pass!(EmptyLineAfter => [
-    EMPTY_LINE_AFTER_OUTER_ATTR,
-    EMPTY_LINE_AFTER_DOC_COMMENTS,
-]);
 
 impl EmptyLineAfter {
     pub fn new() -> Self {
@@ -129,10 +163,55 @@ struct Stop {
     kind: StopKind,
     first: usize,
     last: usize,
+    name: Option<Symbol>,
 }
 
 impl Stop {
-    fn convert_to_inner(&self) -> (Span, String) {
+    fn is_outer_attr_only(&self) -> bool {
+        let Some(name) = self.name else {
+            return false;
+        };
+        // Check if the attribute only has effect when as an outer attribute
+        // The below attributes are collected from the builtin attributes of The Rust Reference
+        // https://doc.rust-lang.org/reference/attributes.html#r-attributes.builtin
+        // And the comments below are from compiler errors and warnings
+        matches!(
+            name,
+            // Cannot be used at crate level
+            sym::repr | sym::test | sym::derive | sym::automatically_derived | sym::path | sym::global_allocator |
+            // Only has an effect on macro definitions
+            sym::macro_export |
+            // Only be applied to trait definitions
+            sym::on_unimplemented |
+            // Only be placed on trait implementations
+            sym::do_not_recommend |
+            // Only has an effect on items
+            sym::ignore | sym::should_panic | sym::proc_macro | sym::proc_macro_derive | sym::proc_macro_attribute |
+            // Has no effect when applied to a module
+            sym::must_use |
+            // Should be applied to a foreign function or static
+            sym::link_name | sym::link_ordinal | sym::link_section |
+            // Should be applied to an `extern crate` item
+            sym::no_link |
+            // Should be applied to a free function, impl method or static
+            sym::export_name | sym::no_mangle |
+            // Should be applied to a `static` variable
+            sym::used |
+            // Should be applied to function or closure
+            sym::inline |
+            // Should be applied to a function definition
+            sym::cold | sym::target_feature | sym::track_caller | sym::instruction_set |
+            // Should be applied to a struct or enum
+            sym::non_exhaustive |
+            // Note: No any warning when it as an inner attribute, but it has no effect
+            sym::panic_handler
+        )
+    }
+
+    fn convert_to_inner(&self) -> Option<(Span, String)> {
+        if self.is_outer_attr_only() {
+            return None;
+        }
         let inner = match self.kind {
             // #![...]
             StopKind::Attr => InnerSpan::new(1, 1),
@@ -140,7 +219,7 @@ impl Stop {
             //   ^      ^
             StopKind::Doc(_) => InnerSpan::new(2, 3),
         };
-        (self.span.from_inner(inner), "!".into())
+        Some((self.span.from_inner(inner), "!".into()))
     }
 
     fn comment_out(&self, cx: &EarlyContext<'_>, suggestions: &mut Vec<(Span, String)>) {
@@ -172,11 +251,12 @@ impl Stop {
         Some(Self {
             span: attr.span,
             kind: match attr.kind {
-                AttrKind::Normal(_) => StopKind::Attr,
+                AttrKind::Normal(_) | AttrKind::Synthetic(_) => StopKind::Attr,
                 AttrKind::DocComment(comment_kind, _) => StopKind::Doc(comment_kind),
             },
             first: file.lookup_line(file.relative_position(lo))?,
             last: file.lookup_line(file.relative_position(hi))?,
+            name: attr.name(),
         })
     }
 }
@@ -208,7 +288,7 @@ impl<'a> Gap<'a> {
         let prev_stop = prev_chunk.last()?;
         let next_stop = next_chunk.first()?;
         let gap_span = prev_stop.span.between(next_stop.span);
-        let gap_snippet = gap_span.get_source_text(cx)?;
+        let gap_snippet = gap_span.get_text(cx)?;
 
         let mut has_comment = false;
         let mut empty_lines = Vec::new();
@@ -293,8 +373,8 @@ impl EmptyLineAfter {
                 diag.span_label(
                     info.span,
                     match kind {
-                        StopKind::Attr => format!("the attribute applies to this {}", info.kind),
-                        StopKind::Doc(_) => format!("the comment documents this {}", info.kind),
+                        StopKind::Attr => format!("the attribute applies to this {}", info.kind.as_str()),
+                        StopKind::Doc(_) => format!("the comment documents this {}", info.kind.as_str()),
                     },
                 );
 
@@ -318,10 +398,10 @@ impl EmptyLineAfter {
                         stop.comment_out(cx, &mut suggestions);
                     }
                     let name = match info.name {
-                        Some(name) => format!("{} `{name}`", info.kind).into(),
+                        Some(name) => format!("{} `{name}`", info.kind.as_str()).into(),
                         None => Cow::from("the following item"),
                     };
-                    diag.multipart_suggestion_verbose(
+                    diag.multipart_suggestion(
                         format!("if the doc comment should not document {name} then comment it out"),
                         suggestions,
                         Applicability::MaybeIncorrect,
@@ -338,7 +418,7 @@ impl EmptyLineAfter {
                     // Commentless empty gaps between line doc comments, possibly intended to be part of the markdown
 
                     let indent = snippet_indent(cx, first_gap.prev_stop.span).unwrap_or_default();
-                    diag.multipart_suggestion_verbose(
+                    diag.multipart_suggestion(
                         format!("if the documentation should include the empty {lines} include {them} in the comment"),
                         empty_lines()
                             .map(|empty_line| (empty_line, format!("{indent}///")))
@@ -354,53 +434,32 @@ impl EmptyLineAfter {
     /// them to inner attributes/docs
     fn suggest_inner(&self, diag: &mut Diag<'_, ()>, kind: StopKind, gaps: &[Gap<'_>], id: NodeId) {
         if let Some(parent) = self.items.iter().rev().nth(1)
-            && (parent.kind == "module" || parent.kind == "crate")
+            && matches!(parent.kind, ItemKindDescr::Module | ItemKindDescr::Crate)
             && parent.mod_items == Some(id)
+            && let suggestions = gaps
+                .iter()
+                .flat_map(|gap| gap.prev_chunk)
+                .filter_map(Stop::convert_to_inner)
+                .collect::<Vec<_>>()
+            && !suggestions.is_empty()
         {
-            let desc = if parent.kind == "module" {
-                "parent module"
-            } else {
-                parent.kind
+            let desc = match parent.kind {
+                ItemKindDescr::Module => "parent module",
+                _ => parent.kind.as_str(),
             };
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 match kind {
                     StopKind::Attr => format!("if the attribute should apply to the {desc} use an inner attribute"),
                     StopKind::Doc(_) => format!("if the comment should document the {desc} use an inner doc comment"),
                 },
-                gaps.iter()
-                    .flat_map(|gap| gap.prev_chunk)
-                    .map(Stop::convert_to_inner)
-                    .collect(),
+                suggestions,
                 Applicability::MaybeIncorrect,
             );
         }
     }
 
-    fn check_item_kind(
-        &mut self,
-        cx: &EarlyContext<'_>,
-        kind: &ItemKind,
-        ident: Option<Ident>,
-        span: Span,
-        attrs: &[Attribute],
-        id: NodeId,
-    ) {
-        self.items.push(ItemInfo {
-            kind: kind.descr(),
-            name: ident.map(|ident| ident.name),
-            span: match ident {
-                Some(ident) => span.with_hi(ident.span.hi()),
-                None => span.shrink_to_lo(),
-            },
-            mod_items: match kind {
-                ItemKind::Mod(_, _, ModKind::Loaded(items, _, _, _)) => items
-                    .iter()
-                    .filter(|i| !matches!(i.span.ctxt().outer_expn_data().kind, ExpnKind::AstPass(_)))
-                    .map(|i| i.id)
-                    .next(),
-                _ => None,
-            },
-        });
+    fn check_item_kind(&mut self, cx: &EarlyContext<'_>, info: ItemInfo, attrs: &[Attribute], id: NodeId) {
+        self.items.push(info);
 
         let mut outer = attrs
             .iter()
@@ -425,6 +484,7 @@ impl EmptyLineAfter {
                 first: line.line,
                 // last doesn't need to be accurate here, we don't compare it with anything
                 last: line.line,
+                name: None,
             });
         }
 
@@ -446,10 +506,21 @@ impl EmptyLineAfter {
     }
 }
 
+fn assoc_item_descr(kind: &AssocItemKind) -> &'static str {
+    match kind {
+        AssocItemKind::Const(_) => "constant item",
+        AssocItemKind::Fn(_) => "function",
+        AssocItemKind::Type(_) => "type alias",
+        AssocItemKind::MacCall(_) => "item macro invocation",
+        AssocItemKind::Delegation(_) => "delegated function",
+        AssocItemKind::DelegationMac(_) => "delegation",
+    }
+}
+
 impl EarlyLintPass for EmptyLineAfter {
     fn check_crate(&mut self, _: &EarlyContext<'_>, krate: &Crate) {
         self.items.push(ItemInfo {
-            kind: "crate",
+            kind: ItemKindDescr::Crate,
             name: Some(kw::Crate),
             span: krate.spans.inner_span.with_hi(krate.spans.inner_span.lo()),
             mod_items: krate
@@ -472,28 +543,31 @@ impl EarlyLintPass for EmptyLineAfter {
     }
 
     fn check_impl_item(&mut self, cx: &EarlyContext<'_>, item: &Item<AssocItemKind>) {
-        self.check_item_kind(
-            cx,
-            &item.kind.clone().into(),
-            item.kind.ident(),
-            item.span,
-            &item.attrs,
-            item.id,
-        );
+        let kind = ItemKindDescr::Other(assoc_item_descr(&item.kind));
+        let info = ItemInfo::new(kind, item.kind.ident(), item.span, None);
+        self.check_item_kind(cx, info, &item.attrs, item.id);
     }
 
     fn check_trait_item(&mut self, cx: &EarlyContext<'_>, item: &Item<AssocItemKind>) {
-        self.check_item_kind(
-            cx,
-            &item.kind.clone().into(),
-            item.kind.ident(),
-            item.span,
-            &item.attrs,
-            item.id,
-        );
+        let kind = ItemKindDescr::Other(assoc_item_descr(&item.kind));
+        let info = ItemInfo::new(kind, item.kind.ident(), item.span, None);
+        self.check_item_kind(cx, info, &item.attrs, item.id);
     }
 
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        self.check_item_kind(cx, &item.kind, item.kind.ident(), item.span, &item.attrs, item.id);
+        let (kind, mod_items) = match &item.kind {
+            ItemKind::Mod(_, _, ModKind::Loaded(items, _, _)) => {
+                let first = items
+                    .iter()
+                    .filter(|i| !matches!(i.span.ctxt().outer_expn_data().kind, ExpnKind::AstPass(_)))
+                    .map(|i| i.id)
+                    .next();
+                (ItemKindDescr::Module, first)
+            },
+            ItemKind::Mod(..) => (ItemKindDescr::Module, None),
+            _ => (ItemKindDescr::Other(item.kind.descr()), None),
+        };
+        let info = ItemInfo::new(kind, item.kind.ident(), item.span, mod_items);
+        self.check_item_kind(cx, info, &item.attrs, item.id);
     }
 }

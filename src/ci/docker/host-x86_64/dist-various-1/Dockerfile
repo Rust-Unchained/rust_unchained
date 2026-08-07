@@ -55,13 +55,18 @@ RUN ./install-riscv64-none-elf.sh
 COPY host-x86_64/dist-various-1/install-riscv32-none-elf.sh /build
 RUN ./install-riscv32-none-elf.sh
 
-COPY host-x86_64/dist-various-1/install-llvm-mingw.sh /build
-RUN ./install-llvm-mingw.sh
+COPY host-x86_64/dist-various-1/install-emscripten.sh /build
+RUN ./install-emscripten.sh
+
+# Add Emscripten to PATH
+ENV PATH="/build/emsdk:/build/emsdk/upstream/emscripten:/build/emsdk/node/current/bin:${PATH}"
 
 # Suppress some warnings in the openwrt toolchains we downloaded
 ENV STAGING_DIR=/tmp
 
 COPY scripts/musl.sh /build
+COPY scripts/musl-cve-2026-6042.diff /build/
+COPY scripts/musl-cve-2026-40200.diff /build/
 RUN env \
     CC=arm-linux-gnueabi-gcc CFLAGS="-march=armv5te -marm -mfloat-abi=soft" \
     CXX=arm-linux-gnueabi-g++ CXXFLAGS="-march=armv5te -marm -mfloat-abi=soft" \
@@ -108,15 +113,17 @@ ENV TARGETS=$TARGETS,riscv32imac-unknown-none-elf
 ENV TARGETS=$TARGETS,riscv32imafc-unknown-none-elf
 ENV TARGETS=$TARGETS,riscv64imac-unknown-none-elf
 ENV TARGETS=$TARGETS,riscv64gc-unknown-none-elf
-ENV TARGETS=$TARGETS,armebv7r-none-eabi
-ENV TARGETS=$TARGETS,armebv7r-none-eabihf
 ENV TARGETS=$TARGETS,armv7r-none-eabi
+ENV TARGETS=$TARGETS,thumbv7r-none-eabi
 ENV TARGETS=$TARGETS,armv7r-none-eabihf
+ENV TARGETS=$TARGETS,thumbv7r-none-eabihf
+ENV TARGETS=$TARGETS,armv8r-none-eabihf
+ENV TARGETS=$TARGETS,thumbv8r-none-eabihf
 ENV TARGETS=$TARGETS,thumbv7neon-unknown-linux-gnueabihf
 ENV TARGETS=$TARGETS,armv7a-none-eabi
-ENV TARGETS=$TARGETS,aarch64-pc-windows-gnullvm
-ENV TARGETS=$TARGETS,i686-pc-windows-gnullvm
-ENV TARGETS=$TARGETS,x86_64-pc-windows-gnullvm
+ENV TARGETS=$TARGETS,thumbv7a-none-eabi
+ENV TARGETS=$TARGETS,armv7a-none-eabihf
+ENV TARGETS=$TARGETS,thumbv7a-none-eabihf
 
 ENV CFLAGS_armv5te_unknown_linux_musleabi="-march=armv5te -marm -mfloat-abi=soft" \
     CFLAGS_arm_unknown_linux_musleabi="-march=armv6 -marm" \
@@ -130,7 +137,19 @@ ENV CFLAGS_armv5te_unknown_linux_musleabi="-march=armv5te -marm -mfloat-abi=soft
     CC_armv7a_none_eabi=arm-none-eabi-gcc \
     CC_armv7a_none_eabihf=arm-none-eabi-gcc \
     CFLAGS_armv7a_none_eabi=-march=armv7-a \
-    CFLAGS_armv7a_none_eabihf=-march=armv7-a+vfpv3 \
+    CFLAGS_armv7a_none_eabihf=-march=armv7-a+fp \
+    CC_thumbv7a_none_eabi=arm-none-eabi-gcc \
+    CC_thumbv7a_none_eabihf=arm-none-eabi-gcc \
+    CFLAGS_thumbv7a_none_eabi=-march=armv7-a \
+    CFLAGS_thumbv7a_none_eabihf="-march=armv7-a+fp -mfpu=vfpv3-d16" \
+    CC_thumbv7r_none_eabi=arm-none-eabi-gcc \
+    CC_thumbv7r_none_eabihf=arm-none-eabi-gcc \
+    CFLAGS_thumbv7r_none_eabi=-march=armv7-r \
+    CFLAGS_thumbv7r_none_eabihf="-march=armv7-r+fp -mfpu=vfpv3-d16" \
+    CC_armv8r_none_eabihf=arm-none-eabi-gcc \
+    CFLAGS_armv8r_none_eabihf="-march=armv8-r+fp.sp -mfpu=fp-armv8" \
+    CC_thumbv8r_none_eabihf=arm-none-eabi-gcc \
+    CFLAGS_thumbv8r_none_eabihf="-march=armv8-r+fp.sp -mfpu=fp-armv8" \
     CC_aarch64_unknown_none_softfloat=aarch64-none-elf-gcc \
     CFLAGS_aarch64_unknown_none_softfloat=-mstrict-align -march=armv8-a+nofp+nosimd \
     CC_aarch64_unknown_none=aarch64-none-elf-gcc \
@@ -148,21 +167,15 @@ ENV CFLAGS_armv5te_unknown_linux_musleabi="-march=armv5te -marm -mfloat-abi=soft
     CC_riscv64imac_unknown_none_elf=riscv64-unknown-elf-gcc \
     CFLAGS_riscv64imac_unknown_none_elf=-march=rv64imac -mabi=lp64 \
     CC_riscv64gc_unknown_none_elf=riscv64-unknown-elf-gcc \
-    CFLAGS_riscv64gc_unknown_none_elf=-march=rv64gc -mabi=lp64 \
-    CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang \
-    CC_i686_pc_windows_gnullvm=i686-w64-mingw32-clang \
-    CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
+    CFLAGS_riscv64gc_unknown_none_elf=-march=rv64gc -mabi=lp64
 
-ENV RUST_CONFIGURE_ARGS \
-      --musl-root-armv5te=/musl-armv5te \
+ENV RUST_CONFIGURE_ARGS="--musl-root-armv5te=/musl-armv5te \
       --musl-root-arm=/musl-arm \
       --musl-root-armhf=/musl-armhf \
       --musl-root-armv7hf=/musl-armv7hf \
-      --disable-docs
+      --disable-docs"
 
-ENV SCRIPT \
-      python3 ../x.py --stage 2 test --host='' --target $RUN_MAKE_TARGETS tests/run-make && \
-      python3 ../x.py dist --host='' --target $TARGETS
+ENV SCRIPT="python3 ../x.py dist --host= --target $TARGETS"
 
 # sccache
 COPY scripts/sccache.sh /scripts/

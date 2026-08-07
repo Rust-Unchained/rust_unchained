@@ -13,22 +13,27 @@
 //! See also a neighboring `body` module.
 
 pub mod format_args;
+pub mod generics;
 pub mod type_ref;
 
-use std::fmt;
+use std::{fmt, mem};
 
-use hir_expand::{name::Name, MacroDefId};
+use hir_expand::{MacroDefId, name::Name};
 use intern::Symbol;
-use la_arena::Idx;
-use rustc_apfloat::ieee::{Half as f16, Quad as f128};
+use la_arena::{Idx, RawIdx};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use syntax::ast;
+use thin_vec::ThinVec;
 use type_ref::TypeRefId;
 
 use crate::{
+    BlockId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    path::{GenericArgs, Path},
+    expr_store::{
+        HygieneId,
+        path::{GenericArgs, Path},
+    },
     type_ref::{Mutability, Rawness},
-    BlockId, ConstBlockId,
 };
 
 pub use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
@@ -39,8 +44,6 @@ pub type ExprId = Idx<Expr>;
 
 pub type PatId = Idx<Pat>;
 
-// FIXME: Encode this as a single u32, we won't ever reach all 32 bits especially given these counts
-// are local to the body.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ExprOrPatId {
     ExprId(ExprId),
@@ -70,7 +73,83 @@ impl ExprOrPatId {
         matches!(self, Self::PatId(_))
     }
 }
-stdx::impl_from!(ExprId, PatId for ExprOrPatId);
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq, salsa::Update)]
+pub struct ExprOrPatIdPacked(u32);
+
+const _: () = assert!(mem::size_of::<ExprOrPatIdPacked>() == mem::size_of::<u32>());
+
+impl ExprOrPatIdPacked {
+    const PAT_BIT: u32 = 1 << (u32::BITS - 1);
+    const INDEX_MASK: u32 = !Self::PAT_BIT;
+
+    pub fn unpack(self) -> ExprOrPatId {
+        match self.is_expr() {
+            true => ExprOrPatId::ExprId(ExprId::from_raw(RawIdx::from_u32(self.0))),
+            false => {
+                ExprOrPatId::PatId(PatId::from_raw(RawIdx::from_u32(self.0 & Self::INDEX_MASK)))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn as_expr(self) -> Option<ExprId> {
+        self.is_expr().then(|| ExprId::from_raw(RawIdx::from_u32(self.0)))
+    }
+
+    #[inline]
+    pub fn is_expr(&self) -> bool {
+        self.0 & Self::PAT_BIT == 0
+    }
+
+    #[inline]
+    pub fn as_pat(self) -> Option<PatId> {
+        self.is_pat().then(|| PatId::from_raw(RawIdx::from_u32(self.0 & Self::INDEX_MASK)))
+    }
+
+    #[inline]
+    pub fn is_pat(&self) -> bool {
+        self.0 & Self::PAT_BIT != 0
+    }
+}
+
+impl fmt::Debug for ExprOrPatIdPacked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.unpack() {
+            ExprOrPatId::ExprId(id) => f.debug_tuple("ExprId").field(&id).finish(),
+            ExprOrPatId::PatId(id) => f.debug_tuple("PatId").field(&id).finish(),
+        }
+    }
+}
+
+impl From<ExprId> for ExprOrPatIdPacked {
+    fn from(value: ExprId) -> Self {
+        let value = value.into_raw().into_u32();
+        // virtually impossible to have IDs that high
+        debug_assert_eq!(value & Self::PAT_BIT, 0);
+        Self(value)
+    }
+}
+
+impl From<PatId> for ExprOrPatId {
+    fn from(value: PatId) -> Self {
+        ExprOrPatId::PatId(value)
+    }
+}
+impl From<ExprId> for ExprOrPatId {
+    fn from(value: ExprId) -> Self {
+        ExprOrPatId::ExprId(value)
+    }
+}
+
+impl From<PatId> for ExprOrPatIdPacked {
+    fn from(value: PatId) -> Self {
+        let value = value.into_raw().into_u32();
+        // virtually impossible to have IDs that high
+        debug_assert_eq!(value & Self::PAT_BIT, 0);
+        Self(value | Self::PAT_BIT)
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Label {
@@ -90,19 +169,19 @@ impl FloatTypeWrapper {
         Self(sym)
     }
 
-    pub fn to_f128(&self) -> f128 {
+    pub fn to_f128(&self) -> Quad {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f64(&self) -> f64 {
+    pub fn to_f64(&self) -> Double {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f32(&self) -> f32 {
+    pub fn to_f32(&self) -> Single {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f16(&self) -> f16 {
+    pub fn to_f16(&self) -> Half {
         self.0.as_str().parse().unwrap_or_default()
     }
 }
@@ -137,11 +216,7 @@ pub enum LiteralOrConst {
 
 impl Literal {
     pub fn negate(self) -> Option<Self> {
-        if let Literal::Int(i, k) = self {
-            Some(Literal::Int(-i, k))
-        } else {
-            None
-        }
+        if let Literal::Int(i, k) = self { Some(Literal::Int(-i, k)) } else { None }
     }
 }
 
@@ -187,6 +262,13 @@ impl From<ast::LiteralKind> for Literal {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Copy)]
+pub enum RecordSpread {
+    None,
+    FieldDefaults,
+    Expr(ExprId),
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Expr {
     /// This is produced if the syntax tree does not have a required expression piece.
@@ -207,12 +289,7 @@ pub enum Expr {
         tail: Option<ExprId>,
         label: Option<LabelId>,
     },
-    Async {
-        id: Option<BlockId>,
-        statements: Box<[Statement]>,
-        tail: Option<ExprId>,
-    },
-    Const(ConstBlockId),
+    Const(ExprId),
     // FIXME: Fold this into Block with an unsafe flag?
     Unsafe {
         id: Option<BlockId>,
@@ -222,6 +299,7 @@ pub enum Expr {
     Loop {
         body: ExprId,
         label: Option<LabelId>,
+        source: LoopSource,
     },
     Call {
         callee: ExprId,
@@ -257,9 +335,9 @@ pub enum Expr {
         expr: Option<ExprId>,
     },
     RecordLit {
-        path: Option<Box<Path>>,
-        fields: Box<[RecordLitField]>,
-        spread: Option<ExprId>,
+        path: Path,
+        fields: ThinVec<RecordLitField>,
+        spread: RecordSpread,
     },
     Field {
         expr: ExprId,
@@ -276,9 +354,6 @@ pub enum Expr {
         expr: ExprId,
         rawness: Rawness,
         mutability: Mutability,
-    },
-    Box {
-        expr: ExprId,
     },
     UnaryOp {
         expr: ExprId,
@@ -320,6 +395,85 @@ pub enum Expr {
     Underscore,
     OffsetOf(OffsetOf),
     InlineAsm(InlineAsm),
+    IncludeBytes,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Expr>() == 48);
+
+impl Expr {
+    pub fn precedence(&self) -> ast::prec::ExprPrecedence {
+        use ast::prec::ExprPrecedence;
+
+        match self {
+            Expr::Array(_)
+            | Expr::InlineAsm(_)
+            | Expr::Block { .. }
+            | Expr::Unsafe { .. }
+            | Expr::Const(_)
+            | Expr::If { .. }
+            | Expr::Literal(_)
+            | Expr::Loop { .. }
+            | Expr::Match { .. }
+            | Expr::Missing
+            | Expr::Path(_)
+            | Expr::RecordLit { .. }
+            | Expr::Tuple { .. }
+            | Expr::OffsetOf(_)
+            | Expr::Underscore
+            | Expr::IncludeBytes => ExprPrecedence::Unambiguous,
+
+            Expr::Await { .. }
+            | Expr::Call { .. }
+            | Expr::Field { .. }
+            | Expr::Index { .. }
+            | Expr::MethodCall { .. } => ExprPrecedence::Postfix,
+
+            Expr::Let { .. } | Expr::UnaryOp { .. } | Expr::Ref { .. } => ExprPrecedence::Prefix,
+
+            Expr::Cast { .. } => ExprPrecedence::Cast,
+
+            Expr::BinaryOp { op, .. } => match op {
+                None => ExprPrecedence::Unambiguous,
+                Some(BinaryOp::LogicOp(LogicOp::Or)) => ExprPrecedence::LOr,
+                Some(BinaryOp::LogicOp(LogicOp::And)) => ExprPrecedence::LAnd,
+                Some(BinaryOp::CmpOp(_)) => ExprPrecedence::Compare,
+                Some(BinaryOp::Assignment { .. }) => ExprPrecedence::Assign,
+                Some(BinaryOp::ArithOp(arith_op)) => match arith_op {
+                    ArithOp::Add | ArithOp::Sub => ExprPrecedence::Sum,
+                    ArithOp::Mul | ArithOp::Div | ArithOp::Rem => ExprPrecedence::Product,
+                    ArithOp::Shl | ArithOp::Shr => ExprPrecedence::Shift,
+                    ArithOp::BitXor => ExprPrecedence::BitXor,
+                    ArithOp::BitOr => ExprPrecedence::BitOr,
+                    ArithOp::BitAnd => ExprPrecedence::BitAnd,
+                },
+            },
+
+            Expr::Assignment { .. } => ExprPrecedence::Assign,
+
+            Expr::Become { .. }
+            | Expr::Break { .. }
+            | Expr::Closure { .. }
+            | Expr::Return { .. }
+            | Expr::Yeet { .. }
+            | Expr::Yield { .. } => ExprPrecedence::Jump,
+
+            Expr::Continue { .. } => ExprPrecedence::Unambiguous,
+
+            Expr::Range { .. } => ExprPrecedence::Range,
+        }
+    }
+}
+
+/// The loop type that yielded an `Expr::Loop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopSource {
+    /// A `loop { .. }` loop.
+    Loop,
+    /// A `while _ { .. }` loop.
+    While,
+    /// A `for _ in _ { .. }` loop.
+    ForLoop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +486,17 @@ pub struct OffsetOf {
 pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
     pub options: AsmOptions,
+    pub kind: InlineAsmKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InlineAsmKind {
+    /// `asm!()`.
+    Asm,
+    /// `global_asm!()`.
+    GlobalAsm,
+    /// `naked_asm!()`.
+    NakedAsm,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -446,11 +611,36 @@ pub enum InlineAsmRegOrRegClass {
     RegClass(Symbol),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoroutineKind {
+    Async,
+    Gen,
+    AsyncGen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClosureKind {
     Closure,
-    Coroutine(Movability),
-    Async,
+    OldCoroutine(Movability),
+    Coroutine { kind: CoroutineKind, source: CoroutineSource },
+    CoroutineClosure(CoroutineKind),
+}
+
+/// In the case of a coroutine created as part of an async/gen construct,
+/// which kind of async/gen construct caused it to be created?
+///
+/// This helps error messages but is also used to drive coercions in
+/// type-checking (see #60424).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
+pub enum CoroutineSource {
+    /// An explicit `async`/`gen` block written by the user.
+    Block,
+
+    /// An explicit `async`/`gen` closure written by the user.
+    Closure,
+
+    /// The `async`/`gen` block generated as the body of an async/gen function.
+    Fn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,7 +651,7 @@ pub enum CaptureBy {
     Ref,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Movability {
     Static,
     Movable,
@@ -555,6 +745,9 @@ pub struct Binding {
     pub name: Name,
     pub mode: BindingAnnotation,
     pub problems: Option<BindingProblems>,
+    /// Note that this may not be the direct `SyntaxContextId` of the binding's expansion, because transparent
+    /// expansions are attributed to their parent expansion (recursively).
+    pub hygiene: HygieneId,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -567,6 +760,8 @@ pub struct RecordFieldPat {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Pat {
     Missing,
+    /// A rest pattern. Not valid outside special context.
+    Rest,
     Wild,
     Tuple {
         args: Box<[PatId]>,
@@ -574,20 +769,20 @@ pub enum Pat {
     },
     Or(Box<[PatId]>),
     Record {
-        path: Option<Box<Path>>,
+        path: Path,
         args: Box<[RecordFieldPat]>,
         ellipsis: bool,
     },
     Range {
         start: Option<ExprId>,
         end: Option<ExprId>,
+        range_type: RangeOp,
     },
     Slice {
         prefix: Box<[PatId]>,
         slice: Option<PatId>,
         suffix: Box<[PatId]>,
     },
-    /// This might refer to a variable if a single segment path (specifically, on destructuring assignment).
     Path(Path),
     Lit(ExprId),
     Bind {
@@ -595,7 +790,7 @@ pub enum Pat {
         subpat: Option<PatId>,
     },
     TupleStruct {
-        path: Option<Box<Path>>,
+        path: Path,
         args: Box<[PatId]>,
         ellipsis: Option<u32>,
     },
@@ -606,6 +801,10 @@ pub enum Pat {
     Box {
         inner: PatId,
     },
+    Deref {
+        inner: PatId,
+    },
+    NotNull,
     ConstBlock(ExprId),
     /// An expression inside a pattern. That can only occur inside assignments.
     ///
@@ -622,7 +821,9 @@ impl Pat {
             | Pat::ConstBlock(..)
             | Pat::Wild
             | Pat::Missing
-            | Pat::Expr(_) => {}
+            | Pat::Rest
+            | Pat::Expr(_)
+            | Pat::NotNull => {}
             Pat::Bind { subpat, .. } => {
                 subpat.iter().copied().for_each(f);
             }
@@ -637,7 +838,7 @@ impl Pat {
             Pat::Record { args, .. } => {
                 args.iter().map(|f| f.pat).for_each(f);
             }
-            Pat::Box { inner } => f(*inner),
+            Pat::Box { inner } | Pat::Deref { inner } => f(*inner),
         }
     }
 }

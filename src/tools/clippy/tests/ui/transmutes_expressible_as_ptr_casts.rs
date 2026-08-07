@@ -4,6 +4,7 @@
 #![warn(clippy::useless_transmute)]
 #![warn(clippy::transmute_ptr_to_ptr)]
 #![allow(unused, clippy::borrow_as_ptr, clippy::missing_transmute_annotations)]
+#![allow(function_casts_as_integer)]
 
 use std::mem::{size_of, transmute};
 
@@ -13,9 +14,6 @@ fn main() {
     // We should see an error message for each transmute, and no error messages for
     // the casts, since the casts are the recommended fixes.
 
-    // e is an integer and U is *U_0, while U_0: Sized; addr-ptr-cast
-    let _ptr_i32_transmute = unsafe { transmute::<usize, *const i32>(usize::MAX) };
-    //~^ useless_transmute
     let ptr_i32 = usize::MAX as *const i32;
 
     // e has type *T, U is *U_0, and either U_0: Sized ...

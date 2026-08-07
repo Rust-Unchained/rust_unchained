@@ -1,14 +1,14 @@
-use crate::{utils, AssistContext, Assists};
+use crate::{AssistContext, Assists, utils};
 use ide_db::{
     assists::{AssistId, AssistKind},
-    syntax_helpers::format_string_exprs::{parse_format_exprs, Arg},
+    syntax_helpers::format_string_exprs::{Arg, parse_format_exprs},
 };
 use itertools::Itertools;
 use syntax::{
-    ast::{self, make},
-    ted, AstNode, AstToken, NodeOrToken,
+    AstNode, AstToken, NodeOrToken,
     SyntaxKind::WHITESPACE,
-    T,
+    SyntaxToken, T,
+    ast::{self, TokenTree},
 };
 
 // Assist: extract_expressions_from_format_string
@@ -30,7 +30,7 @@ use syntax::{
 
 pub(crate) fn extract_expressions_from_format_string(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let fmt_string = ctx.find_token_at_offset::<ast::String>()?;
     let tt = fmt_string.syntax().parent().and_then(ast::TokenTree::cast)?;
@@ -52,30 +52,39 @@ pub(crate) fn extract_expressions_from_format_string(
             } else {
                 AssistKind::QuickFix
             },
+            None,
         ),
         "Extract format expressions",
         tt.syntax().text_range(),
         |edit| {
-            let tt = edit.make_mut(tt);
-
+            let editor = edit.make_editor(tt.syntax());
+            let make = editor.make();
             // Extract existing arguments in macro
-            let tokens = tt.token_trees_and_tokens().collect_vec();
+            let mut raw_tokens = tt.token_trees_and_tokens().skip(1).collect_vec();
+            let format_string_index = format_str_index(&raw_tokens, &fmt_string);
+            let tokens = raw_tokens.split_off(format_string_index);
 
-            let existing_args = if let [_opening_bracket, NodeOrToken::Token(_format_string), _args_start_comma, tokens @ .., NodeOrToken::Token(_end_bracket)] =
-                tokens.as_slice()
+            let existing_args = if let [
+                NodeOrToken::Token(_format_string),
+                _args_start_comma,
+                tokens @ ..,
+                NodeOrToken::Token(_end_bracket),
+            ] = tokens.as_slice()
             {
-                let args = tokens.split(|it| matches!(it, NodeOrToken::Token(t) if t.kind() == T![,])).map(|arg| {
-                    // Strip off leading and trailing whitespace tokens
-                    let arg = match arg.split_first() {
-                        Some((NodeOrToken::Token(t), rest)) if t.kind() == WHITESPACE => rest,
-                        _ => arg,
-                    };
-                    let arg = match arg.split_last() {
-                        Some((NodeOrToken::Token(t), rest)) if t.kind() == WHITESPACE => rest,
-                        _ => arg,
-                    };
-                    arg
-                });
+                let args = tokens
+                    .split(|it| matches!(it, NodeOrToken::Token(t) if t.kind() == T![,]))
+                    .map(|arg| {
+                        // Strip off leading and trailing whitespace tokens
+                        let arg = match arg.split_first() {
+                            Some((NodeOrToken::Token(t), rest)) if t.kind() == WHITESPACE => rest,
+                            _ => arg,
+                        };
+
+                        match arg.split_last() {
+                            Some((NodeOrToken::Token(t), rest)) if t.kind() == WHITESPACE => rest,
+                            _ => arg,
+                        }
+                    });
 
                 args.collect()
             } else {
@@ -84,24 +93,25 @@ pub(crate) fn extract_expressions_from_format_string(
 
             // Start building the new args
             let mut existing_args = existing_args.into_iter();
-            let mut new_tt_bits = vec![NodeOrToken::Token(make::tokens::literal(&new_fmt))];
+            let mut new_tt_bits = raw_tokens;
             let mut placeholder_indexes = vec![];
+
+            new_tt_bits.push(NodeOrToken::Token(make.expr_literal(&new_fmt).token().clone()));
 
             for arg in extracted_args {
                 if matches!(arg, Arg::Expr(_) | Arg::Placeholder) {
                     // insert ", " before each arg
                     new_tt_bits.extend_from_slice(&[
-                        NodeOrToken::Token(make::token(T![,])),
-                        NodeOrToken::Token(make::tokens::single_space()),
+                        NodeOrToken::Token(make.token(T![,])),
+                        NodeOrToken::Token(make.whitespace(" ")),
                     ]);
                 }
 
                 match arg {
                     Arg::Expr(s) => {
                         // insert arg
-                        // FIXME: use the crate's edition for parsing
-                        let expr = ast::Expr::parse(&s, syntax::Edition::CURRENT_FIXME).syntax_node();
-                        let mut expr_tt = utils::tt_from_syntax(expr);
+                        let expr = ast::Expr::parse(&s, ctx.edition()).syntax_node();
+                        let mut expr_tt = utils::tt_from_syntax(expr, make);
                         new_tt_bits.append(&mut expr_tt);
                     }
                     Arg::Placeholder => {
@@ -112,7 +122,7 @@ pub(crate) fn extract_expressions_from_format_string(
                             }
                             None => {
                                 placeholder_indexes.push(new_tt_bits.len());
-                                new_tt_bits.push(NodeOrToken::Token(make::token(T![_])));
+                                new_tt_bits.push(NodeOrToken::Token(make.token(T![_])));
                             }
                         }
                     }
@@ -120,10 +130,9 @@ pub(crate) fn extract_expressions_from_format_string(
                 }
             }
 
-
             // Insert new args
-            let new_tt = make::token_tree(tt_delimiter, new_tt_bits).clone_for_update();
-            ted::replace(tt.syntax(), new_tt.syntax());
+            let new_tt = make.token_tree(tt_delimiter, new_tt_bits);
+            editor.replace(tt.syntax(), new_tt.syntax());
 
             if let Some(cap) = ctx.config.snippet_cap {
                 // Add placeholder snippets over placeholder args
@@ -136,19 +145,35 @@ pub(crate) fn extract_expressions_from_format_string(
                     };
 
                     if stdx::always!(placeholder.kind() == T![_]) {
-                        edit.add_placeholder_snippet_token(cap, placeholder);
+                        let annotation = edit.make_placeholder_snippet(cap);
+                        editor.add_annotation(placeholder, annotation);
                     }
                 }
 
                 // Add the final tabstop after the format literal
-                if let Some(NodeOrToken::Token(literal)) = new_tt.token_trees_and_tokens().nth(1) {
-                    edit.add_tabstop_after_token(cap, literal);
+                if let Some(NodeOrToken::Token(literal)) =
+                    new_tt.token_trees_and_tokens().nth(1 + format_string_index)
+                {
+                    let annotation = edit.make_tabstop_after(cap);
+                    editor.add_annotation(literal, annotation);
                 }
             }
+            edit.add_file_edits(ctx.vfs_file_id(), editor);
         },
     );
 
     Some(())
+}
+
+fn format_str_index(
+    raw_tokens: &[NodeOrToken<TokenTree, SyntaxToken>],
+    fmt_string: &ast::String,
+) -> usize {
+    let fmt_string = fmt_string.syntax();
+    raw_tokens
+        .iter()
+        .position(|tt| tt.as_token().is_some_and(|tt| tt == fmt_string))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -169,6 +194,24 @@ fn main() {
             r#"
 fn main() {
     print!("{} {:b} {}"$0, y + 2, x + 1, 2);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn multiple_middle_arg_on_write() {
+        check_assist(
+            extract_expressions_from_format_string,
+            r#"
+//- minicore: write
+fn main() {
+    write!(writer(), "{} {x + 1:b} {}$0", y + 2, 2);
+}
+"#,
+            r#"
+fn main() {
+    write!(writer(), "{} {:b} {}"$0, y + 2, x + 1, 2);
 }
 "#,
         );

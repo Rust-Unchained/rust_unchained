@@ -1,5 +1,6 @@
 #![warn(clippy::or_then_unwrap)]
-#![allow(clippy::map_identity, clippy::let_unit_value, clippy::unnecessary_literal_unwrap)]
+#![allow(clippy::unnecessary_literal_unwrap)]
+#![expect(clippy::let_unit_value, clippy::map_identity)]
 
 struct SomeStruct;
 impl SomeStruct {
@@ -25,6 +26,12 @@ fn main() {
 
     let result: Result<&str, &str> = Err("Error");
     let _ = result.unwrap_or("fallback"); // should trigger lint
+    //
+    //~^^ or_then_unwrap
+
+    // Call with macro should preserve the macro call rather than expand it
+    let option: Option<Vec<&str>> = None;
+    let _ = option.unwrap_or(vec!["fallback"]); // should trigger lint
     //
     //~^^ or_then_unwrap
 

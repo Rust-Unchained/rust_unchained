@@ -1,14 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::visitors::for_each_expr_without_closures;
-use clippy_utils::{eq_expr_value, higher};
+use clippy_utils::{eq_expr_value, higher, sym};
 use core::ops::ControlFlow;
 use rustc_errors::Diag;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
+use rustc_span::SyntaxContext;
 use rustc_span::edition::Edition::Edition2024;
-use rustc_span::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -62,9 +62,10 @@ impl<'tcx> LateLintPass<'tcx> for IfLetMutex {
             if_else: Some(if_else),
             ..
         }) = higher::IfLet::hir(cx, expr)
-            && let Some(op_mutex) = for_each_expr_without_closures(let_expr, |e| mutex_lock_call(cx, e, None))
+            && let ctxt = expr.span.ctxt()
+            && let Some(op_mutex) = for_each_expr_without_closures(let_expr, |e| mutex_lock_call(cx, ctxt, e, None))
             && let Some(arm_mutex) =
-                for_each_expr_without_closures((if_then, if_else), |e| mutex_lock_call(cx, e, Some(op_mutex)))
+                for_each_expr_without_closures((if_then, if_else), |e| mutex_lock_call(cx, ctxt, e, Some(op_mutex)))
         {
             let diag = |diag: &mut Diag<'_, ()>| {
                 diag.span_label(
@@ -90,14 +91,15 @@ impl<'tcx> LateLintPass<'tcx> for IfLetMutex {
 
 fn mutex_lock_call<'tcx>(
     cx: &LateContext<'tcx>,
+    ctxt: SyntaxContext,
     expr: &'tcx Expr<'_>,
     op_mutex: Option<&'tcx Expr<'_>>,
 ) -> ControlFlow<&'tcx Expr<'tcx>> {
     if let ExprKind::MethodCall(path, self_arg, [], _) = &expr.kind
-        && path.ident.as_str() == "lock"
+        && path.ident.name == sym::lock
         && let ty = cx.typeck_results().expr_ty(self_arg).peel_refs()
-        && is_type_diagnostic_item(cx, ty, sym::Mutex)
-        && op_mutex.is_none_or(|op| eq_expr_value(cx, self_arg, op))
+        && ty.is_diag_item(cx, sym::Mutex)
+        && op_mutex.is_none_or(|op| eq_expr_value(cx, ctxt, self_arg, op))
     {
         ControlFlow::Break(self_arg)
     } else {

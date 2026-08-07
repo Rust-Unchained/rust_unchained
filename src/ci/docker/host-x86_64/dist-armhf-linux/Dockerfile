@@ -4,6 +4,7 @@ COPY scripts/cross-apt-packages.sh /scripts/
 RUN sh /scripts/cross-apt-packages.sh
 
 COPY scripts/crosstool-ng.sh /scripts/
+COPY scripts/crosstool-ng-sha256-20260705.diff /scripts/
 RUN sh /scripts/crosstool-ng.sh
 
 COPY scripts/rustbuild-setup.sh /scripts/
@@ -25,5 +26,5 @@ ENV CC_arm_unknown_linux_gnueabihf=arm-unknown-linux-gnueabihf-gcc \
 
 ENV HOSTS=arm-unknown-linux-gnueabihf
 
-ENV RUST_CONFIGURE_ARGS --enable-full-tools --enable-profiler --disable-docs
-ENV SCRIPT python3 ../x.py dist --host $HOSTS --target $HOSTS
+ENV RUST_CONFIGURE_ARGS="--enable-full-tools --enable-profiler --disable-docs"
+ENV SCRIPT="python3 ../x.py dist --host $HOSTS --target $HOSTS"

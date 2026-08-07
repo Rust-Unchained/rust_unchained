@@ -1,5 +1,4 @@
 #![feature(fn_delegation)]
-#![allow(incomplete_features)]
 
 mod default_param {
     pub trait Trait<T = u32> {
@@ -24,20 +23,6 @@ mod bounds {
     }
 
     impl<T> Trait<T> for u8 {}
-}
-
-mod generic_arguments {
-    trait Trait<T> {
-        fn foo<U>(&self, _: U, _: T) {}
-    }
-
-    impl<T> Trait<T> for u8 {}
-
-    reuse Trait::<_>::foo::<i32> as generic_arguments1;
-    //~^ ERROR mismatched types
-    reuse <u8 as Trait<_>>::foo as generic_arguments2;
-    //~^ ERROR mismatched types
-    reuse <_ as Trait<_>>::foo as generic_arguments3; // OK
 }
 
 reuse default_param::Trait::foo as default_param;

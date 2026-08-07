@@ -1,6 +1,6 @@
 use crate::inherent::*;
 use crate::visit::Flags;
-use crate::{self as ty, Interner};
+use crate::{self as ty, Interner, Region};
 
 bitflags::bitflags! {
     /// Flags that we track on types. These flags are propagated upwards
@@ -74,36 +74,41 @@ bitflags::bitflags! {
         /// Does this have `Projection`?
         const HAS_TY_PROJECTION           = 1 << 10;
         /// Does this have `Free` aliases?
-        const HAS_TY_FREE_ALIAS                 = 1 << 11;
+        const HAS_TY_FREE_ALIAS           = 1 << 11;
         /// Does this have `Opaque`?
         const HAS_TY_OPAQUE               = 1 << 12;
         /// Does this have `Inherent`?
         const HAS_TY_INHERENT             = 1 << 13;
-        /// Does this have `ConstKind::Unevaluated`?
-        const HAS_CT_PROJECTION           = 1 << 14;
+        /// Does this have `ConstKind::Alias`?
+        const HAS_CONST_ALIAS           = 1 << 14;
 
-        /// Does this have `Alias` or `ConstKind::Unevaluated`?
+        /// Does this have `Alias` or `ConstKind::Alias`?
         ///
         /// Rephrased, could this term be normalized further?
         const HAS_ALIAS                   = TypeFlags::HAS_TY_PROJECTION.bits()
                                           | TypeFlags::HAS_TY_FREE_ALIAS.bits()
                                           | TypeFlags::HAS_TY_OPAQUE.bits()
                                           | TypeFlags::HAS_TY_INHERENT.bits()
-                                          | TypeFlags::HAS_CT_PROJECTION.bits();
+                                          | TypeFlags::HAS_CONST_ALIAS.bits();
 
+        /// Is a type or const error reachable?
+        const HAS_NON_REGION_ERROR          = 1 << 15;
+        /// Is a region error reachable?
+        const HAS_RE_ERROR                = 1 << 16;
         /// Is an error type/lifetime/const reachable?
-        const HAS_ERROR                   = 1 << 15;
+        const HAS_ERROR                   = TypeFlags::HAS_NON_REGION_ERROR.bits()
+                                          | TypeFlags::HAS_RE_ERROR.bits();
 
         /// Does this have any region that "appears free" in the type?
         /// Basically anything but `ReBound` and `ReErased`.
-        const HAS_FREE_REGIONS            = 1 << 16;
+        const HAS_FREE_REGIONS            = 1 << 17;
 
         /// Does this have any `ReBound` regions?
-        const HAS_RE_BOUND                = 1 << 17;
+        const HAS_RE_BOUND                = 1 << 18;
         /// Does this have any `Bound` types?
-        const HAS_TY_BOUND                = 1 << 18;
+        const HAS_TY_BOUND                = 1 << 19;
         /// Does this have any `ConstKind::Bound` consts?
-        const HAS_CT_BOUND                = 1 << 19;
+        const HAS_CT_BOUND                = 1 << 20;
         /// Does this have any bound variables?
         /// Used to check if a global bound is safe to evaluate.
         const HAS_BOUND_VARS              = TypeFlags::HAS_RE_BOUND.bits()
@@ -111,7 +116,12 @@ bitflags::bitflags! {
                                           | TypeFlags::HAS_CT_BOUND.bits();
 
         /// Does this have any `ReErased` regions?
-        const HAS_RE_ERASED               = 1 << 20;
+        const HAS_RE_ERASED               = 1 << 21;
+
+        /// Does this have any regions of any kind?
+        const HAS_REGIONS                 = TypeFlags::HAS_FREE_REGIONS.bits()
+                                          | TypeFlags::HAS_RE_BOUND.bits()
+                                          | TypeFlags::HAS_RE_ERASED.bits();
 
         /// Does this value have parameters/placeholders/inference variables which could be
         /// replaced later, in a way that would change the results of `impl` specialization?
@@ -123,13 +133,31 @@ bitflags::bitflags! {
                                           | TypeFlags::HAS_CT_INFER.bits();
 
         /// Does this value have `InferTy::FreshTy/FreshIntTy/FreshFloatTy`?
-        const HAS_TY_FRESH                = 1 << 21;
+        const HAS_TY_FRESH                = 1 << 22;
 
         /// Does this value have `InferConst::Fresh`?
-        const HAS_CT_FRESH                = 1 << 22;
+        const HAS_CT_FRESH                = 1 << 23;
 
         /// Does this have any binders with bound vars (e.g. that need to be anonymized)?
-        const HAS_BINDER_VARS             = 1 << 23;
+        const HAS_BINDER_VARS             = 1 << 24;
+
+        /// Does this type have any coroutines in it?
+        const HAS_TY_CORO                 = 1 << 25;
+
+        /// Does this have a `Bound(BoundVarIndexKind::Canonical, _)`?
+        const HAS_CANONICAL_BOUND         = 1 << 26;
+
+        /// Does this have any aliases with `IsRigid::Yes`?
+        ///
+        /// We have both rigid and non-rigid flags because both can be true for a single
+        /// subject. E.g. one arg is rigid while another is non-rigid for some ADTs.
+        const HAS_RIGID_ALIAS         = 1 << 27;
+
+        /// Does this have any aliases with `IsRigid::No`?
+        ///
+        /// We have a separate flag from `HAS_ALIAS` because `HAS_ALIAS` doesn't care
+        /// about rigidness while we rely on rigidness to skip renormalization.
+        const HAS_NON_RIGID_ALIAS         = 1 << 28;
     }
 }
 
@@ -174,14 +202,14 @@ impl<I: Interner> FlagComputation<I> {
     pub fn for_clauses(clauses: &[I::Clause]) -> FlagComputation<I> {
         let mut result = FlagComputation::new();
         for c in clauses {
-            result.add_flags(c.as_predicate().flags());
-            result.add_exclusive_binder(c.as_predicate().outer_exclusive_binder());
+            result.add_flags(c.flags());
+            result.add_exclusive_binder(c.outer_exclusive_binder());
         }
         result
     }
 
     fn add_flags(&mut self, flags: TypeFlags) {
-        self.flags = self.flags | flags;
+        self.flags |= flags;
     }
 
     /// indicates that `self` refers to something at binding level `binder`
@@ -234,20 +262,29 @@ impl<I: Interner> FlagComputation<I> {
             | ty::Str
             | ty::Foreign(..) => {}
 
-            ty::Error(_) => self.add_flags(TypeFlags::HAS_ERROR),
+            ty::Error(_) => self.add_flags(TypeFlags::HAS_NON_REGION_ERROR),
 
             ty::Param(_) => {
                 self.add_flags(TypeFlags::HAS_TY_PARAM);
             }
 
             ty::Closure(_, args)
-            | ty::Coroutine(_, args)
             | ty::CoroutineClosure(_, args)
             | ty::CoroutineWitness(_, args) => {
                 self.add_args(args.as_slice());
             }
 
-            ty::Bound(debruijn, _) => {
+            ty::Coroutine(_, args) => {
+                self.add_flags(TypeFlags::HAS_TY_CORO);
+                self.add_args(args.as_slice());
+            }
+
+            ty::Bound(ty::BoundVarIndexKind::Canonical, _) => {
+                self.add_flags(TypeFlags::HAS_TY_BOUND);
+                self.add_flags(TypeFlags::HAS_CANONICAL_BOUND);
+            }
+
+            ty::Bound(ty::BoundVarIndexKind::Bound(debruijn), _) => {
                 self.add_bound_var(debruijn);
                 self.add_flags(TypeFlags::HAS_TY_BOUND);
             }
@@ -270,18 +307,18 @@ impl<I: Interner> FlagComputation<I> {
                 self.add_args(args.as_slice());
             }
 
-            ty::Alias(kind, data) => {
-                self.add_flags(match kind {
-                    ty::Projection => TypeFlags::HAS_TY_PROJECTION,
-                    ty::Free => TypeFlags::HAS_TY_FREE_ALIAS,
-                    ty::Opaque => TypeFlags::HAS_TY_OPAQUE,
-                    ty::Inherent => TypeFlags::HAS_TY_INHERENT,
+            ty::Alias(is_rigid, alias) => {
+                self.add_is_rigid(is_rigid);
+                self.add_flags(match alias.kind {
+                    ty::Projection { .. } => TypeFlags::HAS_TY_PROJECTION,
+                    ty::Free { .. } => TypeFlags::HAS_TY_FREE_ALIAS,
+                    ty::Opaque { .. } => TypeFlags::HAS_TY_OPAQUE,
+                    ty::Inherent { .. } => TypeFlags::HAS_TY_INHERENT,
                 });
-
-                self.add_alias_ty(data);
+                self.add_alias_ty(alias);
             }
 
-            ty::Dynamic(obj, r, _) => {
+            ty::Dynamic(obj, r) => {
                 for predicate in obj.iter() {
                     self.bound_computation(predicate, |computation, predicate| match predicate {
                         ty::ExistentialPredicate::Trait(tr) => {
@@ -323,7 +360,7 @@ impl<I: Interner> FlagComputation<I> {
             }
 
             ty::FnDef(_, args) => {
-                self.add_args(args.as_slice());
+                self.add_binder_args(args);
             }
 
             ty::FnPtr(sig_tys, _) => self.bound_computation(sig_tys, |computation, sig_tys| {
@@ -340,6 +377,7 @@ impl<I: Interner> FlagComputation<I> {
 
     fn add_ty_pat(&mut self, pat: <I as Interner>::Pat) {
         self.add_flags(pat.flags());
+        self.add_exclusive_binder(pat.outer_exclusive_binder());
     }
 
     fn add_predicate(&mut self, binder: ty::Binder<I, ty::PredicateKind<I>>) {
@@ -357,14 +395,11 @@ impl<I: Interner> FlagComputation<I> {
             })) => {
                 self.add_args(trait_ref.args.as_slice());
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(
-                a,
-                b,
-            ))) => {
+            ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(ty::OutlivesClause(a, b))) => {
                 self.add_region(a);
                 self.add_region(b);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(
+            ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesClause(
                 ty,
                 region,
             ))) => {
@@ -394,22 +429,19 @@ impl<I: Interner> FlagComputation<I> {
                 self.add_term(term);
             }
             ty::PredicateKind::DynCompatible(_def_id) => {}
-            ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(uv)) => {
-                self.add_const(uv);
+            ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(alias_const)) => {
+                self.add_const(alias_const);
             }
             ty::PredicateKind::ConstEquate(expected, found) => {
                 self.add_const(expected);
                 self.add_const(found);
             }
-            ty::PredicateKind::Ambiguous => {}
             ty::PredicateKind::NormalizesTo(ty::NormalizesTo { alias, term }) => {
                 self.add_alias_term(alias);
                 self.add_term(term);
             }
-            ty::PredicateKind::AliasRelate(t1, t2, _) => {
-                self.add_term(t1);
-                self.add_term(t2);
-            }
+            ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_sym)) => {}
+            ty::PredicateKind::Ambiguous => {}
         }
     }
 
@@ -424,9 +456,9 @@ impl<I: Interner> FlagComputation<I> {
         }
     }
 
-    fn add_region(&mut self, r: I::Region) {
+    fn add_region(&mut self, r: Region<I>) {
         self.add_flags(r.flags());
-        if let ty::ReBound(debruijn, _) = r.kind() {
+        if let ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _) = r.kind() {
             self.add_bound_var(debruijn);
         }
     }
@@ -438,17 +470,22 @@ impl<I: Interner> FlagComputation<I> {
 
     fn add_const_kind(&mut self, c: &ty::ConstKind<I>) {
         match *c {
-            ty::ConstKind::Unevaluated(uv) => {
-                self.add_args(uv.args.as_slice());
-                self.add_flags(TypeFlags::HAS_CT_PROJECTION);
+            ty::ConstKind::Alias(is_rigid, alias_const) => {
+                self.add_is_rigid(is_rigid);
+                self.add_args(alias_const.args.as_slice());
+                self.add_flags(TypeFlags::HAS_CONST_ALIAS);
             }
             ty::ConstKind::Infer(infer) => match infer {
                 ty::InferConst::Fresh(_) => self.add_flags(TypeFlags::HAS_CT_FRESH),
                 ty::InferConst::Var(_) => self.add_flags(TypeFlags::HAS_CT_INFER),
             },
-            ty::ConstKind::Bound(debruijn, _) => {
+            ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), _) => {
                 self.add_bound_var(debruijn);
                 self.add_flags(TypeFlags::HAS_CT_BOUND);
+            }
+            ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, _) => {
+                self.add_flags(TypeFlags::HAS_CT_BOUND);
+                self.add_flags(TypeFlags::HAS_CANONICAL_BOUND);
             }
             ty::ConstKind::Param(_) => {
                 self.add_flags(TypeFlags::HAS_CT_PARAM);
@@ -456,9 +493,19 @@ impl<I: Interner> FlagComputation<I> {
             ty::ConstKind::Placeholder(_) => {
                 self.add_flags(TypeFlags::HAS_CT_PLACEHOLDER);
             }
-            ty::ConstKind::Value(cv) => self.add_ty(cv.ty()),
+            ty::ConstKind::Value(cv) => {
+                self.add_ty(cv.ty());
+                match cv.valtree().kind() {
+                    ty::ValTreeKind::Leaf(_) => (),
+                    ty::ValTreeKind::Branch(cts) => {
+                        for ct in cts.iter() {
+                            self.add_const(ct);
+                        }
+                    }
+                }
+            }
             ty::ConstKind::Expr(e) => self.add_args(e.args().as_slice()),
-            ty::ConstKind::Error(_) => self.add_flags(TypeFlags::HAS_ERROR),
+            ty::ConstKind::Error(_) => self.add_flags(TypeFlags::HAS_NON_REGION_ERROR),
         }
     }
 
@@ -479,12 +526,31 @@ impl<I: Interner> FlagComputation<I> {
     }
 
     fn add_args(&mut self, args: &[I::GenericArg]) {
-        for kind in args {
-            match kind.kind() {
+        for arg in args {
+            match arg.kind() {
                 ty::GenericArgKind::Type(ty) => self.add_ty(ty),
                 ty::GenericArgKind::Lifetime(lt) => self.add_region(lt),
                 ty::GenericArgKind::Const(ct) => self.add_const(ct),
             }
+        }
+    }
+
+    fn add_binder_args(&mut self, args: ty::Binder<I, I::GenericArgs>) {
+        self.bound_computation(args, |this, args| {
+            for arg in args.iter() {
+                match arg.kind() {
+                    ty::GenericArgKind::Type(ty) => this.add_ty(ty),
+                    ty::GenericArgKind::Lifetime(r) => this.add_region(r),
+                    ty::GenericArgKind::Const(ct) => this.add_const(ct),
+                }
+            }
+        });
+    }
+
+    fn add_is_rigid(&mut self, is_rigid: ty::IsRigid) {
+        match is_rigid {
+            ty::IsRigid::Yes => self.add_flags(TypeFlags::HAS_RIGID_ALIAS),
+            ty::IsRigid::No => self.add_flags(TypeFlags::HAS_NON_RIGID_ALIAS),
         }
     }
 

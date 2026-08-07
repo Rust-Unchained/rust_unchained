@@ -6,7 +6,7 @@ repository = "https://github.com/rust-lang/rust.git"
 description = "Tests for the Rust Allocation Library"
 autotests = false
 autobenches = false
-edition = "2021"
+edition = "2024"
 
 [lib]
 path = "lib.rs"
@@ -21,6 +21,10 @@ rand_xorshift = "0.4.0"
 [[test]]
 name = "alloctests"
 path = "tests/lib.rs"
+
+[[test]]
+name = "c_str_alloc_error"
+path = "tests/c_str_alloc_error.rs"
 
 [[test]]
 name = "vec_deque_alloc_error"
@@ -39,7 +43,6 @@ harness = false
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = [
-    'cfg(bootstrap)',
     'cfg(no_global_oom_handling)',
     'cfg(no_rc)',
     'cfg(no_sync)',

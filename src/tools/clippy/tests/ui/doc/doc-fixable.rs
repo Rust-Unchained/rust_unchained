@@ -1,6 +1,6 @@
 //! This file tests for the `DOC_MARKDOWN` lint.
 
-#![allow(dead_code, incomplete_features)]
+#![expect(incomplete_features)]
 #![warn(clippy::doc_markdown)]
 #![feature(custom_inner_attributes, generic_const_exprs)]
 #![rustfmt::skip]
@@ -73,17 +73,19 @@ fn test_units() {
 /// GPLv2 GPLv3
 /// GitHub GitLab
 /// IPv4 IPv6
+/// InfiniBand RoCE
 /// ClojureScript CoffeeScript JavaScript PostScript PureScript TypeScript
-/// WebAssembly
+/// PowerPC PowerShell WebAssembly
 /// NaN NaNs
 /// OAuth GraphQL
+/// SQLite MySQL PostgreSQL MariaDB MongoDB
 /// OCaml
 /// OpenAL OpenDNS OpenGL OpenMP OpenSSH OpenSSL OpenStreetMap OpenTelemetry
 /// OpenType
 /// WebGL WebGL2 WebGPU WebRTC WebSocket WebTransport
 /// TensorFlow
 /// TrueType
-/// iOS macOS FreeBSD NetBSD OpenBSD
+/// iOS macOS FreeBSD NetBSD OpenBSD NixOS
 /// TeX LaTeX BibTeX BibLaTeX
 /// MinGW
 /// CamelCase (see also #2395)
@@ -108,10 +110,6 @@ fn test_allowed() {
 /// be_sure_we_got_to_the_end_of_it
 //~^ doc_markdown
 fn main() {
-    foo_bar();
-    multiline_codeblock();
-    test_emphasis();
-    test_units();
 }
 
 /// ## CamelCaseThing

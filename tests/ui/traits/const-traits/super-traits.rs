@@ -2,22 +2,20 @@
 //@ compile-flags: -Znext-solver
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Foo {
+const trait Foo {
     fn a(&self);
 }
 
-#[const_trait]
-trait Bar: ~const Foo {}
+const trait Bar: [const] Foo {}
 
 struct S;
-impl const Foo for S {
+const impl Foo for S {
     fn a(&self) {}
 }
 
-impl const Bar for S {}
+const impl Bar for S {}
 
-const fn foo<T: ~const Bar>(t: &T) {
+const fn foo<T: [const] Bar>(t: &T) {
     t.a();
 }
 

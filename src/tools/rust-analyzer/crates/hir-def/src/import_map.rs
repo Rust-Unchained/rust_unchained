@@ -2,22 +2,21 @@
 
 use std::fmt;
 
-use base_db::CrateId;
-use fst::{raw::IndexedValue, Automaton, Streamer};
+use base_db::{Crate, SourceDatabase};
+use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir_expand::name::Name;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use span::Edition;
-use stdx::{format_to, TupleExt};
-use triomphe::Arc;
+use stdx::format_to;
 
 use crate::{
-    db::DefDatabase,
+    AdtId, AssocItemId, AttrDefId, Complete, EnumId, FxIndexMap, ModuleDefId, ModuleId, TraitId,
+    attrs::AttrFlags,
     item_scope::{ImportOrExternCrate, ItemInNs},
-    nameres::DefMap,
+    nameres::{assoc::TraitItems, crate_def_map},
     visibility::Visibility,
-    AssocItemId, FxIndexMap, ModuleDefId, ModuleId, TraitId,
 };
 
 /// Item import details stored in the `ImportMap`.
@@ -31,6 +30,8 @@ pub struct ImportInfo {
     pub is_doc_hidden: bool,
     /// Whether this item is annotated with `#[unstable(..)]`.
     pub is_unstable: bool,
+    /// The value of `#[rust_analyzer::completions(...)]`, if exists.
+    pub complete: Complete,
 }
 
 /// A map from publicly exported items to its name.
@@ -60,25 +61,28 @@ enum IsTraitAssocItem {
 
 type ImportMapIndex = FxIndexMap<ItemInNs, (SmallVec<[ImportInfo; 1]>, IsTraitAssocItem)>;
 
+#[salsa::tracked]
 impl ImportMap {
-    pub fn dump(&self, db: &dyn DefDatabase) -> String {
+    #[salsa::tracked(returns(ref))]
+    pub fn of(db: &dyn SourceDatabase, krate: Crate) -> Self {
+        Self::import_map_query_impl(db, krate)
+    }
+}
+
+impl ImportMap {
+    pub fn dump(&self, db: &dyn SourceDatabase) -> String {
         let mut out = String::new();
         for (k, v) in self.item_to_info_map.iter() {
             format_to!(out, "{:?} ({:?}) -> ", k, v.1);
             for v in &v.0 {
-                format_to!(
-                    out,
-                    "{}:{:?}, ",
-                    v.name.display(db.upcast(), Edition::CURRENT),
-                    v.container
-                );
+                format_to!(out, "{}:{:?}, ", v.name.display(db, Edition::CURRENT), v.container);
             }
             format_to!(out, "\n");
         }
         out
     }
 
-    pub(crate) fn import_map_query(db: &dyn DefDatabase, krate: CrateId) -> Arc<Self> {
+    fn import_map_query_impl(db: &dyn SourceDatabase, krate: Crate) -> Self {
         let _p = tracing::info_span!("import_map_query").entered();
 
         let map = Self::collect_import_map(db, krate);
@@ -122,21 +126,21 @@ impl ImportMap {
         }
 
         let importables = importables.into_iter().map(|(item, _, idx)| (item, idx)).collect();
-        Arc::new(ImportMap { item_to_info_map: map, fst: builder.into_map(), importables })
+        ImportMap { item_to_info_map: map, fst: builder.into_map(), importables }
     }
 
     pub fn import_info_for(&self, item: ItemInNs) -> Option<&[ImportInfo]> {
         self.item_to_info_map.get(&item).map(|(info, _)| &**info)
     }
 
-    fn collect_import_map(db: &dyn DefDatabase, krate: CrateId) -> ImportMapIndex {
+    fn collect_import_map(db: &dyn SourceDatabase, krate: Crate) -> ImportMapIndex {
         let _p = tracing::info_span!("collect_import_map").entered();
 
-        let def_map = db.crate_def_map(krate);
+        let def_map = crate_def_map(db, krate);
         let mut map = FxIndexMap::default();
 
         // We look only into modules that are public(ly reexported), starting with the crate root.
-        let root = def_map.module_id(DefMap::ROOT);
+        let root = def_map.root_module_id();
         let mut worklist = vec![root];
         let mut visited = FxHashSet::default();
 
@@ -144,22 +148,16 @@ impl ImportMap {
             if !visited.insert(module) {
                 continue;
             }
-            let ext_def_map;
-            let mod_data = if module.krate == krate {
-                &def_map[module.local_id]
+            let mod_data = if module.krate(db) == krate {
+                &def_map[module]
             } else {
                 // The crate might reexport a module defined in another crate.
-                ext_def_map = module.def_map(db);
-                &ext_def_map[module.local_id]
+                &module.def_map(db)[module]
             };
 
             let visible_items = mod_data.scope.entries().filter_map(|(name, per_ns)| {
                 let per_ns = per_ns.filter_visibility(|vis| vis == Visibility::Public);
-                if per_ns.is_none() {
-                    None
-                } else {
-                    Some((name, per_ns))
-                }
+                if per_ns.is_none() { None } else { Some((name, per_ns)) }
             });
 
             for (name, per_ns) in visible_items {
@@ -172,23 +170,45 @@ impl ImportMap {
                         }
                     } else {
                         match item {
-                            ItemInNs::Types(id) | ItemInNs::Values(id) => id.try_into().ok(),
+                            ItemInNs::Types(id) | ItemInNs::Values(id) => match id {
+                                ModuleDefId::ModuleId(it) => Some(AttrDefId::ModuleId(it)),
+                                ModuleDefId::FunctionId(it) => Some(it.into()),
+                                ModuleDefId::AdtId(it) => Some(it.into()),
+                                ModuleDefId::EnumVariantId(it) => Some(it.into()),
+                                ModuleDefId::ConstId(it) => Some(it.into()),
+                                ModuleDefId::StaticId(it) => Some(it.into()),
+                                ModuleDefId::TraitId(it) => Some(it.into()),
+                                ModuleDefId::TypeAliasId(it) => Some(it.into()),
+                                ModuleDefId::MacroId(it) => Some(it.into()),
+                                ModuleDefId::BuiltinType(_) => None,
+                            },
                             ItemInNs::Macros(id) => Some(id.into()),
                         }
                     };
-                    let (is_doc_hidden, is_unstable) = attr_id.map_or((false, false), |attr_id| {
-                        let attrs = db.attrs(attr_id);
-                        (attrs.has_doc_hidden(), attrs.is_unstable())
-                    });
+                    let (is_doc_hidden, is_unstable, do_not_complete) = match attr_id {
+                        None => (false, false, Complete::Yes),
+                        Some(attr_id) => {
+                            let attrs = AttrFlags::query(db, attr_id);
+                            let do_not_complete =
+                                Complete::extract(matches!(attr_id, AttrDefId::TraitId(_)), attrs);
+                            (
+                                attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                                attrs.contains(AttrFlags::IS_UNSTABLE),
+                                do_not_complete,
+                            )
+                        }
+                    };
 
                     let import_info = ImportInfo {
                         name: name.clone(),
                         container: module,
                         is_doc_hidden,
                         is_unstable,
+                        complete: do_not_complete,
                     };
 
-                    if let Some(ModuleDefId::TraitId(tr)) = item.as_module_def_id() {
+                    let module_def = item.as_module_def_id();
+                    if let Some(ModuleDefId::TraitId(tr)) = module_def {
                         Self::collect_trait_assoc_items(
                             db,
                             &mut map,
@@ -196,6 +216,8 @@ impl ImportMap {
                             matches!(item, ItemInNs::Types(_)),
                             &import_info,
                         );
+                    } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def {
+                        Self::collect_enum_variants(db, &mut map, enum_, &import_info);
                     }
 
                     let (infos, _) =
@@ -204,7 +226,7 @@ impl ImportMap {
                     infos.push(import_info);
 
                     // If we've just added a module, descend into it.
-                    if let Some(ModuleDefId::ModuleId(mod_id)) = item.as_module_def_id() {
+                    if let Some(ModuleDefId::ModuleId(mod_id)) = module_def {
                         worklist.push(mod_id);
                     }
                 }
@@ -214,15 +236,42 @@ impl ImportMap {
         map
     }
 
+    fn collect_enum_variants(
+        db: &dyn SourceDatabase,
+        map: &mut ImportMapIndex,
+        enum_: EnumId,
+        enum_import_info: &ImportInfo,
+    ) {
+        let _p = tracing::info_span!("collect_enum_variants").entered();
+        for (variant_name, &(variant, _)) in &enum_.enum_variants(db).variants {
+            let attr_id = variant.into();
+            let attrs = AttrFlags::query(db, attr_id);
+            let do_not_complete = Complete::extract(false, attrs);
+            let variant_info = ImportInfo {
+                container: enum_import_info.container,
+                name: variant_name.clone(),
+                is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
+                complete: do_not_complete,
+            };
+
+            let (infos, _) = map
+                .entry(ItemInNs::Types(variant.into()))
+                .or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::No));
+            infos.reserve_exact(1);
+            infos.push(variant_info);
+        }
+    }
+
     fn collect_trait_assoc_items(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         map: &mut ImportMapIndex,
         tr: TraitId,
         is_type_in_ns: bool,
         trait_import_info: &ImportInfo,
     ) {
         let _p = tracing::info_span!("collect_trait_assoc_items").entered();
-        for &(ref assoc_item_name, item) in &db.trait_data(tr).items {
+        for &(ref assoc_item_name, item) in &TraitItems::query(db, tr).items {
             let module_def_id = match item {
                 AssocItemId::FunctionId(f) => ModuleDefId::from(f),
                 AssocItemId::ConstId(c) => ModuleDefId::from(c),
@@ -239,12 +288,17 @@ impl ImportMap {
                 ItemInNs::Values(module_def_id)
             };
 
-            let attrs = &db.attrs(item.into());
+            let attr_id = item.into();
+            let attrs = AttrFlags::query(db, attr_id);
+            let item_do_not_complete = Complete::extract(false, attrs);
+            let do_not_complete =
+                Complete::for_trait_item(trait_import_info.complete, item_do_not_complete);
             let assoc_item_info = ImportInfo {
                 container: trait_import_info.container,
                 name: assoc_item_name.clone(),
-                is_doc_hidden: attrs.has_doc_hidden(),
-                is_unstable: attrs.is_unstable(),
+                is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
+                complete: do_not_complete,
             };
 
             let (infos, _) =
@@ -399,16 +453,14 @@ impl Query {
 ///
 /// This returns a list of items that could be imported from dependencies of `krate`.
 pub fn search_dependencies(
-    db: &dyn DefDatabase,
-    krate: CrateId,
+    db: &dyn SourceDatabase,
+    krate: Crate,
     query: &Query,
-) -> FxHashSet<ItemInNs> {
+) -> FxHashSet<(ItemInNs, Complete)> {
     let _p = tracing::info_span!("search_dependencies", ?query).entered();
 
-    let graph = db.crate_graph();
-
     let import_maps: Vec<_> =
-        graph[krate].dependencies.iter().map(|dep| db.import_map(dep.crate_id)).collect();
+        krate.data(db).dependencies.iter().map(|dep| ImportMap::of(db, dep.crate_id)).collect();
 
     let mut op = fst::map::OpBuilder::new();
 
@@ -441,17 +493,17 @@ pub fn search_dependencies(
 }
 
 fn search_maps(
-    _db: &dyn DefDatabase,
-    import_maps: &[Arc<ImportMap>],
+    _db: &dyn SourceDatabase,
+    import_maps: &[&ImportMap],
     mut stream: fst::map::Union<'_>,
     query: &Query,
-) -> FxHashSet<ItemInNs> {
+) -> FxHashSet<(ItemInNs, Complete)> {
     let mut res = FxHashSet::default();
     while let Some((_, indexed_values)) = stream.next() {
         for &IndexedValue { index: import_map_idx, value } in indexed_values {
             let end = (value & 0xFFFF_FFFF) as usize;
             let start = (value >> 32) as usize;
-            let ImportMap { item_to_info_map, importables, .. } = &*import_maps[import_map_idx];
+            let ImportMap { item_to_info_map, importables, .. } = import_maps[import_map_idx];
             let importables = &importables[start..end];
 
             let iter = importables
@@ -465,8 +517,9 @@ fn search_maps(
                 })
                 .filter(|&(_, info)| {
                     query.search_mode.check(&query.query, query.case_sensitive, info.name.as_str())
-                });
-            res.extend(iter.map(TupleExt::head));
+                })
+                .map(|(item, import_info)| (item, import_info.complete));
+            res.extend(iter);
         }
     }
 
@@ -475,16 +528,16 @@ fn search_maps(
 
 #[cfg(test)]
 mod tests {
-    use base_db::{SourceDatabase, Upcast};
-    use expect_test::{expect, Expect};
+    use base_db::all_crates;
+    use expect_test::{Expect, expect};
     use test_fixture::WithFixture;
 
-    use crate::{test_db::TestDB, ItemContainerId, Lookup};
+    use crate::{ItemContainerId, Lookup, nameres::assoc::TraitItems, test_db::TestDB};
 
     use super::*;
 
     impl ImportMap {
-        fn fmt_for_test(&self, db: &dyn DefDatabase) -> String {
+        fn fmt_for_test(&self, db: &dyn SourceDatabase) -> String {
             let mut importable_paths: Vec<_> = self
                 .item_to_info_map
                 .iter()
@@ -512,24 +565,26 @@ mod tests {
         expect: Expect,
     ) {
         let db = TestDB::with_files(ra_fixture);
-        let crate_graph = db.crate_graph();
-        let krate = crate_graph
+        let all_crates = all_crates(&db);
+        let krate = all_crates
             .iter()
+            .copied()
             .find(|&krate| {
-                crate_graph[krate]
+                krate
+                    .extra_data(&db)
                     .display_name
                     .as_ref()
                     .is_some_and(|it| it.crate_name().as_str() == crate_name)
             })
             .expect("could not find crate");
 
-        let actual = search_dependencies(db.upcast(), krate, &query)
+        let actual = search_dependencies(&db, krate, &query)
             .into_iter()
-            .filter_map(|dependency| {
-                let dependency_krate = dependency.krate(db.upcast())?;
-                let dependency_imports = db.import_map(dependency_krate);
+            .filter_map(|(dependency, _)| {
+                let dependency_krate = dependency.krate(&db)?;
+                let dependency_imports = ImportMap::of(&db, dependency_krate);
 
-                let (path, mark) = match assoc_item_path(&db, &dependency_imports, dependency) {
+                let (path, mark) = match assoc_item_path(&db, dependency_imports, dependency) {
                     Some(assoc_item_path) => (assoc_item_path, "a"),
                     None => (
                         render_path(&db, &dependency_imports.import_info_for(dependency)?[0]),
@@ -545,7 +600,7 @@ mod tests {
 
                 Some(format!(
                     "{}::{} ({})\n",
-                    crate_graph[dependency_krate].display_name.as_ref()?,
+                    dependency_krate.extra_data(&db).display_name.as_ref()?,
                     path,
                     mark
                 ))
@@ -558,7 +613,7 @@ mod tests {
     }
 
     fn assoc_item_path(
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         dependency_imports: &ImportMap,
         dependency: ItemInNs,
     ) -> Option<String> {
@@ -575,8 +630,8 @@ mod tests {
 
         let trait_info = dependency_imports.import_info_for(ItemInNs::Types(trait_id.into()))?;
 
-        let trait_data = db.trait_data(trait_id);
-        let (assoc_item_name, _) = trait_data
+        let trait_items = TraitItems::query(db, trait_id);
+        let (assoc_item_name, _) = trait_items
             .items
             .iter()
             .find(|(_, assoc_item_id)| &dependency_assoc_item_id == assoc_item_id)?;
@@ -584,23 +639,24 @@ mod tests {
         Some(format!(
             "{}::{}",
             render_path(db, &trait_info[0]),
-            assoc_item_name.display(db.upcast(), Edition::CURRENT)
+            assoc_item_name.display(db, Edition::CURRENT)
         ))
     }
 
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let db = TestDB::with_files(ra_fixture);
-        let crate_graph = db.crate_graph();
+        let all_crates = all_crates(&db);
 
-        let actual = crate_graph
+        let actual = all_crates
             .iter()
+            .copied()
             .filter_map(|krate| {
-                let cdata = &crate_graph[krate];
+                let cdata = &krate.extra_data(&db);
                 let name = cdata.display_name.as_ref()?;
 
-                let map = db.import_map(krate);
+                let map = ImportMap::of(&db, krate);
 
-                Some(format!("{name}:\n{}\n", map.fmt_for_test(db.upcast())))
+                Some(format!("{name}:\n{}\n", map.fmt_for_test(&db)))
             })
             .sorted()
             .collect::<String>();
@@ -608,7 +664,7 @@ mod tests {
         expect.assert_eq(&actual)
     }
 
-    fn render_path(db: &dyn DefDatabase, info: &ImportInfo) -> String {
+    fn render_path(db: &dyn SourceDatabase, info: &ImportInfo) -> String {
         let mut module = info.container;
         let mut segments = vec![&info.name];
 
@@ -616,14 +672,13 @@ mod tests {
         assert!(def_map.block_id().is_none(), "block local items should not be in `ImportMap`");
 
         while let Some(parent) = module.containing_module(db) {
-            let parent_data = &def_map[parent.local_id];
-            let (name, _) =
-                parent_data.children.iter().find(|(_, id)| **id == module.local_id).unwrap();
+            let parent_data = &def_map[parent];
+            let (name, _) = parent_data.children.iter().find(|(_, id)| **id == module).unwrap();
             segments.push(name);
             module = parent;
         }
 
-        segments.iter().rev().map(|it| it.display(db.upcast(), Edition::CURRENT)).join("::")
+        segments.iter().rev().map(|it| it.display(db, Edition::CURRENT)).join("::")
     }
 
     #[test]

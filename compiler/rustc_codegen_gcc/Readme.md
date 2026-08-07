@@ -12,29 +12,45 @@ This is a GCC codegen for rustc, which means it can be loaded by the existing ru
 The primary goal of this project is to be able to compile Rust code on platforms unsupported by LLVM.
 A secondary goal is to check if using the gcc backend will provide any run-time speed improvement for the programs compiled using rustc.
 
+## Getting Started
+
+Note: **This requires a patched libgccjit in order to work.
+You need to use my [fork of gcc](https://github.com/rust-lang/gcc) which already includes these patches.**
+The default configuration (see below in the [Quick start](#quick-start) section) will download a `libgccjit` built in the CI that already contains these patches, so you don't need to build this fork yourself if you use the default configuration.
+
 ### Dependencies
 
-**rustup:** Follow the instructions on the official [website](https://www.rust-lang.org/tools/install)
+- rustup: follow instructions on the [official website](https://rustup.rs)
+- consider to install DejaGnu which is necessary for running the libgccjit test suite. [website](https://www.gnu.org/software/dejagnu/#downloading)
+- additional packages: `flex`, `libmpfr-dev`, `libgmp-dev`, `libmpc3`, `libmpc-dev`
+  
+### Quick start
 
-**DejaGnu:** Consider to install DejaGnu which is necessary for running the libgccjit test suite. [website](https://www.gnu.org/software/dejagnu/#downloading)
+1. Clone and configure the repository:
+   ```bash
+   git clone https://github.com/rust-lang/rustc_codegen_gcc
+   cd rustc_codegen_gcc
+   cp config.example.toml config.toml
+   ```
 
+2. Build and test:
+   ```bash
+   ./y.sh prepare  # downloads and patches sysroot
+   ./y.sh build --sysroot --release
+   
+   # Verify setup with a simple test
+   ./y.sh cargo build --manifest-path tests/hello-world/Cargo.toml
+   
+   # Run full test suite (expect ~100 failing UI tests)
+   ./y.sh test --release
+   ```
 
-
-## Building
-
-**This requires a patched libgccjit in order to work.
-You need to use my [fork of gcc](https://github.com/rust-lang/gcc) which already includes these patches.**
-
-```bash
-$ cp config.example.toml config.toml
-```
-
-If don't need to test GCC patches you wrote in our GCC fork, then the default configuration should
+If you don't need to test GCC patches you wrote in our GCC fork, then the default configuration should
 be all you need. You can update the `rustc_codegen_gcc` without worrying about GCC.
 
 ### Building with your own GCC version
 
-If you wrote a patch for GCC and want to test it without this backend, you will need
+If you wrote a patch for GCC and want to test it with this backend, you will need
 to do a few more things.
 
 To build it (most of these instructions come from [here](https://gcc.gnu.org/onlinedocs/jit/internals/index.html), so don't hesitate to take a look there if you encounter an issue):
@@ -54,10 +70,16 @@ $ ../gcc/configure \
 $ make -j4 # You can replace `4` with another number depending on how many cores you have.
 ```
 
-If you want to run libgccjit tests, you will need to also enable the C++ language in the `configure`:
+If you want to run libgccjit tests, you will need to
+* Enable the C++ language in the `configure` step:
 
 ```bash
 --enable-languages=jit,c++
+```
+* Install [dejagnu](https://www.gnu.org/software/dejagnu/#downloading) to run the tests:
+
+```bash
+$ sudo apt install dejagnu
 ```
 
 Then to run libgccjit tests:
@@ -105,7 +127,7 @@ You have to run these commands, in the corresponding order:
 $ ./y.sh prepare
 $ ./y.sh build --sysroot
 ```
-To check if all is  working correctly, run:
+To check if all is working correctly, run:
 
  ```bash
 $ ./y.sh cargo build --manifest-path tests/hello-world/Cargo.toml
@@ -118,16 +140,6 @@ $ CHANNEL="release" $CG_GCCJIT_DIR/y.sh cargo run
 ```
 
 If you compiled cg_gccjit in debug mode (aka you didn't pass `--release` to `./y.sh test`) you should use `CHANNEL="debug"` instead or omit `CHANNEL="release"` completely.
-
-### LTO
-
-To use LTO, you need to set the variable `EMBED_LTO_BITCODE=1` in addition to setting `lto = "fat"` in the `Cargo.toml`.
-
-Failing to set `EMBED_LTO_BITCODE` will give you the following error:
-
-```
-error: failed to copy bitcode to object file: No such file or directory (os error 2)
-```
 
 ### Rustc
 
@@ -143,7 +155,7 @@ You can do the same manually (although we don't recommend it):
 $ LIBRARY_PATH="[gcc-path value]" LD_LIBRARY_PATH="[gcc-path value]" rustc +$(cat $CG_GCCJIT_DIR/rust-toolchain | grep 'channel' | cut -d '=' -f 2 | sed 's/"//g' | sed 's/ //g') -Cpanic=abort -Zcodegen-backend=$CG_GCCJIT_DIR/target/release/librustc_codegen_gcc.so --sysroot $CG_GCCJIT_DIR/build_sysroot/sysroot my_crate.rs
 ```
 
-## Env vars
+## Environment variables
 
  * _**CG_GCCJIT_DUMP_ALL_MODULES**_: Enables dumping of all compilation modules. When set to "1", a dump is created for each module during compilation and stored in `/tmp/reproducers/`.
  * _**CG_GCCJIT_DUMP_MODULE**_: Enables dumping of a specific module. When set with the module name, e.g., `CG_GCCJIT_DUMP_MODULE=module_name`, a dump of that specific module is created in `/tmp/reproducers/`.

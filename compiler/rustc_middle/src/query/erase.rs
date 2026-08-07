@@ -1,393 +1,262 @@
+//! To improve compile times and code size for the compiler itself, query
+//! values are "erased" in some contexts (e.g. inside in-memory cache types),
+//! to reduce the number of generic instantiations created during codegen.
+//!
+//! See <https://github.com/rust-lang/rust/pull/151715> for some bootstrap-time
+//! and performance benchmarks.
+
 use std::ffi::OsStr;
 use std::intrinsics::transmute_unchecked;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
-use rustc_span::ErrorGuaranteed;
+use rustc_ast::tokenstream::TokenStream;
+use rustc_data_structures::steal::Steal;
+use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_span::def_id::ModId;
+use rustc_span::{ErrorGuaranteed, Spanned};
 
-use crate::query::CyclePlaceholder;
-use crate::ty::adjustment::CoerceUnsizedInfo;
-use crate::ty::{self, Ty};
-use crate::{mir, traits};
+use crate::mono::{MonoItem, NormalizationErrorInMono};
+use crate::ty::{self, Ty, TyCtxt};
+use crate::{mir, thir, traits};
 
+unsafe extern "C" {
+    type NoAutoTraits;
+}
+
+/// Internal implementation detail of [`Erased`].
 #[derive(Copy, Clone)]
-pub struct Erased<T: Copy> {
-    // We use `MaybeUninit` here so we can store any value
-    // in `data` since we aren't actually storing a `T`.
-    data: MaybeUninit<T>,
+pub struct ErasedData<Storage: Copy> {
+    /// We use `MaybeUninit` here to make sure it's legal to store a transmuted
+    /// value that isn't actually of type `Storage`.
+    data: MaybeUninit<Storage>,
+    /// `Storage` is an erased type, so we use an external type here to opt-out of auto traits
+    /// as those would be incorrect.
+    no_auto_traits: PhantomData<NoAutoTraits>,
 }
 
-pub trait EraseType: Copy {
-    type Result: Copy;
+// SAFETY: The bounds on `erase_val` ensure the types we erase are `DynSync` and `DynSend`
+unsafe impl<Storage: Copy> DynSync for ErasedData<Storage> {}
+unsafe impl<Storage: Copy> DynSend for ErasedData<Storage> {}
+
+/// Trait for types that can be erased into [`Erased<Self>`].
+///
+/// Erasing and unerasing values is performed by [`erase_val`] and [`restore_val`].
+///
+/// FIXME: This whole trait could potentially be replaced by `T: Copy` and the
+/// storage type `[u8; size_of::<T>()]` when support for that is more mature.
+pub trait Erasable: Copy {
+    /// Storage type to used for erased values of this type.
+    /// Should be `[u8; N]`, where N is equal to `size_of::<Self>`.
+    ///
+    /// [`ErasedData`] wraps this storage type in `MaybeUninit` to ensure that
+    /// transmutes to/from erased storage are well-defined.
+    type Storage: Copy;
 }
 
-// Allow `type_alias_bounds` since compilation will fail without `EraseType`.
-#[allow(type_alias_bounds)]
-pub type Erase<T: EraseType> = Erased<impl Copy>;
+/// A value of `T` that has been "erased" into some opaque storage type.
+///
+/// This is helpful for reducing the number of concrete instantiations needed
+/// during codegen when building the compiler.
+///
+/// Using an opaque type alias allows the type checker to enforce that
+/// `Erased<T>` and `Erased<U>` are still distinct types, while allowing
+/// monomorphization to see that they might actually use the same storage type.
+pub type Erased<T: Erasable> = ErasedData<impl Copy>;
 
+/// Erases a value of type `T` into `Erased<T>`.
+///
+/// `Erased<T>` and `Erased<U>` are type-checked as distinct types, but codegen
+/// can see whether they actually have the same storage type.
 #[inline(always)]
-#[define_opaque(Erase)]
-pub fn erase<T: EraseType>(src: T) -> Erase<T> {
+#[define_opaque(Erased)]
+// The `DynSend` and `DynSync` bounds on `T` are used to
+// justify the safety of the implementations of these traits for `ErasedData`.
+pub fn erase_val<T: Erasable + DynSend + DynSync>(value: T) -> Erased<T> {
     // Ensure the sizes match
     const {
-        if size_of::<T>() != size_of::<T::Result>() {
-            panic!("size of T must match erased type T::Result")
+        if size_of::<T>() != size_of::<T::Storage>() {
+            panic!("size of T must match erased type <T as Erasable>::Storage")
         }
     };
 
-    Erased::<<T as EraseType>::Result> {
+    ErasedData::<<T as Erasable>::Storage> {
         // `transmute_unchecked` is needed here because it does not have `transmute`'s size check
-        // (and thus allows to transmute between `T` and `MaybeUninit<T::Result>`) (we do the size
+        // (and thus allows to transmute between `T` and `MaybeUninit<T::Storage>`) (we do the size
         // check ourselves in the `const` block above).
         //
         // `transmute_copy` is also commonly used for this (and it would work here since
-        // `EraseType: Copy`), but `transmute_unchecked` better explains the intent.
+        // `Erasable: Copy`), but `transmute_unchecked` better explains the intent.
         //
         // SAFETY: It is safe to transmute to MaybeUninit for types with the same sizes.
-        data: unsafe { transmute_unchecked::<T, MaybeUninit<T::Result>>(src) },
+        data: unsafe { transmute_unchecked::<T, MaybeUninit<T::Storage>>(value) },
+        no_auto_traits: PhantomData,
     }
 }
 
-/// Restores an erased value.
+/// Restores an erased value to its real type.
+///
+/// This relies on the fact that `Erased<T>` and `Erased<U>` are type-checked
+/// as distinct types, even if they use the same storage type.
 #[inline(always)]
-#[define_opaque(Erase)]
-pub fn restore<T: EraseType>(value: Erase<T>) -> T {
-    let value: Erased<<T as EraseType>::Result> = value;
-    // See comment in `erase` for why we use `transmute_unchecked`.
+#[define_opaque(Erased)]
+pub fn restore_val<T: Erasable>(erased_value: Erased<T>) -> T {
+    let ErasedData { data, .. }: ErasedData<<T as Erasable>::Storage> = erased_value;
+    // See comment in `erase_val` for why we use `transmute_unchecked`.
     //
-    // SAFETY: Due to the use of impl Trait in `Erase` the only way to safely create an instance
-    // of `Erase` is to call `erase`, so we know that `value.data` is a valid instance of `T` of
-    // the right size.
-    unsafe { transmute_unchecked::<MaybeUninit<T::Result>, T>(value.data) }
+    // SAFETY: Due to the use of impl Trait in `Erased` the only way to safely create an instance
+    // of `Erased` is to call `erase_val`, so we know that `erased_value.data` is a valid instance
+    // of `T` of the right size.
+    unsafe { transmute_unchecked::<MaybeUninit<T::Storage>, T>(data) }
 }
 
-impl<T> EraseType for &'_ T {
-    type Result = [u8; size_of::<&'static ()>()];
+impl<T> Erasable for &'_ T {
+    type Storage = [u8; size_of::<&'_ ()>()];
 }
 
-impl<T> EraseType for &'_ [T] {
-    type Result = [u8; size_of::<&'static [()]>()];
+impl<T> Erasable for &'_ [T] {
+    type Storage = [u8; size_of::<&'_ [()]>()];
 }
 
-impl EraseType for &'_ OsStr {
-    type Result = [u8; size_of::<&'static OsStr>()];
+// Note: this impl does not overlap with the impl for `&'_ T` above because `RawList` is unsized
+// and does not satisfy the implicit `T: Sized` bound.
+//
+// Furthermore, even if that implicit bound was removed (by adding `T: ?Sized`) this impl still
+// wouldn't overlap because `?Sized` is equivalent to `MetaSized` and `RawList` does not satisfy
+// `MetaSized` because it contains an extern type.
+impl<H, T> Erasable for &'_ ty::RawList<H, T> {
+    type Storage = [u8; size_of::<&'_ ty::RawList<(), ()>>()];
 }
 
-impl<T> EraseType for &'_ ty::List<T> {
-    type Result = [u8; size_of::<&'static ty::List<()>>()];
+impl<T> Erasable for Result<&'_ T, traits::query::NoSolution> {
+    type Storage = [u8; size_of::<Result<&'_ (), traits::query::NoSolution>>()];
 }
 
-impl<T> EraseType for &'_ ty::ListWithCachedTypeInfo<T> {
-    type Result = [u8; size_of::<&'static ty::ListWithCachedTypeInfo<()>>()];
+impl<T> Erasable for Result<&'_ T, ErrorGuaranteed> {
+    type Storage = [u8; size_of::<Result<&'_ (), ErrorGuaranteed>>()];
 }
 
-impl<I: rustc_index::Idx, T> EraseType for &'_ rustc_index::IndexSlice<I, T> {
-    type Result = [u8; size_of::<&'static rustc_index::IndexSlice<u32, ()>>()];
+impl<T> Erasable for Option<&'_ T> {
+    type Storage = [u8; size_of::<Option<&'_ ()>>()];
 }
 
-impl<T> EraseType for Result<&'_ T, traits::query::NoSolution> {
-    type Result = [u8; size_of::<Result<&'static (), traits::query::NoSolution>>()];
+impl<T: Erasable> Erasable for ty::EarlyBinder<'_, T> {
+    type Storage = T::Storage;
 }
 
-impl<T> EraseType for Result<&'_ [T], traits::query::NoSolution> {
-    type Result = [u8; size_of::<Result<&'static [()], traits::query::NoSolution>>()];
+impl<T0, T1> Erasable for (&'_ T0, &'_ T1) {
+    type Storage = [u8; size_of::<(&'_ (), &'_ ())>()];
 }
 
-impl<T> EraseType for Result<&'_ T, rustc_errors::ErrorGuaranteed> {
-    type Result = [u8; size_of::<Result<&'static (), rustc_errors::ErrorGuaranteed>>()];
+impl<T0, T1, T2> Erasable for (&'_ T0, &'_ T1, &'_ T2) {
+    type Storage = [u8; size_of::<(&'_ (), &'_ (), &'_ ())>()];
 }
 
-impl<T> EraseType for Result<&'_ [T], rustc_errors::ErrorGuaranteed> {
-    type Result = [u8; size_of::<Result<&'static [()], rustc_errors::ErrorGuaranteed>>()];
+impl<T0, T1> Erasable for (&'_ [T0], &'_ [T1]) {
+    type Storage = [u8; size_of::<(&'_ [()], &'_ [()])>()];
 }
 
-impl<T> EraseType for Result<&'_ T, traits::CodegenObligationError> {
-    type Result = [u8; size_of::<Result<&'static (), traits::CodegenObligationError>>()];
-}
-
-impl<T> EraseType for Result<&'_ T, &'_ ty::layout::FnAbiError<'_>> {
-    type Result = [u8; size_of::<Result<&'static (), &'static ty::layout::FnAbiError<'static>>>()];
-}
-
-impl<T> EraseType for Result<(&'_ T, crate::thir::ExprId), rustc_errors::ErrorGuaranteed> {
-    type Result = [u8; size_of::<
-        Result<(&'static (), crate::thir::ExprId), rustc_errors::ErrorGuaranteed>,
-    >()];
-}
-
-impl EraseType for Result<Option<ty::Instance<'_>>, rustc_errors::ErrorGuaranteed> {
-    type Result =
-        [u8; size_of::<Result<Option<ty::Instance<'static>>, rustc_errors::ErrorGuaranteed>>()];
-}
-
-impl EraseType for Result<CoerceUnsizedInfo, rustc_errors::ErrorGuaranteed> {
-    type Result = [u8; size_of::<Result<CoerceUnsizedInfo, rustc_errors::ErrorGuaranteed>>()];
-}
-
-impl EraseType
-    for Result<Option<ty::EarlyBinder<'_, ty::Const<'_>>>, rustc_errors::ErrorGuaranteed>
-{
-    type Result = [u8; size_of::<
-        Result<Option<ty::EarlyBinder<'static, ty::Const<'static>>>, rustc_errors::ErrorGuaranteed>,
-    >()];
-}
-
-impl EraseType for Result<ty::GenericArg<'_>, traits::query::NoSolution> {
-    type Result = [u8; size_of::<Result<ty::GenericArg<'static>, traits::query::NoSolution>>()];
-}
-
-impl EraseType for Result<bool, &ty::layout::LayoutError<'_>> {
-    type Result = [u8; size_of::<Result<bool, &'static ty::layout::LayoutError<'static>>>()];
-}
-
-impl EraseType for Result<rustc_abi::TyAndLayout<'_, Ty<'_>>, &ty::layout::LayoutError<'_>> {
-    type Result = [u8; size_of::<
-        Result<
-            rustc_abi::TyAndLayout<'static, Ty<'static>>,
-            &'static ty::layout::LayoutError<'static>,
-        >,
-    >()];
-}
-
-impl EraseType for Result<mir::ConstAlloc<'_>, mir::interpret::ErrorHandled> {
-    type Result = [u8; size_of::<Result<mir::ConstAlloc<'static>, mir::interpret::ErrorHandled>>()];
-}
-
-impl EraseType for Result<mir::ConstValue<'_>, mir::interpret::ErrorHandled> {
-    type Result = [u8; size_of::<Result<mir::ConstValue<'static>, mir::interpret::ErrorHandled>>()];
-}
-
-impl EraseType for Result<Result<ty::ValTree<'_>, Ty<'_>>, mir::interpret::ErrorHandled> {
-    type Result = [u8; size_of::<
-        Result<Result<ty::ValTree<'static>, Ty<'static>>, mir::interpret::ErrorHandled>,
-    >()];
-}
-
-impl EraseType for Result<&'_ ty::List<Ty<'_>>, ty::util::AlwaysRequiresDrop> {
-    type Result =
-        [u8; size_of::<Result<&'static ty::List<Ty<'static>>, ty::util::AlwaysRequiresDrop>>()];
-}
-
-impl EraseType for Result<ty::EarlyBinder<'_, Ty<'_>>, CyclePlaceholder> {
-    type Result = [u8; size_of::<Result<ty::EarlyBinder<'static, Ty<'_>>, CyclePlaceholder>>()];
-}
-
-impl<T> EraseType for Option<&'_ T> {
-    type Result = [u8; size_of::<Option<&'static ()>>()];
-}
-
-impl<T> EraseType for Option<&'_ [T]> {
-    type Result = [u8; size_of::<Option<&'static [()]>>()];
-}
-
-impl EraseType for Option<&'_ OsStr> {
-    type Result = [u8; size_of::<Option<&'static OsStr>>()];
-}
-
-impl EraseType for Option<mir::DestructuredConstant<'_>> {
-    type Result = [u8; size_of::<Option<mir::DestructuredConstant<'static>>>()];
-}
-
-impl EraseType for Option<ty::ImplTraitHeader<'_>> {
-    type Result = [u8; size_of::<Option<ty::ImplTraitHeader<'static>>>()];
-}
-
-impl EraseType for Option<ty::EarlyBinder<'_, Ty<'_>>> {
-    type Result = [u8; size_of::<Option<ty::EarlyBinder<'static, Ty<'static>>>>()];
-}
-
-impl EraseType for rustc_hir::MaybeOwner<'_> {
-    type Result = [u8; size_of::<rustc_hir::MaybeOwner<'static>>()];
-}
-
-impl<T: EraseType> EraseType for ty::EarlyBinder<'_, T> {
-    type Result = T::Result;
-}
-
-impl EraseType for ty::Binder<'_, ty::FnSig<'_>> {
-    type Result = [u8; size_of::<ty::Binder<'static, ty::FnSig<'static>>>()];
-}
-
-impl EraseType for ty::Binder<'_, &'_ ty::List<Ty<'_>>> {
-    type Result = [u8; size_of::<ty::Binder<'static, &'static ty::List<Ty<'static>>>>()];
-}
-
-impl<T0, T1> EraseType for (&'_ T0, &'_ T1) {
-    type Result = [u8; size_of::<(&'static (), &'static ())>()];
-}
-
-impl<T0, T1> EraseType for (&'_ T0, &'_ [T1]) {
-    type Result = [u8; size_of::<(&'static (), &'static [()])>()];
-}
-
-impl<T0, T1> EraseType for (&'_ [T0], &'_ [T1]) {
-    type Result = [u8; size_of::<(&'static [()], &'static [()])>()];
-}
-
-impl<T0> EraseType for (&'_ T0, Result<(), ErrorGuaranteed>) {
-    type Result = [u8; size_of::<(&'static (), Result<(), ErrorGuaranteed>)>()];
-}
-
-macro_rules! trivial {
+macro_rules! impl_erasable_for_types_with_no_type_params {
     ($($ty:ty),+ $(,)?) => {
         $(
-            impl EraseType for $ty {
-                type Result = [u8; size_of::<$ty>()];
+            impl Erasable for $ty {
+                type Storage = [u8; size_of::<$ty>()];
             }
         )*
     }
 }
 
-trivial! {
+// For types with no type parameters the erased storage for `Foo` is
+// `[u8; size_of::<Foo>()]`. ('_ lifetimes are allowed.)
+impl_erasable_for_types_with_no_type_params! {
+    // tidy-alphabetical-start
+    (&'_ ty::CrateInherentImpls, Result<(), ErrorGuaranteed>),
     (),
-    bool,
+    (traits::solve::QueryResult<'_>, &'_ traits::solve::inspect::Probe<TyCtxt<'_>>),
+    Option<&'_ OsStr>,
+    Option<&'_ [rustc_hir::PreciseCapturingArgKind<rustc_span::Symbol, rustc_span::Symbol>]>,
+    Option<(mir::ConstValue, Ty<'_>)>,
     Option<(rustc_span::def_id::DefId, rustc_session::config::EntryFnType)>,
+    Option<rustc_abi::Align>,
     Option<rustc_ast::expand::allocator::AllocatorKind>,
-    Option<rustc_attr_data_structures::ConstStability>,
-    Option<rustc_attr_data_structures::DefaultBodyStability>,
-    Option<rustc_attr_data_structures::Stability>,
     Option<rustc_data_structures::svh::Svh>,
-    Option<rustc_hir::def::DefKind>,
+    Option<rustc_hir::ConstStability>,
     Option<rustc_hir::CoroutineKind>,
-    Option<rustc_hir::HirId>,
+    Option<rustc_hir::DefaultBodyStability>,
+    Option<rustc_hir::Stability>,
     Option<rustc_middle::middle::stability::DeprecationEntry>,
     Option<rustc_middle::ty::AsyncDestructor>,
     Option<rustc_middle::ty::Destructor>,
-    Option<rustc_middle::ty::ImplTraitInTraitData>,
+    Option<rustc_middle::ty::IntrinsicDef>,
     Option<rustc_middle::ty::ScalarInt>,
+    Option<rustc_span::Span>,
     Option<rustc_span::def_id::CrateNum>,
     Option<rustc_span::def_id::DefId>,
     Option<rustc_span::def_id::LocalDefId>,
-    Option<rustc_span::Span>,
-    Option<rustc_abi::FieldIdx>,
     Option<rustc_target::spec::PanicStrategy>,
+    Option<ty::EarlyBinder<'_, Ty<'_>>>,
+    Option<ty::Value<'_>>,
     Option<usize>,
-    Option<rustc_middle::ty::IntrinsicDef>,
-    Result<(), rustc_errors::ErrorGuaranteed>,
-    Result<(), rustc_middle::traits::query::NoSolution>,
+    Result<&'_ TokenStream, ()>,
+    Result<&'_ rustc_target::callconv::FnAbi<'_, Ty<'_>>, &'_ ty::layout::FnAbiError<'_>>,
+    Result<&'_ traits::ImplSource<'_, ()>, traits::CodegenObligationError>,
+    Result<&'_ ty::List<Ty<'_>>, ty::util::AlwaysRequiresDrop>,
+    Result<(&'_ Steal<thir::Thir<'_>>, thir::ExprId), ErrorGuaranteed>,
+    Result<(&'_ [Spanned<MonoItem<'_>>], &'_ [Spanned<MonoItem<'_>>]), NormalizationErrorInMono>,
+    Result<(), ErrorGuaranteed>,
+    Result<Option<ty::EarlyBinder<'_, ty::Const<'_>>>, ErrorGuaranteed>,
+    Result<Option<ty::Instance<'_>>, ErrorGuaranteed>,
+    Result<bool, &ty::layout::LayoutError<'_>>,
+    Result<mir::ConstAlloc<'_>, mir::interpret::ErrorHandled>,
+    Result<mir::ConstValue, mir::interpret::ErrorHandled>,
+    Result<rustc_abi::TyAndLayout<'_, Ty<'_>>, &ty::layout::LayoutError<'_>>,
     Result<rustc_middle::traits::EvaluationResult, rustc_middle::traits::OverflowError>,
-    rustc_abi::ReprOptions,
-    rustc_ast::expand::allocator::AllocatorKind,
-    rustc_attr_data_structures::ConstStability,
-    rustc_attr_data_structures::DefaultBodyStability,
-    rustc_attr_data_structures::Deprecation,
-    rustc_attr_data_structures::Stability,
+    Result<rustc_middle::ty::adjustment::CoerceUnsizedInfo, ErrorGuaranteed>,
+    Result<ty::GenericArg<'_>, traits::query::NoSolution>,
+    Ty<'_>,
+    bool,
     rustc_data_structures::svh::Svh,
-    rustc_errors::ErrorGuaranteed,
     rustc_hir::Constness,
-    rustc_hir::def_id::DefId,
-    rustc_hir::def_id::DefIndex,
-    rustc_hir::def_id::LocalDefId,
-    rustc_hir::def_id::LocalModDefId,
-    rustc_hir::def::DefKind,
     rustc_hir::Defaultness,
-    rustc_hir::definitions::DefKey,
-    rustc_hir::CoroutineKind,
     rustc_hir::HirId,
-    rustc_hir::IsAsync,
-    rustc_hir::ItemLocalId,
-    rustc_hir::LangItem,
+    rustc_hir::MaybeOwner<'_>,
     rustc_hir::OpaqueTyOrigin<rustc_hir::def_id::DefId>,
-    rustc_hir::OwnerId,
-    rustc_hir::Upvar,
-    rustc_index::bit_set::FiniteBitSet<u32>,
-    rustc_middle::middle::dependency_format::Linkage,
-    rustc_middle::middle::exported_symbols::SymbolExportInfo,
+    rustc_hir::def::DefKind,
+    rustc_hir::def_id::DefId,
+    rustc_middle::hir::ProjectedMaybeOwner<'_>,
+    rustc_middle::middle::codegen_fn_attrs::SanitizerFnAttrs,
     rustc_middle::middle::resolve_bound_vars::ObjectLifetimeDefault,
-    rustc_middle::middle::resolve_bound_vars::ResolvedArg,
-    rustc_middle::middle::stability::DeprecationEntry,
     rustc_middle::mir::ConstQualifs,
+    rustc_middle::mir::ConstValue,
     rustc_middle::mir::interpret::AllocId,
-    rustc_middle::mir::interpret::CtfeProvenance,
-    rustc_middle::mir::interpret::ErrorHandled,
-    rustc_middle::thir::ExprId,
-    rustc_middle::traits::CodegenObligationError,
-    rustc_middle::traits::EvaluationResult,
-    rustc_middle::traits::OverflowError,
-    rustc_middle::traits::query::NoSolution,
-    rustc_middle::traits::WellFormedLoc,
-    rustc_middle::ty::adjustment::CoerceUnsizedInfo,
+    rustc_middle::mir::interpret::EvalStaticInitializerRawResult<'_>,
+    rustc_middle::mir::interpret::EvalToValTreeResult<'_>,
+    rustc_middle::mono::MonoItemPartitions<'_>,
+    rustc_middle::traits::query::MethodAutoderefStepsResult<'_>,
+    rustc_middle::ty::AdtDef<'_>,
+    rustc_middle::ty::AnonConstKind,
     rustc_middle::ty::AssocItem,
-    rustc_middle::ty::AssocItemContainer,
     rustc_middle::ty::Asyncness,
-    rustc_middle::ty::AsyncDestructor,
-    rustc_middle::ty::BoundVariableKind,
-    rustc_middle::ty::DeducedParamAttrs,
-    rustc_middle::ty::Destructor,
-    rustc_middle::ty::fast_reject::SimplifiedType,
-    rustc_middle::ty::ImplPolarity,
-    rustc_middle::ty::Representability,
-    rustc_middle::ty::UnusedGenericParams,
-    rustc_middle::ty::util::AlwaysRequiresDrop,
-    rustc_middle::ty::Visibility<rustc_span::def_id::DefId>,
-    rustc_session::config::CrateType,
-    rustc_session::config::EntryFnType,
+    rustc_middle::ty::Binder<'_, ty::CoroutineWitnessTypes<TyCtxt<'_>>>,
+    rustc_middle::ty::Binder<'_, ty::FnSig<'_>>,
+    rustc_middle::ty::ClosureTypeInfo<'_>,
+    rustc_middle::ty::Const<'_>,
+    rustc_middle::ty::ConstConditions<'_>,
+    rustc_middle::ty::GenericClauses<'_>,
+    rustc_middle::ty::ImplTraitHeader<'_>,
+    rustc_middle::ty::ParamEnv<'_>,
+    rustc_middle::ty::SymbolName<'_>,
+    rustc_middle::ty::TypingEnv<'_>,
+    rustc_middle::ty::Visibility<ModId>,
+    rustc_middle::ty::inhabitedness::InhabitedPredicate<'_>,
+    rustc_session::Limits,
     rustc_session::config::OptLevel,
     rustc_session::config::SymbolManglingVersion,
     rustc_session::cstore::CrateDepKind,
-    rustc_session::cstore::ExternCrate,
-    rustc_session::cstore::LinkagePreference,
-    rustc_session::Limits,
-    rustc_session::lint::LintExpectationId,
-    rustc_span::def_id::CrateNum,
-    rustc_span::def_id::DefPathHash,
-    rustc_span::ExpnHash,
     rustc_span::ExpnId,
     rustc_span::Span,
     rustc_span::Symbol,
-    rustc_span::Ident,
     rustc_target::spec::PanicStrategy,
-    rustc_type_ir::Variance,
-    u32,
     usize,
-}
-
-macro_rules! tcx_lifetime {
-    ($($($fake_path:ident)::+),+ $(,)?) => {
-        $(
-            impl<'tcx> EraseType for $($fake_path)::+<'tcx> {
-                type Result = [u8; size_of::<$($fake_path)::+<'static>>()];
-            }
-        )*
-    }
-}
-
-tcx_lifetime! {
-    rustc_middle::middle::exported_symbols::ExportedSymbol,
-    rustc_middle::mir::Const,
-    rustc_middle::mir::DestructuredConstant,
-    rustc_middle::mir::ConstAlloc,
-    rustc_middle::mir::ConstValue,
-    rustc_middle::mir::interpret::GlobalId,
-    rustc_middle::mir::interpret::LitToConstInput,
-    rustc_middle::mir::interpret::EvalStaticInitializerRawResult,
-    rustc_middle::mir::mono::MonoItemPartitions,
-    rustc_middle::traits::query::MethodAutoderefStepsResult,
-    rustc_middle::traits::query::type_op::AscribeUserType,
-    rustc_middle::traits::query::type_op::Eq,
-    rustc_middle::traits::query::type_op::ProvePredicate,
-    rustc_middle::traits::query::type_op::Subtype,
-    rustc_middle::ty::AdtDef,
-    rustc_middle::ty::AliasTy,
-    rustc_middle::ty::ClauseKind,
-    rustc_middle::ty::ClosureTypeInfo,
-    rustc_middle::ty::Const,
-    rustc_middle::ty::DestructuredConst,
-    rustc_middle::ty::ExistentialTraitRef,
-    rustc_middle::ty::FnSig,
-    rustc_middle::ty::GenericArg,
-    rustc_middle::ty::GenericPredicates,
-    rustc_middle::ty::ConstConditions,
-    rustc_middle::ty::inhabitedness::InhabitedPredicate,
-    rustc_middle::ty::Instance,
-    rustc_middle::ty::InstanceKind,
-    rustc_middle::ty::layout::FnAbiError,
-    rustc_middle::ty::layout::LayoutError,
-    rustc_middle::ty::ParamEnv,
-    rustc_middle::ty::Predicate,
-    rustc_middle::ty::SymbolName,
-    rustc_middle::ty::TraitRef,
-    rustc_middle::ty::Ty,
-    rustc_middle::ty::UnevaluatedConst,
-    rustc_middle::ty::ValTree,
-    rustc_middle::ty::VtblEntry,
+    // tidy-alphabetical-end
 }

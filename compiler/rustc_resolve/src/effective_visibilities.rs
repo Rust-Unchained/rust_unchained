@@ -1,19 +1,22 @@
 use std::mem;
 
 use rustc_ast::visit::Visitor;
-use rustc_ast::{Crate, EnumDef, ast, visit};
+use rustc_ast::{Attribute, Crate, EnumDef, ast, visit};
 use rustc_data_structures::fx::FxHashSet;
+use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
 use rustc_middle::middle::privacy::{EffectiveVisibilities, EffectiveVisibility, Level};
 use rustc_middle::ty::Visibility;
+use rustc_span::def_id::{CRATE_MOD_ID, LocalModId};
+use rustc_span::sym;
 use tracing::info;
 
-use crate::{NameBinding, NameBindingKind, Resolver};
+use crate::{Decl, DeclKind, Resolver};
 
 #[derive(Clone, Copy)]
 enum ParentId<'ra> {
     Def(LocalDefId),
-    Import(NameBinding<'ra>),
+    Import(Decl<'ra>),
 }
 
 impl ParentId<'_> {
@@ -28,35 +31,43 @@ impl ParentId<'_> {
 pub(crate) struct EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
     r: &'a mut Resolver<'ra, 'tcx>,
     def_effective_visibilities: EffectiveVisibilities,
-    /// While walking import chains we need to track effective visibilities per-binding, and def id
+    /// While walking import chains we need to track effective visibilities per-decl, and def id
     /// keys in `Resolver::effective_visibilities` are not enough for that, because multiple
-    /// bindings can correspond to a single def id in imports. So we keep a separate table.
-    import_effective_visibilities: EffectiveVisibilities<NameBinding<'ra>>,
+    /// declarations can correspond to a single def id in imports. So we keep a separate table.
+    import_effective_visibilities: EffectiveVisibilities<Decl<'ra>>,
     // It's possible to recalculate this at any point, but it's relatively expensive.
     current_private_vis: Visibility,
+    /// A set of pairs corresponding to modules, where the first module is
+    /// reachable via a macro that's defined in the second module. This cannot
+    /// be represented as reachable because it can't handle the following case:
+    ///
+    /// pub mod n {                         // Should be `Public`
+    ///     pub(crate) mod p {              // Should *not* be accessible
+    ///         pub fn f() -> i32 { 12 }    // Must be `Reachable`
+    ///     }
+    /// }
+    /// pub macro m() {
+    ///     n::p::f()
+    /// }
+    macro_reachable: FxHashSet<(LocalDefId, LocalDefId)>,
     changed: bool,
 }
 
 impl Resolver<'_, '_> {
-    fn nearest_normal_mod(&mut self, def_id: LocalDefId) -> LocalDefId {
-        self.get_nearest_non_block_module(def_id.to_def_id()).nearest_parent_mod().expect_local()
-    }
-
-    fn private_vis_import(&mut self, binding: NameBinding<'_>) -> Visibility {
-        let NameBindingKind::Import { import, .. } = binding.kind else { unreachable!() };
+    fn private_vis_decl(&self, decl: Decl<'_>) -> Visibility {
         Visibility::Restricted(
-            import
-                .id()
-                .map(|id| self.nearest_normal_mod(self.local_def_id(id)))
-                .unwrap_or(CRATE_DEF_ID),
+            decl.parent_module.map_or(CRATE_MOD_ID, |m| m.nearest_parent_mod().expect_local()),
         )
     }
 
-    fn private_vis_def(&mut self, def_id: LocalDefId) -> Visibility {
-        // For mod items `nearest_normal_mod` returns its argument, but we actually need its parent.
-        let normal_mod_id = self.nearest_normal_mod(def_id);
-        if normal_mod_id == def_id {
-            Visibility::Restricted(self.tcx.local_parent(def_id))
+    fn private_vis_def(&self, def_id: LocalDefId) -> Visibility {
+        // For mod items `normal_mod_id` will be equal to `def_id`, but we actually need its parent.
+        let normal_mod_id = self
+            .get_nearest_non_block_module(def_id.to_def_id())
+            .nearest_parent_mod()
+            .expect_local();
+        if normal_mod_id.to_local_def_id() == def_id {
+            Visibility::Restricted(LocalModId::new_unchecked(self.tcx.local_parent(def_id)))
         } else {
             Visibility::Restricted(normal_mod_id)
         }
@@ -70,12 +81,13 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
     pub(crate) fn compute_effective_visibilities<'c>(
         r: &'a mut Resolver<'ra, 'tcx>,
         krate: &'c Crate,
-    ) -> FxHashSet<NameBinding<'ra>> {
+    ) -> FxHashSet<Decl<'ra>> {
         let mut visitor = EffectiveVisibilitiesVisitor {
             r,
             def_effective_visibilities: Default::default(),
             import_effective_visibilities: Default::default(),
-            current_private_vis: Visibility::Restricted(CRATE_DEF_ID),
+            current_private_vis: Visibility::Restricted(CRATE_MOD_ID),
+            macro_reachable: Default::default(),
             changed: true,
         };
 
@@ -91,17 +103,16 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         let mut exported_ambiguities = FxHashSet::default();
 
         // Update visibilities for import def ids. These are not used during the
-        // `EffectiveVisibilitiesVisitor` pass, because we have more detailed binding-based
+        // `EffectiveVisibilitiesVisitor` pass, because we have more detailed declaration-based
         // information, but are used by later passes. Effective visibility of an import def id
-        // is the maximum value among visibilities of bindings corresponding to that def id.
-        for (binding, eff_vis) in visitor.import_effective_visibilities.iter() {
-            let NameBindingKind::Import { import, .. } = binding.kind else { unreachable!() };
-            if !binding.is_ambiguity_recursive() {
-                if let Some(node_id) = import.id() {
-                    r.effective_visibilities.update_eff_vis(r.local_def_id(node_id), eff_vis, r.tcx)
-                }
-            } else if binding.ambiguity.is_some() && eff_vis.is_public_at_level(Level::Reexported) {
-                exported_ambiguities.insert(*binding);
+        // is the maximum value among visibilities of declarations corresponding to that def id.
+        for (decl, eff_vis) in visitor.import_effective_visibilities.iter() {
+            let DeclKind::Import { import, .. } = decl.kind else { unreachable!() };
+            if let Some(def_id) = import.def_id() {
+                r.effective_visibilities.update_eff_vis(def_id, eff_vis, r.tcx)
+            }
+            if decl.ambiguity.get().is_some() && eff_vis.is_public_at_level(Level::Reexported) {
+                exported_ambiguities.insert(*decl);
             }
         }
 
@@ -110,47 +121,47 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         exported_ambiguities
     }
 
-    /// Update effective visibilities of bindings in the given module,
+    /// Update effective visibilities of name declarations in the given module,
     /// including their whole reexport chains.
     fn set_bindings_effective_visibilities(&mut self, module_id: LocalDefId) {
-        assert!(self.r.module_map.contains_key(&module_id.to_def_id()));
-        let module = self.r.get_module(module_id.to_def_id()).unwrap();
-        let resolutions = self.r.resolutions(module);
-
-        for (_, name_resolution) in resolutions.borrow().iter() {
-            let Some(mut binding) = name_resolution.borrow().binding() else {
+        let module = self.r.expect_module(module_id.to_def_id());
+        for (_, name_resolution) in self.r.resolutions(module).iter() {
+            let Some(decl) = name_resolution.borrow(self.r).best_decl() else {
                 continue;
             };
-            // Set the given effective visibility level to `Level::Direct` and
-            // sets the rest of the `use` chain to `Level::Reexported` until
-            // we hit the actual exported item.
-            //
-            // If the binding is ambiguous, put the root ambiguity binding and all reexports
-            // leading to it into the table. They are used by the `ambiguous_glob_reexports`
-            // lint. For all bindings added to the table this way `is_ambiguity` returns true.
-            let is_ambiguity =
-                |binding: NameBinding<'ra>, warn: bool| binding.ambiguity.is_some() && !warn;
-            let mut parent_id = ParentId::Def(module_id);
-            let mut warn_ambiguity = binding.warn_ambiguity;
-            while let NameBindingKind::Import { binding: nested_binding, .. } = binding.kind {
-                self.update_import(binding, parent_id);
+            self.update_decl_chain(decl, ParentId::Def(module_id));
+        }
+    }
 
-                if is_ambiguity(binding, warn_ambiguity) {
-                    // Stop at the root ambiguity, further bindings in the chain should not
-                    // be reexported because the root ambiguity blocks any access to them.
-                    // (Those further bindings are most likely not ambiguities themselves.)
-                    break;
-                }
-
-                parent_id = ParentId::Import(binding);
-                binding = nested_binding;
-                warn_ambiguity |= nested_binding.warn_ambiguity;
+    /// Update effective visibilities for the whole reexport chain of a declaration.
+    /// Set the given effective visibility level to `Level::Direct` and
+    /// sets the rest of the `use` chain to `Level::Reexported` until
+    /// we hit the actual exported item.
+    fn update_decl_chain(&mut self, mut decl: Decl<'ra>, mut parent_id: ParentId<'ra>) {
+        let priv_vis = |this: &Self, parent_id, decl| match parent_id {
+            ParentId::Def(_) => this.current_private_vis,
+            ParentId::Import(_) => this.r.private_vis_decl(decl),
+        };
+        while let DeclKind::Import { source_decl, .. } = decl.kind {
+            self.update_import(decl, parent_id, priv_vis(self, parent_id, decl));
+            if let Some(max_vis_decl) = decl.ambiguity_vis_max.get() {
+                // The name is exported with the visibility of the most visible declaration
+                // in its ambiguous glob set (see `DeclData::vis`), so everything on that
+                // declaration's reexport chain, including the final item, must get its
+                // effective visibility from that declaration as well. Otherwise the item
+                // would be considered unreachable by dead code analysis and metadata
+                // encoding despite being exported (see the regression test
+                // `ambiguous-import-visibility-globglob-mir.rs`).
+                // This also avoids the most visible import in an ambiguous glob set
+                // being reported as unused.
+                self.update_decl_chain(max_vis_decl, parent_id);
             }
-            if !is_ambiguity(binding, warn_ambiguity)
-                && let Some(def_id) = binding.res().opt_def_id().and_then(|id| id.as_local())
-            {
-                self.update_def(def_id, binding.vis.expect_local(), parent_id);
-            }
+            parent_id = ParentId::Import(decl);
+            decl = source_decl;
+        }
+        if let Some(def_id) = decl.res().opt_def_id().and_then(|id| id.as_local()) {
+            let priv_vis = priv_vis(self, parent_id, decl);
+            self.update_def(def_id, decl.vis().expect_local(), parent_id, priv_vis);
         }
     }
 
@@ -163,43 +174,39 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
                 .effective_vis_or_private(def_id, || self.r.private_vis_def(def_id)),
             ParentId::Import(binding) => self
                 .import_effective_visibilities
-                .effective_vis_or_private(binding, || self.r.private_vis_import(binding)),
+                .effective_vis_or_private(binding, || self.r.private_vis_decl(binding)),
         }
     }
 
     /// All effective visibilities for a node are larger or equal than private visibility
     /// for that node (see `check_invariants` in middle/privacy.rs).
     /// So if either parent or nominal visibility is the same as private visibility, then
-    /// `min(parent_vis, nominal_vis) <= private_vis`, and the update logic is guaranteed
+    /// `min(parent_vis, nominal_vis) <= priv_vis`, and the update logic is guaranteed
     /// to not update anything and we can skip it.
-    ///
-    /// We are checking this condition only if the correct value of private visibility is
-    /// cheaply available, otherwise it doesn't make sense performance-wise.
-    ///
-    /// `None` is returned if the update can be skipped,
-    /// and cheap private visibility is returned otherwise.
     fn may_update(
         &self,
         nominal_vis: Visibility,
         parent_id: ParentId<'_>,
-    ) -> Option<Option<Visibility>> {
-        match parent_id {
-            ParentId::Def(def_id) => (nominal_vis != self.current_private_vis
-                && self.r.tcx.local_visibility(def_id) != self.current_private_vis)
-                .then_some(Some(self.current_private_vis)),
-            ParentId::Import(_) => Some(None),
-        }
+        priv_vis: Visibility,
+    ) -> bool {
+        nominal_vis != priv_vis
+            && match parent_id {
+                ParentId::Def(def_id) => self.r.tcx.local_visibility(def_id),
+                ParentId::Import(decl) => decl.vis().expect_local(),
+            } != priv_vis
     }
 
-    fn update_import(&mut self, binding: NameBinding<'ra>, parent_id: ParentId<'ra>) {
-        let nominal_vis = binding.vis.expect_local();
-        let Some(cheap_private_vis) = self.may_update(nominal_vis, parent_id) else { return };
+    fn update_import(&mut self, decl: Decl<'ra>, parent_id: ParentId<'ra>, priv_vis: Visibility) {
+        let nominal_vis = decl.vis().expect_local();
+        if !self.may_update(nominal_vis, parent_id, priv_vis) {
+            return;
+        };
         let inherited_eff_vis = self.effective_vis_or_private(parent_id);
         let tcx = self.r.tcx;
         self.changed |= self.import_effective_visibilities.update(
-            binding,
+            decl,
             Some(nominal_vis),
-            || cheap_private_vis.unwrap_or_else(|| self.r.private_vis_import(binding)),
+            priv_vis,
             inherited_eff_vis,
             parent_id.level(),
             tcx,
@@ -211,14 +218,17 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
         def_id: LocalDefId,
         nominal_vis: Visibility,
         parent_id: ParentId<'ra>,
+        priv_vis: Visibility,
     ) {
-        let Some(cheap_private_vis) = self.may_update(nominal_vis, parent_id) else { return };
+        if !self.may_update(nominal_vis, parent_id, priv_vis) {
+            return;
+        };
         let inherited_eff_vis = self.effective_vis_or_private(parent_id);
         let tcx = self.r.tcx;
         self.changed |= self.def_effective_visibilities.update(
             def_id,
             Some(nominal_vis),
-            || cheap_private_vis.unwrap_or_else(|| self.r.private_vis_def(def_id)),
+            priv_vis,
             inherited_eff_vis,
             parent_id.level(),
             tcx,
@@ -226,16 +236,126 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
     }
 
     fn update_field(&mut self, def_id: LocalDefId, parent_id: LocalDefId) {
-        self.update_def(def_id, self.r.tcx.local_visibility(def_id), ParentId::Def(parent_id));
+        let nominal_vis = self.r.tcx.local_visibility(def_id);
+        self.update_def(def_id, nominal_vis, ParentId::Def(parent_id), self.current_private_vis);
+    }
+
+    fn update_macro(&mut self, def_id: LocalDefId, inherited_effective_vis: EffectiveVisibility) {
+        let max_vis = Some(self.r.tcx.local_visibility(def_id));
+        let priv_vis = if def_id == CRATE_DEF_ID {
+            Visibility::Restricted(CRATE_MOD_ID)
+        } else {
+            self.r.private_vis_def(def_id)
+        };
+        self.changed |= self.def_effective_visibilities.update(
+            def_id,
+            max_vis,
+            priv_vis,
+            inherited_effective_vis,
+            Level::Reachable,
+            self.r.tcx,
+        );
+    }
+
+    // We have to make sure that the items that macros might reference
+    // are reachable, since they might be exported transitively.
+    fn update_reachability_from_macro(
+        &mut self,
+        local_def_id: LocalDefId,
+        md: &ast::MacroDef,
+        attrs: &[Attribute],
+    ) {
+        // Non-opaque macros cannot make other items more accessible than they already are.
+        if rustc_ast::attr::find_by_name(attrs, sym::rustc_macro_transparency)
+            .map_or(md.macro_rules, |attr| attr.value_str() != Some(sym::opaque))
+        {
+            return;
+        }
+
+        let macro_module_def_id = self.r.tcx.local_parent(local_def_id);
+        if self.r.tcx.def_kind(macro_module_def_id) != DefKind::Mod {
+            // The macro's parent doesn't correspond to a `mod`, return early (#63164, #65252).
+            return;
+        }
+
+        let Some(macro_ev) = self
+            .def_effective_visibilities
+            .effective_vis(local_def_id)
+            .filter(|ev| ev.public_at_level().is_some())
+            .copied()
+        else {
+            return;
+        };
+
+        // Since we are starting from an externally visible module,
+        // all the parents in the loop below are also guaranteed to be modules.
+        let mut module_def_id = macro_module_def_id;
+        loop {
+            self.update_macro_reachable(module_def_id, macro_module_def_id, macro_ev);
+            if module_def_id == CRATE_DEF_ID {
+                break;
+            }
+            module_def_id = self.r.tcx.local_parent(module_def_id);
+        }
+    }
+
+    /// Updates the item as being reachable through a macro defined in the given
+    /// module. Returns `true` if the level has changed.
+    fn update_macro_reachable(
+        &mut self,
+        module_def_id: LocalDefId,
+        defining_mod: LocalDefId,
+        macro_ev: EffectiveVisibility,
+    ) {
+        if self.macro_reachable.insert((module_def_id, defining_mod)) {
+            let module = self.r.expect_module(module_def_id.to_def_id());
+            for (_, name_resolution) in self.r.resolutions(module).iter() {
+                let Some(decl) = name_resolution.borrow(self.r).best_decl() else {
+                    continue;
+                };
+
+                if let Res::Def(def_kind, def_id) = decl.res()
+                    && let Some(def_id) = def_id.as_local()
+                    // FIXME: defs should be checked with `EffectiveVisibilities::is_reachable`.
+                    && decl.vis().is_accessible_from(defining_mod, self.r.tcx)
+                {
+                    let vis = self.r.tcx.local_visibility(def_id);
+                    self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod, macro_ev);
+                }
+            }
+        }
+    }
+
+    fn update_macro_reachable_def(
+        &mut self,
+        def_id: LocalDefId,
+        def_kind: DefKind,
+        vis: Visibility,
+        module: LocalDefId,
+        macro_ev: EffectiveVisibility,
+    ) {
+        self.update_macro(def_id, macro_ev);
+
+        match def_kind {
+            DefKind::Mod => {
+                if vis.is_accessible_from(module, self.r.tcx) {
+                    self.update_macro_reachable(def_id, module, macro_ev);
+                }
+            }
+            DefKind::Struct | DefKind::Union => {
+                self.r.macro_reachable_adts.entry(def_id).or_default().insert(module);
+            }
+            _ => {}
+        }
     }
 }
 
 impl<'a, 'ra, 'tcx> Visitor<'a> for EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
     fn visit_item(&mut self, item: &'a ast::Item) {
-        let def_id = self.r.local_def_id(item.id);
+        let def_id = self.r.owner_def_id(item.id);
         // Update effective visibilities of nested items.
         // If it's a mod, also make the visitor walk all of its items
-        match item.kind {
+        match &item.kind {
             // Resolved in rustc_privacy when types are available
             ast::ItemKind::Impl(..) => return,
 
@@ -245,26 +365,28 @@ impl<'a, 'ra, 'tcx> Visitor<'a> for EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> 
             ),
 
             ast::ItemKind::Mod(..) => {
-                let prev_private_vis =
-                    mem::replace(&mut self.current_private_vis, Visibility::Restricted(def_id));
+                let prev_private_vis = mem::replace(
+                    &mut self.current_private_vis,
+                    Visibility::Restricted(LocalModId::new_unchecked(def_id)),
+                );
                 self.set_bindings_effective_visibilities(def_id);
                 visit::walk_item(self, item);
                 self.current_private_vis = prev_private_vis;
             }
 
-            ast::ItemKind::Enum(_, EnumDef { ref variants }, _) => {
+            ast::ItemKind::Enum(_, _, EnumDef { variants }) => {
                 self.set_bindings_effective_visibilities(def_id);
                 for variant in variants {
-                    let variant_def_id = self.r.local_def_id(variant.id);
+                    let variant_def_id = self.r.child_def_id(item.id, variant.id);
                     for field in variant.data.fields() {
-                        self.update_field(self.r.local_def_id(field.id), variant_def_id);
+                        self.update_field(self.r.child_def_id(item.id, field.id), variant_def_id);
                     }
                 }
             }
 
-            ast::ItemKind::Struct(_, ref def, _) | ast::ItemKind::Union(_, ref def, _) => {
+            ast::ItemKind::Struct(_, _, def) | ast::ItemKind::Union(_, _, def) => {
                 for field in def.fields() {
-                    self.update_field(self.r.local_def_id(field.id), def_id);
+                    self.update_field(self.r.child_def_id(item.id, field.id), def_id);
                 }
             }
 
@@ -272,14 +394,18 @@ impl<'a, 'ra, 'tcx> Visitor<'a> for EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> 
                 self.set_bindings_effective_visibilities(def_id);
             }
 
+            ast::ItemKind::MacroDef(_, macro_def) => {
+                self.update_reachability_from_macro(def_id, macro_def, &item.attrs);
+            }
+
             ast::ItemKind::ExternCrate(..)
             | ast::ItemKind::Use(..)
             | ast::ItemKind::Static(..)
             | ast::ItemKind::Const(..)
+            | ast::ItemKind::ConstBlock(..)
             | ast::ItemKind::GlobalAsm(..)
             | ast::ItemKind::TyAlias(..)
             | ast::ItemKind::TraitAlias(..)
-            | ast::ItemKind::MacroDef(..)
             | ast::ItemKind::ForeignMod(..)
             | ast::ItemKind::Fn(..)
             | ast::ItemKind::Delegation(..) => return,

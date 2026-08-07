@@ -1,11 +1,12 @@
 use derive_where::derive_where;
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_abi::ExternAbi;
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
-use crate::solve::NoSolution;
-use crate::{self as ty, Interner};
+use crate::solve::{NoSolution, NoSolutionOrRerunNonErased};
+use crate::{self as ty, Interner, Region};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(TypeFoldable_Generic, TypeVisitable_Generic)]
+#[derive(TypeFoldable_Generic, TypeVisitable_Generic, GenericTypeVisitable)]
 pub struct ExpectedFound<T> {
     pub expected: T,
     pub found: T,
@@ -18,35 +19,36 @@ impl<T> ExpectedFound<T> {
 }
 
 // Data structures used in type unification
-#[derive_where(Clone, Copy, PartialEq, Eq, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic)]
+#[derive_where(Clone, Copy, PartialEq, Debug; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum TypeError<I: Interner> {
     Mismatch,
     PolarityMismatch(#[type_visitable(ignore)] ExpectedFound<ty::PredicatePolarity>),
     SafetyMismatch(#[type_visitable(ignore)] ExpectedFound<I::Safety>),
-    AbiMismatch(#[type_visitable(ignore)] ExpectedFound<I::Abi>),
+    AbiMismatch(#[type_visitable(ignore)] ExpectedFound<ExternAbi>),
     Mutability,
     ArgumentMutability(usize),
     TupleSize(ExpectedFound<usize>),
     ArraySize(ExpectedFound<I::Const>),
     ArgCount,
 
-    RegionsDoesNotOutlive(I::Region, I::Region),
-    RegionsInsufficientlyPolymorphic(I::BoundRegion, I::Region),
+    RegionsDoesNotOutlive(Region<I>, Region<I>),
+    RegionsInsufficientlyPolymorphic(ty::BoundRegion<I>, Region<I>),
     RegionsPlaceholderMismatch,
 
     Sorts(ExpectedFound<I::Ty>),
     ArgumentSorts(ExpectedFound<I::Ty>, usize),
-    Traits(ExpectedFound<I::DefId>),
+    Traits(ExpectedFound<I::TraitId>),
     VariadicMismatch(ExpectedFound<bool>),
+    SplatMismatch(ExpectedFound<Option<u8>>),
 
     /// Instantiating a type variable with the given type would have
     /// created a cycle (because it appears somewhere within that
     /// type).
     CyclicTy(I::Ty),
     CyclicConst(I::Const),
-    ProjectionMismatched(ExpectedFound<I::DefId>),
+    ProjectionMismatched(ExpectedFound<ty::AliasTermKind<I>>),
     ExistentialMismatch(ExpectedFound<I::BoundExistentialPredicates>),
     ConstMismatch(ExpectedFound<I::Const>),
 
@@ -57,6 +59,8 @@ pub enum TypeError<I: Interner> {
     /// Safe `#[target_feature]` functions are not assignable to safe function pointers.
     TargetFeatureCast(I::DefId),
 }
+
+impl<I: Interner> Eq for TypeError<I> {}
 
 impl<I: Interner> TypeError<I> {
     pub fn involves_regions(self) -> bool {
@@ -73,7 +77,7 @@ impl<I: Interner> TypeError<I> {
         match self {
             CyclicTy(_) | CyclicConst(_) | SafetyMismatch(_) | PolarityMismatch(_) | Mismatch
             | AbiMismatch(_) | ArraySize(_) | ArgumentSorts(..) | Sorts(_)
-            | VariadicMismatch(_) | TargetFeatureCast(_) => false,
+            | VariadicMismatch(_) | SplatMismatch(_) | TargetFeatureCast(_) => false,
 
             Mutability
             | ArgumentMutability(_)
@@ -95,5 +99,11 @@ impl<I: Interner> TypeError<I> {
 impl<I: Interner> From<TypeError<I>> for NoSolution {
     fn from(_: TypeError<I>) -> NoSolution {
         NoSolution
+    }
+}
+
+impl<I: Interner> From<TypeError<I>> for NoSolutionOrRerunNonErased {
+    fn from(_: TypeError<I>) -> NoSolutionOrRerunNonErased {
+        NoSolutionOrRerunNonErased::NoSolution(NoSolution)
     }
 }

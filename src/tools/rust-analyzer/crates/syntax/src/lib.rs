@@ -10,8 +10,8 @@
 //! the [Swift] one.
 //!
 //! The most interesting modules here are `syntax_node` (which defines concrete
-//! syntax tree) and `ast` (which defines abstract syntax tree on top of the
-//! CST). The actual parser live in a separate `parser` crate, though the
+//! syntax tree) and [`ast`] (which defines abstract syntax tree on top of the
+//! CST). The actual parser live in a separate [`parser`] crate, though the
 //! lexer lives in this crate.
 //!
 //! See `api_walkthrough` test in this file for a quick API tour!
@@ -19,13 +19,21 @@
 //! [RFC]: <https://github.com/rust-lang/rfcs/pull/2256>
 //! [Swift]: <https://github.com/apple/swift/blob/13d593df6f359d0cb2fc81cfaac273297c539455/lib/Syntax/README.md>
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod parsing;
 mod ptr;
 mod syntax_error;
 mod syntax_node;
 #[cfg(test)]
 mod tests;
-mod token_text;
 mod validation;
 
 pub mod algo;
@@ -34,7 +42,6 @@ pub mod ast;
 pub mod fuzz;
 pub mod hacks;
 pub mod syntax_editor;
-pub mod ted;
 pub mod utils;
 
 use std::{marker::PhantomData, ops::Range};
@@ -50,15 +57,14 @@ pub use crate::{
         PreorderWithTokens, RustLanguage, SyntaxElement, SyntaxElementChildren, SyntaxNode,
         SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder,
     },
-    token_text::TokenText,
 };
 pub use parser::{Edition, SyntaxKind, T};
 pub use rowan::{
-    api::Preorder, Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize,
-    TokenAtOffset, WalkEvent,
+    Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    api::Preorder,
 };
 pub use rustc_literal_escaper as unescape;
-pub use smol_str::{format_smolstr, SmolStr, SmolStrBuilder, ToSmolStr};
+pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
 /// errors.
@@ -67,7 +73,7 @@ pub use smol_str::{format_smolstr, SmolStr, SmolStrBuilder, ToSmolStr};
 /// files.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parse<T> {
-    green: GreenNode,
+    green: Option<GreenNode>,
     errors: Option<Arc<[SyntaxError]>>,
     _ty: PhantomData<fn() -> T>,
 }
@@ -81,14 +87,14 @@ impl<T> Clone for Parse<T> {
 impl<T> Parse<T> {
     fn new(green: GreenNode, errors: Vec<SyntaxError>) -> Parse<T> {
         Parse {
-            green,
+            green: Some(green),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
             _ty: PhantomData,
         }
     }
 
     pub fn syntax_node(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green.clone())
+        SyntaxNode::new_root(self.green.as_ref().unwrap().clone())
     }
 
     pub fn errors(&self) -> Vec<SyntaxError> {
@@ -100,8 +106,10 @@ impl<T> Parse<T> {
 
 impl<T: AstNode> Parse<T> {
     /// Converts this parse result into a parse result for an untyped syntax tree.
-    pub fn to_syntax(self) -> Parse<SyntaxNode> {
-        Parse { green: self.green, errors: self.errors, _ty: PhantomData }
+    pub fn to_syntax(mut self) -> Parse<SyntaxNode> {
+        let green = self.green.take();
+        let errors = self.errors.take();
+        Parse { green, errors, _ty: PhantomData }
     }
 
     /// Gets the parsed syntax tree as a typed ast node.
@@ -124,9 +132,9 @@ impl<T: AstNode> Parse<T> {
 }
 
 impl Parse<SyntaxNode> {
-    pub fn cast<N: AstNode>(self) -> Option<Parse<N>> {
+    pub fn cast<N: AstNode>(mut self) -> Option<Parse<N>> {
         if N::cast(self.syntax_node()).is_some() {
-            Some(Parse { green: self.green, errors: self.errors, _ty: PhantomData })
+            Some(Parse { green: self.green.take(), errors: self.errors.take(), _ty: PhantomData })
         } else {
             None
         }
@@ -162,7 +170,7 @@ impl Parse<SourceFile> {
             edition,
         )
         .map(|(green_node, errors, _reparsed_range)| Parse {
-            green: green_node,
+            green: Some(green_node),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
             _ty: PhantomData,
         })
@@ -195,6 +203,39 @@ impl ast::Expr {
             root.kind()
         );
         Parse::new(green, errors)
+    }
+}
+
+#[cfg(not(no_salsa_async_drops))]
+impl<T> Drop for Parse<T> {
+    fn drop(&mut self) {
+        let Some(green) = self.green.take() else {
+            return;
+        };
+        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<GreenNode>> =
+            std::sync::OnceLock::new();
+        PARSE_DROP_THREAD
+            .get_or_init(|| {
+                let (sender, receiver) = std::sync::mpsc::channel::<GreenNode>();
+                std::thread::Builder::new()
+                    .name("ParseNodeDropper".to_owned())
+                    .spawn(move || {
+                        loop {
+                            // block on a receive
+                            _ = receiver.recv();
+                            // then drain the entire channel
+                            while receiver.try_recv().is_ok() {}
+                            // and sleep for a bit
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
+                        // otherwise this thread will constantly wake up and sleep again.
+                    })
+                    .unwrap();
+                sender
+            })
+            .send(green)
+            .unwrap();
     }
 }
 
@@ -231,11 +272,14 @@ macro_rules! match_ast {
     (match $node:ident { $($tt:tt)* }) => { $crate::match_ast!(match ($node) { $($tt)* }) };
 
     (match ($node:expr) {
-        $( $( $path:ident )::+ ($it:pat) => $res:expr, )*
+        $( $( $path:ident )::+ ($it:pat) $(if $guard:expr)? => $res:expr, )*
         _ => $catch_all:expr $(,)?
     }) => {{
-        $( if let Some($it) = $($path::)+cast($node.clone()) { $res } else )*
-        { $catch_all }
+        #[allow(clippy::question_mark, reason = "if `$catch_all` is `return None` Clippy can mark this")]
+        {
+            $( if let Some($it) = $($path::)+cast($node.clone()) $(&& $guard)? { $res } else )*
+            { $catch_all }
+        }
     }};
 }
 
@@ -258,7 +302,7 @@ fn api_walkthrough() {
     assert!(parse.errors().is_empty());
 
     // The `tree` method returns an owned syntax node of type `SourceFile`.
-    // Owned nodes are cheap: inside, they are `Rc` handles to the underling data.
+    // Owned nodes are cheap: inside, they are `Rc` handles to the underlying data.
     let file: SourceFile = parse.tree();
 
     // `SourceFile` is the root of the syntax tree. We can iterate file's items.

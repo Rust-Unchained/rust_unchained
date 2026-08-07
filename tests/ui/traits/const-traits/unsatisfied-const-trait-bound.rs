@@ -1,5 +1,6 @@
 //@ known-bug: unknown
-// Ensure that we print unsatisfied always-const trait bounds as `const Trait` in diagnostics.
+// This used to ensure that the next solver prints unsatisfied always-const trait bounds as
+// `const Trait`, but no longer does because GCE is incompatible with the next solver.
 //@ compile-flags: -Znext-solver
 
 #![feature(const_trait_impl, generic_const_exprs)]
@@ -7,8 +8,7 @@
 
 fn require<T: const Trait>() {}
 
-#[const_trait]
-trait Trait {
+const trait Trait {
     fn make() -> u32;
 }
 
@@ -29,5 +29,5 @@ struct Container<const N: u32>;
 fn accept0<T: Trait>(_: Container<{ T::make() }>) {}
 
 // FIXME(const_trait_impl): Instead of suggesting `+ const Trait`, suggest
-//                 changing `~const Trait` to `const Trait`.
-const fn accept1<T: ~const Trait>(_: Container<{ T::make() }>) {}
+//                 changing `[const] Trait` to `const Trait`.
+const fn accept1<T: [const] Trait>(_: Container<{ T::make() }>) {}

@@ -8,10 +8,12 @@
 //@ ignore-fuchsia no exception handler registered for segfault
 //@ compile-flags: -C lto
 //@ no-prefer-dynamic
-//@ ignore-nto Crash analysis impossible at SIGSEGV in QNX Neutrino
+//@ ignore-nto Crash analysis impossible at SIGSEGV in QNX SDP 7.x
+//@ ignore-qnx Crash analysis impossible at SIGSEGV in QNX SDP 8.0+
 //@ ignore-ios Stack probes are enabled, but the SIGSEGV handler isn't
 //@ ignore-tvos Stack probes are enabled, but the SIGSEGV handler isn't
 //@ ignore-watchos Stack probes are enabled, but the SIGSEGV handler isn't
 //@ ignore-visionos Stack probes are enabled, but the SIGSEGV handler isn't
+//@ ignore-backends: gcc
 
 include!("stack-probes.rs");

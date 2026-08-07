@@ -1,15 +1,21 @@
-use crate::spec::{Target, TargetMetadata, base};
+use crate::spec::{Arch, FramePointer, Target, TargetMetadata, base};
 
 pub(crate) fn target() -> Target {
     let mut base = base::windows_msvc::opts();
     base.max_atomic_width = Some(128);
-    base.features = "+v8a,+neon,+fp-armv8".into();
+    base.features = "+v8a,+neon".into();
+
+    // Microsoft recommends enabling frame pointers on Arm64 Windows.
+    // From https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions?view=msvc-170#integer-registers
+    // "The frame pointer (x29) is required for compatibility with fast stack walking used by ETW
+    // and other services. It must point to the previous {x29, x30} pair on the stack."
+    base.frame_pointer = FramePointer::NonLeaf;
 
     Target {
         llvm_target: "aarch64-pc-windows-msvc".into(),
         metadata: TargetMetadata {
             description: Some("ARM64 Windows MSVC".into()),
-            tier: Some(2),
+            tier: Some(1),
             host_tools: Some(true),
             std: Some(true),
         },
@@ -17,7 +23,7 @@ pub(crate) fn target() -> Target {
         data_layout:
             "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32"
                 .into(),
-        arch: "aarch64".into(),
+        arch: Arch::AArch64,
         options: base,
     }
 }

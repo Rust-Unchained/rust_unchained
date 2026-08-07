@@ -1,26 +1,28 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::source::{IntoSpan, SpanRangeExt};
+use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::source::{IntoSpan, SpanExt};
 use clippy_utils::ty::get_field_by_name;
 use clippy_utils::visitors::{for_each_expr, for_each_expr_without_closures};
-use clippy_utils::{ExprUseNode, expr_use_ctxt, is_diag_item_method, is_diag_trait_item, path_to_local_id};
+use clippy_utils::{ExprUseNode, get_expr_use_site, sym};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir::{BindingMode, BorrowKind, ByRef, ClosureKind, Expr, ExprKind, Mutability, Node, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, AutoBorrowMutability};
-use rustc_span::{DUMMY_SP, Span, Symbol, sym};
+use rustc_span::{DUMMY_SP, Span, Symbol, SyntaxContext};
 
 use super::MANUAL_INSPECT;
 
 #[expect(clippy::too_many_lines)]
-pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name: &str, name_span: Span, msrv: Msrv) {
+pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name: Symbol, name_span: Span, msrv: Msrv) {
     if let ExprKind::Closure(c) = arg.kind
         && matches!(c.kind, ClosureKind::Closure)
         && let typeck = cx.typeck_results()
-        && let Some(fn_id) = typeck.type_dependent_def_id(expr.hir_id)
-        && (is_diag_trait_item(cx, fn_id, sym::Iterator)
-            || ((is_diag_item_method(cx, fn_id, sym::Option) || is_diag_item_method(cx, fn_id, sym::Result))
+        && let Some(fn_def) = typeck.type_dependent_def(expr.hir_id)
+        && (fn_def.opt_parent(cx).is_diag_item(cx, sym::Iterator)
+            || ((fn_def.opt_parent(cx).opt_impl_ty(cx).is_diag_item(cx, sym::Option)
+                || fn_def.opt_parent(cx).opt_impl_ty(cx).is_diag_item(cx, sym::Result))
                 && msrv.meets(cx, msrvs::OPTION_RESULT_INSPECT)))
         && let body = cx.tcx.hir_body(c.body)
         && let [param] = body.params
@@ -29,7 +31,7 @@ pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name:
         && let ExprKind::Block(block, _) = body.value.kind
         && let Some(final_expr) = block.expr
         && !block.stmts.is_empty()
-        && path_to_local_id(final_expr, arg_id)
+        && final_expr.res_local_id() == Some(arg_id)
         && typeck.expr_adjustments(final_expr).is_empty()
     {
         let mut requires_copy = false;
@@ -45,9 +47,9 @@ pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name:
         let can_lint = for_each_expr_without_closures(block.stmts, |e| {
             if let ExprKind::Closure(c) = e.kind {
                 // Nested closures don't need to treat returns specially.
-                let _: Option<!> = for_each_expr(cx, cx.tcx.hir_body(c.body).value, |e| {
-                    if path_to_local_id(e, arg_id) {
-                        let (kind, same_ctxt) = check_use(cx, e);
+                let _: Option<!> = for_each_expr(cx.tcx, cx.tcx.hir_body(c.body).value, |e| {
+                    if e.res_local_id() == Some(arg_id) {
+                        let (kind, same_ctxt) = check_use(cx, ctxt, e);
                         match (kind, same_ctxt && e.span.ctxt() == ctxt) {
                             (_, false) | (UseKind::Deref | UseKind::Return(..), true) => {
                                 requires_copy = true;
@@ -64,8 +66,8 @@ pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name:
                 });
             } else if matches!(e.kind, ExprKind::Ret(_)) {
                 ret_count += 1;
-            } else if path_to_local_id(e, arg_id) {
-                let (kind, same_ctxt) = check_use(cx, e);
+            } else if e.res_local_id() == Some(arg_id) {
+                let (kind, same_ctxt) = check_use(cx, ctxt, e);
                 match (kind, same_ctxt && e.span.ctxt() == ctxt) {
                     (UseKind::Return(..), false) => {
                         return ControlFlow::Break(());
@@ -100,8 +102,7 @@ pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name:
             match x {
                 UseKind::Return(s) => edits.push((s.with_leading_whitespace(cx).with_ctxt(s.ctxt()), String::new())),
                 UseKind::Borrowed(s) => {
-                    #[expect(clippy::range_plus_one)]
-                    let range = s.map_range(cx, |src, range| {
+                    let range = s.map_range(cx, |_, src, range| {
                         let src = src.get(range.clone())?;
                         let trimmed = src.trim_start_matches([' ', '\t', '\n', '\r', '(']);
                         trimmed.starts_with('&').then(|| {
@@ -168,8 +169,8 @@ pub(crate) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>, name:
                 edits.extend(addr_of_edits);
             }
             let edit = match name {
-                "map" => "inspect",
-                "map_err" => "inspect_err",
+                sym::map => "inspect",
+                sym::map_err => "inspect_err",
                 _ => return,
             };
             edits.push((name_span, edit.to_string()));
@@ -208,8 +209,8 @@ enum UseKind<'tcx> {
 }
 
 /// Checks how the value is used, and whether it was used in the same `SyntaxContext`.
-fn check_use<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -> (UseKind<'tcx>, bool) {
-    let use_cx = expr_use_ctxt(cx, e);
+fn check_use<'tcx>(cx: &LateContext<'tcx>, ctxt: SyntaxContext, e: &'tcx Expr<'_>) -> (UseKind<'tcx>, bool) {
+    let use_cx = get_expr_use_site(cx.tcx, cx.typeck_results(), ctxt, e);
     if use_cx
         .adjustments
         .first()

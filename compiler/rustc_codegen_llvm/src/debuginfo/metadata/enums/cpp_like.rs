@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use libc::c_uint;
-use rustc_abi::{Align, Endian, Size, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{Align, Endian, FieldIdx, Size, TagEncoding, VariantIdx, Variants};
 use rustc_codegen_ssa::debuginfo::type_names::compute_debuginfo_type_name;
 use rustc_codegen_ssa::debuginfo::{tag_base_type, wants_c_like_enum_debuginfo};
 use rustc_codegen_ssa::traits::{ConstCodegenMethods, MiscCodegenMethods};
@@ -11,7 +11,7 @@ use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, AdtDef, CoroutineArgs, CoroutineArgsExt, Ty};
 use smallvec::smallvec;
 
-use crate::common::{AsCCharPtr, CodegenCx};
+use crate::common::CodegenCx;
 use crate::debuginfo::dwarf_const::DW_TAG_const_type;
 use crate::debuginfo::metadata::enums::DiscrResult;
 use crate::debuginfo::metadata::type_map::{self, Stub, UniqueTypeId};
@@ -21,8 +21,8 @@ use crate::debuginfo::metadata::{
     size_and_align_of, type_di_node, unknown_file_metadata, visibility_di_flags,
 };
 use crate::debuginfo::utils::DIB;
+use crate::llvm;
 use crate::llvm::debuginfo::{DIFile, DIFlags, DIType};
-use crate::llvm::{self};
 
 // The names of the associated constants in each variant wrapper struct.
 // These have to match up with the names being used in `intrinsic.natvis`.
@@ -378,20 +378,17 @@ fn build_single_variant_union_fields<'ll, 'tcx>(
             variant_struct_type_wrapper_di_node,
             None,
         ),
-        unsafe {
-            llvm::LLVMRustDIBuilderCreateStaticMemberType(
-                DIB(cx),
-                enum_type_di_node,
-                TAG_FIELD_NAME.as_c_char_ptr(),
-                TAG_FIELD_NAME.len(),
-                unknown_file_metadata(cx),
-                UNKNOWN_LINE_NUMBER,
-                variant_names_type_di_node,
-                visibility_flags,
-                Some(cx.const_u64(SINGLE_VARIANT_VIRTUAL_DISR)),
-                tag_base_type_align.bits() as u32,
-            )
-        }
+        create_static_member_type(
+            cx,
+            enum_type_di_node,
+            TAG_FIELD_NAME,
+            unknown_file_metadata(cx),
+            UNKNOWN_LINE_NUMBER,
+            variant_names_type_di_node,
+            visibility_flags,
+            Some(cx.const_u64(SINGLE_VARIANT_VIRTUAL_DISR)),
+            tag_base_type_align,
+        ),
     ]
 }
 
@@ -401,7 +398,7 @@ fn build_union_fields_for_enum<'ll, 'tcx>(
     enum_type_and_layout: TyAndLayout<'tcx>,
     enum_type_di_node: &'ll DIType,
     variant_indices: impl Iterator<Item = VariantIdx> + Clone,
-    tag_field: usize,
+    tag_field: FieldIdx,
     untagged_variant_index: Option<VariantIdx>,
 ) -> SmallVec<&'ll DIType> {
     let tag_base_type = tag_base_type(cx.tcx, enum_type_and_layout);
@@ -570,27 +567,28 @@ fn build_variant_struct_wrapper_type_di_node<'ll, 'tcx>(
             let build_assoc_const = |name: &str,
                                      type_di_node_: &'ll DIType,
                                      value: u64,
-                                     align: Align| unsafe {
+                                     align: Align|
+             -> &'ll llvm::Metadata {
                 // FIXME: Currently we force all DISCR_* values to be u64's as LLDB seems to have
                 // problems inspecting other value types. Since DISCR_* is typically only going to be
                 // directly inspected via the debugger visualizer - which compares it to the `tag` value
                 // (whose type is not modified at all) it shouldn't cause any real problems.
                 let (t_di, align) = if name == ASSOC_CONST_DISCR_NAME {
-                    (type_di_node_, align.bits() as u32)
+                    (type_di_node_, align)
                 } else {
                     let ty_u64 = Ty::new_uint(cx.tcx, ty::UintTy::U64);
-                    (type_di_node(cx, ty_u64), Align::EIGHT.bits() as u32)
+                    (type_di_node(cx, ty_u64), Align::EIGHT)
                 };
 
                 // must wrap type in a `const` modifier for LLDB to be able to inspect the value of the member
-                let field_type =
-                    llvm::LLVMRustDIBuilderCreateQualifiedType(DIB(cx), DW_TAG_const_type, t_di);
+                let field_type = unsafe {
+                    llvm::LLVMDIBuilderCreateQualifiedType(DIB(cx), DW_TAG_const_type, t_di)
+                };
 
-                llvm::LLVMRustDIBuilderCreateStaticMemberType(
-                    DIB(cx),
+                create_static_member_type(
+                    cx,
                     wrapper_struct_type_di_node,
-                    name.as_c_char_ptr(),
-                    name.len(),
+                    name,
                     unknown_file_metadata(cx),
                     UNKNOWN_LINE_NUMBER,
                     field_type,
@@ -806,7 +804,7 @@ fn build_union_fields_for_direct_tag_enum_or_coroutine<'ll, 'tcx>(
     variant_field_infos: &[VariantFieldInfo<'ll>],
     discr_type_di_node: &'ll DIType,
     tag_base_type: Ty<'tcx>,
-    tag_field: usize,
+    tag_field: FieldIdx,
     untagged_variant_index: Option<VariantIdx>,
     di_flags: DIFlags,
 ) -> SmallVec<&'ll DIType> {
@@ -859,7 +857,7 @@ fn build_union_fields_for_direct_tag_enum_or_coroutine<'ll, 'tcx>(
     }));
 
     assert_eq!(
-        cx.size_and_align_of(enum_type_and_layout.field(cx, tag_field).ty),
+        cx.size_and_align_of(enum_type_and_layout.field(cx, tag_field.as_usize()).ty),
         cx.size_and_align_of(self::tag_base_type(cx.tcx, enum_type_and_layout))
     );
 
@@ -876,7 +874,7 @@ fn build_union_fields_for_direct_tag_enum_or_coroutine<'ll, 'tcx>(
             Endian::Big => (8, 0),
         };
 
-        let tag_field_offset = enum_type_and_layout.fields.offset(tag_field).bytes();
+        let tag_field_offset = enum_type_and_layout.fields.offset(tag_field.as_usize()).bytes();
         let lo_offset = Size::from_bytes(tag_field_offset + lo_offset);
         let hi_offset = Size::from_bytes(tag_field_offset + hi_offset);
 
@@ -906,8 +904,8 @@ fn build_union_fields_for_direct_tag_enum_or_coroutine<'ll, 'tcx>(
             cx,
             enum_type_di_node,
             TAG_FIELD_NAME,
-            enum_type_and_layout.field(cx, tag_field),
-            enum_type_and_layout.fields.offset(tag_field),
+            enum_type_and_layout.field(cx, tag_field.as_usize()),
+            enum_type_and_layout.fields.offset(tag_field.as_usize()),
             di_flags,
             tag_base_type_di_node,
             None,
@@ -975,4 +973,31 @@ fn variant_struct_wrapper_type_name(variant_index: VariantIdx) -> Cow<'static, s
         .get(variant_index.as_usize())
         .map(|&s| Cow::from(s))
         .unwrap_or_else(|| format!("Variant{}", variant_index.as_usize()).into())
+}
+
+fn create_static_member_type<'ll>(
+    cx: &CodegenCx<'ll, '_>,
+    scope: &'ll llvm::Metadata,
+    name: &str,
+    file: &'ll llvm::Metadata,
+    line_number: c_uint,
+    ty: &'ll llvm::Metadata,
+    flags: DIFlags,
+    value: Option<&'ll llvm::Value>,
+    align: Align,
+) -> &'ll llvm::Metadata {
+    unsafe {
+        llvm::LLVMDIBuilderCreateStaticMemberType(
+            DIB(cx),
+            scope,
+            name.as_ptr(),
+            name.len(),
+            file,
+            line_number,
+            ty,
+            flags,
+            value,
+            align.bits() as c_uint,
+        )
+    }
 }

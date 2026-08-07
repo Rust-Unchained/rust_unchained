@@ -9,22 +9,21 @@
     target_os = "illumos",
     target_os = "haiku",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "cygwin"
 ))]
 use libc::MSG_NOSIGNAL;
 
 use super::{SocketAddr, sockaddr_un};
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use super::{SocketAncillary, recv_vectored_with_ancillary_from, send_vectored_with_ancillary_to};
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use crate::io::{IoSlice, IoSliceMut};
 use crate::net::Shutdown;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::path::Path;
-use crate::sealed::Sealed;
-use crate::sys::cvt;
 use crate::sys::net::Socket;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner, cvt};
 use crate::time::Duration;
 use crate::{fmt, io};
 #[cfg(not(any(
@@ -38,6 +37,7 @@ use crate::{fmt, io};
     target_os = "illumos",
     target_os = "haiku",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "cygwin"
 )))]
 const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
@@ -46,7 +46,8 @@ const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(target_family = "unix", doc = "```no_run")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
 /// use std::os::unix::net::UnixDatagram;
 ///
 /// fn main() -> std::io::Result<()> {
@@ -60,10 +61,6 @@ const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
 /// ```
 #[stable(feature = "unix_socket", since = "1.10.0")]
 pub struct UnixDatagram(Socket);
-
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl Sealed for UnixDatagram {}
 
 #[stable(feature = "unix_socket", since = "1.10.0")]
 impl fmt::Debug for UnixDatagram {
@@ -85,7 +82,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let sock = match UnixDatagram::bind("/path/to/the/socket") {
@@ -112,7 +110,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -146,7 +145,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let sock = match UnixDatagram::unbound() {
@@ -159,7 +159,7 @@ impl UnixDatagram {
     /// ```
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn unbound() -> io::Result<UnixDatagram> {
-        let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_DGRAM)?;
+        let inner = Socket::new(libc::AF_UNIX, libc::SOCK_DGRAM)?;
         Ok(UnixDatagram(inner))
     }
 
@@ -169,7 +169,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let (sock1, sock2) = match UnixDatagram::pair() {
@@ -197,7 +198,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -226,7 +228,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -264,7 +267,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -282,7 +286,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -304,7 +309,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -354,7 +360,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -376,7 +383,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -397,8 +405,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -428,7 +442,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary_from(
         &self,
@@ -447,8 +461,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -478,7 +498,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary(
         &self,
@@ -497,7 +517,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -531,7 +552,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -567,7 +589,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -588,8 +611,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -613,7 +642,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary_to<P: AsRef<Path>>(
         &self,
@@ -630,8 +659,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -655,7 +690,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary(
         &self,
@@ -676,7 +711,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
@@ -691,7 +727,8 @@ impl UnixDatagram {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
@@ -720,7 +757,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
@@ -735,7 +773,8 @@ impl UnixDatagram {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
@@ -757,7 +796,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
@@ -778,7 +818,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
@@ -799,7 +840,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -842,7 +884,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -864,7 +907,8 @@ impl UnixDatagram {
     /// specified portions to immediately return with an appropriate value
     /// (see the documentation of [`Shutdown`]).
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::net::Shutdown;
     ///
@@ -888,7 +932,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixDatagram;
@@ -920,7 +965,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixDatagram;

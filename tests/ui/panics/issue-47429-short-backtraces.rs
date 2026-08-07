@@ -1,3 +1,4 @@
+//@ edition:2015..2021
 // Regression test for #47429: short backtraces were not terminating correctly
 
 //@ compile-flags: -O
@@ -5,6 +6,9 @@
 //@ run-fail
 //@ check-run-results
 //@ exec-env:RUST_BACKTRACE=1
+
+// FIXME(#61117): Respect debuginfo-level-tests, do not force debuginfo-level=0
+//@ compile-flags: -Cdebuginfo=0
 
 // This is needed to avoid test output differences across std being built with v0 symbols vs legacy
 // symbols.

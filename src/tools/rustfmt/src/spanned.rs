@@ -1,10 +1,9 @@
 use std::cmp::max;
 
-use rustc_ast::{ast, ptr};
-use rustc_span::{Span, source_map};
+use rustc_ast::ast;
+use rustc_span::Span;
 
 use crate::macros::MacroArg;
-use crate::patterns::RangeOperand;
 use crate::utils::{mk_sp, outer_attributes};
 
 /// Spanned returns a span including attributes, if available.
@@ -12,13 +11,13 @@ pub(crate) trait Spanned {
     fn span(&self) -> Span;
 }
 
-impl<T: Spanned> Spanned for ptr::P<T> {
+impl<T: Spanned> Spanned for Box<T> {
     fn span(&self) -> Span {
         (**self).span()
     }
 }
 
-impl<T> Spanned for source_map::Spanned<T> {
+impl<T> Spanned for rustc_span::Spanned<T> {
     fn span(&self) -> Span {
         self.span
     }
@@ -122,7 +121,7 @@ impl Spanned for ast::GenericParam {
     fn span(&self) -> Span {
         let lo = match self.kind {
             _ if !self.attrs.is_empty() => self.attrs[0].span.lo(),
-            ast::GenericParamKind::Const { kw_span, .. } => kw_span.lo(),
+            ast::GenericParamKind::Const { span, .. } => span.lo(),
             _ => self.ident.span.lo(),
         };
         let hi = if self.bounds.is_empty() {
@@ -203,11 +202,5 @@ impl Spanned for ast::PreciseCapturingArg {
             ast::PreciseCapturingArg::Lifetime(lt) => lt.ident.span,
             ast::PreciseCapturingArg::Arg(path, _) => path.span,
         }
-    }
-}
-
-impl<'a, T> Spanned for RangeOperand<'a, T> {
-    fn span(&self) -> Span {
-        self.span
     }
 }

@@ -5,7 +5,8 @@ use std::{io, iter, str};
 use rustc_abi::{Align, Size};
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::callconv::{Conv, FnAbi};
+use rustc_target::callconv::FnAbi;
+use rustc_target::spec::Env;
 
 use self::shims::windows::handle::{Handle, PseudoHandle};
 use crate::shims::os_str::bytes_to_os_str;
@@ -136,134 +137,209 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
-        // According to
-        // https://github.com/rust-lang/rust/blob/fb00adbdb69266f10df95a4527b767b0ad35ea48/compiler/rustc_target/src/spec/mod.rs#L2766-L2768,
-        // x86-32 Windows uses a different calling convention than other Windows targets
-        // for the "system" ABI.
-        let sys_conv = if this.tcx.sess.target.arch == "x86" { Conv::X86Stdcall } else { Conv::C };
-
         // See `fn emulate_foreign_item_inner` in `shims/foreign_items.rs` for the general pattern.
 
         // Windows API stubs.
-        // HANDLE = isize
-        // NTSTATUS = LONH = i32
+        // HANDLE = *mut c_void (formerly: isize)
+        // NTSTATUS = LONG = i32
         // DWORD = ULONG = u32
         // BOOL = i32
         // BOOLEAN = u8
         match link_name.as_str() {
             // Environment related shims
             "GetEnvironmentVariableW" => {
-                let [name, buf, size] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [name, buf, size] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _, *mut _, u32) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.GetEnvironmentVariableW(name, buf, size)?;
                 this.write_scalar(result, dest)?;
             }
             "SetEnvironmentVariableW" => {
-                let [name, value] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [name, value] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _, *const _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.SetEnvironmentVariableW(name, value)?;
                 this.write_scalar(result, dest)?;
             }
             "GetEnvironmentStringsW" => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.GetEnvironmentStringsW()?;
                 this.write_pointer(result, dest)?;
             }
             "FreeEnvironmentStringsW" => {
-                let [env_block] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [env_block] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.FreeEnvironmentStringsW(env_block)?;
                 this.write_scalar(result, dest)?;
             }
             "GetCurrentDirectoryW" => {
-                let [size, buf] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [size, buf] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32, *mut _) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.GetCurrentDirectoryW(size, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "SetCurrentDirectoryW" => {
-                let [path] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [path] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.SetCurrentDirectoryW(path)?;
                 this.write_scalar(result, dest)?;
             }
             "GetUserProfileDirectoryW" => {
-                let [token, buf, size] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [token, buf, size] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *mut _, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.GetUserProfileDirectoryW(token, buf, size)?;
                 this.write_scalar(result, dest)?;
             }
             "GetCurrentProcessId" => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.GetCurrentProcessId()?;
+                this.write_scalar(result, dest)?;
+            }
+            "GetTempPathW" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [bufferlength, buffer] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32, *mut _) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.GetTempPathW(bufferlength, buffer)?;
                 this.write_scalar(result, dest)?;
             }
 
             // File related shims
             "NtWriteFile" => {
-                if !this.frame_in_std() {
-                    throw_unsup_format!(
-                        "`NtWriteFile` support is crude and just enough for stdout to work"
-                    );
-                }
-
                 let [
                     handle,
-                    _event,
-                    _apc_routine,
-                    _apc_context,
+                    event,
+                    apc_routine,
+                    apc_context,
                     io_status_block,
                     buf,
                     n,
                     byte_offset,
-                    _key,
-                ] = this.check_shim(abi, sys_conv, link_name, args)?;
-                let handle = this.read_target_isize(handle)?;
-                let buf = this.read_pointer(buf)?;
-                let n = this.read_scalar(n)?.to_u32()?;
-                let byte_offset = this.read_target_usize(byte_offset)?; // is actually a pointer
-                let io_status_block = this
-                    .deref_pointer_as(io_status_block, this.windows_ty_layout("IO_STATUS_BLOCK"))?;
-
-                if byte_offset != 0 {
-                    throw_unsup_format!(
-                        "`NtWriteFile` `ByteOffset` parameter is non-null, which is unsupported"
-                    );
-                }
-
-                let written = if handle == -11 || handle == -12 {
-                    // stdout/stderr
-                    use io::Write;
-
-                    let buf_cont =
-                        this.read_bytes_ptr_strip_provenance(buf, Size::from_bytes(u64::from(n)))?;
-                    let res = if this.machine.mute_stdout_stderr {
-                        Ok(buf_cont.len())
-                    } else if handle == -11 {
-                        io::stdout().write(buf_cont)
-                    } else {
-                        io::stderr().write(buf_cont)
-                    };
-                    // We write at most `n` bytes, which is a `u32`, so we cannot have written more than that.
-                    res.ok().map(|n| u32::try_from(n).unwrap())
-                } else {
-                    throw_unsup_format!(
-                        "on Windows, writing to anything except stdout/stderr is not supported"
-                    )
-                };
-                // We have to put the result into io_status_block.
-                if let Some(n) = written {
-                    let io_status_information =
-                        this.project_field_named(&io_status_block, "Information")?;
-                    this.write_scalar(
-                        Scalar::from_target_usize(n.into(), this),
-                        &io_status_information,
-                    )?;
-                }
-                // Return whether this was a success. >= 0 is success.
-                // For the error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
-                this.write_scalar(
-                    Scalar::from_u32(if written.is_some() { 0 } else { 0xC0000185u32 }),
+                    key,
+                ] = this.check_shim_sig(
+                    shim_sig!(
+                        extern "system" fn(
+                            winapi::HANDLE,
+                            winapi::HANDLE,
+                            *mut _,
+                            *mut _,
+                            *mut _,
+                            *mut _,
+                            u32,
+                            *mut _,
+                            *mut _,
+                        ) -> i32
+                    ),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.NtWriteFile(
+                    handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    key,
+                    dest,
+                )?;
+            }
+            "NtReadFile" => {
+                let [
+                    handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    key,
+                ] = this.check_shim_sig(
+                    shim_sig!(
+                        extern "system" fn(
+                            winapi::HANDLE,
+                            winapi::HANDLE,
+                            *mut _,
+                            *mut _,
+                            *mut _,
+                            *mut _,
+                            u32,
+                            *mut _,
+                            *mut _,
+                        ) -> i32
+                    ),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.NtReadFile(
+                    handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    key,
                     dest,
                 )?;
             }
             "GetFullPathNameW" => {
-                let [filename, size, buffer, filepart] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [filename, size, buffer, filepart] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _, u32, *mut _, *mut _) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.check_no_isolation("`GetFullPathNameW`")?;
 
                 let filename = this.read_pointer(filename)?;
@@ -300,7 +376,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     creation_disposition,
                     flags_and_attributes,
                     template_file,
-                ] = this.check_shim(abi, sys_conv, link_name, args)?;
+                ] = this.check_shim_sig(
+                    shim_sig!(
+                        extern "system" fn(
+                            *const _,
+                            u32,
+                            u32,
+                            *mut _,
+                            u32,
+                            u32,
+                            winapi::HANDLE,
+                        ) -> winapi::HANDLE
+                    ),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let handle = this.CreateFileW(
                     file_name,
                     desired_access,
@@ -313,19 +404,84 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(handle.to_scalar(this), dest)?;
             }
             "GetFileInformationByHandle" => {
-                let [handle, info] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [handle, info] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let res = this.GetFileInformationByHandle(handle, info)?;
                 this.write_scalar(res, dest)?;
             }
+            "SetFileInformationByHandle" => {
+                let [handle, class, info, size] = this.check_shim_sig(
+                    shim_sig!(
+                        extern "system" fn(
+                            winapi::HANDLE,
+                            winapi::FILE_INFO_BY_HANDLE_CLASS,
+                            *mut _,
+                            u32,
+                        ) -> winapi::BOOL
+                    ),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let res = this.SetFileInformationByHandle(handle, class, info, size)?;
+                this.write_scalar(res, dest)?;
+            }
+            "FlushFileBuffers" => {
+                let [handle] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let res = this.FlushFileBuffers(handle)?;
+                this.write_scalar(res, dest)?;
+            }
             "DeleteFileW" => {
-                let [file_name] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [file_name] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let res = this.DeleteFileW(file_name)?;
+                this.write_scalar(res, dest)?;
+            }
+            "SetFilePointerEx" => {
+                let [file, distance_to_move, new_file_pointer, move_method] = this.check_shim_sig(
+                    // i64 is actually a LARGE_INTEGER union of {u32, i32} and {i64}
+                    shim_sig!(extern "system" fn(winapi::HANDLE, i64, *mut _, u32) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let res =
+                    this.SetFilePointerEx(file, distance_to_move, new_file_pointer, move_method)?;
+                this.write_scalar(res, dest)?;
+            }
+            "MoveFileExW" => {
+                let [existing_name, new_name, flags] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _, *const _, u32) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let res = this.MoveFileExW(existing_name, new_name, flags)?;
                 this.write_scalar(res, dest)?;
             }
 
             // Allocation
             "HeapAlloc" => {
-                let [handle, flags, size] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [handle, flags, size] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, u32, usize) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_target_isize(handle)?;
                 let flags = this.read_scalar(flags)?.to_u32()?;
                 let size = this.read_target_usize(size)?;
@@ -347,7 +503,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_pointer(ptr, dest)?;
             }
             "HeapFree" => {
-                let [handle, flags, ptr] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [handle, flags, ptr] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, u32, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
                 let ptr = this.read_pointer(ptr)?;
@@ -359,8 +521,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Scalar::from_i32(1), dest)?;
             }
             "HeapReAlloc" => {
-                let [handle, flags, old_ptr, size] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [handle, flags, old_ptr, size] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, u32, *mut _, usize) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
                 let old_ptr = this.read_pointer(old_ptr)?;
@@ -380,7 +547,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_pointer(new_ptr, dest)?;
             }
             "LocalFree" => {
-                let [ptr] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [ptr] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HLOCAL) -> winapi::HLOCAL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let ptr = this.read_pointer(ptr)?;
                 // "If the hMem parameter is NULL, LocalFree ignores the parameter and returns NULL."
                 // (https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localfree)
@@ -392,17 +565,32 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // errno
             "SetLastError" => {
-                let [error] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [error] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let error = this.read_scalar(error)?;
                 this.set_last_error(error)?;
             }
             "GetLastError" => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let last_error = this.get_last_error()?;
                 this.write_scalar(last_error, dest)?;
             }
             "RtlNtStatusToDosError" => {
-                let [status] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [status] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(i32) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let status = this.read_scalar(status)?.to_u32()?;
                 let err = match status {
                     // STATUS_MEDIA_WRITE_PROTECTED => ERROR_WRITE_PROTECT
@@ -423,8 +611,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Querying system information
             "GetSystemInfo" => {
+                // FIXME: This does not have a direct test (#3179).
                 // Also called from `page_size` crate.
-                let [system_info] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [system_info] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let system_info =
                     this.deref_pointer_as(system_info, this.windows_ty_layout("SYSTEM_INFO"))?;
                 // Initialize with `0`.
@@ -444,22 +638,40 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Thread-local storage
             "TlsAlloc" => {
+                // FIXME: This does not have a direct test (#3179).
                 // This just creates a key; Windows does not natively support TLS destructors.
 
                 // Create key and return it.
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let key = this.machine.tls.create_tls_key(None, dest.layout.size)?;
                 this.write_scalar(Scalar::from_uint(key, dest.layout.size), dest)?;
             }
             "TlsGetValue" => {
-                let [key] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [key] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let key = u128::from(this.read_scalar(key)?.to_u32()?);
                 let active_thread = this.active_thread();
                 let ptr = this.machine.tls.load_tls(key, active_thread, this)?;
                 this.write_scalar(ptr, dest)?;
             }
             "TlsSetValue" => {
-                let [key, new_ptr] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [key, new_ptr] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let key = u128::from(this.read_scalar(key)?.to_u32()?);
                 let active_thread = this.active_thread();
                 let new_data = this.read_scalar(new_ptr)?;
@@ -469,7 +681,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_int(1, dest)?;
             }
             "TlsFree" => {
-                let [key] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [key] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let key = u128::from(this.read_scalar(key)?.to_u32()?);
                 this.machine.tls.delete_tls_key(key)?;
 
@@ -477,9 +695,103 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_int(1, dest)?;
             }
 
+            // Fiber-local storage - similar to TLS but supports destructors.
+            "FlsAlloc" => {
+                // FIXME: This does not have a direct test (#3179).
+                // Create key and return it.
+                let [dtor] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::PFLS_CALLBACK_FUNCTION) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let dtor = this.read_pointer(dtor)?;
+
+                // Extract the function type out of the signature (that seems easier than constructing it ourselves).
+                let dtor = if !this.ptr_is_null(dtor)? {
+                    Some((
+                        this.get_ptr_fn(dtor)?.as_instance()?,
+                        this.machine.current_user_relevant_span(),
+                    ))
+                } else {
+                    None
+                };
+
+                let key = this.machine.tls.create_tls_key(dtor, dest.layout.size)?;
+                this.write_scalar(Scalar::from_uint(key, dest.layout.size), dest)?;
+            }
+            "FlsGetValue" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [key] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let key = u128::from(this.read_scalar(key)?.to_u32()?);
+                let active_thread = this.active_thread();
+                let ptr = this.machine.tls.load_tls(key, active_thread, this)?;
+                this.write_scalar(ptr, dest)?;
+            }
+            "FlsSetValue" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [key, new_ptr] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let key = u128::from(this.read_scalar(key)?.to_u32()?);
+                let active_thread = this.active_thread();
+                let new_data = this.read_scalar(new_ptr)?;
+                this.machine.tls.store_tls(key, active_thread, new_data, &*this.tcx)?;
+
+                // Return success (`1`).
+                this.write_int(1, dest)?;
+            }
+            "FlsFree" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [key] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let key = u128::from(this.read_scalar(key)?.to_u32()?);
+                let tls_entry = this.machine.tls.delete_tls_key(key)?;
+
+                // FIXME: We should run the destructor here *for all threads*. But that's non-trivial and std doesn't need it so we bail out with an "unsupported" error.
+                if !tls_entry.data.is_empty() && tls_entry.dtor.is_some() {
+                    throw_unsup_format!(
+                        "calling `FlsFree` on a key with an associated dtor is not supported"
+                    );
+                }
+
+                // Return success (`1`).
+                this.write_int(1, dest)?;
+            }
+            "IsThreadAFiber" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                // Return FALSE, as Miri does not support fibers.
+                this.write_int(0, dest)?;
+            }
+
             // Access to command-line arguments
             "GetCommandLineW" => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.write_pointer(
                     this.machine.cmd_line.expect("machine must be initialized"),
                     dest,
@@ -488,30 +800,56 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Time related shims
             "GetSystemTimeAsFileTime" | "GetSystemTimePreciseAsFileTime" => {
-                #[allow(non_snake_case)]
-                let [LPFILETIME] = this.check_shim(abi, sys_conv, link_name, args)?;
-                this.GetSystemTimeAsFileTime(link_name.as_str(), LPFILETIME)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [filetime] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.GetSystemTimeAsFileTime(link_name.as_str(), filetime)?;
             }
             "QueryPerformanceCounter" => {
-                #[allow(non_snake_case)]
-                let [lpPerformanceCount] = this.check_shim(abi, sys_conv, link_name, args)?;
-                let result = this.QueryPerformanceCounter(lpPerformanceCount)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [performance_count] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.QueryPerformanceCounter(performance_count)?;
                 this.write_scalar(result, dest)?;
             }
             "QueryPerformanceFrequency" => {
-                #[allow(non_snake_case)]
-                let [lpFrequency] = this.check_shim(abi, sys_conv, link_name, args)?;
-                let result = this.QueryPerformanceFrequency(lpFrequency)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [frequency] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.QueryPerformanceFrequency(frequency)?;
                 this.write_scalar(result, dest)?;
             }
             "Sleep" => {
-                let [timeout] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [timeout] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.Sleep(timeout)?;
             }
             "CreateWaitableTimerExW" => {
-                let [attributes, name, flags, access] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [attributes, name, flags, access] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _, *const _, u32, u32) -> winapi::HANDLE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_pointer(attributes)?;
                 this.read_pointer(name)?;
                 this.read_scalar(flags)?.to_u32()?;
@@ -524,38 +862,70 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Synchronization primitives
             "InitOnceBeginInitialize" => {
-                let [ptr, flags, pending, context] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                let [ptr, flags, pending, context] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _, u32, *mut _, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.InitOnceBeginInitialize(ptr, flags, pending, context, dest)?;
             }
             "InitOnceComplete" => {
-                let [ptr, flags, context] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [ptr, flags, context] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _, u32, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let result = this.InitOnceComplete(ptr, flags, context)?;
                 this.write_scalar(result, dest)?;
             }
             "WaitOnAddress" => {
-                let [ptr_op, compare_op, size_op, timeout_op] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [ptr_op, compare_op, size_op, timeout_op] = this.check_shim_sig(
+                    // First pointer is volatile
+                    shim_sig!(extern "system" fn(*mut _, *mut _, usize, u32) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.WaitOnAddress(ptr_op, compare_op, size_op, timeout_op, dest)?;
             }
             "WakeByAddressSingle" => {
-                let [ptr_op] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [ptr_op] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.WakeByAddressSingle(ptr_op)?;
             }
             "WakeByAddressAll" => {
-                let [ptr_op] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [ptr_op] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.WakeByAddressAll(ptr_op)?;
             }
 
             // Dynamic symbol loading
             "GetProcAddress" => {
-                #[allow(non_snake_case)]
-                let [hModule, lpProcName] = this.check_shim(abi, sys_conv, link_name, args)?;
-                this.read_target_isize(hModule)?;
-                let name = this.read_c_str(this.read_pointer(lpProcName)?)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [module, proc_name] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HMODULE, *const _) -> winapi::FARPROC),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.read_target_isize(module)?;
+                let name = this.read_c_str(this.read_pointer(proc_name)?)?;
                 if let Ok(name) = str::from_utf8(name)
                     && is_dyn_sym(name)
                 {
@@ -568,8 +938,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Threading
             "CreateThread" => {
-                let [security, stacksize, start, arg, flags, thread] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                let [security, stacksize, start, arg, flags, thread] = this.check_shim_sig(
+                    shim_sig!(
+                        extern "system" fn(
+                            *mut _,
+                            usize,
+                            *mut _,
+                            *mut _,
+                            u32,
+                            *mut _,
+                        ) -> winapi::HANDLE
+                    ),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 let thread_id =
                     this.CreateThread(security, stacksize, start, arg, flags, thread)?;
@@ -577,13 +960,35 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Handle::Thread(thread_id).to_scalar(this), dest)?;
             }
             "WaitForSingleObject" => {
-                let [handle, timeout] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [handle, timeout] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, u32) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
-                let ret = this.WaitForSingleObject(handle, timeout)?;
-                this.write_scalar(ret, dest)?;
+                this.WaitForSingleObject(handle, timeout, dest)?;
+            }
+            "GetCurrentProcess" => {
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> winapi::HANDLE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                this.write_scalar(
+                    Handle::Pseudo(PseudoHandle::CurrentProcess).to_scalar(this),
+                    dest,
+                )?;
             }
             "GetCurrentThread" => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> winapi::HANDLE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.write_scalar(
                     Handle::Pseudo(PseudoHandle::CurrentThread).to_scalar(this),
@@ -591,7 +996,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )?;
             }
             "SetThreadDescription" => {
-                let [handle, name] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [handle, name] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *const _) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 let handle = this.read_handle(handle, "SetThreadDescription")?;
                 let name = this.read_wide_str(this.read_pointer(name)?)?;
@@ -606,7 +1016,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Scalar::from_u32(0), dest)?;
             }
             "GetThreadDescription" => {
-                let [handle, name_ptr] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [handle, name_ptr] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *mut _) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 let handle = this.read_handle(handle, "GetThreadDescription")?;
                 let name_ptr = this.deref_pointer_as(name_ptr, this.machine.layouts.mut_raw_ptr)?; // the pointer where we should store the ptr to the name
@@ -628,10 +1043,40 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(name, &name_ptr)?;
                 this.write_scalar(res, dest)?;
             }
+            "GetThreadId" => {
+                let [handle] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let handle = this.read_handle(handle, "GetThreadId")?;
+                let thread = match handle {
+                    Handle::Thread(thread) => thread,
+                    Handle::Pseudo(PseudoHandle::CurrentThread) => this.active_thread(),
+                    _ => this.invalid_handle("GetThreadDescription")?,
+                };
+                this.write_scalar(Scalar::from_u32(thread.to_u32()), dest)?;
+            }
+            "GetCurrentThreadId" => {
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.write_scalar(Scalar::from_u32(this.active_thread().to_u32()), dest)?;
+            }
 
             // Miscellaneous
             "ExitProcess" => {
-                let [code] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [code] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Windows technically uses u32, but we unify everything to a Unix-style i32.
                 let code = this.read_scalar(code)?.to_i32()?;
                 throw_machine_stop!(TerminationInfo::Exit { code, leak_check: false });
@@ -639,15 +1084,27 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "SystemFunction036" => {
                 // used by getrandom 0.1
                 // This is really 'RtlGenRandom'.
-                let [ptr, len] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [ptr, len] = this.check_shim_sig(
+                    // Returns winapi::BOOLEAN, which is a byte
+                    shim_sig!(extern "system" fn(*mut _, u32) -> u8),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_scalar(len)?.to_u32()?;
                 this.gen_random(ptr, len.into())?;
                 this.write_scalar(Scalar::from_bool(true), dest)?;
             }
             "ProcessPrng" => {
+                // FIXME: This does not have a direct test (#3179).
                 // used by `std`
-                let [ptr, len] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [ptr, len] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _, usize) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_target_usize(len)?;
                 this.gen_random(ptr, len)?;
@@ -655,8 +1112,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             "BCryptGenRandom" => {
                 // used by getrandom 0.2
-                let [algorithm, ptr, len, flags] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                let [algorithm, ptr, len, flags] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _, *mut _, u32, u32) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 let algorithm = this.read_scalar(algorithm)?;
                 let algorithm = algorithm.to_target_usize(this)?;
                 let ptr = this.read_pointer(ptr)?;
@@ -689,8 +1150,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_null(dest)?; // STATUS_SUCCESS
             }
             "GetConsoleScreenBufferInfo" => {
+                // FIXME: This does not have a direct test (#3179).
                 // `term` needs this, so we fake it.
-                let [console, buffer_info] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [console, buffer_info] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_target_isize(console)?;
                 // FIXME: this should use deref_pointer_as, but CONSOLE_SCREEN_BUFFER_INFO is not in std
                 this.deref_pointer(buffer_info)?;
@@ -699,23 +1166,65 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_null(dest)?;
             }
             "GetStdHandle" => {
-                let [which] = this.check_shim(abi, sys_conv, link_name, args)?;
-                let which = this.read_scalar(which)?.to_i32()?;
-                // We just make this the identity function, so we know later in `NtWriteFile` which
-                // one it is. This is very fake, but libtest needs it so we cannot make it a
-                // std-only shim.
-                // FIXME: this should return real HANDLEs when io support is added
-                this.write_scalar(Scalar::from_target_isize(which.into(), this), dest)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [which] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32) -> winapi::HANDLE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let res = this.GetStdHandle(which)?;
+                this.write_scalar(res, dest)?;
+            }
+            "DuplicateHandle" => {
+                let [src_proc, src_handle, target_proc, target_handle, access, inherit, options] =
+                    this.check_shim_sig(
+                        shim_sig!(
+                            extern "system" fn(
+                                winapi::HANDLE,
+                                winapi::HANDLE,
+                                winapi::HANDLE,
+                                *mut _,
+                                u32,
+                                winapi::BOOL,
+                                u32,
+                            ) -> winapi::BOOL
+                        ),
+                        link_name,
+                        abi,
+                        args,
+                    )?;
+                let res = this.DuplicateHandle(
+                    src_proc,
+                    src_handle,
+                    target_proc,
+                    target_handle,
+                    access,
+                    inherit,
+                    options,
+                )?;
+                this.write_scalar(res, dest)?;
             }
             "CloseHandle" => {
-                let [handle] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [handle] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 let ret = this.CloseHandle(handle)?;
 
                 this.write_scalar(ret, dest)?;
             }
             "GetModuleFileNameW" => {
-                let [handle, filename, size] = this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [handle, filename, size] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HMODULE, *mut _, u32) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.check_no_isolation("`GetModuleFileNameW`")?;
 
                 let handle = this.read_handle(handle, "GetModuleFileNameW")?;
@@ -748,8 +1257,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
             "FormatMessageW" => {
-                let [flags, module, message_id, language_id, buffer, size, arguments] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [flags, module, message_id, language_id, buffer, size, arguments] = this
+                    .check_shim_sig(
+                        shim_sig!(
+                            extern "system" fn(u32, *const _, u32, u32, *mut _, u32, *mut _) -> u32
+                        ),
+                        link_name,
+                        abi,
+                        args,
+                    )?;
 
                 let flags = this.read_scalar(flags)?.to_u32()?;
                 let _module = this.read_pointer(module)?; // seems to contain a module name
@@ -781,76 +1298,116 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_int(length.strict_sub(1), dest)?;
             }
 
+            "_Unwind_RaiseException" => {
+                // FIXME: This does not have a direct test (#3179).
+                // This is not formally part of POSIX, but it is very wide-spread on POSIX systems.
+                // It was originally specified as part of the Itanium C++ ABI:
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi-eh.html#base-throw.
+                // MinGW implements _Unwind_RaiseException on top of SEH exceptions.
+                if this.tcx.sess.target.env != Env::Gnu {
+                    throw_unsup_format!(
+                        "`_Unwind_RaiseException` is not supported on non-MinGW Windows",
+                    );
+                }
+                // This function looks and behaves exactly like miri_start_unwind.
+                let [payload] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(*mut _) -> unwind::libunwind::_Unwind_Reason_Code),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                this.handle_miri_start_unwind(payload)?;
+                return interp_ok(EmulateItemResult::NeedsUnwind);
+            }
+
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
             // These shims are enabled only when the caller is in the standard library.
             "GetProcessHeap" if this.frame_in_std() => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> winapi::HANDLE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Just fake a HANDLE
                 // It's fine to not use the Handle type here because its a stub
                 this.write_int(1, dest)?;
             }
             "GetModuleHandleA" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_lpModuleName] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [_module_name] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*const _) -> winapi::HMODULE),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // We need to return something non-null here to make `compat_fn!` work.
                 this.write_int(1, dest)?;
             }
             "SetConsoleTextAttribute" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_hConsoleOutput, _wAttribute] =
-                    this.check_shim(abi, sys_conv, link_name, args)?;
+                let [_console_output, _attribute] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, u16) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Pretend these does not exist / nothing happened, by returning zero.
                 this.write_null(dest)?;
             }
             "GetConsoleMode" if this.frame_in_std() => {
-                let [console, mode] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [console, mode] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE, *mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 this.read_target_isize(console)?;
                 this.deref_pointer_as(mode, this.machine.layouts.u32)?;
                 // Indicate an error.
                 this.write_null(dest)?;
             }
             "GetFileType" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_hFile] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [_file] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(winapi::HANDLE) -> u32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Return unknown file type.
                 this.write_null(dest)?;
             }
             "AddVectoredExceptionHandler" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_First, _Handler] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [_first, _handler] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(u32, *mut _) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Any non zero value works for the stdlib. This is just used for stack overflows anyway.
                 this.write_int(1, dest)?;
             }
             "SetThreadStackGuarantee" if this.frame_in_std() => {
-                #[allow(non_snake_case)]
-                let [_StackSizeInBytes] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [_stack_size_in_bytes] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn(*mut _) -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
                 // Any non zero value works for the stdlib. This is just used for stack overflows anyway.
                 this.write_int(1, dest)?;
             }
             // this is only callable from std because we know that std ignores the return value
             "SwitchToThread" if this.frame_in_std() => {
-                let [] = this.check_shim(abi, sys_conv, link_name, args)?;
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "system" fn() -> winapi::BOOL),
+                    link_name,
+                    abi,
+                    args,
+                )?;
 
                 this.yield_active_thread();
 
                 // FIXME: this should return a nonzero value if this call does result in switching to another thread.
                 this.write_null(dest)?;
-            }
-
-            "_Unwind_RaiseException" => {
-                // This is not formally part of POSIX, but it is very wide-spread on POSIX systems.
-                // It was originally specified as part of the Itanium C++ ABI:
-                // https://itanium-cxx-abi.github.io/cxx-abi/abi-eh.html#base-throw.
-                // MinGW implements _Unwind_RaiseException on top of SEH exceptions.
-                if this.tcx.sess.target.env != "gnu" {
-                    throw_unsup_format!(
-                        "`_Unwind_RaiseException` is not supported on non-MinGW Windows",
-                    );
-                }
-                // This function looks and behaves excatly like miri_start_unwind.
-                let [payload] = this.check_shim(abi, Conv::C, link_name, args)?;
-                this.handle_miri_start_unwind(payload)?;
-                return interp_ok(EmulateItemResult::NeedsUnwind);
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),

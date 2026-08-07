@@ -4,7 +4,7 @@
 //! In the past we've accidentally checked in test binaries and such which add a
 //! huge amount of bloat to the Git history, so it's good to just ensure we
 //! don't do that again.
-#![allow(unused)]
+
 pub use os_impl::*;
 
 // All files are executable on Windows, so just check on Unix.
@@ -12,11 +12,13 @@ pub use os_impl::*;
 mod os_impl {
     use std::path::Path;
 
+    use crate::diagnostics::TidyCtx;
+
     pub fn check_filesystem_support(_sources: &[&Path], _output: &Path) -> bool {
         return false;
     }
 
-    pub fn check(_path: &Path, _bad: &mut bool) {}
+    pub fn check(_path: &Path, _tidy_ctx: TidyCtx) {}
 }
 
 #[cfg(unix)]
@@ -35,6 +37,8 @@ mod os_impl {
     }
 
     use FilesystemSupport::*;
+
+    use crate::diagnostics::TidyCtx;
 
     fn is_executable(path: &Path) -> std::io::Result<bool> {
         Ok(path.metadata()?.mode() & 0o111 != 0)
@@ -75,7 +79,7 @@ mod os_impl {
                         return ReadOnlyFs;
                     }
 
-                    panic!("unable to create temporary file `{:?}`: {:?}", path, e);
+                    panic!("unable to create temporary file `{path:?}`: {e:?}");
                 }
             }
         }
@@ -83,12 +87,7 @@ mod os_impl {
         for &source_dir in sources {
             match check_dir(source_dir) {
                 Unsupported => return false,
-                ReadOnlyFs => {
-                    return match check_dir(output) {
-                        Supported => true,
-                        _ => false,
-                    };
-                }
+                ReadOnlyFs => return matches!(check_dir(output), Supported),
                 _ => {}
             }
         }
@@ -111,59 +110,59 @@ mod os_impl {
     }
 
     #[cfg(unix)]
-    pub fn check(path: &Path, bad: &mut bool) {
-		use std::ffi::OsStr;
+    pub fn check(path: &Path, tidy_ctx: TidyCtx) {
+        let mut check = tidy_ctx.start_check("bins");
 
-		//const ALLOWED: &[&str] = &["configure", "x"];
+        use std::ffi::OsStr;
 
-		for p in RI_EXCLUSION_LIST {
-			if !path.join(Path::new(p)).exists() {
-				tidy_error!(bad, "rust-installer test bins missed: {p}");
-			}
-		}
+        const ALLOWED: &[&str] = &["configure", "x"];
 
-		// FIXME: we don't need to look at all binaries, only files that have been modified in this branch
-		// (e.g. using `git ls-files`).
-		walk_no_read(
-			&[path],
-			|path, _is_dir| {
-				filter_dirs(path)
-					|| path.ends_with("src/etc")
-					|| filter_rust_installer_no_so_bins(path)
-			},
-			&mut |entry| {
-				let file = entry.path();
-				let extension = file.extension();
-				let scripts = ["py", "sh", "ps1", "woff2"];
-				if scripts.into_iter().any(|e| extension == Some(OsStr::new(e))) {
-					return;
-				}
+        for p in RI_EXCLUSION_LIST {
+            if !path.join(Path::new(p)).exists() {
+                check.error(format!("rust-installer test bins missed: {p}"));
+            }
+        }
 
-				/*
-				if t!(is_executable(&file), file) {
-					let rel_path = file.strip_prefix(path).unwrap();
-					let git_friendly_path = rel_path.to_str().unwrap().replace("\\", "/");
+        // FIXME: we don't need to look at all binaries, only files that have been modified in this branch
+        // (e.g. using `git ls-files`).
+        walk_no_read(
+            &[path],
+            |path, _is_dir| {
+                filter_dirs(path)
+                    || path.ends_with("src/etc")
+                    || filter_rust_installer_no_so_bins(path)
+            },
+            &mut |entry| {
+                let file = entry.path();
+                let extension = file.extension();
+                let scripts = ["py", "sh", "ps1", "woff2"];
+                if scripts.into_iter().any(|e| extension == Some(OsStr::new(e))) {
+                    return;
+                }
 
-					if ALLOWED.contains(&git_friendly_path.as_str()) {
-						return;
-					}
+                if t!(is_executable(file), file) {
+                    let rel_path = file.strip_prefix(path).unwrap();
+                    let git_friendly_path = rel_path.to_str().unwrap().replace("\\", "/");
 
-					let output = Command::new("git")
-						.arg("ls-files")
-						.arg(&git_friendly_path)
-						.current_dir(path)
-						.stderr(Stdio::null())
-						.output()
-						.unwrap_or_else(|e| {
-							panic!("could not run git ls-files: {e}");
-						});
-					let path_bytes = rel_path.as_os_str().as_bytes();
-					if output.status.success() && output.stdout.starts_with(path_bytes) {
-						tidy_error!(bad, "binary checked into source: {}", file.display());
-					}
-				}
-				*/
-			},
-		)
+                    if ALLOWED.contains(&git_friendly_path.as_str()) {
+                        return;
+                    }
+
+                    let output = Command::new("git")
+                        .arg("ls-files")
+                        .arg(&git_friendly_path)
+                        .current_dir(path)
+                        .stderr(Stdio::null())
+                        .output()
+                        .unwrap_or_else(|e| {
+                            panic!("could not run git ls-files: {e}");
+                        });
+                    let path_bytes = rel_path.as_os_str().as_bytes();
+                    if output.status.success() && output.stdout.starts_with(path_bytes) {
+                        check.error(format!("binary checked into source: {}", file.display()));
+                    }
+                }
+            },
+        )
     }
 }

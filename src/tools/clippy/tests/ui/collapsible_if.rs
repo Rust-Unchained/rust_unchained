@@ -1,11 +1,5 @@
-#![allow(
-    clippy::assertions_on_constants,
-    clippy::equatable_if_let,
-    clippy::needless_if,
-    clippy::nonminimal_bool,
-    clippy::eq_op,
-    clippy::redundant_pattern_matching
-)]
+#![allow(clippy::eq_op, clippy::needless_ifs)]
+#![expect(clippy::assertions_on_constants, clippy::redundant_pattern_matching)]
 
 #[rustfmt::skip]
 #[warn(clippy::collapsible_if)]
@@ -108,26 +102,7 @@ fn main() {
         }
     }
 
-    // Test behavior wrt. `let_chains`.
-    // None of the cases below should be collapsed.
     fn truth() -> bool { true }
-
-    // Prefix:
-    if let 0 = 1 {
-        if truth() {}
-    }
-
-    // Suffix:
-    if truth() {
-        if let 0 = 1 {}
-    }
-
-    // Midfix:
-    if truth() {
-        if let 0 = 1 {
-            if truth() {}
-        }
-    }
 
     // Fix #5962
     if matches!(true, true) {
@@ -171,4 +146,61 @@ fn layout_check() -> u32 {
         // This is a comment, do not collapse code to it
     }; 3
     //~^^^^^ collapsible_if
+}
+
+fn issue13365() {
+    // all the `expect`s that we should fulfill
+    if true {
+        #[expect(clippy::collapsible_if)]
+        if true {}
+    }
+
+    if true {
+        #[expect(clippy::style)]
+        if true {}
+    }
+
+    if true {
+        #[expect(clippy::all)]
+        if true {}
+    }
+}
+
+fn issue14722() {
+    let x = if true {
+        Some(1)
+    } else {
+        if true {
+            println!("Some debug information");
+        };
+        None
+    };
+}
+
+fn issue14799() {
+    if true {
+        #[cfg(target_os = "freebsd")]
+        todo!();
+
+        if true {}
+    };
+}
+
+fn in_parens() {
+    if true {
+        (if true {
+            println!("In parens, linted");
+        })
+    }
+    //~^^^^^ collapsible_if
+}
+
+fn in_brackets() {
+    if true {
+        {
+            if true {
+                println!("In brackets, not linted");
+            }
+        }
+    }
 }

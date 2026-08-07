@@ -1,4 +1,4 @@
-//@ check-pass
+//@ edition:2015
 // https://github.com/rust-lang/rust/pull/113099#issuecomment-1638206152
 
 pub use evp::*; //~ WARNING ambiguous glob re-exports
@@ -24,6 +24,5 @@ mod handwritten {
 
 fn main() {
     id();
-    //~^ WARNING `id` is ambiguous
-    //~| WARNING this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    //~^ ERROR `id` is ambiguous
 }

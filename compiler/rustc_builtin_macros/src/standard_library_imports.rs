@@ -36,18 +36,16 @@ pub fn inject(
     let span = DUMMY_SP.with_def_site_ctxt(expn_id.to_expn_id());
     let call_site = DUMMY_SP.with_call_site_ctxt(expn_id.to_expn_id());
 
-    let ecfg = ExpansionConfig::default("std_lib_injection".to_string(), features);
+    let ecfg = ExpansionConfig::default(sym::std_lib_injection, features);
     let cx = ExtCtxt::new(sess, ecfg, resolver, None);
 
     let ident_span = if edition >= Edition2018 { span } else { call_site };
 
     let item = cx.item(
         span,
-        thin_vec![cx.attr_word(sym::macro_use, span)],
+        ast::AttrVec::new(),
         ast::ItemKind::ExternCrate(None, Ident::new(name, ident_span)),
     );
-
-    krate.items.insert(0, item);
 
     let root = (edition == Edition2015).then_some(kw::PathRoot);
 
@@ -70,11 +68,10 @@ pub fn inject(
         thin_vec![cx.attr_word(sym::prelude_import, span)],
         ast::ItemKind::Use(ast::UseTree {
             prefix: cx.path(span, import_path),
-            kind: ast::UseTreeKind::Glob,
-            span,
+            kind: ast::UseTreeKind::Glob(span),
         }),
     );
 
-    krate.items.insert(0, use_item);
+    krate.items.splice(0..0, [item, use_item]);
     krate.items.len() - orig_num_items
 }

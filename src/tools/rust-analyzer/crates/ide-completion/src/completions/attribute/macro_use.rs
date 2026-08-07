@@ -3,11 +3,11 @@ use hir::ModuleDef;
 use ide_db::SymbolKind;
 use syntax::ast;
 
-use crate::{context::CompletionContext, item::CompletionItem, Completions};
+use crate::{Completions, context::CompletionContext, item::CompletionItem};
 
 pub(super) fn complete_macro_use(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     extern_crate: Option<&ast::ExternCrate>,
     existing_imports: &[ast::Path],
 ) {
@@ -15,16 +15,16 @@ pub(super) fn complete_macro_use(
     let Some(extern_crate) = ctx.sema.to_def(extern_crate) else { return };
     let Some(krate) = extern_crate.resolved_crate(ctx.db) else { return };
 
-    for mod_def in krate.root_module().declarations(ctx.db) {
+    for mod_def in krate.root_module(ctx.db).declarations(ctx.db) {
         if let ModuleDef::Macro(mac) = mod_def {
             let mac_name = mac.name(ctx.db);
             let mac_name = mac_name.as_str();
 
-            let existing_import = existing_imports
+            let already_imported = existing_imports
                 .iter()
                 .filter_map(|p| p.as_single_name_ref())
-                .find(|n| n.text() == mac_name);
-            if existing_import.is_some() {
+                .any(|n| n.text() == mac_name);
+            if already_imported {
                 continue;
             }
 

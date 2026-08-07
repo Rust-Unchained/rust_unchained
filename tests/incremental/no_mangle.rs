@@ -1,6 +1,6 @@
-//@ revisions:cfail1 cfail2
-//@ check-pass
+//@ revisions: cpass1 cpass2
 //@ compile-flags: --crate-type cdylib
+//@ needs-crate-type: cdylib
 
 #![deny(unused_attributes)]
 

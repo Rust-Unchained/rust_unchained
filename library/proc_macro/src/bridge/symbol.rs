@@ -10,10 +10,10 @@
 //! proc_macro, this module should probably be removed or simplified.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::num::NonZero;
-use std::str;
 
-use super::*;
+use crate::bridge::{Buffer, Decode, Encode, Mark, arena, client, fxhash, server};
 
 /// Handle for a symbol string stored within the Interner.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -33,7 +33,7 @@ impl Symbol {
     /// Validates and normalizes before converting it to a symbol.
     pub(crate) fn new_ident(string: &str, is_raw: bool) -> Self {
         // Fast-path: check if this is a valid ASCII identifier
-        if Self::is_valid_ascii_ident(string.as_bytes()) {
+        if Self::is_valid_ascii_ident(string.as_bytes()) || string == "$crate" {
             if is_raw && !Self::can_be_raw(string) {
                 panic!("`{}` cannot be a raw identifier", string);
             }
@@ -47,7 +47,7 @@ impl Symbol {
         if string.is_ascii() {
             Err(())
         } else {
-            client::Symbol::normalize_and_validate_ident(string)
+            client::Methods::symbol_normalize_and_validate_ident(string)
         }
         .unwrap_or_else(|_| panic!("`{:?}` is not a valid identifier", string))
     }
@@ -78,10 +78,7 @@ impl Symbol {
 
     // Mimics the behavior of `Symbol::can_be_raw` from `rustc_span`
     fn can_be_raw(string: &str) -> bool {
-        match string {
-            "_" | "super" | "self" | "Self" | "crate" => false,
-            _ => true,
-        }
+        !matches!(string, "_" | "super" | "self" | "Self" | "crate" | "$crate")
     }
 }
 
@@ -98,29 +95,25 @@ impl fmt::Display for Symbol {
 }
 
 impl<S> Encode<S> for Symbol {
-    fn encode(self, w: &mut Writer, s: &mut S) {
+    fn encode(self, w: &mut Buffer, s: &mut S) {
         self.with(|sym| sym.encode(w, s))
     }
 }
 
-impl<S: server::Server> DecodeMut<'_, '_, server::HandleStore<server::MarkedTypes<S>>>
-    for Marked<S::Symbol, Symbol>
-{
-    fn decode(r: &mut Reader<'_>, s: &mut server::HandleStore<server::MarkedTypes<S>>) -> Self {
+impl<S: server::Server> Decode<'_, '_, server::HandleStore<S>> for server::MarkedSymbol<S> {
+    fn decode(r: &mut &[u8], s: &mut server::HandleStore<S>) -> Self {
         Mark::mark(S::intern_symbol(<&str>::decode(r, s)))
     }
 }
 
-impl<S: server::Server> Encode<server::HandleStore<server::MarkedTypes<S>>>
-    for Marked<S::Symbol, Symbol>
-{
-    fn encode(self, w: &mut Writer, s: &mut server::HandleStore<server::MarkedTypes<S>>) {
+impl<S: server::Server> Encode<server::HandleStore<S>> for server::MarkedSymbol<S> {
+    fn encode(self, w: &mut Buffer, s: &mut server::HandleStore<S>) {
         S::with_symbol_string(&self.unmark(), |sym| sym.encode(w, s))
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for Symbol {
-    fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
+impl<S> Decode<'_, '_, S> for Symbol {
+    fn decode(r: &mut &[u8], s: &mut S) -> Self {
         Symbol::new(<&str>::decode(r, s))
     }
 }

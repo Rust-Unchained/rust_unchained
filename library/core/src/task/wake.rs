@@ -104,6 +104,7 @@ impl RawWaker {
 /// synchronization. This is because [`LocalWaker`] is not thread safe itself, so it cannot
 /// be sent across threads.
 #[stable(feature = "futures_api", since = "1.36.0")]
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub struct RawWakerVTable {
     /// This function will be called when the [`RawWaker`] gets cloned, e.g. when
@@ -417,15 +418,16 @@ unsafe impl Sync for Waker {}
 impl Waker {
     /// Wakes up the task associated with this `Waker`.
     ///
-    /// As long as the executor keeps running and the task is not finished, it is
-    /// guaranteed that each invocation of [`wake()`](Self::wake) (or
+    /// As long as the executor keeps running and the task is not finished,
+    /// it is guaranteed that each invocation of [`wake()`](Self::wake) (or
     /// [`wake_by_ref()`](Self::wake_by_ref)) will be followed by at least one
-    /// [`poll()`] of the task to which this `Waker` belongs. This makes
-    /// it possible to temporarily yield to other tasks while running potentially
-    /// unbounded processing loops.
+    /// [`poll()`] of the task to which this `Waker` belongs, such that the call to
+    /// [`wake()`](Self::wake) (or [`wake_by_ref()`](Self::wake_by_ref)) _happens-before_
+    /// the beginning of the invocation of [`poll()`]. This makes it possible to temporarily
+    /// yield to other tasks while running potentially unbounded processing loops.
     ///
     /// Note that the above implies that multiple wake-ups may be coalesced into a
-    /// single [`poll()`] invocation by the runtime.
+    /// single [`poll()`] invocation by the executor.
     ///
     /// Also note that yielding to competing tasks is not guaranteed: it is the
     /// executor’s choice which task to run and the executor may choose to run the
@@ -582,6 +584,28 @@ impl Waker {
     #[stable(feature = "waker_getters", since = "1.83.0")]
     pub fn vtable(&self) -> &'static RawWakerVTable {
         self.waker.vtable
+    }
+
+    /// Constructs a `Waker` from a function pointer.
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "waker_from_fn_ptr", issue = "148457")]
+    pub const fn from_fn_ptr(f: fn()) -> Self {
+        // SAFETY: Unsafe is used for transmutes, pointer came from `fn()` so it
+        //         is sound to transmute it back to `fn()`.
+        static VTABLE: RawWakerVTable = unsafe {
+            RawWakerVTable::new(
+                |this| RawWaker::new(this, &VTABLE),
+                |this| transmute::<*const (), fn()>(this)(),
+                |this| transmute::<*const (), fn()>(this)(),
+                |_| {},
+            )
+        };
+        let raw = RawWaker::new(f as *const (), &VTABLE);
+
+        // SAFETY: `clone` is just a copy, `drop` is a no-op while `wake` and
+        //         `wake_by_ref` just call the function pointer.
+        unsafe { Self::from_raw(raw) }
     }
 }
 
@@ -878,6 +902,28 @@ impl LocalWaker {
     pub fn vtable(&self) -> &'static RawWakerVTable {
         self.waker.vtable
     }
+
+    /// Constructs a `LocalWaker` from a function pointer.
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "waker_from_fn_ptr", issue = "148457")]
+    pub const fn from_fn_ptr(f: fn()) -> Self {
+        // SAFETY: Unsafe is used for transmutes, pointer came from `fn()` so it
+        //         is sound to transmute it back to `fn()`.
+        static VTABLE: RawWakerVTable = unsafe {
+            RawWakerVTable::new(
+                |this| RawWaker::new(this, &VTABLE),
+                |this| transmute::<*const (), fn()>(this)(),
+                |this| transmute::<*const (), fn()>(this)(),
+                |_| {},
+            )
+        };
+        let raw = RawWaker::new(f as *const (), &VTABLE);
+
+        // SAFETY: `clone` is just a copy, `drop` is a no-op while `wake` and
+        //         `wake_by_ref` just call the function pointer.
+        unsafe { Self::from_raw(raw) }
+    }
 }
 #[unstable(feature = "local_waker", issue = "118959")]
 impl Clone for LocalWaker {
@@ -900,7 +946,8 @@ impl Clone for LocalWaker {
 }
 
 #[unstable(feature = "local_waker", issue = "118959")]
-impl AsRef<LocalWaker> for Waker {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsRef<LocalWaker> for Waker {
     fn as_ref(&self) -> &LocalWaker {
         // SAFETY: LocalWaker is just Waker without thread safety
         unsafe { transmute(self) }

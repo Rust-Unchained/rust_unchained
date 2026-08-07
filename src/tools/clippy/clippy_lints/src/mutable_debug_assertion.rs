@@ -1,5 +1,6 @@
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::macros::{find_assert_eq_args, root_macro_call_first_node};
+use clippy_utils::macros::{MacroCall, find_assert_args, find_assert_eq_args, root_macro_call_first_node};
+use clippy_utils::sym;
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{BorrowKind, Expr, ExprKind, MatchSource, Mutability};
 use rustc_lint::{LateContext, LateLintPass};
@@ -42,28 +43,36 @@ impl<'tcx> LateLintPass<'tcx> for DebugAssertWithMutCall {
         let Some(macro_call) = root_macro_call_first_node(cx, e) else {
             return;
         };
-        let macro_name = cx.tcx.item_name(macro_call.def_id);
-        if !matches!(
-            macro_name.as_str(),
-            "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
-        ) {
-            return;
+        match cx.tcx.get_diagnostic_name(macro_call.def_id) {
+            Some(sym::debug_assert_macro) => {
+                if let Some((arg, _)) = find_assert_args(cx, e, macro_call.expn) {
+                    check_arg(cx, arg, &macro_call);
+                }
+            },
+            Some(sym::debug_assert_ne_macro | sym::debug_assert_eq_macro) => {
+                if let Some((lhs, rhs, _)) = find_assert_eq_args(cx, e, macro_call.expn) {
+                    check_arg(cx, lhs, &macro_call);
+                    check_arg(cx, rhs, &macro_call);
+                }
+            },
+            _ => {},
         }
-        let Some((lhs, rhs, _)) = find_assert_eq_args(cx, e, macro_call.expn) else {
-            return;
-        };
-        for arg in [lhs, rhs] {
-            let mut visitor = MutArgVisitor::new(cx);
-            visitor.visit_expr(arg);
-            if let Some(span) = visitor.expr_span() {
-                span_lint(
-                    cx,
-                    DEBUG_ASSERT_WITH_MUT_CALL,
-                    span,
-                    format!("do not call a function with mutable arguments inside of `{macro_name}!`"),
-                );
-            }
-        }
+    }
+}
+
+fn check_arg<'tcx>(cx: &LateContext<'tcx>, arg: &'tcx Expr<'tcx>, macro_call: &MacroCall) {
+    let mut visitor = MutArgVisitor::new(cx);
+    visitor.visit_expr(arg);
+    if let Some(span) = visitor.expr_span() {
+        span_lint(
+            cx,
+            DEBUG_ASSERT_WITH_MUT_CALL,
+            span,
+            format!(
+                "do not call a function with mutable arguments inside of `{}!`",
+                cx.tcx.item_name(macro_call.def_id)
+            ),
+        );
     }
 }
 

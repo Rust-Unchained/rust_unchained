@@ -1,12 +1,13 @@
-// skip-filecheck
+//@ skip-filecheck
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 // EMIT_MIR_FOR_EACH_BIT_WIDTH
 
 #![feature(flt2dec)]
+#![feature(num_internals)]
 
 extern crate core;
 
-use core::num::flt2dec;
+use core::num::imp::flt2dec;
 use std::fmt::{Formatter, Result};
 
 // EMIT_MIR funky_arms.float_to_exponential_common.GVN.diff

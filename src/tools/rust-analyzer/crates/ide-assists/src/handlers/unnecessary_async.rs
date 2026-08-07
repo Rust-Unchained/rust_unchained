@@ -1,13 +1,13 @@
 use ide_db::{
-    assists::{AssistId, AssistKind},
+    EditionedFileId,
+    assists::AssistId,
     defs::Definition,
     search::{FileReference, FileReferenceNode},
     syntax_helpers::node_ext::full_path_of_name_ref,
-    EditionedFileId,
 };
 use syntax::{
-    ast::{self, NameRef},
     AstNode, SyntaxKind, TextRange,
+    ast::{self, NameRef},
 };
 
 use crate::{AssistContext, Assists};
@@ -28,7 +28,7 @@ use crate::{AssistContext, Assists};
 // pub fn foo() {}
 // pub async fn bar() { foo() }
 // ```
-pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let function: ast::Fn = ctx.find_node_at_offset()?;
 
     // Do nothing if the cursor isn't on the async token.
@@ -41,10 +41,10 @@ pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         return None;
     }
     // Do nothing if the method is a member of trait.
-    if let Some(impl_) = function.syntax().ancestors().nth(2).and_then(ast::Impl::cast) {
-        if impl_.trait_().is_some() {
-            return None;
-        }
+    if let Some(impl_) = function.syntax().ancestors().nth(2).and_then(ast::Impl::cast)
+        && impl_.trait_().is_some()
+    {
+        return None;
     }
 
     // Remove the `async` keyword plus whitespace after it, if any.
@@ -60,7 +60,7 @@ pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
 
     // Otherwise, we may remove the `async` keyword.
     acc.add(
-        AssistId("unnecessary_async", AssistKind::QuickFix),
+        AssistId::quick_fix("unnecessary_async"),
         "Remove unnecessary async",
         async_range,
         |edit| {
@@ -90,9 +90,9 @@ pub(crate) fn unnecessary_async(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
     )
 }
 
-fn find_all_references(
-    ctx: &AssistContext<'_>,
-    def: &Definition,
+fn find_all_references<'db>(
+    ctx: &AssistContext<'_, 'db>,
+    def: &Definition<'db>,
 ) -> impl Iterator<Item = (EditionedFileId, FileReference)> {
     def.usages(&ctx.sema).all().into_iter().flat_map(|(file_id, references)| {
         references.into_iter().map(move |reference| (file_id, reference))
@@ -101,7 +101,7 @@ fn find_all_references(
 
 /// Finds the await expression for the given `NameRef`.
 /// If no await expression is found, returns None.
-fn find_await_expression(ctx: &AssistContext<'_>, nameref: &NameRef) -> Option<ast::AwaitExpr> {
+fn find_await_expression(ctx: &AssistContext<'_, '_>, nameref: &NameRef) -> Option<ast::AwaitExpr> {
     // From the nameref, walk up the tree to the await expression.
     let await_expr = if let Some(path) = full_path_of_name_ref(nameref) {
         // Function calls.

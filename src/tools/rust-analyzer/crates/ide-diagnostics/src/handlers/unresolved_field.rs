@@ -1,32 +1,29 @@
-use std::iter;
-
 use either::Either;
-use hir::{db::ExpandDatabase, Adt, FileRange, HasSource, HirDisplay, InFile, Struct, Union};
+use hir::{Adt, FileRange, HasSource, HirDisplay, InFile, Struct, Union};
 use ide_db::text_edit::TextEdit;
 use ide_db::{
-    assists::{Assist, AssistId, AssistKind},
+    assists::{Assist, AssistId},
     helpers::is_editable_crate,
     label::Label,
     source_change::{SourceChange, SourceChangeBuilder},
 };
 use syntax::{
-    algo,
-    ast::{self, edit::IndentLevel, make, FieldList, Name, Visibility},
-    AstNode, AstPtr, Direction, SyntaxKind, TextSize,
+    AstNode, AstPtr, Direction, SyntaxKind, TextSize, algo,
+    ast::{self, FieldList, Name, Visibility, edit::IndentLevel, make},
 };
 use syntax::{
-    ast::{edit::AstNodeEdit, Type},
     SyntaxNode,
+    ast::{Type, edit::AstNodeEdit},
 };
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: unresolved-field
 //
 // This diagnostic is triggered if a field does not exist on a given type.
 pub(crate) fn unresolved_field(
-    ctx: &DiagnosticsContext<'_>,
-    d: &hir::UnresolvedField,
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::UnresolvedField<'_>,
 ) -> Diagnostic {
     let method_suffix = if d.method_with_same_name_exists {
         ", but a method with a similar name exists"
@@ -53,26 +50,21 @@ pub(crate) fn unresolved_field(
         }),
     )
     .with_fixes(fixes(ctx, d))
-    .experimental()
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedField) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::UnresolvedField<'_>) -> Option<Vec<Assist>> {
     let mut fixes = Vec::new();
     if d.method_with_same_name_exists {
         fixes.extend(method_fix(ctx, &d.expr));
     }
     fixes.extend(field_fix(ctx, d));
-    if fixes.is_empty() {
-        None
-    } else {
-        Some(fixes)
-    }
+    if fixes.is_empty() { None } else { Some(fixes) }
 }
 
 // FIXME: Add Snippet Support
-fn field_fix(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedField) -> Option<Assist> {
+fn field_fix(ctx: &DiagnosticsContext<'_, '_>, d: &hir::UnresolvedField<'_>) -> Option<Assist> {
     // Get the FileRange of the invalid field access
-    let root = ctx.sema.db.parse_or_expand(d.expr.file_id);
+    let root = d.expr.file_id.parse_or_expand(ctx.sema.db);
     let expr = d.expr.value.to_node(&root).left()?;
 
     let error_range = ctx.sema.original_range_opt(expr.syntax())?;
@@ -91,7 +83,7 @@ fn field_fix(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedField) -> Option<A
         make::ty("()")
     };
 
-    if !is_editable_crate(target_module.krate(), ctx.sema.db)
+    if !is_editable_crate(target_module.krate(ctx.sema.db), ctx.sema.db)
         || SyntaxKind::from_keyword(field_name, ctx.edition).is_some()
     {
         return None;
@@ -109,7 +101,7 @@ fn field_fix(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedField) -> Option<A
 }
 
 fn add_variant_to_union(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     adt_union: Union,
     field_name: &str,
     suggested_type: Type,
@@ -124,10 +116,10 @@ fn add_variant_to_union(
     let (offset, record_field) =
         record_field_layout(None, field_name, suggested_type, field_list, adt_syntax.value)?;
 
-    let mut src_change_builder = SourceChangeBuilder::new(range.file_id);
+    let mut src_change_builder = SourceChangeBuilder::new(range.file_id.file_id(ctx.sema.db));
     src_change_builder.insert(offset, record_field);
     Some(Assist {
-        id: AssistId("add-variant-to-union", AssistKind::QuickFix),
+        id: AssistId::quick_fix("add-variant-to-union"),
         label: Label::new("Add field to union".to_owned()),
         group: None,
         target: error_range.range,
@@ -137,7 +129,7 @@ fn add_variant_to_union(
 }
 
 fn add_field_to_struct_fix(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     adt_struct: Struct,
     field_name: &str,
     suggested_type: Type,
@@ -170,12 +162,13 @@ fn add_field_to_struct_fix(
                 struct_syntax.value,
             )?;
 
-            let mut src_change_builder = SourceChangeBuilder::new(struct_range.file_id);
+            let mut src_change_builder =
+                SourceChangeBuilder::new(struct_range.file_id.file_id(ctx.sema.db));
 
             // FIXME: Allow for choosing a visibility modifier see https://github.com/rust-lang/rust-analyzer/issues/11563
             src_change_builder.insert(offset, record_field);
             Some(Assist {
-                id: AssistId("add-field-to-record-struct", AssistKind::QuickFix),
+                id: AssistId::quick_fix("add-field-to-record-struct"),
                 label: Label::new("Add field to Record Struct".to_owned()),
                 group: None,
                 target: error_range.range,
@@ -185,7 +178,8 @@ fn add_field_to_struct_fix(
         }
         None => {
             // Add a field list to the Unit Struct
-            let mut src_change_builder = SourceChangeBuilder::new(struct_range.file_id);
+            let mut src_change_builder =
+                SourceChangeBuilder::new(struct_range.file_id.file_id(ctx.sema.db));
             let field_name = match field_name.chars().next() {
                 // FIXME : See match arm below regarding tuple structs.
                 Some(ch) if ch.is_numeric() => return None,
@@ -198,20 +192,23 @@ fn add_field_to_struct_fix(
                 Some(make::visibility_pub_crate())
             };
             // FIXME: Allow for choosing a visibility modifier see https://github.com/rust-lang/rust-analyzer/issues/11563
-            let indent = IndentLevel::from_node(struct_syntax.value) + 1;
+            let indent = IndentLevel::from_node(struct_syntax.value);
 
-            let field = make::record_field(visibility, field_name, suggested_type).indent(indent);
-            let record_field_list = make::record_field_list(iter::once(field));
+            let field =
+                make::record_field(visibility, field_name, suggested_type).indent(indent + 1);
             // A Unit Struct with no `;` is invalid syntax. We should not suggest this fix.
             let semi_colon =
                 algo::skip_trivia_token(struct_syntax.value.last_token()?, Direction::Prev)?;
             if semi_colon.kind() != SyntaxKind::SEMICOLON {
                 return None;
             }
-            src_change_builder.replace(semi_colon.text_range(), record_field_list.to_string());
+            src_change_builder.replace(
+                semi_colon.text_range(),
+                format!(" {{\n{}{field},\n{indent}}}", indent + 1),
+            );
 
             Some(Assist {
-                id: AssistId("convert-unit-struct-to-record-struct", AssistKind::QuickFix),
+                id: AssistId::quick_fix("convert-unit-struct-to-record-struct"),
                 label: Label::new("Convert Unit Struct to Record Struct and add field".to_owned()),
                 group: None,
                 target: error_range.range,
@@ -234,7 +231,7 @@ fn record_field_layout(
     field_list: ast::RecordFieldList,
     struct_syntax: &SyntaxNode,
 ) -> Option<(TextSize, String)> {
-    let (offset, needs_comma, trailing_new_line, indent) = match field_list.fields().last() {
+    let (offset, needs_comma, indent) = match field_list.fields().last() {
         Some(record_field) => {
             let syntax = algo::skip_trivia_token(field_list.r_curly_token()?, Direction::Prev)?;
 
@@ -243,19 +240,22 @@ fn record_field_layout(
             (
                 last_field_syntax.text_range().end(),
                 syntax.kind() != SyntaxKind::COMMA,
-                false,
                 last_field_indent,
             )
         }
         // Empty Struct. Add a field right before the closing brace
         None => {
             let indent = IndentLevel::from_node(struct_syntax) + 1;
-            let offset = field_list.r_curly_token()?.text_range().start();
-            (offset, false, true, indent)
+            let offset = field_list.l_curly_token()?.text_range().end();
+            (offset, false, indent)
         }
     };
-    let comma = if needs_comma { ",\n" } else { "" };
-    let trailing_new_line = if trailing_new_line { "\n" } else { "" };
+    let trailing_new_line = if !field_list.syntax().text().contains_char('\n') {
+        format!("\n{}", field_list.indent_level())
+    } else {
+        String::new()
+    };
+    let comma = if needs_comma { ",\n" } else { "\n" };
     let record_field = make::record_field(visibility, name, suggested_type);
 
     Some((offset, format!("{comma}{indent}{record_field}{trailing_new_line}")))
@@ -263,19 +263,19 @@ fn record_field_layout(
 
 // FIXME: We should fill out the call here, move the cursor and trigger signature help
 fn method_fix(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     expr_ptr: &InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
 ) -> Option<Assist> {
-    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
+    let root = expr_ptr.file_id.parse_or_expand(ctx.sema.db);
     let expr = expr_ptr.value.to_node(&root);
     let FileRange { range, file_id } = ctx.sema.original_range_opt(expr.syntax())?;
     Some(Assist {
-        id: AssistId("expected-field-found-method-call-fix", AssistKind::QuickFix),
+        id: AssistId::quick_fix("expected-field-found-method-call-fix"),
         label: Label::new("Use parentheses to call the method".to_owned()),
         group: None,
         target: range,
         source_change: Some(SourceChange::from_text_edit(
-            file_id,
+            file_id.file_id(ctx.sema.db),
             TextEdit::insert(range.end(), "()".to_owned()),
         )),
         command: None,
@@ -285,11 +285,11 @@ fn method_fix(
 mod tests {
 
     use crate::{
+        DiagnosticsConfig,
         tests::{
             check_diagnostics, check_diagnostics_with_config, check_diagnostics_with_disabled,
             check_fix, check_no_fix,
         },
-        DiagnosticsConfig,
     };
 
     #[test]
@@ -381,18 +381,24 @@ fn foo() {
     fn unresolved_field_fix_on_unit() {
         check_fix(
             r#"
+            mod indent {
                 struct Foo;
 
                 fn foo() {
                     Foo.bar$0;
                 }
+            }
             "#,
             r#"
-                struct Foo{ bar: () }
+            mod indent {
+                struct Foo {
+                    bar: (),
+                }
 
                 fn foo() {
                     Foo.bar;
                 }
+            }
             "#,
         );
     }
@@ -400,6 +406,7 @@ fn foo() {
     fn unresolved_field_fix_on_empty() {
         check_fix(
             r#"
+            mod indent {
                 struct Foo{
                 }
 
@@ -407,8 +414,10 @@ fn foo() {
                     let foo = Foo{};
                     foo.bar$0;
                 }
+            }
             "#,
             r#"
+            mod indent {
                 struct Foo{
                     bar: ()
                 }
@@ -417,6 +426,32 @@ fn foo() {
                     let foo = Foo{};
                     foo.bar;
                 }
+            }
+            "#,
+        );
+
+        check_fix(
+            r#"
+            mod indent {
+                struct Foo {}
+
+                fn foo() {
+                    let foo = Foo{};
+                    foo.bar$0;
+                }
+            }
+            "#,
+            r#"
+            mod indent {
+                struct Foo {
+                    bar: ()
+                }
+
+                fn foo() {
+                    let foo = Foo{};
+                    foo.bar;
+                }
+            }
             "#,
         );
     }

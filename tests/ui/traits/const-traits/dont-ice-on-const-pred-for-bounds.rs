@@ -8,12 +8,11 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Trait {
+const trait Trait {
     type Assoc: const Trait;
 }
 
-const fn needs_trait<T: ~const Trait>() {}
+const fn needs_trait<T: [const] Trait>() {}
 
 fn test<T: Trait>() {
     const { needs_trait::<T::Assoc>() };

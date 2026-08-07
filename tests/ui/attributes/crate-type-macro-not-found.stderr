@@ -5,7 +5,7 @@ LL | #[crate_type = foo!()]
    |                ^^^ consider moving the definition of `foo` before this call
    |
 note: a macro with the same name exists, but it appears later
-  --> $DIR/crate-type-macro-not-found.rs:4:14
+  --> $DIR/crate-type-macro-not-found.rs:5:14
    |
 LL | macro_rules! foo {
    |              ^^^

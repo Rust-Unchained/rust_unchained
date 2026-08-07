@@ -1,3 +1,4 @@
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_index::IndexSlice;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
@@ -53,7 +54,7 @@ macro_rules! parse_by_kind {
                 } => $call_expr,
             )*
             $(
-                ExprKind::Adt(box AdtExpr { adt_def, variant_index, .. }) if {
+                ExprKind::Adt(AdtExpr { adt_def, variant_index, .. }) if {
                     $self.tcx.is_diagnostic_item(rustc_span::sym::$adt, adt_def.did()) &&
                     adt_def.variants()[*variant_index].name == rustc_span::sym::$variant
                 } => $variant_expr,
@@ -261,6 +262,7 @@ impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
             let value = match operand {
                 Operand::Constant(c) => VarDebugInfoContents::Const(*c),
                 Operand::Copy(p) | Operand::Move(p) => VarDebugInfoContents::Place(p),
+                Operand::RuntimeChecks(_) => unreachable!(),
             };
             let dbginfo = VarDebugInfo {
                 name,
@@ -286,22 +288,14 @@ impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
         self.parse_var(pattern)
     }
 
-    fn parse_var(&mut self, mut pat: &Pat<'tcx>) -> PResult<(LocalVarId, Ty<'tcx>, Span)> {
-        // Make sure we throw out any `AscribeUserType` we find
-        loop {
-            match &pat.kind {
-                PatKind::Binding { var, ty, .. } => break Ok((*var, *ty, pat.span)),
-                PatKind::AscribeUserType { subpattern, .. } => {
-                    pat = subpattern;
-                }
-                _ => {
-                    break Err(ParseError {
-                        span: pat.span,
-                        item_description: format!("{:?}", pat.kind),
-                        expected: "local".to_string(),
-                    });
-                }
-            }
+    fn parse_var(&mut self, pat: &Pat<'tcx>) -> PResult<(LocalVarId, Ty<'tcx>, Span)> {
+        match &pat.kind {
+            PatKind::Binding { var, ty, .. } => Ok((*var, *ty, pat.span)),
+            _ => Err(ParseError {
+                span: pat.span,
+                item_description: format!("{:?}", pat.kind),
+                expected: "local".to_string(),
+            }),
         }
     }
 
@@ -315,10 +309,8 @@ impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
             let stmt = self.statement_as_expr(*stmt_id)?;
             let span = self.thir[stmt].span;
             let statement = self.parse_statement(stmt)?;
-            data.statements.push(Statement {
-                source_info: SourceInfo { span, scope: self.source_scope },
-                kind: statement,
-            });
+            data.statements
+                .push(Statement::new(SourceInfo { span, scope: self.source_scope }, statement));
         }
 
         let Some(trailing) = block.expr else { return Err(self.expr_error(expr_id, "terminator")) };
@@ -327,6 +319,7 @@ impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
         data.terminator = Some(Terminator {
             source_info: SourceInfo { span, scope: self.source_scope },
             kind: terminator,
+            attributes: ThinVec::new(),
         });
 
         Ok(data)

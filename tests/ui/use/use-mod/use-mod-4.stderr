@@ -1,42 +1,14 @@
-error[E0429]: `self` imports are only allowed within a { } list
-  --> $DIR/use-mod-4.rs:1:8
+error[E0432]: unresolved import `crate::foo`
+  --> $DIR/use-mod-4.rs:1:12
    |
-LL | use foo::self;
-   |        ^^^^^^
+LL | use crate::foo::self;
+   |            ^^^ use of unresolved module or unlinked crate `foo`
    |
-help: consider importing the module directly
+help: you might be missing a crate named `foo`, add it to your project and import it in your code
    |
-LL - use foo::self;
-LL + use foo;
+LL + extern crate foo;
    |
-help: alternatively, use the multi-path `use` syntax to import `self`
-   |
-LL | use foo::{self};
-   |          +    +
 
-error[E0429]: `self` imports are only allowed within a { } list
-  --> $DIR/use-mod-4.rs:4:13
-   |
-LL | use std::mem::self;
-   |             ^^^^^^
-   |
-help: consider importing the module directly
-   |
-LL - use std::mem::self;
-LL + use std::mem;
-   |
-help: alternatively, use the multi-path `use` syntax to import `self`
-   |
-LL | use std::mem::{self};
-   |               +    +
+error: aborting due to 1 previous error
 
-error[E0432]: unresolved import `foo`
-  --> $DIR/use-mod-4.rs:1:5
-   |
-LL | use foo::self;
-   |     ^^^^^^^^^ no `foo` in the root
-
-error: aborting due to 3 previous errors
-
-Some errors have detailed explanations: E0429, E0432.
-For more information about an error, try `rustc --explain E0429`.
+For more information about this error, try `rustc --explain E0432`.

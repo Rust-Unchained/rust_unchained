@@ -18,16 +18,19 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::traits::Obligation;
 use rustc_middle::bug;
 use rustc_middle::query::LocalCrate;
+use rustc_middle::traits::query::NoSolution;
+use rustc_middle::ty::fast_reject::{self, TreatParams};
 use rustc_middle::ty::print::PrintTraitRefExt as _;
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeVisitableExt, TypingMode};
+use rustc_middle::ty::{
+    self, GenericArgsRef, Ty, TyCtxt, TypeVisitableExt, TypingMode, Unnormalized,
+};
 use rustc_session::lint::builtin::COHERENCE_LEAK_CHECK;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, sym};
-use rustc_type_ir::solve::NoSolution;
 use specialization_graph::GraphExt;
 use tracing::{debug, instrument};
 
+use crate::diagnostics::NegativePositiveConflict;
 use crate::error_reporting::traits::to_pretty_impl_header;
-use crate::errors::NegativePositiveConflict;
 use crate::infer::{InferCtxt, TyCtxtInferExt};
 use crate::traits::select::IntercrateAmbiguityCause;
 use crate::traits::{
@@ -117,7 +120,7 @@ pub fn translate_args_with_cause<'tcx>(
         param_env, source_impl, source_args, target_node
     );
     let source_trait_ref =
-        infcx.tcx.impl_trait_ref(source_impl).unwrap().instantiate(infcx.tcx, source_args);
+        infcx.tcx.impl_trait_ref(source_impl).instantiate(infcx.tcx, source_args).skip_norm_wip();
 
     // translate the Self and Param parts of the generic parameters, since those
     // vary across impls
@@ -162,9 +165,9 @@ fn fulfill_implication<'tcx>(
     );
 
     let ocx = ObligationCtxt::new(infcx);
-    let source_trait_ref = ocx.normalize(cause, param_env, source_trait_ref);
+    let source_trait_ref = ocx.normalize(cause, param_env, Unnormalized::new_wip(source_trait_ref));
 
-    if !ocx.select_all_or_error().is_empty() {
+    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
         infcx.dcx().span_delayed_bug(
             infcx.tcx.def_span(source_impl),
             format!("failed to fully normalize {source_trait_ref}"),
@@ -176,11 +179,7 @@ fn fulfill_implication<'tcx>(
     let target_trait_ref = ocx.normalize(
         cause,
         param_env,
-        infcx
-            .tcx
-            .impl_trait_ref(target_impl)
-            .expect("expected source impl to be a trait impl")
-            .instantiate(infcx.tcx, target_args),
+        infcx.tcx.impl_trait_ref(target_impl).instantiate(infcx.tcx, target_args),
     );
 
     // do the impls unify? If not, no specialization.
@@ -189,15 +188,16 @@ fn fulfill_implication<'tcx>(
     // Now check that the source trait ref satisfies all the where clauses of the target impl.
     // This is not just for correctness; we also need this to constrain any params that may
     // only be referenced via projection predicates.
-    let predicates = ocx.normalize(
-        cause,
+    let clauses = infcx.tcx.clauses_of(target_impl).instantiate(infcx.tcx, target_args);
+    let obligations = predicates_for_generics(
+        |_, _| cause.clone(),
+        |clause| ocx.normalize(cause, param_env, clause),
         param_env,
-        infcx.tcx.predicates_of(target_impl).instantiate(infcx.tcx, target_args),
+        clauses,
     );
-    let obligations = predicates_for_generics(|_, _| cause.clone(), param_env, predicates);
     ocx.register_obligations(obligations);
 
-    let errors = ocx.select_all_or_error();
+    let errors = ocx.evaluate_obligations_error_on_ambiguity();
     if !errors.is_empty() {
         // no dice!
         debug!(
@@ -233,7 +233,7 @@ pub(super) fn specialization_enabled_in(tcx: TyCtxt<'_>, _: LocalCrate) -> bool 
 ///
 /// For the purposes of const traits, we also check that the specializing
 /// impl is not more restrictive than the parent impl. That is, if the
-/// `parent_impl_def_id` is a const impl (conditionally based off of some `~const`
+/// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
 #[instrument(skip(tcx), level = "debug")]
@@ -256,7 +256,7 @@ pub(super) fn specializes(
         }
     }
 
-    let specializing_impl_trait_header = tcx.impl_trait_header(specializing_impl_def_id).unwrap();
+    let specializing_impl_trait_header = tcx.impl_trait_header(specializing_impl_def_id);
 
     // We determine whether there's a subset relationship by:
     //
@@ -295,7 +295,7 @@ pub(super) fn specializes(
     let ocx = ObligationCtxt::new(&infcx);
     let specializing_impl_trait_ref = ocx.normalize(cause, param_env, specializing_impl_trait_ref);
 
-    if !ocx.select_all_or_error().is_empty() {
+    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
         infcx.dcx().span_delayed_bug(
             infcx.tcx.def_span(specializing_impl_def_id),
             format!("failed to fully normalize {specializing_impl_trait_ref}"),
@@ -307,11 +307,7 @@ pub(super) fn specializes(
     let parent_impl_trait_ref = ocx.normalize(
         cause,
         param_env,
-        infcx
-            .tcx
-            .impl_trait_ref(parent_impl_def_id)
-            .expect("expected source impl to be a trait impl")
-            .instantiate(infcx.tcx, parent_args),
+        infcx.tcx.impl_trait_ref(parent_impl_def_id).instantiate(infcx.tcx, parent_args),
     );
 
     // do the impls unify? If not, no specialization.
@@ -323,15 +319,16 @@ pub(super) fn specializes(
     // Now check that the source trait ref satisfies all the where clauses of the target impl.
     // This is not just for correctness; we also need this to constrain any params that may
     // only be referenced via projection predicates.
-    let predicates = ocx.normalize(
-        cause,
+    let clauses = infcx.tcx.clauses_of(parent_impl_def_id).instantiate(infcx.tcx, parent_args);
+    let obligations = predicates_for_generics(
+        |_, _| cause.clone(),
+        |clause| ocx.normalize(cause, param_env, clause),
         param_env,
-        infcx.tcx.predicates_of(parent_impl_def_id).instantiate(infcx.tcx, parent_args),
+        clauses,
     );
-    let obligations = predicates_for_generics(|_, _| cause.clone(), param_env, predicates);
     ocx.register_obligations(obligations);
 
-    let errors = ocx.select_all_or_error();
+    let errors = ocx.evaluate_obligations_error_on_ambiguity();
     if !errors.is_empty() {
         // no dice!
         debug!(
@@ -353,11 +350,11 @@ pub(super) fn specializes(
             return false;
         }
 
-        let const_conditions = ocx.normalize(
-            cause,
-            param_env,
-            infcx.tcx.const_conditions(parent_impl_def_id).instantiate(infcx.tcx, parent_args),
-        );
+        let const_conditions =
+            infcx.tcx.const_conditions(parent_impl_def_id).instantiate(infcx.tcx, parent_args);
+        let const_conditions = const_conditions
+            .into_iter()
+            .map(|(trait_ref, span)| (ocx.normalize(cause, param_env, trait_ref), span));
         ocx.register_obligations(const_conditions.into_iter().map(|(trait_ref, _)| {
             Obligation::new(
                 infcx.tcx,
@@ -367,7 +364,7 @@ pub(super) fn specializes(
             )
         }));
 
-        let errors = ocx.select_all_or_error();
+        let errors = ocx.evaluate_obligations_error_on_ambiguity();
         if !errors.is_empty() {
             // no dice!
             debug!(
@@ -398,7 +395,38 @@ pub(super) fn specialization_graph_provider(
     let mut sg = specialization_graph::Graph::new();
     let overlap_mode = specialization_graph::OverlapMode::get(tcx, trait_id);
 
-    let mut trait_impls: Vec<_> = tcx.all_impls(trait_id).collect();
+    // Skip foreign non-blanket impls whose simplified-self bucket holds no
+    // local impl. This is sound because:
+    // - foreign impls are never overlap-checked, only recorded; `Ancestors`
+    //   reads their parent lazily from metadata instead (the same value).
+    // - a local non-blanket impl is only compared against blanket impls and
+    //   impls in its own bucket (see `filtered_children`), and instantiation
+    //   preserves the simplified type, so kept buckets are complete at every
+    //   level of the tree.
+    // - a local blanket impl, including alias self types which simplify to
+    //   `None`, is compared against every child, so then all buckets are kept;
+    //   pruning them would change error recovery (see impl-unpin.rs, `tait`
+    //   revision).
+    let all_impls = tcx.trait_impls_of(trait_id);
+    let mut trait_impls: Vec<DefId> = all_impls.blanket_impls().to_vec();
+    let has_local_blanket_impl =
+        all_impls.blanket_impls().iter().any(|impl_def_id| impl_def_id.is_local());
+    for (&simplified_self, bucket) in all_impls.non_blanket_impls() {
+        if has_local_blanket_impl || bucket.iter().any(|impl_def_id| impl_def_id.is_local()) {
+            trait_impls.extend(bucket.iter().copied());
+        } else if cfg!(debug_assertions) {
+            // Assert metadata-derived key matches what the overlap checker recomputes.
+            for &impl_def_id in bucket {
+                let self_ty = tcx.impl_trait_ref(impl_def_id).skip_binder().self_ty();
+                debug_assert_eq!(
+                    fast_reject::simplify_type(tcx, self_ty, TreatParams::InstantiateWithInfer),
+                    Some(simplified_self),
+                    "trait_impls_of bucket key disagrees with overlap-check \
+                     simplification for foreign impl {impl_def_id:?}",
+                );
+            }
+        }
+    }
 
     // The coherence checking implementation seems to rely on impls being
     // iterated over (roughly) in definition order, so we are sorting by
@@ -571,7 +599,7 @@ fn report_conflicting_impls<'tcx>(
     match used_to_be_allowed {
         None => {
             let reported = if overlap.with_impl.is_local()
-                || tcx.ensure_ok().orphan_check_impl(impl_def_id).is_ok()
+                || tcx.ensure_result().orphan_check_impl(impl_def_id).is_ok()
             {
                 let mut err = tcx.dcx().struct_span_err(impl_span, msg());
                 err.code(E0119);
@@ -586,10 +614,15 @@ fn report_conflicting_impls<'tcx>(
             let lint = match kind {
                 FutureCompatOverlapErrorKind::LeakCheck => COHERENCE_LEAK_CHECK,
             };
-            tcx.node_span_lint(lint, tcx.local_def_id_to_hir_id(impl_def_id), impl_span, |err| {
-                err.primary_message(msg());
-                decorate(tcx, &overlap, impl_span, err);
-            });
+            tcx.emit_node_span_lint(
+                lint,
+                tcx.local_def_id_to_hir_id(impl_def_id),
+                impl_span,
+                rustc_errors::DiagDecorator(|err| {
+                    err.primary_message(msg());
+                    decorate(tcx, &overlap, impl_span, err);
+                }),
+            );
             Ok(())
         }
     }

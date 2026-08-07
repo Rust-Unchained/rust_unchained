@@ -19,6 +19,13 @@ typedef struct Simple {
 EXPORT int32_t access_simple(const Simple *s_ptr) {
   return s_ptr->field;
 }
+// Some copies so Rust can import them at different types.
+EXPORT int32_t access_simple2(const Simple *s_ptr) {
+  return s_ptr->field;
+}
+EXPORT int32_t access_simple3(const Simple *s_ptr) {
+  return s_ptr->field;
+}
 
 /* Test: test_access_nested */
 
@@ -48,4 +55,10 @@ typedef struct Static {
 
 EXPORT int32_t access_static(const Static *s_ptr) {
   return s_ptr->recurse->recurse->value;
+}
+
+/* Test: unexposed_reachable_alloc */
+
+EXPORT uintptr_t do_one_deref(const int32_t ***ptr) {
+  return (uintptr_t)*ptr;
 }

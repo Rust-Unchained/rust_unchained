@@ -4,6 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use rustc_data_structures::Limit;
 use rustc_errors::pluralize;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind};
@@ -11,7 +12,7 @@ use rustc_macros::extension;
 pub use rustc_type_ir::error::ExpectedFound;
 
 use crate::ty::print::{FmtPrinter, Print, with_forced_trimmed_paths};
-use crate::ty::{self, Lift, Ty, TyCtxt};
+use crate::ty::{self, Ty, TyCtxt};
 
 pub type TypeError<'tcx> = rustc_type_ir::error::TypeError<TyCtxt<'tcx>>;
 
@@ -34,7 +35,7 @@ impl<'tcx> TypeError<'tcx> {
         }
 
         match self {
-            TypeError::CyclicTy(_) => "cyclic type of infinite size".into(),
+            TypeError::CyclicTy(_) => "recursive type with infinite-size name".into(),
             TypeError::CyclicConst(_) => "encountered a self-referencing constant".into(),
             TypeError::Mismatch => "types differ".into(),
             TypeError::PolarityMismatch(values) => {
@@ -95,10 +96,24 @@ impl<'tcx> TypeError<'tcx> {
                 if values.found { "variadic" } else { "non-variadic" }
             )
             .into(),
+            TypeError::SplatMismatch(ref values) => format!(
+                "expected fn with {}, found fn with {}",
+                if let Some(index) = values.expected {
+                    format!("arg {index} splatted")
+                } else {
+                    "no splatted arg".to_string()
+                },
+                if let Some(index) = values.found {
+                    format!("arg {index} splatted")
+                } else {
+                    "no splatted arg".to_string()
+                }
+            )
+            .into(),
             TypeError::ProjectionMismatched(ref values) => format!(
                 "expected `{}`, found `{}`",
-                tcx.def_path_str(values.expected),
-                tcx.def_path_str(values.found)
+                tcx.alias_term_kind_def_path_str(values.expected),
+                tcx.alias_term_kind_def_path_str(values.found)
             )
             .into(),
             TypeError::ExistentialMismatch(ref values) => report_maybe_different(
@@ -114,7 +129,8 @@ impl<'tcx> TypeError<'tcx> {
             }
             TypeError::IntrinsicCast => "cannot coerce intrinsics to function pointers".into(),
             TypeError::TargetFeatureCast(_) => {
-                "cannot coerce functions with `#[target_feature]` to safe function pointers".into()
+                "cannot coerce functions with `#[target_feature(..)]` to safe function pointers"
+                    .into()
             }
         }
     }
@@ -147,20 +163,22 @@ impl<'tcx> Ty<'tcx> {
             ty::Infer(ty::FreshTy(_)) => "fresh type".into(),
             ty::Infer(ty::FreshIntTy(_)) => "fresh integral type".into(),
             ty::Infer(ty::FreshFloatTy(_)) => "fresh floating-point type".into(),
-            ty::Alias(ty::Projection | ty::Inherent, _) => "associated type".into(),
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { .. } | ty::Inherent { .. }, .. }) => {
+                "associated type".into()
+            }
             ty::Param(p) => format!("type parameter `{p}`").into(),
-            ty::Alias(ty::Opaque, ..) => {
-                if tcx.ty_is_opaque_future(self) {
-                    "future".into()
-                } else {
-                    "opaque type".into()
-                }
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
+                if tcx.ty_is_opaque_future(self) { "future".into() } else { "opaque type".into() }
             }
             ty::Error(_) => "type error".into(),
             _ => {
                 let width = tcx.sess.diagnostic_width();
                 let length_limit = std::cmp::max(width / 4, 40);
-                format!("`{}`", tcx.string_with_limit(self, length_limit)).into()
+                format!(
+                    "`{}`",
+                    tcx.string_with_limit(self, length_limit, hir::def::Namespace::TypeNS)
+                )
+                .into()
             }
         }
     }
@@ -204,24 +222,24 @@ impl<'tcx> Ty<'tcx> {
             ty::Tuple(..) => "tuple".into(),
             ty::Placeholder(..) => "higher-ranked type".into(),
             ty::Bound(..) => "bound type variable".into(),
-            ty::Alias(ty::Projection | ty::Inherent, _) => "associated type".into(),
-            ty::Alias(ty::Free, _) => "type alias".into(),
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { .. } | ty::Inherent { .. }, .. }) => {
+                "associated type".into()
+            }
+            ty::Alias(_, ty::AliasTy { kind: ty::Free { .. }, .. }) => "type alias".into(),
             ty::Param(_) => "type parameter".into(),
-            ty::Alias(ty::Opaque, ..) => "opaque type".into(),
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }) => "opaque type".into(),
         }
     }
 }
 
 impl<'tcx> TyCtxt<'tcx> {
-    pub fn string_with_limit<T>(self, p: T, length_limit: usize) -> String
+    pub fn string_with_limit<T>(self, t: T, length_limit: usize, ns: hir::def::Namespace) -> String
     where
-        T: Copy + for<'a, 'b> Lift<TyCtxt<'b>, Lifted: Print<'b, FmtPrinter<'a, 'b>>>,
+        T: Copy + for<'a> Print<FmtPrinter<'a, 'tcx>>,
     {
         let mut type_limit = 50;
-        let regular = FmtPrinter::print_string(self, hir::def::Namespace::TypeNS, |cx| {
-            self.lift(p).expect("could not lift for printing").print(cx)
-        })
-        .expect("could not write to `String`");
+        let regular = FmtPrinter::print_string(self, ns, |p| t.print(p))
+            .expect("could not write to `String`");
         if regular.len() <= length_limit {
             return regular;
         }
@@ -229,16 +247,9 @@ impl<'tcx> TyCtxt<'tcx> {
         loop {
             // Look for the longest properly trimmed path that still fits in length_limit.
             short = with_forced_trimmed_paths!({
-                let mut cx = FmtPrinter::new_with_limit(
-                    self,
-                    hir::def::Namespace::TypeNS,
-                    rustc_session::Limit(type_limit),
-                );
-                self.lift(p)
-                    .expect("could not lift for printing")
-                    .print(&mut cx)
-                    .expect("could not print type");
-                cx.into_buffer()
+                let mut p = FmtPrinter::new_with_limit(self, ns, Limit(type_limit));
+                t.print(&mut p).expect("could not print type");
+                p.into_buffer()
             });
             if short.len() <= length_limit || type_limit == 0 {
                 break;
@@ -251,15 +262,29 @@ impl<'tcx> TyCtxt<'tcx> {
     /// When calling this after a `Diag` is constructed, the preferred way of doing so is
     /// `tcx.short_string(ty, diag.long_ty_path())`. The diagnostic itself is the one that keeps
     /// the existence of a "long type" anywhere in the diagnostic, so the note telling the user
-    /// where we wrote the file to is only printed once.
-    pub fn short_string<T>(self, p: T, path: &mut Option<PathBuf>) -> String
+    /// where we wrote the file to is only printed once. The path will use the type namespace.
+    pub fn short_string<T>(self, t: T, path: &mut Option<PathBuf>) -> String
     where
-        T: Copy + Hash + for<'a, 'b> Lift<TyCtxt<'b>, Lifted: Print<'b, FmtPrinter<'a, 'b>>>,
+        T: Copy + Hash + for<'a> Print<FmtPrinter<'a, 'tcx>>,
     {
-        let regular = FmtPrinter::print_string(self, hir::def::Namespace::TypeNS, |cx| {
-            self.lift(p).expect("could not lift for printing").print(cx)
-        })
-        .expect("could not write to `String`");
+        self.short_string_namespace(t, path, hir::def::Namespace::TypeNS)
+    }
+
+    /// When calling this after a `Diag` is constructed, the preferred way of doing so is
+    /// `tcx.short_string(ty, diag.long_ty_path())`. The diagnostic itself is the one that keeps
+    /// the existence of a "long type" anywhere in the diagnostic, so the note telling the user
+    /// where we wrote the file to is only printed once.
+    pub fn short_string_namespace<T>(
+        self,
+        t: T,
+        path: &mut Option<PathBuf>,
+        namespace: hir::def::Namespace,
+    ) -> String
+    where
+        T: Copy + Hash + for<'a> Print<FmtPrinter<'a, 'tcx>>,
+    {
+        let regular = FmtPrinter::print_string(self, namespace, |p| t.print(p))
+            .expect("could not write to `String`");
 
         if !self.sess.opts.unstable_opts.write_long_types_to_disk || self.sess.opts.verbose {
             return regular;
@@ -270,13 +295,13 @@ impl<'tcx> TyCtxt<'tcx> {
         if regular.len() <= width * 2 / 3 {
             return regular;
         }
-        let short = self.string_with_limit(p, length_limit);
+        let short = self.string_with_limit(t, length_limit, namespace);
         if regular == short {
             return regular;
         }
         // Ensure we create an unique file for the type passed in when we create a file.
         let mut s = DefaultHasher::new();
-        p.hash(&mut s);
+        t.hash(&mut s);
         let hash = s.finish();
         *path = Some(path.take().unwrap_or_else(|| {
             self.output_filenames(()).temp_path_for_diagnostic(&format!("long-type-{hash}.txt"))
@@ -297,6 +322,19 @@ impl<'tcx> TyCtxt<'tcx> {
         match write!(file, "{regular}\n") {
             Ok(_) => short,
             Err(_) => regular,
+        }
+    }
+
+    pub fn alias_term_kind_def_path_str(self, alias: ty::AliasTermKind<'tcx>) -> String {
+        match alias {
+            ty::AliasTermKind::ProjectionTy { def_id }
+            | ty::AliasTermKind::InherentTy { def_id }
+            | ty::AliasTermKind::OpaqueTy { def_id }
+            | ty::AliasTermKind::FreeTy { def_id }
+            | ty::AliasTermKind::AnonConst { def_id }
+            | ty::AliasTermKind::ProjectionConst { def_id }
+            | ty::AliasTermKind::FreeConst { def_id }
+            | ty::AliasTermKind::InherentConst { def_id } => self.def_path_str(def_id),
         }
     }
 }

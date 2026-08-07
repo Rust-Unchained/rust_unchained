@@ -33,7 +33,7 @@ this group to help with triaging, which can include:
 
 1. **Labeling issues**
 
-    For the `good-first-issue` label, it can still be good to use `@rustbot` to
+    For the `good first issue` label, it can still be good to use `@rustbot` to
     subscribe to the issue and help interested parties, if they post questions
     in the comments. 
 
@@ -51,7 +51,7 @@ this group to help with triaging, which can include:
     busy or wants to abandon it. If the reviewer is busy, the PR can be
     reassigned to someone else.
 
-    Checkout: https://triage.rust-lang.org/triage/rust-lang/rust-clippy to
+    Checkout: <https://triage.rust-lang.org/triage/rust-lang/rust-clippy> to
     monitor PRs.
 
 While not part of their duties, contributors are encouraged to review PRs

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 
@@ -48,7 +49,7 @@ def eprint(*args, **kwargs):
     print(*args, **kwargs)
 
 
-def get(base, url, path, checksums, verbose=False):
+def get(base, url, path, checksums, verbose=0):
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         temp_path = temp_file.name
 
@@ -65,11 +66,11 @@ def get(base, url, path, checksums, verbose=False):
         sha256 = checksums[url]
         if os.path.exists(path):
             if verify(path, sha256, False):
-                if verbose:
+                if verbose > 0:
                     eprint("using already-download file", path)
                 return
             else:
-                if verbose:
+                if verbose > 0:
                     eprint(
                         "ignoring already-download file",
                         path,
@@ -79,12 +80,12 @@ def get(base, url, path, checksums, verbose=False):
         download(temp_path, "{}/{}".format(base, url), True, verbose)
         if not verify(temp_path, sha256, verbose):
             raise RuntimeError("failed verification")
-        if verbose:
+        if verbose > 0:
             eprint("moving {} to {}".format(temp_path, path))
         shutil.move(temp_path, path)
     finally:
         if os.path.isfile(temp_path):
-            if verbose:
+            if verbose > 0:
                 eprint("removing", temp_path)
             os.unlink(temp_path)
 
@@ -112,11 +113,11 @@ def _download(path, url, probably_big, verbose, exception):
     # If an error occurs:
     #  - If we are on win32 fallback to powershell
     #  - Otherwise raise the error if appropriate
-    if probably_big or verbose:
+    if probably_big or verbose > 0:
         eprint("downloading {}".format(url))
 
     try:
-        if (probably_big or verbose) and "GITHUB_ACTIONS" not in os.environ:
+        if (probably_big or verbose > 0) and "GITHUB_ACTIONS" not in os.environ:
             option = "--progress-bar"
         else:
             option = "--silent"
@@ -179,7 +180,7 @@ def _download(path, url, probably_big, verbose, exception):
 
 def verify(path, expected, verbose):
     """Check if the sha256 sum of the given path is valid"""
-    if verbose:
+    if verbose > 0:
         eprint("verifying", path)
     with open(path, "rb") as source:
         found = hashlib.sha256(source.read()).hexdigest()
@@ -193,7 +194,7 @@ def verify(path, expected, verbose):
     return verified
 
 
-def unpack(tarball, tarball_suffix, dst, verbose=False, match=None):
+def unpack(tarball, tarball_suffix, dst, verbose=0, match=None):
     """Unpack the given tarball file"""
     eprint("extracting", tarball)
     fname = os.path.basename(tarball).replace(tarball_suffix, "")
@@ -207,7 +208,7 @@ def unpack(tarball, tarball_suffix, dst, verbose=False, match=None):
             name = name[len(match) + 1 :]
 
             dst_path = os.path.join(dst, name)
-            if verbose:
+            if verbose > 0:
                 eprint("  extracting", member)
             tar.extract(member, dst)
             src_path = os.path.join(dst, member)
@@ -217,9 +218,9 @@ def unpack(tarball, tarball_suffix, dst, verbose=False, match=None):
     shutil.rmtree(os.path.join(dst, fname))
 
 
-def run(args, verbose=False, exception=False, is_bootstrap=False, **kwargs):
+def run(args, verbose=0, exception=False, is_bootstrap=False, **kwargs):
     """Run a child program in a new process"""
-    if verbose:
+    if verbose > 0:
         eprint("running: " + " ".join(args))
     sys.stdout.flush()
     # Ensure that the .exe is used on Windows just in case a Linux ELF has been
@@ -232,7 +233,7 @@ def run(args, verbose=False, exception=False, is_bootstrap=False, **kwargs):
     code = ret.wait()
     if code != 0:
         err = "failed to run: " + " ".join(args)
-        if verbose or exception:
+        if verbose > 0 or exception:
             raise RuntimeError(err)
         # For most failures, we definitely do want to print this error, or the user will have no
         # idea what went wrong. But when we've successfully built bootstrap and it failed, it will
@@ -292,13 +293,13 @@ def default_build_triple(verbose):
             version = version.decode(default_encoding)
             host = next(x for x in version.split("\n") if x.startswith("host: "))
             triple = host.split("host: ")[1]
-            if verbose:
+            if verbose > 0:
                 eprint(
                     "detected default triple {} from pre-installed rustc".format(triple)
                 )
             return triple
         except Exception as e:
-            if verbose:
+            if verbose > 0:
                 eprint("pre-installed rustc not detected: {}".format(e))
                 eprint("falling back to auto-detect")
 
@@ -310,6 +311,12 @@ def default_build_triple(verbose):
         return "x86_64-pc-windows-msvc"
 
     kernel, cputype, processor = uname.decode(default_encoding).split(maxsplit=2)
+
+    # ON NetBSD, use `uname -p` to set the CPU type
+    if kernel == "NetBSD":
+        cputype = (
+            subprocess.check_output(["uname", "-p"]).strip().decode(default_encoding)
+        )
 
     # The goal here is to come up with the same triple as LLVM would,
     # at least for the subset of platforms we're willing to target.
@@ -333,7 +340,11 @@ def default_build_triple(verbose):
         if ostype == "Android":
             kernel = "linux-android"
         else:
-            kernel = "unknown-linux-gnu"
+            python_soabi = sysconfig.get_config_var("SOABI")
+            if python_soabi is not None and "musl" in python_soabi:
+                kernel = "unknown-linux-musl"
+            else:
+                kernel = "unknown-linux-gnu"
     elif kernel == "SunOS":
         kernel = "pc-solaris"
         # On Solaris, uname -m will return a machine classification instead
@@ -394,6 +405,7 @@ def default_build_triple(verbose):
         "i686": "i686",
         "i686-AT386": "i686",
         "i786": "i686",
+        "loongarch32": "loongarch32",
         "loongarch64": "loongarch64",
         "m68k": "m68k",
         "csky": "csky",
@@ -427,10 +439,16 @@ def default_build_triple(verbose):
             kernel = "linux-androideabi"
         else:
             kernel += "eabihf"
-    elif cputype in {"armv7l", "armv8l"}:
+    elif cputype in {"armv6hf", "earmv6hf"}:
+        cputype = "armv6"
+        if kernel == "unknown-netbsd":
+            kernel += "-eabihf"
+    elif cputype in {"armv7l", "earmv7hf", "armv8l"}:
         cputype = "armv7"
         if kernel == "linux-android":
             kernel = "linux-androideabi"
+        elif kernel == "unknown-netbsd":
+            kernel += "-eabihf"
         else:
             kernel += "eabihf"
     elif cputype == "mips":
@@ -461,7 +479,7 @@ def default_build_triple(verbose):
 @contextlib.contextmanager
 def output(filepath):
     tmp = filepath + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         yield f
     try:
         if os.path.exists(filepath):
@@ -578,6 +596,7 @@ class RustBuild(object):
         self.download_url = (
             os.getenv("RUSTUP_DIST_SERVER") or self.stage0_data["dist_server"]
         )
+        self.jobs = self.get_toml("jobs", "build") or "default"
 
         self.build = args.build or self.build_triple()
 
@@ -677,10 +696,10 @@ class RustBuild(object):
             for download_info in tarballs_download_info:
                 download_component(download_info)
 
-            # Unpack the tarballs in parallle.
+            # Unpack the tarballs in parallel.
             # In Python 2.7, Pool cannot be used as a context manager.
             pool_size = min(len(tarballs_download_info), get_cpus())
-            if self.verbose:
+            if self.verbose > 0:
                 print(
                     "Choosing a pool size of",
                     pool_size,
@@ -759,7 +778,7 @@ class RustBuild(object):
             # Use `/etc/os-release` instead of `/etc/NIXOS`.
             # The latter one does not exist on NixOS when using tmpfs as root.
             try:
-                with open("/etc/os-release", "r") as f:
+                with open("/etc/os-release", "r", encoding="utf-8") as f:
                     is_nixos = any(
                         ln.strip() in ("ID=nixos", "ID='nixos'", 'ID="nixos"')
                         for ln in f
@@ -844,7 +863,8 @@ class RustBuild(object):
         if ".so" not in fname:
             # Finally, set the correct .interp for binaries
             with open(
-                "{}/nix-support/dynamic-linker".format(nix_deps_dir)
+                "{}/nix-support/dynamic-linker".format(nix_deps_dir),
+                encoding="utf-8",
             ) as dynamic_linker:
                 patchelf_args += ["--set-interpreter", dynamic_linker.read().rstrip()]
 
@@ -869,7 +889,7 @@ class RustBuild(object):
         """Check if the given program stamp is out of date"""
         if not os.path.exists(stamp_path) or self.clean:
             return True
-        with open(stamp_path, "r") as stamp:
+        with open(stamp_path, "r", encoding="utf-8") as stamp:
             return key != stamp.read()
 
     def bin_root(self):
@@ -906,6 +926,21 @@ class RustBuild(object):
         >>> rb.get_toml('key', 'c') is None
         True
 
+        A dotted key names a table relative to its enclosing section, so the
+        full table path must match for the key to be found:
+
+        >>> rb.config_toml = 'build.cargo = "/path/to/cargo"'
+        >>> rb.get_toml('cargo', 'build')
+        '/path/to/cargo'
+        >>> rb.get_toml('cargo', 'other') is None
+        True
+
+        A dotted key inside a section composes with that section's name:
+
+        >>> rb.config_toml = '[target]\\nx86_64-unknown-linux-gnu.cc = "gcc"'
+        >>> rb.get_toml('cc', 'target.x86_64-unknown-linux-gnu')
+        'gcc'
+
         >>> rb.config_toml = 'key1 = true'
         >>> rb.get_toml("key1")
         'true'
@@ -920,10 +955,24 @@ class RustBuild(object):
             if section_match is not None:
                 cur_section = section_match.group(1)
 
-            match = re.match(r"^{}\s*=(.*)$".format(key), line)
+            # Match the key, optionally preceded by a dotted-table prefix (the
+            # `build.` in `build.cargo`), which names a table relative to the
+            # current `[section]` and is appended to `cur_section`. This is a
+            # subset parser, not full TOML: quoted names (e.g. the `'a.b'` that
+            # configure.py emits for dotted targets) are not matched here.
+            match = re.match(
+                r"^\s*(?:([\w.-]+)\.)?{}\s*=(.*)$".format(re.escape(key)), line
+            )
             if match is not None:
-                value = match.group(1)
-                if section is None or section == cur_section:
+                prefix = match.group(1)
+                if prefix is None:
+                    line_section = cur_section
+                elif cur_section is None:
+                    line_section = prefix
+                else:
+                    line_section = "{}.{}".format(cur_section, prefix)
+                value = match.group(2)
+                if section is None or section == line_section:
                     return RustBuild.get_string(value) or value.strip()
         return None
 
@@ -939,7 +988,10 @@ class RustBuild(object):
         """Return config path for the given program at the given stage
 
         >>> rb = RustBuild()
-        >>> rb.config_toml = 'rustc = "rustc"\\n'
+        >>> rb.config_toml = 'build.rustc = "rustc"\\n'
+        >>> rb.program_config('rustc')
+        'rustc'
+        >>> rb.config_toml = '[build]\\nrustc = "rustc"\\n'
         >>> rb.program_config('rustc')
         'rustc'
         >>> rb.config_toml = ''
@@ -948,7 +1000,7 @@ class RustBuild(object):
         ... "bin", "cargo")
         True
         """
-        config = self.get_toml(program)
+        config = self.get_toml(program, "build")
         if config:
             return os.path.expanduser(config)
         return os.path.join(self.bin_root(), "bin", "{}{}".format(program, EXE_SUFFIX))
@@ -1021,6 +1073,9 @@ class RustBuild(object):
         # See also: <https://github.com/rust-lang/rust/issues/70208>.
         if "CARGO_BUILD_TARGET" in env:
             del env["CARGO_BUILD_TARGET"]
+        # if in CI, don't use incremental build when building bootstrap.
+        if "GITHUB_ACTIONS" in env:
+            env["CARGO_INCREMENTAL"] = "0"
         env["CARGO_TARGET_DIR"] = build_dir
         env["RUSTC"] = self.rustc()
         env["LD_LIBRARY_PATH"] = (
@@ -1091,6 +1146,21 @@ class RustBuild(object):
         else:
             env["RUSTFLAGS"] = "-Zallow-features="
 
+        if not os.path.isfile(self.cargo()):
+            raise Exception("no cargo executable found at `{}`".format(self.cargo()))
+        args = [
+            self.cargo(),
+            "build",
+            "--jobs=" + self.jobs,
+            "--manifest-path",
+            os.path.join(self.rust_root, "src/bootstrap/Cargo.toml"),
+            "-Zroot-dir=" + self.rust_root,
+        ]
+        # verbose cargo output is very noisy, so only enable it with -vv
+        args.extend("--verbose" for _ in range(self.verbose - 1))
+        if self.verbose < 0:
+            args.append("--quiet")
+
         target_features = []
         if self.get_toml("crt-static", build_section) == "true":
             target_features += ["+crt-static"]
@@ -1109,26 +1179,13 @@ class RustBuild(object):
         else:
             deny_warnings = self.warnings == "deny"
         if deny_warnings:
-            env["RUSTFLAGS"] += " -Dwarnings"
+            env["CARGO_BUILD_WARNINGS"] = "deny"
 
         # Add RUSTFLAGS_BOOTSTRAP to RUSTFLAGS for bootstrap compilation.
         # Note that RUSTFLAGS_BOOTSTRAP should always be added to the end of
-        # RUSTFLAGS to be actually effective (e.g., if we have `-Dwarnings` in
-        # RUSTFLAGS, passing `-Awarnings` from RUSTFLAGS_BOOTSTRAP should override it).
+        # RUSTFLAGS, since that causes RUSTFLAGS_BOOTSTRAP to override RUSTFLAGS.
         if "RUSTFLAGS_BOOTSTRAP" in env:
             env["RUSTFLAGS"] += " " + env["RUSTFLAGS_BOOTSTRAP"]
-
-        env["PATH"] = os.path.join(self.bin_root(), "bin") + os.pathsep + env["PATH"]
-        if not os.path.isfile(self.cargo()):
-            raise Exception("no cargo executable found at `{}`".format(self.cargo()))
-        args = [
-            self.cargo(),
-            "build",
-            "--manifest-path",
-            os.path.join(self.rust_root, "src/bootstrap/Cargo.toml"),
-            "-Zroot-dir=" + self.rust_root,
-        ]
-        args.extend("--verbose" for _ in range(self.verbose))
 
         if "BOOTSTRAP_TRACING" in env:
             args.append("--features=tracing")
@@ -1172,8 +1229,6 @@ class RustBuild(object):
             return "<commit>"
         cmd = [
             "git",
-            "-C",
-            repo_path,
             "rev-list",
             "--author",
             author_email,
@@ -1181,7 +1236,9 @@ class RustBuild(object):
             "HEAD",
         ]
         try:
-            commit = subprocess.check_output(cmd, universal_newlines=True).strip()
+            commit = subprocess.check_output(
+                cmd, universal_newlines=True, cwd=repo_path
+            ).strip()
             return commit or "<commit>"
         except subprocess.CalledProcessError:
             return "<commit>"
@@ -1235,7 +1292,12 @@ class RustBuild(object):
 
 def parse_args(args):
     """Parse the command line arguments that the python script needs."""
-    parser = argparse.ArgumentParser(add_help=False)
+
+    # Pass allow_abbrev=False to remove support for inexact matches (e.g.,
+    # `--json` turning on `--json-output`). The argument list here is partial,
+    # most flags are matched in the Rust bootstrap code. This prevents the
+    # default ambiguity checks in argparse from functioning correctly.
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("-h", "--help", action="store_true")
     parser.add_argument("--config")
     parser.add_argument("--build-dir")
@@ -1246,14 +1308,19 @@ def parse_args(args):
     parser.add_argument(
         "--warnings", choices=["deny", "warn", "default"], default="default"
     )
-    parser.add_argument("-v", "--verbose", action="count", default=0)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-v", "--verbose", action="count", default=0)
+    # Note that we're storing the `--quiet` value in `verbose`. That way we don't need to thread
+    # `self.quiet` throughout the code. That could be error prone, which could let some output
+    # through that should have been suppressed.
+    group.add_argument("-q", "--quiet", action="store_const", const=-1, dest="verbose")
 
     return parser.parse_known_args(args)[0]
 
 
 def parse_stage0_file(path):
     result = {}
-    with open(path, "r") as file:
+    with open(path, "r", encoding="utf-8") as file:
         for line in file:
             line = line.strip()
             if line and not line.startswith("#"):
@@ -1293,7 +1360,7 @@ def bootstrap(args):
     # Give a hard error if `--config` or `RUST_BOOTSTRAP_CONFIG` are set to a missing path,
     # but not if `bootstrap.toml` hasn't been created.
     if not using_default_path or os.path.exists(toml_path):
-        with open(toml_path) as config:
+        with open(toml_path, encoding="utf-8") as config:
             config_toml = config.read()
     else:
         config_toml = ""
@@ -1323,7 +1390,7 @@ def bootstrap(args):
 
         # HACK: This works because `self.get_toml()` returns the first match it finds for a
         # specific key, so appending our defaults at the end allows the user to override them
-        with open(include_path) as included_toml:
+        with open(include_path, encoding="utf-8") as included_toml:
             config_toml += os.linesep + included_toml.read()
 
     # Configure initial bootstrap
@@ -1356,11 +1423,28 @@ def main():
         sys.argv[1] = "-h"
 
     args = parse_args(sys.argv)
-    help_triggered = args.help or len(sys.argv) == 1
 
-    # If the user is asking for help, let them know that the whole download-and-build
+    # Root help (e.g., x.py --help) prints help from the saved file to save the time
+    if len(sys.argv) == 1 or sys.argv[1] in ["-h", "--help"]:
+        try:
+            with open(
+                os.path.join(os.path.dirname(__file__), "../etc/xhelp"),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                # The file from bootstrap func already has newline.
+                print(f.read(), end="")
+                sys.exit(0)
+        except Exception as error:
+            eprint(
+                f"ERROR: unable to run help: {error}\n",
+                "x.py run generate-help may solve the problem.",
+            )
+            sys.exit(1)
+
+    # If the user is asking for other helps, let them know that the whole download-and-build
     # process has to happen before anything is printed out.
-    if help_triggered:
+    if args.help:
         eprint(
             "INFO: Downloading and building bootstrap before processing --help command.\n"
             "      See src/bootstrap/README.md for help with common commands."
@@ -1378,13 +1462,14 @@ def main():
             eprint(error)
         success_word = "unsuccessfully"
 
-    if not help_triggered:
+    if not args.help:
         eprint(
             "Build completed",
             success_word,
             "in",
             format_build_time(time() - start_time),
         )
+
     sys.exit(exit_code)
 
 

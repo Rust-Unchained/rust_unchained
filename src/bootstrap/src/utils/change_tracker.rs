@@ -46,10 +46,10 @@ pub fn find_recent_config_change_ids(current_id: usize) -> &'static [ChangeInfo]
         // an empty list (it may be due to switching from a recent branch to an
         // older one); otherwise, return the full list (assuming the user provided
         // the incorrect change-id by accident).
-        if let Some(config) = CONFIG_CHANGE_HISTORY.iter().max_by_key(|config| config.change_id) {
-            if current_id > config.change_id {
-                return &[];
-            }
+        if let Some(config) = CONFIG_CHANGE_HISTORY.iter().max_by_key(|config| config.change_id)
+            && current_id > config.change_id
+        {
+            return &[];
         }
 
         CONFIG_CHANGE_HISTORY
@@ -73,7 +73,7 @@ pub fn human_readable_changes(changes: &[ChangeInfo]) -> String {
 /// Keeps track of major changes made to the bootstrap configuration.
 ///
 /// If you make any major changes (such as adding new values or changing default values),
-/// please ensure adding `ChangeInfo` to the end(because the list must be sorted by the merge date)
+/// please ensure adding `ChangeInfo` to the end (because the list must be sorted by the merge date)
 /// of this list.
 pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
     ChangeInfo {
@@ -149,7 +149,7 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
     ChangeInfo {
         change_id: 121976,
         severity: ChangeSeverity::Info,
-        summary: "A new `boostrap-cache-path` option has been introduced which can be utilized to modify the cache path for bootstrap.",
+        summary: "A new `bootstrap-cache-path` option has been introduced which can be utilized to modify the cache path for bootstrap.",
     },
     ChangeInfo {
         change_id: 122108,
@@ -400,5 +400,275 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
         change_id: 138934,
         severity: ChangeSeverity::Info,
         summary: "Added new option `include` to create config extensions.",
+    },
+    ChangeInfo {
+        change_id: 140438,
+        severity: ChangeSeverity::Info,
+        summary: "Added a new option `rust.debug-assertions-tools` to control debug assertions for tools.",
+    },
+    ChangeInfo {
+        change_id: 140732,
+        severity: ChangeSeverity::Info,
+        summary: "`./x run` now supports running in-tree `rustfmt`, e.g., `./x run rustfmt -- --check /path/to/file.rs`.",
+    },
+    ChangeInfo {
+        change_id: 119899,
+        severity: ChangeSeverity::Warning,
+        summary: "Stage0 library no longer matches the in-tree library, which means stage1 compiler now uses the beta library.",
+    },
+    ChangeInfo {
+        change_id: 141970,
+        severity: ChangeSeverity::Info,
+        summary: "Added new bootstrap flag `--skip-std-check-if-no-download-rustc` that skips std checks when download-rustc is unavailable. Mainly intended for developers to reduce RA overhead.",
+    },
+    ChangeInfo {
+        change_id: 142379,
+        severity: ChangeSeverity::Info,
+        summary: "Added new option `tool.TOOL_NAME.features` to specify the features to compile a tool with",
+    },
+    ChangeInfo {
+        change_id: 142581,
+        severity: ChangeSeverity::Warning,
+        summary: "It is no longer possible to `x build` with stage 0. All build commands have to be on stage 1+.",
+    },
+    ChangeInfo {
+        change_id: 143175,
+        severity: ChangeSeverity::Info,
+        summary: "It is no longer possible to combine `rust.lld = true` with configuring external LLVM using `llvm.llvm-config`.",
+    },
+    ChangeInfo {
+        change_id: 143255,
+        severity: ChangeSeverity::Warning,
+        summary: "`rust.lld` is no longer enabled by default for the dist profile.",
+    },
+    ChangeInfo {
+        change_id: 143251,
+        severity: ChangeSeverity::Info,
+        summary: "Added new option `build.tidy-extra-checks` to specify a default value for the --extra-checks cli flag.",
+    },
+    ChangeInfo {
+        change_id: 143493,
+        severity: ChangeSeverity::Warning,
+        summary: "The `spellcheck:fix` tidy extra check argument has been removed, use `--bless` instead",
+    },
+    ChangeInfo {
+        change_id: 143048,
+        severity: ChangeSeverity::Warning,
+        summary: "The default check stage has been changed to 1. It is no longer possible to `x check` with stage 0. All check commands have to be on stage 1+. Bootstrap tools can now also only be checked for the host target.",
+    },
+    ChangeInfo {
+        change_id: 143577,
+        severity: ChangeSeverity::Warning,
+        summary: "`download-rustc` has been temporarily disabled for the library profile due to implementation bugs (see #142505).",
+    },
+    ChangeInfo {
+        change_id: 143398,
+        severity: ChangeSeverity::Info,
+        summary: "The --extra-checks flag now supports prefixing any check with `auto:` to only run it if relevant files are modified",
+    },
+    ChangeInfo {
+        change_id: 143785,
+        severity: ChangeSeverity::Info,
+        summary: "A --compile-time-deps flag has been added to reduce the time it takes rust-analyzer to start",
+    },
+    ChangeInfo {
+        change_id: 143733,
+        severity: ChangeSeverity::Info,
+        summary: "Option `tool.TOOL_NAME.features` now works on any subcommand, not just `build`.",
+    },
+    ChangeInfo {
+        change_id: 143630,
+        severity: ChangeSeverity::Warning,
+        summary: "The current `./x suggest` implementation has been removed due to it being quite broken and a lack of maintenance bandwidth, with no prejudice against re-implementing it in a more maintainable form.",
+    },
+    ChangeInfo {
+        change_id: 143926,
+        severity: ChangeSeverity::Warning,
+        summary: "Removed `rust.description` and `llvm.ccache` as it was deprecated in #137723 and #136941 long time ago.",
+    },
+    ChangeInfo {
+        change_id: 144675,
+        severity: ChangeSeverity::Warning,
+        summary: "Added `build.compiletest-allow-stage0` flag instead of `COMPILETEST_FORCE_STAGE0` env var, and reject running `compiletest` self tests against stage 0 rustc unless explicitly allowed.",
+    },
+    ChangeInfo {
+        change_id: 145011,
+        severity: ChangeSeverity::Warning,
+        summary: "It is no longer possible to `x doc` with stage 0. All doc commands have to be on stage 1+.",
+    },
+    ChangeInfo {
+        change_id: 145295,
+        severity: ChangeSeverity::Warning,
+        summary: "The names of stageN directories in the build directory have been consolidated with the new (post-stage-0-redesign) staging scheme. Some tools and binaries might be located in a different build directory than before.",
+    },
+    ChangeInfo {
+        change_id: 145131,
+        severity: ChangeSeverity::Warning,
+        summary: "It is no longer possible to `x clippy` with stage 0. All clippy commands have to be on stage 1+.",
+    },
+    ChangeInfo {
+        change_id: 145256,
+        severity: ChangeSeverity::Info,
+        summary: "Added `--test-codegen-backend` CLI option for tests",
+    },
+    ChangeInfo {
+        change_id: 145379,
+        severity: ChangeSeverity::Info,
+        summary: "Build/check now supports forwarding `--timings` flag to cargo.",
+    },
+    ChangeInfo {
+        change_id: 145472,
+        severity: ChangeSeverity::Warning,
+        summary: "It is no longer possible to `x dist` or `x install` with stage 0. All dist and install commands have to be on stage 1+.",
+    },
+    ChangeInfo {
+        change_id: 143689,
+        severity: ChangeSeverity::Info,
+        summary: "The `optimized-compiler-builtins` option now accepts a path to an existing compiler-rt builtins library.",
+    },
+    ChangeInfo {
+        change_id: 145876,
+        severity: ChangeSeverity::Info,
+        summary: "It is now possible to `check/build/dist` the standard stage 0 library if you use a stage0 rustc built from in-tree sources. This is useful for quickly cross-compiling the standard library. You have to enable build.local-rebuild for this to work.",
+    },
+    ChangeInfo {
+        change_id: 145663,
+        severity: ChangeSeverity::Warning,
+        summary: "It is no longer possible to `x test` with stage 0, except for running compiletest and opting into `build.compiletest-allow-stage0`.",
+    },
+    ChangeInfo {
+        change_id: 145976,
+        severity: ChangeSeverity::Info,
+        summary: "Added a new option `rust.break-on-ice` to control if internal compiler errors cause a debug break on Windows.",
+    },
+    ChangeInfo {
+        change_id: 146435,
+        severity: ChangeSeverity::Info,
+        summary: "The default value of the `gcc.download-ci-gcc` option has been changed to `true`.",
+    },
+    ChangeInfo {
+        change_id: 146458,
+        severity: ChangeSeverity::Info,
+        summary: "There is now a bootstrap option called `rust.parallel-frontend-threads`, which can be used to set the number of threads for the compiler frontend used during compilation of Rust code.",
+    },
+    ChangeInfo {
+        change_id: 146663,
+        severity: ChangeSeverity::Info,
+        summary: "New option `build.windows-rc` that will override which resource compiler on Windows will be used to compile Rust.",
+    },
+    ChangeInfo {
+        change_id: 147046,
+        severity: ChangeSeverity::Warning,
+        summary: "The `rust.use-lld` option has been renamed to `rust.bootstrap-override-lld`. Note that it only serves for overriding the linker used when building Rust code in bootstrap to be LLD.",
+    },
+    ChangeInfo {
+        change_id: 146929,
+        severity: ChangeSeverity::Info,
+        summary: "`compiletest` is now always built with the stage 0 compiler, so `build.compiletest-use-stage0-libtest` has no effect.",
+    },
+    ChangeInfo {
+        change_id: 147157,
+        severity: ChangeSeverity::Warning,
+        summary: "`rust.lld = true` no longer automatically causes the `x86_64-unknown-linux-gnu` target to default into using the self-contained LLD linker. This target now uses the LLD linker by default. To opt out, set `target.x86_64-unknown-linux-gnu.default-linker-linux-override = 'off'`.",
+    },
+    ChangeInfo {
+        change_id: 147888,
+        severity: ChangeSeverity::Info,
+        summary: "`llvm.enzyme` now works with `download-ci-llvm=true`.",
+    },
+    ChangeInfo {
+        change_id: 148636,
+        severity: ChangeSeverity::Info,
+        summary: "The `build.python` option is now respected on macOS (previously ignored and forced to be /usr/bin/python3).",
+    },
+    ChangeInfo {
+        change_id: 148911,
+        severity: ChangeSeverity::Warning,
+        summary: "Flags from `*FLAGS*` (such as `RUSTFLAGS`) env. vars. now have precedence over rustflags set by bootstrap. Before, it was the other way around.",
+    },
+    ChangeInfo {
+        change_id: 148763,
+        severity: ChangeSeverity::Info,
+        summary: "`yarn` is now used instead of `npm` to install dependencies for some extra tidy checks. Use `build.yarn` to manually specify the path to `yarn` (`build.npm` is no longer used).",
+    },
+    ChangeInfo {
+        change_id: 148803,
+        severity: ChangeSeverity::Info,
+        summary: "The `-Zannotate-moves` option is now always enabled when building rustc, sysroot and tools.",
+    },
+    ChangeInfo {
+        change_id: 148795,
+        severity: ChangeSeverity::Info,
+        summary: "New options `rust.rustflags` for all targets and per-target `rustflags` that will pass specified flags to rustc for all stages. Target-specific flags override global `rust.rustflags` ones.",
+    },
+    ChangeInfo {
+        change_id: 149354,
+        severity: ChangeSeverity::Info,
+        summary: "New option `gcc.libgccjit-libs-dir` to specify which libgccjit.so to use per target.",
+    },
+    ChangeInfo {
+        change_id: 148671,
+        severity: ChangeSeverity::Info,
+        summary: "New option `llvm.offload-clang-dir` to allow building an in-tree llvm offload and openmp runtime with an external clang.",
+    },
+    ChangeInfo {
+        change_id: 153143,
+        severity: ChangeSeverity::Warning,
+        summary: "`x.py test --no-doc` is renamed to `--all-targets`. Additionally `--tests` is added which only executes unit and integration tests.",
+    },
+    ChangeInfo {
+        change_id: 154508,
+        severity: ChangeSeverity::Info,
+        summary: "`x.py` stopped accepting partial argument names. Use full names to avoid errors.",
+    },
+    ChangeInfo {
+        change_id: 154586,
+        severity: ChangeSeverity::Info,
+        summary: "New option `build.record_failed_tests_path` to store failed tests when passing `--record`. These can be rerun with `--rerun`.",
+    },
+    ChangeInfo {
+        change_id: 154587,
+        severity: ChangeSeverity::Info,
+        summary: "New `--verbose-run-make-subprocess-output` flag for `x.py test` (defaults to true). Set `--verbose-run-make-subprocess-output=false` to suppress verbose subprocess output for passing run-make tests when using `--no-capture`.",
+    },
+    ChangeInfo {
+        change_id: 158169,
+        severity: ChangeSeverity::Info,
+        summary: "New option `rust.compress-debuginfo` allows configuring whether Rust and C/C++ debuginfo should be compressed.",
+    },
+    ChangeInfo {
+        change_id: 158912,
+        severity: ChangeSeverity::Info,
+        summary: "New config section `pgo` was introduced, to configure PGO profiling options. The `--rust-profile-use`/`--rust-profile-generate`/`--llvm-profile-use`/`--llvm-profile-generate` flags and the `rust.profile-use`/`rust.profile-generate` config options have been deprecated.",
+    },
+    ChangeInfo {
+        change_id: 155617,
+        severity: ChangeSeverity::Warning,
+        summary: "`jemalloc` options are replaced with `override-allocator` which take allocator names such as `jemalloc`",
+    },
+    ChangeInfo {
+        change_id: 159011,
+        severity: ChangeSeverity::Info,
+        summary: "A new `build.sde` configuration option has been added to support intrinsic-test.",
+    },
+    ChangeInfo {
+        change_id: 159455,
+        severity: ChangeSeverity::Warning,
+        summary: "GDB and LLDB are no longer automatically discovered from the environment. If you want to use path discovery for them, you can opt in using `build.gdb = \"discover\"` or `build.lldb = \"discover\"`.",
+    },
+    ChangeInfo {
+        change_id: 159878,
+        severity: ChangeSeverity::Warning,
+        summary: "Obsolete option `build.compiletest-use-stage0-libtest` has no effect and has been removed.",
+    },
+    ChangeInfo {
+        change_id: 160142,
+        severity: ChangeSeverity::Warning,
+        summary: "The `rust.use-lld` option has been removed. Use `rust.bootstrap-override-lld` instead.",
+    },
+    ChangeInfo {
+        change_id: 160100,
+        severity: ChangeSeverity::Warning,
+        summary: "The `override-allocator` option has been renamed: The global setting is now `build.allocator` and the per-target setting is `target.<target>.allocator`. It can now be set to 'system' to explicitly request the system allocator.",
     },
 ];

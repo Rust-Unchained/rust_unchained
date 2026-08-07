@@ -5,49 +5,61 @@ use crate::path::{Path, PathBuf};
 
 pub mod common;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_family = "unix")] {
+cfg_select! {
+    any(target_family = "unix", target_os = "wasi") => {
         mod unix;
         use unix as imp;
+        #[cfg(not(target_os = "wasi"))]
         pub use unix::{chown, fchown, lchown, mkfifo};
-        #[cfg(not(target_os = "fuchsia"))]
+        #[cfg(not(any(target_os = "fuchsia", target_os = "wasi")))]
         pub use unix::chroot;
+        #[cfg(not(target_os = "wasi"))]
         pub(crate) use unix::debug_assert_fd_is_open;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        pub(crate) use unix::CachedFileMetadata;
-        use crate::sys::common::small_c_string::run_path_with_cstr as with_native_path;
-    } else if #[cfg(target_os = "windows")] {
+        pub(super) use unix::CachedFileMetadata;
+        use crate::sys::helpers::run_path_with_cstr as with_native_path;
+    }
+    target_os = "windows" => {
         mod windows;
         use windows as imp;
         pub use windows::{symlink_inner, junction_point};
         use crate::sys::path::with_native_path;
-    } else if #[cfg(target_os = "hermit")] {
+    }
+    target_os = "hermit" => {
         mod hermit;
         use hermit as imp;
-    } else if #[cfg(target_os = "solid_asp3")] {
+    }
+    target_os = "motor" => {
+        mod motor;
+        use motor as imp;
+    }
+    target_os = "solid_asp3" => {
         mod solid;
         use solid as imp;
-    } else if #[cfg(target_os = "uefi")] {
+    }
+    target_os = "uefi" => {
         mod uefi;
         use uefi as imp;
-    } else if #[cfg(target_os = "wasi")] {
-        mod wasi;
-        use wasi as imp;
-    } else {
+    }
+    target_os = "vexos" => {
+        mod vexos;
+        use vexos as imp;
+    }
+    _ => {
         mod unsupported;
         use unsupported as imp;
     }
 }
 
 // FIXME: Replace this with platform-specific path conversion functions.
-#[cfg(not(any(target_family = "unix", target_os = "windows")))]
+#[cfg(not(any(target_family = "unix", target_os = "windows", target_os = "wasi")))]
 #[inline]
 pub fn with_native_path<T>(path: &Path, f: &dyn Fn(&Path) -> io::Result<T>) -> io::Result<T> {
     f(path)
 }
 
 pub use imp::{
-    DirBuilder, DirEntry, File, FileAttr, FilePermissions, FileTimes, FileType, OpenOptions,
+    Dir, DirBuilder, DirEntry, File, FileAttr, FilePermissions, FileTimes, FileType, OpenOptions,
     ReadDir,
 };
 
@@ -108,6 +120,10 @@ pub fn set_permissions(path: &Path, perm: FilePermissions) -> io::Result<()> {
     with_native_path(path, &|path| imp::set_perm(path, perm.clone()))
 }
 
+pub fn set_permissions_nofollow(path: &Path, perm: FilePermissions) -> io::Result<()> {
+    with_native_path(path, &|path| imp::set_perm_nofollow(path, perm.clone()))
+}
+
 pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     with_native_path(path, &imp::canonicalize)
 }
@@ -126,4 +142,12 @@ pub fn exists(path: &Path) -> io::Result<bool> {
     return imp::exists(path);
     #[cfg(windows)]
     with_native_path(path, &imp::exists)
+}
+
+pub fn set_times(path: &Path, times: FileTimes) -> io::Result<()> {
+    with_native_path(path, &|path| imp::set_times(path, times.clone()))
+}
+
+pub fn set_times_nofollow(path: &Path, times: FileTimes) -> io::Result<()> {
+    with_native_path(path, &|path| imp::set_times_nofollow(path, times.clone()))
 }

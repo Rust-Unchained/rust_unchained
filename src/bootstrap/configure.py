@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
-# ignore-tidy-linelength
+# ignore-tidy-file-linelength
 
 from __future__ import absolute_import, division, print_function
 import shlex
 import sys
 import os
+import re
 
 rust_dir = os.path.dirname(os.path.abspath(__file__))
 rust_dir = os.path.dirname(rust_dir)
@@ -119,6 +120,11 @@ o("optimize-llvm", "llvm.optimize", "build optimized LLVM")
 o("llvm-assertions", "llvm.assertions", "build LLVM with assertions")
 o("llvm-enzyme", "llvm.enzyme", "build LLVM with enzyme")
 o("llvm-offload", "llvm.offload", "build LLVM with gpu offload support")
+o(
+    "llvm-offload-clang-dir",
+    "llvm.offload-clang-dir",
+    "pass the absolute directory of ClangConfig.cmake",
+)
 o("llvm-plugins", "llvm.plugins", "build LLVM with plugin interface")
 o("debug-assertions", "rust.debug-assertions", "build with debugging assertions")
 o(
@@ -339,6 +345,11 @@ o(
     "don't truncate options when printing them in this configure script",
 )
 v("set", None, "set arbitrary key/value pairs in TOML configuration")
+v(
+    "parallel-frontend-threads",
+    "rust.parallel-frontend-threads",
+    "number of parallel threads for rustc compilation",
+)
 
 
 def p(msg):
@@ -585,16 +596,31 @@ def parse_example_config(known_args, config):
     section_order = [None]
     targets = {}
     top_level_keys = []
+    comment_lines = []
 
-    with open(rust_dir + "/bootstrap.example.toml") as example_config:
+    with open(rust_dir + "/bootstrap.example.toml", encoding="utf-8") as example_config:
         example_lines = example_config.read().split("\n")
     for line in example_lines:
-        if cur_section is None:
-            if line.count("=") == 1:
-                top_level_key = line.split("=")[0]
-                top_level_key = top_level_key.strip(" #")
-                top_level_keys.append(top_level_key)
-        if line.startswith("["):
+        if line.count("=") >= 1 and not line.startswith("# "):
+            key = line.split("=")[0]
+            key = key.strip(" #")
+            parts = key.split(".")
+            if len(parts) > 1:
+                cur_section = parts[0]
+                if cur_section not in sections:
+                    sections[cur_section] = ["[" + cur_section + "]"]
+                    section_order.append(cur_section)
+            elif cur_section is None:
+                top_level_keys.append(key)
+            # put the comment lines within the start of
+            # a new section, not outside it.
+            sections[cur_section] += comment_lines
+            comment_lines = []
+            # remove just the `section.` part from the line, if present.
+            sections[cur_section].append(
+                re.sub("(#?)([a-zA-Z_-]+\\.)?(.*)", "\\1\\3", line)
+            )
+        elif line.startswith("["):
             cur_section = line[1:-1]
             if cur_section.startswith("target"):
                 cur_section = "target"
@@ -605,8 +631,9 @@ def parse_example_config(known_args, config):
             sections[cur_section] = [line]
             section_order.append(cur_section)
         else:
-            sections[cur_section].append(line)
+            comment_lines.append(line)
 
+    sections[cur_section] += comment_lines
     # Fill out the `targets` array by giving all configured targets a copy of the
     # `target` section we just loaded from the example config
     configured_targets = [build(known_args)]
@@ -722,19 +749,29 @@ def configure_file(sections, top_level_keys, targets, config):
 
 
 def write_uncommented(target, f):
+    """Writes each block in 'target' that is not composed entirely of comments to 'f'.
+
+    A block is a sequence of non-empty lines separated by empty lines.
+    """
     block = []
-    is_comment = True
+
+    def flush(last):
+        # If the block is entirely made of comments, ignore it
+        entire_block_comments = all(ln.startswith("#") or ln == "" for ln in block)
+        if not entire_block_comments and len(block) > 0:
+            for line in block:
+                f.write(line + "\n")
+            # Required to output a newline before the start of a new section
+            if last:
+                f.write("\n")
+        block.clear()
 
     for line in target:
         block.append(line)
         if len(line) == 0:
-            if not is_comment:
-                for ln in block:
-                    f.write(ln + "\n")
-            block = []
-            is_comment = True
-            continue
-        is_comment = is_comment and line.startswith("#")
+            flush(last=False)
+
+    flush(last=True)
     return f
 
 

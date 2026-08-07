@@ -1,11 +1,48 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use crate::rustc_info::get_rustc_path;
 use crate::utils::{
     cargo_install, create_dir, get_sysroot_dir, git_clone_root_dir, remove_file, run_command,
     run_command_with_output, walk_dir,
 };
+
+// This is needed on systems where nothing is configured.
+// git really needs something here, or it will fail.
+// Even using --author is not enough.
+const GIT_CMD: [&dyn AsRef<OsStr>; 9] = [
+    &"git",
+    &"-c",
+    &"user.name=None",
+    &"-c",
+    &"user.email=none@example.com",
+    &"-c",
+    &"core.autocrlf=false",
+    &"-c",
+    &"commit.gpgSign=false",
+];
+
+fn run_git_command(
+    command: &dyn AsRef<OsStr>,
+    input: &[&dyn AsRef<OsStr>],
+    cwd: Option<&Path>,
+) -> Result<Output, String> {
+    let git_cmd =
+        &GIT_CMD.into_iter().chain([command]).chain(input.iter().cloned()).collect::<Vec<_>>()[..];
+    run_command(git_cmd, cwd)
+}
+
+fn run_git_command_with_output(
+    command: &dyn AsRef<OsStr>,
+    input: &[&dyn AsRef<OsStr>],
+    cwd: Option<&Path>,
+) -> Result<(), String> {
+    let git_cmd =
+        &GIT_CMD.into_iter().chain([command]).chain(input.iter().cloned()).collect::<Vec<_>>()[..];
+    run_command_with_output(git_cmd, cwd)
+}
 
 fn prepare_libcore(
     sysroot_path: &Path,
@@ -18,9 +55,9 @@ fn prepare_libcore(
     if let Some(path) = sysroot_source {
         rustlib_dir = Path::new(&path)
             .canonicalize()
-            .map_err(|error| format!("Failed to canonicalize path: {:?}", error))?;
+            .map_err(|error| format!("Failed to canonicalize path: {error:?}"))?;
         if !rustlib_dir.is_dir() {
-            return Err(format!("Custom sysroot path {:?} not found", rustlib_dir));
+            return Err(format!("Custom sysroot path {rustlib_dir:?} not found"));
         }
     } else {
         let rustc_path = match get_rustc_path() {
@@ -36,17 +73,17 @@ fn prepare_libcore(
         rustlib_dir = parent
             .join("../lib/rustlib/src/rust")
             .canonicalize()
-            .map_err(|error| format!("Failed to canonicalize path: {:?}", error))?;
+            .map_err(|error| format!("Failed to canonicalize path: {error:?}"))?;
         if !rustlib_dir.is_dir() {
             return Err("Please install `rust-src` component".to_string());
         }
     }
 
     let sysroot_dir = sysroot_path.join("sysroot_src");
-    if sysroot_dir.is_dir() {
-        if let Err(error) = fs::remove_dir_all(&sysroot_dir) {
-            return Err(format!("Failed to remove `{}`: {:?}", sysroot_dir.display(), error,));
-        }
+    if sysroot_dir.is_dir()
+        && let Err(error) = fs::remove_dir_all(&sysroot_dir)
+    {
+        return Err(format!("Failed to remove `{}`: {:?}", sysroot_dir.display(), error,));
     }
 
     let sysroot_library_dir = sysroot_dir.join("library");
@@ -55,19 +92,12 @@ fn prepare_libcore(
     run_command(&[&"cp", &"-r", &rustlib_dir.join("library"), &sysroot_dir], None)?;
 
     println!("[GIT] init (cwd): `{}`", sysroot_dir.display());
-    run_command(&[&"git", &"init"], Some(&sysroot_dir))?;
+    run_git_command(&"init", &[], Some(&sysroot_dir))?;
     println!("[GIT] add (cwd): `{}`", sysroot_dir.display());
-    run_command(&[&"git", &"add", &"."], Some(&sysroot_dir))?;
+    run_git_command(&"add", &[&"."], Some(&sysroot_dir))?;
     println!("[GIT] commit (cwd): `{}`", sysroot_dir.display());
 
-    // This is needed on systems where nothing is configured.
-    // git really needs something here, or it will fail.
-    // Even using --author is not enough.
-    run_command(&[&"git", &"config", &"user.email", &"none@example.com"], Some(&sysroot_dir))?;
-    run_command(&[&"git", &"config", &"user.name", &"None"], Some(&sysroot_dir))?;
-    run_command(&[&"git", &"config", &"core.autocrlf", &"false"], Some(&sysroot_dir))?;
-    run_command(&[&"git", &"config", &"commit.gpgSign", &"false"], Some(&sysroot_dir))?;
-    run_command(&[&"git", &"commit", &"-m", &"Initial commit", &"-q"], Some(&sysroot_dir))?;
+    run_git_command(&"commit", &[&"-m", &"Initial commit", &"-q"], Some(&sysroot_dir))?;
 
     let mut patches = Vec::new();
     walk_dir(
@@ -105,10 +135,11 @@ fn prepare_libcore(
     for file_path in patches {
         println!("[GIT] apply `{}`", file_path.display());
         let path = Path::new("../../..").join(file_path);
-        run_command_with_output(&[&"git", &"apply", &path], Some(&sysroot_dir))?;
-        run_command_with_output(&[&"git", &"add", &"-A"], Some(&sysroot_dir))?;
-        run_command_with_output(
-            &[&"git", &"commit", &"--no-gpg-sign", &"-m", &format!("Patch {}", path.display())],
+        run_git_command_with_output(&"apply", &[&path], Some(&sysroot_dir))?;
+        run_git_command_with_output(&"add", &[&"-A"], Some(&sysroot_dir))?;
+        run_git_command_with_output(
+            &"commit",
+            &[&"-m", &format!("Patch {}", path.display())],
             Some(&sysroot_dir),
         )?;
     }
@@ -117,17 +148,18 @@ fn prepare_libcore(
     Ok(())
 }
 
-// TODO: remove when we can ignore warnings in rustdoc tests.
+// FIXME: remove when we can ignore warnings in rustdoc tests.
 fn prepare_rand() -> Result<(), String> {
     // Apply patch for the rand crate.
     let file_path = "patches/crates/0001-Remove-deny-warnings.patch";
     let rand_dir = Path::new("build/rand");
-    println!("[GIT] apply `{}`", file_path);
+    println!("[GIT] apply `{file_path}`");
     let path = Path::new("../..").join(file_path);
-    run_command_with_output(&[&"git", &"apply", &path], Some(rand_dir))?;
-    run_command_with_output(&[&"git", &"add", &"-A"], Some(rand_dir))?;
-    run_command_with_output(
-        &[&"git", &"commit", &"--no-gpg-sign", &"-m", &format!("Patch {}", path.display())],
+    run_git_command_with_output(&"apply", &[&path], Some(rand_dir))?;
+    run_git_command_with_output(&"add", &[&"-A"], Some(rand_dir))?;
+    run_git_command_with_output(
+        &"commit",
+        &[&"-m", &format!("Patch {}", path.display())],
         Some(rand_dir),
     )?;
 
@@ -149,13 +181,13 @@ fn clone_and_setup<F>(repo_url: &str, checkout_commit: &str, extra: Option<F>) -
 where
     F: Fn(&Path) -> Result<(), String>,
 {
-    let clone_result = git_clone_root_dir(repo_url, &Path::new(crate::BUILD_DIR), false)?;
+    let clone_result = git_clone_root_dir(repo_url, Path::new(crate::BUILD_DIR), false)?;
     if !clone_result.ran_clone {
         println!("`{}` has already been cloned", clone_result.repo_name);
     }
     let repo_path = Path::new(crate::BUILD_DIR).join(&clone_result.repo_name);
-    run_command(&[&"git", &"checkout", &"--", &"."], Some(&repo_path))?;
-    run_command(&[&"git", &"checkout", &checkout_commit], Some(&repo_path))?;
+    run_git_command(&"checkout", &[&"--", &"."], Some(&repo_path))?;
+    run_git_command(&"checkout", &[&checkout_commit], Some(&repo_path))?;
     if let Some(extra) = extra {
         extra(&repo_path)?;
     }

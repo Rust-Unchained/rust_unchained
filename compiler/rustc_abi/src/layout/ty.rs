@@ -1,70 +1,25 @@
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 
 use rustc_data_structures::intern::Interned;
-use rustc_macros::HashStable_Generic;
+use rustc_data_structures::range_set::RangeSet;
+use rustc_macros::StableHash;
 
+use crate::layout::{FieldIdx, VariantIdx};
 use crate::{
-    AbiAndPrefAlign, Align, BackendRepr, FieldsShape, Float, HasDataLayout, LayoutData, Niche,
-    PointeeInfo, Primitive, Scalar, Size, TargetDataLayout, Variants,
+    AbiAlign, Align, BackendRepr, FieldsShape, Float, HasDataLayout, LayoutData, Niche,
+    PointeeInfo, Primitive, Size, Variants,
 };
 
 // Explicitly import `Float` to avoid ambiguity with `Primitive::Float`.
 
-rustc_index::newtype_index! {
-    /// The *source-order* index of a field in a variant.
-    ///
-    /// This is how most code after type checking refers to fields, rather than
-    /// using names (as names have hygiene complications and more complex lookup).
-    ///
-    /// Particularly for `repr(Rust)` types, this may not be the same as *layout* order.
-    /// (It is for `repr(C)` `struct`s, however.)
-    ///
-    /// For example, in the following types,
-    /// ```rust
-    /// # enum Never {}
-    /// # #[repr(u16)]
-    /// enum Demo1 {
-    ///    Variant0 { a: Never, b: i32 } = 100,
-    ///    Variant1 { c: u8, d: u64 } = 10,
-    /// }
-    /// struct Demo2 { e: u8, f: u16, g: u8 }
-    /// ```
-    /// `b` is `FieldIdx(1)` in `VariantIdx(0)`,
-    /// `d` is `FieldIdx(1)` in `VariantIdx(1)`, and
-    /// `f` is `FieldIdx(1)` in `VariantIdx(0)`.
-    #[derive(HashStable_Generic)]
-    #[encodable]
-    #[orderable]
-    pub struct FieldIdx {}
-}
-
-rustc_index::newtype_index! {
-    /// The *source-order* index of a variant in a type.
-    ///
-    /// For enums, these are always `0..variant_count`, regardless of any
-    /// custom discriminants that may have been defined, and including any
-    /// variants that may end up uninhabited due to field types.  (Some of the
-    /// variants may not be present in a monomorphized ABI [`Variants`], but
-    /// those skipped variants are always counted when determining the *index*.)
-    ///
-    /// `struct`s, `tuples`, and `unions`s are considered to have a single variant
-    /// with variant index zero, aka [`FIRST_VARIANT`].
-    #[derive(HashStable_Generic)]
-    #[encodable]
-    #[orderable]
-    pub struct VariantIdx {
-        /// Equivalent to `VariantIdx(0)`.
-        const FIRST_VARIANT = 0;
-    }
-}
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash)]
 #[rustc_pass_by_value]
 pub struct Layout<'a>(pub Interned<'a, LayoutData<FieldIdx, VariantIdx>>);
 
 impl<'a> fmt::Debug for Layout<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // See comment on `<LayoutS as Debug>::fmt` above.
+        // See comment on `<LayoutData as Debug>::fmt` above.
         self.0.0.fmt(f)
     }
 }
@@ -93,7 +48,7 @@ impl<'a> Layout<'a> {
         self.0.0.largest_niche
     }
 
-    pub fn align(self) -> AbiAndPrefAlign {
+    pub fn align(self) -> AbiAlign {
         self.0.0.align
     }
 
@@ -108,16 +63,6 @@ impl<'a> Layout<'a> {
     pub fn unadjusted_abi_align(self) -> Align {
         self.0.0.unadjusted_abi_align
     }
-
-    /// Whether the layout is from a type that implements [`std::marker::PointerLike`].
-    ///
-    /// Currently, that means that the type is pointer-sized, pointer-aligned,
-    /// and has a initialized (non-union), scalar ABI.
-    pub fn is_pointer_like(self, data_layout: &TargetDataLayout) -> bool {
-        self.size() == data_layout.pointer_size
-            && self.align().abi == data_layout.pointer_align.abi
-            && matches!(self.backend_repr(), BackendRepr::Scalar(Scalar::Initialized { .. }))
-    }
 }
 
 /// The layout of a type, alongside the type itself.
@@ -127,7 +72,7 @@ impl<'a> Layout<'a> {
 /// to that obtained from `layout_of(ty)`, as we need to produce
 /// layouts for which Rust types do not exist, such as enum variants
 /// or synthetic fields of enums (i.e., discriminants) and wide pointers.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash)]
 pub struct TyAndLayout<'a, Ty> {
     pub ty: Ty,
     pub layout: Layout<'a>,
@@ -158,7 +103,7 @@ impl<'a, Ty> AsRef<LayoutData<FieldIdx, VariantIdx>> for TyAndLayout<'a, Ty> {
 
 /// Trait that needs to be implemented by the higher-level type representation
 /// (e.g. `rustc_middle::ty::Ty`), to provide `rustc_target::abi` functionality.
-pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug {
+pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug + std::fmt::Display {
     fn ty_and_layout_for_variant(
         this: TyAndLayout<'a, Self>,
         cx: &C,
@@ -175,9 +120,19 @@ pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug {
     fn is_tuple(this: TyAndLayout<'a, Self>) -> bool;
     fn is_unit(this: TyAndLayout<'a, Self>) -> bool;
     fn is_transparent(this: TyAndLayout<'a, Self>) -> bool;
+    fn is_scalable_vector(this: TyAndLayout<'a, Self>) -> bool;
+    /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+    fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'a, Self>) -> bool;
 }
 
 impl<'a, Ty> TyAndLayout<'a, Ty> {
+    /// Synthetize a layout representing the variant-specific fields of an enum-like layout.
+    ///
+    /// Note that the resulting layout *does not* fully describes `self.ty` at that specific
+    /// variant: prefix fields (e.g. in coroutines) and tag information are lost.
+    ///
+    /// If you don't need type information about the variant's fields, prefer using
+    /// `self.layout.variants` directly.
     pub fn for_variant<C>(self, cx: &C, variant_index: VariantIdx) -> Self
     where
         Ty: TyAbiInterface<'a, C>,
@@ -272,9 +227,52 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
         Ty::is_transparent(self)
     }
 
+    pub fn is_scalable_vector<C>(self) -> bool
+    where
+        Ty: TyAbiInterface<'a, C>,
+    {
+        Ty::is_scalable_vector(self)
+    }
+
+    /// If this method returns `true`, then this type should always have a `PassMode` of
+    /// `Indirect { on_stack: false, .. }` when being used as the argument type of a function with a
+    /// non-Rustic ABI (this is true for structs annotated with the
+    /// `#[rustc_pass_indirectly_in_non_rustic_abis]` attribute).
+    ///
+    /// This is used to replicate some of the behaviour of C array-to-pointer decay; however unlike
+    /// C any changes the caller makes to the passed value will not be reflected in the callee, so
+    /// the attribute is only useful for types where observing the value in the caller after the
+    /// function call isn't allowed (a.k.a. `va_list`).
+    ///
+    /// This function handles transparent types automatically.
+    pub fn pass_indirectly_in_non_rustic_abis<C>(self, cx: &C) -> bool
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        let base = self.peel_transparent_wrappers(cx);
+        Ty::is_pass_indirectly_in_non_rustic_abis_flag_set(base)
+    }
+
+    /// Recursively peel away transparent wrappers, returning the inner value.
+    ///
+    /// The return value is not `repr(transparent)` and/or does
+    /// not have a non-1zst field.
+    pub fn peel_transparent_wrappers<C>(mut self, cx: &C) -> Self
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        while self.is_transparent()
+            && let Some((_, field)) = self.non_1zst_field(cx)
+        {
+            self = field;
+        }
+
+        self
+    }
+
     /// Finds the one field that is not a 1-ZST.
     /// Returns `None` if there are multiple non-1-ZST fields or only 1-ZST-fields.
-    pub fn non_1zst_field<C>(&self, cx: &C) -> Option<(usize, Self)>
+    pub fn non_1zst_field<C>(&self, cx: &C) -> Option<(FieldIdx, Self)>
     where
         Ty: TyAbiInterface<'a, C> + Copy,
     {
@@ -288,8 +286,156 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                 // More than one non-1-ZST field.
                 return None;
             }
-            found = Some((field_idx, field));
+            found = Some((FieldIdx::from_usize(field_idx), field));
         }
         found
+    }
+
+    /// Whether this type/layout has any padding that is dependent on a variant, i.e. has bytes that
+    /// are padding for some, but not all, valid values of this type.
+    pub fn has_variant_dependent_padding<C>(&self, cx: &C) -> bool
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        match self.variants {
+            Variants::Multiple { .. } => true,
+            Variants::Empty => false,
+            Variants::Single { .. } => match &self.fields {
+                FieldsShape::Primitive | FieldsShape::Union(_) => false,
+                FieldsShape::Array { count, .. } => {
+                    *count > 0 && self.field(cx, 0).has_variant_dependent_padding(cx)
+                }
+                FieldsShape::Arbitrary { offsets, .. } => {
+                    (0..offsets.len()).any(|i| self.field(cx, i).has_variant_dependent_padding(cx))
+                }
+            },
+        }
+    }
+
+    /// The ranges of bytes that are always ignored by the representation relation of this type.
+    ///
+    /// In other words, for any sequence of bytes, if we reset the these padding bytes to uninit,
+    /// then these two sequences of bytes represent the same value (or they are both invalid).
+    /// This is the "guaranteed" padding. There may be more bytes that are padding for some
+    /// but not all variants of this type; those are not included.
+    /// (E.g. `Option<i8>` has no guaranteed padding so the empty range set is returned, but its `None` value still has padding).
+    pub fn variant_independent_padding_ranges<C>(&self, cx: &C) -> Vec<Range<Size>>
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        let mut data = RangeSet::new();
+        self.add_data_ranges(cx, Size::ZERO, &mut data);
+
+        // Find gaps between the data ranges.
+        let mut uninit_ranges = Vec::new();
+        let mut covered_until = Size::ZERO;
+        for &(offset, size) in data.0.iter() {
+            if offset > covered_until {
+                uninit_ranges.push(covered_until..offset);
+            }
+            covered_until = Ord::max(covered_until, offset + size);
+        }
+
+        // Add trailing padding.
+        if self.size > covered_until {
+            uninit_ranges.push(covered_until..self.size);
+        }
+
+        uninit_ranges
+    }
+
+    /// The ranges of bytes that are ignored by the representation relation of this variant.
+    ///
+    /// The result does not include variant-independent padding.
+    pub fn variant_dependent_padding_ranges<C>(
+        &self,
+        cx: &C,
+        variant_index: VariantIdx,
+    ) -> Vec<Range<Size>>
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        let Variants::Multiple { .. } = self.variants else {
+            return Vec::new();
+        };
+
+        // Bytes that are data in some variant.
+        let mut any = RangeSet::new();
+        self.add_data_ranges(cx, Size::ZERO, &mut any);
+
+        // Bytes that are data in this variant.
+        let mut this = RangeSet::new();
+
+        // The variants do not contain e.g. the discriminant or coroutine upvars.
+        let FieldsShape::Arbitrary { offsets, in_memory_order: _ } = &self.fields else {
+            unreachable!("a multi-variant layout should have `Arbitrary` fields")
+        };
+
+        // So add them explicitly.
+        for (field, &offset) in offsets.iter_enumerated() {
+            let field = self.field(cx, field.as_usize());
+            field.add_data_ranges(cx, offset, &mut this);
+        }
+
+        self.for_variant(cx, variant_index).add_data_ranges(cx, Size::ZERO, &mut this);
+
+        // Padding specific to this variant: data in some variant, but not in this one.
+        any.difference(&this).0.iter().map(|&(offset, size)| offset..offset + size).collect()
+    }
+
+    /// Extend `out` with all ranges of bytes that *may* carry relevant data for values of this type.
+    /// For enums and unions there are offsets that are initialized for some
+    /// variants but not for others; those offset *will* get added to `out`.
+    fn add_data_ranges<C>(self, cx: &C, base_offset: Size, out: &mut RangeSet<Size>)
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        if self.is_zst() {
+            return;
+        }
+
+        // Visit the fields of this value. For enum values the fields include the discriminant.
+        match &self.fields {
+            FieldsShape::Primitive => {
+                out.add_range(base_offset, self.size);
+            }
+            &FieldsShape::Union(field_count) => {
+                for field in 0..field_count.get() {
+                    let field = self.field(cx, field);
+                    field.add_data_ranges(cx, base_offset, out);
+                }
+            }
+            &FieldsShape::Array { stride, count } => {
+                let elem = self.field(cx, 0);
+
+                // For scalars we know there is no padding between the elements,
+                // so the entire array is a single big data range.
+                if elem.backend_repr.is_scalar() {
+                    out.add_range(base_offset, elem.size * count);
+                } else {
+                    // FIXME: this is really inefficient for large arrays.
+                    for idx in 0..count {
+                        elem.add_data_ranges(cx, base_offset + idx * stride, out);
+                    }
+                }
+            }
+            FieldsShape::Arbitrary { offsets, in_memory_order: _ } => {
+                for (field, &offset) in offsets.iter_enumerated() {
+                    let field = self.field(cx, field.as_usize());
+                    field.add_data_ranges(cx, base_offset + offset, out);
+                }
+            }
+        }
+
+        // Visit the fields of each variant.
+        match &self.variants {
+            Variants::Empty | Variants::Single { index: _ } => { /* done */ }
+            Variants::Multiple { variants, .. } => {
+                for variant in variants.indices() {
+                    let variant = self.for_variant(cx, variant);
+                    variant.add_data_ranges(cx, base_offset, out);
+                }
+            }
+        }
     }
 }

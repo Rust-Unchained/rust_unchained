@@ -1,12 +1,10 @@
 #![warn(clippy::or_fun_call)]
-#![allow(dead_code)]
 #![allow(
-    clippy::borrow_as_ptr,
-    clippy::uninlined_format_args,
-    clippy::unnecessary_wraps,
-    clippy::unnecessary_literal_unwrap,
-    clippy::useless_vec
+    clippy::map_or_identity,
+    clippy::unnecessary_option_map_or_else,
+    clippy::unnecessary_result_map_or_else
 )]
+#![expect(clippy::unnecessary_literal_unwrap, clippy::useless_vec)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -52,7 +50,7 @@ fn or_fun_call() {
     with_constructor.unwrap_or_else(make);
     //~^ or_fun_call
 
-    let with_new = Some(vec![1]);
+    let with_new: Option<Vec<i32>> = Some(vec![1]);
     with_new.unwrap_or_default();
     //~^ unwrap_or_default
 
@@ -76,6 +74,22 @@ fn or_fun_call() {
     with_default_type.unwrap_or_default();
     //~^ unwrap_or_default
 
+    let with_default_literal = Some(1);
+    with_default_literal.unwrap_or(0);
+    // Do not lint because `.unwrap_or_default()` wouldn't be simpler
+
+    let with_default_literal = Some(1.0);
+    with_default_literal.unwrap_or(0.0);
+    // Do not lint because `.unwrap_or_default()` wouldn't be simpler
+
+    let with_default_literal = Some("foo");
+    with_default_literal.unwrap_or("");
+    // Do not lint because `.unwrap_or_default()` wouldn't be simpler
+
+    let with_default_vec_macro = Some(vec![1, 2, 3]);
+    with_default_vec_macro.unwrap_or(vec![]);
+    // Do not lint because `.unwrap_or_default()` wouldn't be simpler
+
     let self_default = None::<FakeDefault>;
     self_default.unwrap_or_else(<FakeDefault>::default);
     //~^ or_fun_call
@@ -84,7 +98,7 @@ fn or_fun_call() {
     real_default.unwrap_or_default();
     //~^ unwrap_or_default
 
-    let with_vec = Some(vec![1]);
+    let with_vec: Option<Vec<i32>> = Some(vec![1]);
     with_vec.unwrap_or_default();
     //~^ unwrap_or_default
 
@@ -180,7 +194,6 @@ fn f() -> Option<()> {
 mod issue6675 {
     unsafe fn ptr_to_ref<'a, T>(p: *const T) -> &'a T {
         unsafe {
-            #[allow(unused)]
             let x = vec![0; 1000]; // future-proofing, make this function expensive.
             &*p
         }
@@ -282,6 +295,8 @@ mod issue8993 {
         let _ = Some(4).map_or_else(g, f);
         //~^ or_fun_call
         let _ = Some(4).map_or(0, f);
+        let _ = Some(4).map_or_else(|| "asd".to_string().len() as i32, f);
+        //~^ or_fun_call
     }
 }
 
@@ -310,7 +325,7 @@ mod lazy {
             }
         }
 
-        let with_new = Some(vec![1]);
+        let with_new: Option<Vec<i32>> = Some(vec![1]);
         with_new.unwrap_or_default();
         //~^ unwrap_or_default
 
@@ -409,4 +424,70 @@ fn fn_call_in_nested_expr() {
     //~^ or_fun_call
 }
 
+mod result_map_or {
+    fn g() -> i32 {
+        3
+    }
+
+    fn f(n: i32) -> i32 {
+        n
+    }
+
+    fn test_map_or() {
+        let x: Result<i32, ()> = Ok(4);
+        let _ = x.map_or_else(|_| g(), |v| v);
+        //~^ or_fun_call
+        let _ = x.map_or_else(|_| g(), f);
+        //~^ or_fun_call
+        let _ = x.map_or(0, f);
+        let _ = x.map_or_else(|_| "asd".to_string().len() as i32, f);
+        //~^ or_fun_call
+    }
+}
+
+fn test_option_get_or_insert() {
+    // assume that this is slow call
+    fn g() -> u8 {
+        99
+    }
+    let mut x = Some(42_u8);
+    let _ = x.get_or_insert_with(g);
+    //~^ or_fun_call
+}
+
+fn test_option_and() {
+    // assume that this is slow call
+    fn g() -> Option<u8> {
+        Some(99)
+    }
+    let mut x = Some(42_u8);
+    let _ = x.and_then(|_| g());
+    //~^ or_fun_call
+}
+
+fn test_result_and() {
+    // assume that this is slow call
+    fn g() -> Result<u8, ()> {
+        Ok(99)
+    }
+    let mut x: Result<u8, ()> = Ok(42);
+    let _ = x.and_then(|_| g());
+    //~^ or_fun_call
+}
+
+#[clippy::msrv = "1.15"]
+fn below_msrv(opt: Option<i32>, res: Result<i32, ()>) {
+    let _ = opt.unwrap_or_default();
+    //~^ unwrap_or_default
+    let _ = res.unwrap_or_else(|_| Default::default());
+    //~^ or_fun_call
+}
+
+#[clippy::msrv = "1.16"]
+fn above_msrv(opt: Option<i32>, res: Result<i32, ()>) {
+    let _ = opt.unwrap_or_default();
+    //~^ unwrap_or_default
+    let _ = res.unwrap_or_default();
+    //~^ unwrap_or_default
+}
 fn main() {}

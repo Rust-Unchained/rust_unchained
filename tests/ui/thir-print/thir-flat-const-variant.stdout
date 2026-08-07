@@ -3,6 +3,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -11,29 +12,17 @@ Thir {
                 fields: [],
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 7,
             span: $DIR/thir-flat-const-variant.rs:12:32: 12:34 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(7),
-                lint_level: Explicit(
-                    HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).7),
-                ),
+                hir_id: HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).7),
                 value: e0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 7,
             span: $DIR/thir-flat-const-variant.rs:12:32: 12:34 (#0),
         },
         Expr {
@@ -53,29 +42,17 @@ Thir {
                 },
             ),
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:12:23: 12:35 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).3),
-                ),
+                hir_id: HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).3),
                 value: e2,
             },
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:12:23: 12:35 (#0),
         },
     ],
@@ -88,6 +65,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -96,29 +74,17 @@ Thir {
                 fields: [],
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 8,
             span: $DIR/thir-flat-const-variant.rs:13:33: 13:35 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(8),
-                lint_level: Explicit(
-                    HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).8),
-                ),
+                hir_id: HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).8),
                 value: e0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 8,
             span: $DIR/thir-flat-const-variant.rs:13:33: 13:35 (#0),
         },
         Expr {
@@ -138,29 +104,17 @@ Thir {
                 },
             ),
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:13:23: 13:36 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).3),
-                ),
+                hir_id: HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).3),
                 value: e2,
             },
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:13:23: 13:36 (#0),
         },
     ],
@@ -173,6 +127,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -181,29 +136,17 @@ Thir {
                 fields: [],
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 7,
             span: $DIR/thir-flat-const-variant.rs:14:33: 14:35 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(7),
-                lint_level: Explicit(
-                    HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).7),
-                ),
+                hir_id: HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).7),
                 value: e0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 7,
             span: $DIR/thir-flat-const-variant.rs:14:33: 14:35 (#0),
         },
         Expr {
@@ -223,29 +166,17 @@ Thir {
                 },
             ),
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:14:24: 14:36 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).3),
-                ),
+                hir_id: HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).3),
                 value: e2,
             },
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:14:24: 14:36 (#0),
         },
     ],
@@ -258,6 +189,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -266,29 +198,17 @@ Thir {
                 fields: [],
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 8,
             span: $DIR/thir-flat-const-variant.rs:15:34: 15:36 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(8),
-                lint_level: Explicit(
-                    HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).8),
-                ),
+                hir_id: HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).8),
                 value: e0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 8,
             span: $DIR/thir-flat-const-variant.rs:15:34: 15:36 (#0),
         },
         Expr {
@@ -308,29 +228,17 @@ Thir {
                 },
             ),
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:15:24: 15:37 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).3),
-                ),
+                hir_id: HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).3),
                 value: e2,
             },
             ty: Foo,
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(3),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 3,
             span: $DIR/thir-flat-const-variant.rs:15:24: 15:37 (#0),
         },
     ],
@@ -343,6 +251,7 @@ Thir {
     body_type: Fn(
         fn(),
     ),
+    attributes: {},
     arms: [],
     blocks: [
         Block {
@@ -360,29 +269,17 @@ Thir {
                 block: b0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(2),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 2,
             span: $DIR/thir-flat-const-variant.rs:18:11: 18:13 (#0),
         },
         Expr {
             kind: Scope {
                 region_scope: Node(2),
-                lint_level: Explicit(
-                    HirId(DefId(0:12 ~ thir_flat_const_variant[1f54]::main).2),
-                ),
+                hir_id: HirId(DefId(0:12 ~ thir_flat_const_variant[1f54]::main).2),
                 value: e0,
             },
             ty: (),
-            temp_lifetime: TempLifetime {
-                temp_lifetime: Some(
-                    Node(2),
-                ),
-                backwards_incompatible: None,
-            },
+            temp_scope_id: 2,
             span: $DIR/thir-flat-const-variant.rs:18:11: 18:13 (#0),
         },
     ],

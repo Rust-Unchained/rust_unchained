@@ -3,7 +3,7 @@
 #![allow(
     clippy::cognitive_complexity,
     clippy::match_ref_pats,
-    clippy::needless_if,
+    clippy::needless_ifs,
     clippy::manual_range_patterns
 )]
 #![allow(unreachable_patterns, irrefutable_let_patterns, unused_variables)]
@@ -23,6 +23,6 @@ fn main() {
     //~^ unnested_or_patterns
     if let box (0 | 1 | 2 | 3 | 4) = Box::new(0) {}
     //~^ unnested_or_patterns
-    if let box box (0 | 2 | 4) = Box::new(Box::new(0)) {}
+    if let box (box (0 | 2 | 4)) = Box::new(Box::new(0)) {}
     //~^ unnested_or_patterns
 }

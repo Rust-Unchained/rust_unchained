@@ -1,5 +1,6 @@
 //@aux-build:../auxiliary/proc_macro_attr.rs
-#![warn(clippy::empty_line_after_outer_attr, clippy::empty_line_after_doc_comments)]
+#![warn(clippy::empty_line_after_outer_attr)]
+#![deny(clippy::empty_line_after_doc_comments)]
 
 //~v empty_line_after_outer_attr
 #![crate_type = "lib"]
@@ -107,5 +108,14 @@ pub trait Bazz {
 second line
 ")]
 pub struct Args;
+
+mod issue_14980 {
+    //~v empty_line_after_outer_attr
+    #[repr(align(536870912))]
+    enum Aligned {
+        Zero = 0,
+        One = 1,
+    }
+}
 
 fn main() {}

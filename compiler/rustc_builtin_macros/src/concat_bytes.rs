@@ -1,11 +1,10 @@
-use rustc_ast::ptr::P;
 use rustc_ast::tokenstream::TokenStream;
-use rustc_ast::{ExprKind, LitIntType, LitKind, UintTy, token};
+use rustc_ast::{ExprKind, LitIntType, LitKind, StrStyle, UintTy, token};
 use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
-use rustc_session::errors::report_lit_error;
+use rustc_session::diagnostics::report_lit_error;
 use rustc_span::{ErrorGuaranteed, Span};
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::get_exprs_from_tts;
 
 /// Emits errors for literal expressions that are invalid inside and outside of an array.
@@ -15,21 +14,38 @@ fn invalid_type_err(
     span: Span,
     is_nested: bool,
 ) -> ErrorGuaranteed {
-    use errors::{
+    use diagnostics::{
         ConcatBytesInvalid, ConcatBytesInvalidSuggestion, ConcatBytesNonU8, ConcatBytesOob,
     };
     let snippet = cx.sess.source_map().span_to_snippet(span).ok();
     let dcx = cx.dcx();
     match LitKind::from_token_lit(token_lit) {
-        Ok(LitKind::CStr(_, _)) => {
+        Ok(LitKind::CStr(_, style)) => {
             // Avoid ambiguity in handling of terminal `NUL` by refusing to
             // concatenate C string literals as bytes.
-            dcx.emit_err(errors::ConcatCStrLit { span })
+            let sugg = if let Some(mut as_bstr) = snippet
+                && style == StrStyle::Cooked
+                && as_bstr.starts_with('c')
+                && as_bstr.ends_with('"')
+            {
+                // Suggest`c"foo"` -> `b"foo\0"` if we can
+                as_bstr.replace_range(0..1, "b");
+                as_bstr.pop();
+                as_bstr.push_str(r#"\0""#);
+                Some(ConcatBytesInvalidSuggestion::CStrLit { span, as_bstr })
+            } else {
+                // No suggestion for a missing snippet, raw strings, or if for some reason we have
+                // a span that doesn't match `c"foo"` (possible if a proc macro assigns a span
+                // that doesn't actually point to a C string).
+                None
+            };
+            // We can only provide a suggestion if we have a snip and it is not a raw string
+            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "C string", sugg, cs_note: Some(()) })
         }
         Ok(LitKind::Char(_)) => {
             let sugg =
                 snippet.map(|snippet| ConcatBytesInvalidSuggestion::CharLit { span, snippet });
-            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "character", sugg })
+            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "character", sugg, cs_note: None })
         }
         Ok(LitKind::Str(_, _)) => {
             // suggestion would be invalid if we are nested
@@ -38,18 +54,21 @@ fn invalid_type_err(
             } else {
                 None
             };
-            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "string", sugg })
+            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "string", sugg, cs_note: None })
         }
         Ok(LitKind::Float(_, _)) => {
-            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "float", sugg: None })
+            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "float", sugg: None, cs_note: None })
         }
-        Ok(LitKind::Bool(_)) => {
-            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "boolean", sugg: None })
-        }
+        Ok(LitKind::Bool(_)) => dcx.emit_err(ConcatBytesInvalid {
+            span,
+            lit_kind: "boolean",
+            sugg: None,
+            cs_note: None,
+        }),
         Ok(LitKind::Int(_, _)) if !is_nested => {
             let sugg =
                 snippet.map(|snippet| ConcatBytesInvalidSuggestion::IntLit { span, snippet });
-            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "numeric", sugg })
+            dcx.emit_err(ConcatBytesInvalid { span, lit_kind: "numeric", sugg, cs_note: None })
         }
         Ok(LitKind::Int(val, LitIntType::Unsuffixed | LitIntType::Unsigned(UintTy::U8))) => {
             assert!(val.get() > u8::MAX.into()); // must be an error
@@ -70,7 +89,7 @@ fn handle_array_element(
     cx: &ExtCtxt<'_>,
     guar: &mut Option<ErrorGuaranteed>,
     missing_literals: &mut Vec<rustc_span::Span>,
-    expr: &P<rustc_ast::Expr>,
+    expr: &Box<rustc_ast::Expr>,
 ) -> Option<u8> {
     let dcx = cx.dcx();
 
@@ -86,7 +105,10 @@ fn handle_array_element(
                 Ok(LitKind::Byte(val)) => return Some(val),
                 Ok(LitKind::ByteStr(..)) => {
                     guar.get_or_insert_with(|| {
-                        dcx.emit_err(errors::ConcatBytesArray { span: expr.span, bytestr: true })
+                        dcx.emit_err(diagnostics::ConcatBytesArray {
+                            span: expr.span,
+                            bytestr: true,
+                        })
                     });
                 }
                 _ => {
@@ -96,12 +118,12 @@ fn handle_array_element(
         }
         ExprKind::Array(_) | ExprKind::Repeat(_, _) => {
             guar.get_or_insert_with(|| {
-                dcx.emit_err(errors::ConcatBytesArray { span: expr.span, bytestr: false })
+                dcx.emit_err(diagnostics::ConcatBytesArray { span: expr.span, bytestr: false })
             });
         }
         ExprKind::IncludedBytes(..) => {
             guar.get_or_insert_with(|| {
-                dcx.emit_err(errors::ConcatBytesArray { span: expr.span, bytestr: false })
+                dcx.emit_err(diagnostics::ConcatBytesArray { span: expr.span, bytestr: false })
             });
         }
         _ => missing_literals.push(expr.span),
@@ -148,24 +170,25 @@ pub(crate) fn expand_concat_bytes(
                         }
                     }
                 } else {
-                    guar = Some(
-                        cx.dcx().emit_err(errors::ConcatBytesBadRepeat { span: count.value.span }),
-                    );
+                    guar =
+                        Some(cx.dcx().emit_err(diagnostics::ConcatBytesBadRepeat {
+                            span: count.value.span,
+                        }));
                 }
             }
             &ExprKind::Lit(token_lit) => match LitKind::from_token_lit(token_lit) {
                 Ok(LitKind::Byte(val)) => {
                     accumulator.push(val);
                 }
-                Ok(LitKind::ByteStr(ref bytes, _)) => {
-                    accumulator.extend_from_slice(bytes);
+                Ok(LitKind::ByteStr(ref byte_sym, _)) => {
+                    accumulator.extend_from_slice(byte_sym.as_byte_str());
                 }
                 _ => {
                     guar.get_or_insert_with(|| invalid_type_err(cx, token_lit, e.span, false));
                 }
             },
-            ExprKind::IncludedBytes(bytes) => {
-                accumulator.extend_from_slice(bytes);
+            ExprKind::IncludedBytes(byte_sym) => {
+                accumulator.extend_from_slice(byte_sym.as_byte_str());
             }
             ExprKind::Err(guarantee) => {
                 guar = Some(*guarantee);
@@ -177,7 +200,8 @@ pub(crate) fn expand_concat_bytes(
         }
     }
     ExpandResult::Ready(if !missing_literals.is_empty() {
-        let guar = cx.dcx().emit_err(errors::ConcatBytesMissingLiteral { spans: missing_literals });
+        let guar =
+            cx.dcx().emit_err(diagnostics::ConcatBytesMissingLiteral { spans: missing_literals });
         MacEager::expr(DummyResult::raw_expr(sp, Some(guar)))
     } else if let Some(guar) = guar {
         MacEager::expr(DummyResult::raw_expr(sp, Some(guar)))

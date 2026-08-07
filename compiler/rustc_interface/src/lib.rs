@@ -1,5 +1,4 @@
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(let_chains))]
 #![feature(decl_macro)]
 #![feature(file_buffered)]
 #![feature(iter_intersperse)]
@@ -7,11 +6,10 @@
 // tidy-alphabetical-end
 
 mod callbacks;
-pub mod errors;
+pub mod diagnostics;
 pub mod interface;
 mod limits;
 pub mod passes;
-mod proc_macro_decls;
 mod queries;
 pub mod util;
 
@@ -22,5 +20,3 @@ pub use queries::Linker;
 
 #[cfg(test)]
 mod tests;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # tidy-alphabetical-start
-rustc-rayon-core = { version = "0.5.0" }
+rand = "0.9.0"
 rustc_ast = { path = "../rustc_ast" }
 rustc_ast_lowering = { path = "../rustc_ast_lowering" }
 rustc_ast_passes = { path = "../rustc_ast_passes" }
@@ -20,7 +20,6 @@ rustc_data_structures = { path = "../rustc_data_structures" }
 rustc_errors = { path = "../rustc_errors" }
 rustc_expand = { path = "../rustc_expand" }
 rustc_feature = { path = "../rustc_feature" }
-rustc_fluent_macro = { path = "../rustc_fluent_macro" }
 rustc_fs_util = { path = "../rustc_fs_util" }
 rustc_hir = { path = "../rustc_hir" }
 rustc_hir_analysis = { path = "../rustc_hir_analysis" }
@@ -37,12 +36,12 @@ rustc_parse = { path = "../rustc_parse" }
 rustc_passes = { path = "../rustc_passes" }
 rustc_privacy = { path = "../rustc_privacy" }
 rustc_query_impl = { path = "../rustc_query_impl" }
-rustc_query_system = { path = "../rustc_query_system" }
 rustc_resolve = { path = "../rustc_resolve" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
 rustc_symbol_mangling = { path = "../rustc_symbol_mangling" }
 rustc_target = { path = "../rustc_target" }
+rustc_thread_pool = { path = "../rustc_thread_pool" }
 rustc_trait_selection = { path = "../rustc_trait_selection" }
 rustc_traits = { path = "../rustc_traits" }
 rustc_ty_utils = { path = "../rustc_ty_utils" }
@@ -56,5 +55,7 @@ rustc_abi = { path = "../rustc_abi" }
 
 [features]
 # tidy-alphabetical-start
+check_only = ['rustc_codegen_llvm?/check_only']
 llvm = ['dep:rustc_codegen_llvm']
+llvm_offload = ['rustc_codegen_llvm/llvm_offload']
 # tidy-alphabetical-end

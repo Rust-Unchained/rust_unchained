@@ -1,3 +1,4 @@
+//@ edition:2015..2021
 // Test for std::panic::set_backtrace_style.
 
 //@ compile-flags: -O
@@ -5,6 +6,9 @@
 //@ run-fail
 //@ check-run-results
 //@ exec-env:RUST_BACKTRACE=0
+
+// FIXME(#61117): Respect debuginfo-level-tests, do not force debuginfo-level=0
+//@ compile-flags: -Cdebuginfo=0
 
 // This is needed to avoid test output differences across std being built with v0 symbols vs legacy
 // symbols.

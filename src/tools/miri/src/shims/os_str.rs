@@ -7,7 +7,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use rustc_middle::ty::Ty;
-use rustc_middle::ty::layout::LayoutOf;
+use rustc_target::spec::Os;
 
 use crate::*;
 
@@ -282,7 +282,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     *c = sep;
                 }
             }
-            // If this starts with `//?/`, it was probably produced by `unix_to_windows`` and we
+            // If this starts with `//?/`, it was probably produced by `unix_to_windows` and we
             // remove the `//?` that got added to get the Unix path back out.
             if path.get(0..4) == Some(&[sep, sep, b'?'.into(), sep]) {
                 // Remove first 3 characters. It still starts with `/` so it is absolute on Unix.
@@ -316,7 +316,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // The new path is still absolute on Windows.
                 path.remove(0);
             }
-            // If this starts withs a `\` but not a `\\`, then this was absolute on Unix but is
+            // If this starts with a `\` but not a `\\`, then this was absolute on Unix but is
             // relative on Windows (relative to "the root of the current directory", e.g. the
             // drive letter).
             else if path.first() == Some(&sep) && path.get(1) != Some(&sep) {
@@ -330,7 +330,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Below we assume that everything non-Windows works like Unix, at least
         // when it comes to file system path conventions.
         #[cfg(windows)]
-        return if target_os == "windows" {
+        return if *target_os == Os::Windows {
             // Windows-on-Windows, all fine.
             os_str
         } else {
@@ -346,8 +346,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             Cow::Owned(OsString::from_wide(&path))
         };
-        #[cfg(unix)]
-        return if target_os == "windows" {
+        #[cfg(not(windows))]
+        return if *target_os == Os::Windows {
             // Windows target, Unix host.
             let mut path: Vec<u8> = os_str.into_owned().into_encoded_bytes();
             match direction {

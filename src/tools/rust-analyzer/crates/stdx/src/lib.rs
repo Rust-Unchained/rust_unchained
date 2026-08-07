@@ -1,5 +1,6 @@
 //! Missing batteries for standard libraries.
 
+use std::borrow::Cow;
 use std::io as sio;
 use std::process::Command;
 use std::{cmp::Ordering, ops, time::Instant};
@@ -12,13 +13,13 @@ pub mod non_empty_vec;
 pub mod panic_context;
 pub mod process;
 pub mod rand;
-pub mod thin_vec;
 pub mod thread;
+pub mod variance;
 
 pub use itertools;
 
 #[inline(always)]
-pub fn is_ci() -> bool {
+pub const fn is_ci() -> bool {
     option_env!("CI").is_some()
 }
 
@@ -27,14 +28,14 @@ pub fn hash_once<Hasher: std::hash::Hasher + Default>(thing: impl std::hash::Has
 }
 
 #[must_use]
-#[allow(clippy::print_stderr)]
+#[expect(clippy::print_stderr, reason = "only visible to developers")]
 pub fn timeit(label: &'static str) -> impl Drop {
     let start = Instant::now();
-    defer(move || eprintln!("{}: {:.2?}", label, start.elapsed()))
+    defer(move || eprintln!("{}: {:.2}", label, start.elapsed().as_nanos()))
 }
 
 /// Prints backtrace to stderr, useful for debugging.
-#[allow(clippy::print_stderr)]
+#[expect(clippy::print_stderr, reason = "only visible to developers")]
 pub fn print_backtrace() {
     #[cfg(feature = "backtrace")]
     eprintln!("{:?}", backtrace::Backtrace::new());
@@ -73,6 +74,20 @@ impl<T, U, V> TupleExt for (T, U, V) {
     }
     fn tail(self) -> Self::Tail {
         self.2
+    }
+}
+
+impl<T> TupleExt for &T
+where
+    T: TupleExt + Copy,
+{
+    type Head = T::Head;
+    type Tail = T::Tail;
+    fn head(self) -> Self::Head {
+        (*self).head()
+    }
+    fn tail(self) -> Self::Tail {
+        (*self).tail()
     }
 }
 
@@ -127,6 +142,7 @@ where
 }
 
 // Taken from rustc.
+#[must_use]
 pub fn to_camel_case(ident: &str) -> String {
     ident
         .trim_matches('_')
@@ -157,7 +173,7 @@ pub fn to_camel_case(ident: &str) -> String {
 
             camel_cased_component
         })
-        .fold((String::new(), None), |(acc, prev): (_, Option<String>), next| {
+        .fold((String::new(), None), |(mut acc, prev): (_, Option<String>), next| {
             // separate two components with an underscore if their boundary cannot
             // be distinguished using an uppercase/lowercase case distinction
             let join = prev
@@ -167,48 +183,89 @@ pub fn to_camel_case(ident: &str) -> String {
                     Some(!char_has_case(l) && !char_has_case(f))
                 })
                 .unwrap_or(false);
-            (acc + if join { "_" } else { "" } + &next, Some(next))
+            acc.push_str(if join { "_" } else { "" });
+            acc.push_str(&next);
+            (acc, Some(next))
         })
         .0
 }
 
 // Taken from rustc.
-pub fn char_has_case(c: char) -> bool {
+#[must_use]
+pub const fn char_has_case(c: char) -> bool {
     c.is_lowercase() || c.is_uppercase()
 }
 
+#[must_use]
 pub fn is_upper_snake_case(s: &str) -> bool {
     s.chars().all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
 }
 
 pub fn replace(buf: &mut String, from: char, to: &str) {
-    if !buf.contains(from) {
+    let replace_count = buf.chars().filter(|&ch| ch == from).count();
+    if replace_count == 0 {
         return;
     }
-    // FIXME: do this in place.
-    *buf = buf.replace(from, to);
+    let from_len = from.len_utf8();
+    let additional = to.len().saturating_sub(from_len);
+    buf.reserve(additional * replace_count);
+
+    let mut end = buf.len();
+    while let Some(i) = buf[..end].rfind(from) {
+        buf.replace_range(i..i + from_len, to);
+        end = i;
+    }
 }
 
+#[must_use]
 pub fn trim_indent(mut text: &str) -> String {
     if text.starts_with('\n') {
         text = &text[1..];
     }
-    let indent = text
-        .lines()
-        .filter(|it| !it.trim().is_empty())
-        .map(|it| it.len() - it.trim_start().len())
-        .min()
-        .unwrap_or(0);
+    let indent = indent_of(text);
     text.split_inclusive('\n')
         .map(
             |line| {
-                if line.len() <= indent {
-                    line.trim_start_matches(' ')
-                } else {
-                    &line[indent..]
-                }
+                if line.len() <= indent { line.trim_start_matches(' ') } else { &line[indent..] }
             },
         )
+        .collect()
+}
+
+#[must_use]
+fn indent_of(text: &str) -> usize {
+    text.lines()
+        .filter(|it| !it.trim().is_empty())
+        .map(|it| it.len() - it.trim_start().len())
+        .min()
+        .unwrap_or(0)
+}
+
+#[must_use]
+pub fn dedent_by(spaces: usize, text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim_start_matches(' ');
+            if line.len() - trimmed.len() <= spaces { trimmed } else { &line[spaces..] }
+        })
+        .collect()
+}
+
+/// Indent non empty lines, including the first line
+#[must_use]
+pub fn indent_string(s: &str, indent_level: u8) -> String {
+    if indent_level == 0 || s.is_empty() {
+        return s.to_owned();
+    }
+    let indent_str = "    ".repeat(indent_level as usize);
+    s.split_inclusive("\n")
+        .map(|line| {
+            if line.trim_end().is_empty() {
+                Cow::Borrowed(line)
+            } else {
+                format!("{indent_str}{line}").into()
+            }
+        })
         .collect()
 }
 
@@ -254,8 +311,8 @@ impl ops::DerefMut for JodChild {
 
 impl Drop for JodChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        _ = self.0.kill();
+        _ = self.0.wait();
     }
 }
 
@@ -264,12 +321,11 @@ impl JodChild {
         command.spawn().map(Self)
     }
 
+    #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn into_inner(self) -> std::process::Child {
-        if cfg!(target_arch = "wasm32") {
-            panic!("no processes on wasm");
-        }
         // SAFETY: repr transparent, except on WASM
-        unsafe { std::mem::transmute::<JodChild, std::process::Child>(self) }
+        unsafe { std::mem::transmute::<Self, std::process::Child>(self) }
     }
 }
 
@@ -341,5 +397,66 @@ mod tests {
             ),
             "fn main() {\n    return 92;\n}\n"
         );
+    }
+
+    #[test]
+    fn test_dedent() {
+        assert_eq!(dedent_by(0, ""), "");
+        assert_eq!(dedent_by(1, ""), "");
+        assert_eq!(dedent_by(2, ""), "");
+        assert_eq!(dedent_by(0, "foo"), "foo");
+        assert_eq!(dedent_by(2, "foo"), "foo");
+        assert_eq!(dedent_by(2, "  foo"), "foo");
+        assert_eq!(dedent_by(2, "    foo"), "  foo");
+        assert_eq!(dedent_by(2, "    foo\nbar"), "  foo\nbar");
+        assert_eq!(dedent_by(2, "foo\n    bar"), "foo\n  bar");
+        assert_eq!(dedent_by(2, "foo\n\n    bar"), "foo\n\n  bar");
+        assert_eq!(dedent_by(2, "foo\n.\n    bar"), "foo\n.\n  bar");
+        assert_eq!(dedent_by(2, "foo\n .\n    bar"), "foo\n.\n  bar");
+        assert_eq!(dedent_by(2, "foo\n   .\n    bar"), "foo\n .\n  bar");
+    }
+
+    #[test]
+    fn test_indent_of() {
+        assert_eq!(indent_of(""), 0);
+        assert_eq!(indent_of(" "), 0);
+        assert_eq!(indent_of(" x"), 1);
+        assert_eq!(indent_of(" x\n"), 1);
+        assert_eq!(indent_of(" x\ny"), 0);
+        assert_eq!(indent_of(" x\n y"), 1);
+        assert_eq!(indent_of(" x\n  y"), 1);
+        assert_eq!(indent_of("  x\n  y"), 2);
+        assert_eq!(indent_of("  x\n  y\n"), 2);
+        assert_eq!(indent_of("  x\n\n  y\n"), 2);
+    }
+
+    #[test]
+    fn test_replace() {
+        #[track_caller]
+        fn test_replace(src: &str, from: char, to: &str, expected: &str) {
+            let mut s = src.to_owned();
+            replace(&mut s, from, to);
+            assert_eq!(s, expected, "from: {from:?}, to: {to:?}");
+        }
+
+        test_replace("", 'a', "b", "");
+        test_replace("", 'a', "😀", "");
+        test_replace("", '😀', "a", "");
+        test_replace("a", 'a', "b", "b");
+        test_replace("aa", 'a', "b", "bb");
+        test_replace("ada", 'a', "b", "bdb");
+        test_replace("a", 'a', "😀", "😀");
+        test_replace("😀", '😀', "a", "a");
+        test_replace("😀x", '😀', "a", "ax");
+        test_replace("y😀x", '😀', "a", "yax");
+        test_replace("a,b,c", ',', ".", "a.b.c");
+        test_replace("a,b,c", ',', "..", "a..b..c");
+        test_replace("a.b.c", '.', "..", "a..b..c");
+        test_replace("a.b.c", '.', "..", "a..b..c");
+        test_replace("a😀b😀c", '😀', ".", "a.b.c");
+        test_replace("a.b.c", '.', "😀", "a😀b😀c");
+        test_replace("a.b.c", '.', "😀😀", "a😀😀b😀😀c");
+        test_replace(".a.b.c.", '.', "()", "()a()b()c()");
+        test_replace(".a.b.c.", '.', "", "abc");
     }
 }

@@ -5,7 +5,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 // This diagnostic is triggered if rust-analyzer is unable to resolve a path in
 // a `use` declaration.
 pub(crate) fn unresolved_import(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::UnresolvedImport,
 ) -> Diagnostic {
     Diagnostic::new_with_syntax_node_ptr(
@@ -18,7 +18,6 @@ pub(crate) fn unresolved_import(
     // - `cfg_if!`-generated code in libstd (we don't load the sysroot correctly)
     // - `core::arch` (we don't handle `#[path = "../<path>"]` correctly)
     // - proc macros and/or proc macro generated code
-    .experimental()
 }
 
 #[cfg(test)]

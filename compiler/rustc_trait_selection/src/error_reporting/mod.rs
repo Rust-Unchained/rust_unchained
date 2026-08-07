@@ -7,8 +7,6 @@ use rustc_macros::extension;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, Ty};
 
-use crate::error_reporting::infer::sub_relations;
-
 pub mod infer;
 pub mod traits;
 
@@ -21,12 +19,10 @@ pub mod traits;
 /// methods which should not be used during the happy path.
 pub struct TypeErrCtxt<'a, 'tcx> {
     pub infcx: &'a InferCtxt<'tcx>,
-    pub sub_relations: std::cell::RefCell<sub_relations::SubRelations>,
+    pub param_env: Option<ty::ParamEnv<'tcx>>,
 
     pub typeck_results: Option<std::cell::Ref<'a, ty::TypeckResults<'tcx>>>,
-    pub fallback_has_occurred: bool,
-
-    pub normalize_fn_sig: Box<dyn Fn(ty::PolyFnSig<'tcx>) -> ty::PolyFnSig<'tcx> + 'a>,
+    pub diverging_fallback_has_occurred: bool,
 
     pub autoderef_steps: Box<dyn Fn(Ty<'tcx>) -> Vec<(Ty<'tcx>, PredicateObligations<'tcx>)> + 'a>,
 }
@@ -38,10 +34,9 @@ impl<'tcx> InferCtxt<'tcx> {
     fn err_ctxt(&self) -> TypeErrCtxt<'_, 'tcx> {
         TypeErrCtxt {
             infcx: self,
-            sub_relations: Default::default(),
+            param_env: None,
             typeck_results: None,
-            fallback_has_occurred: false,
-            normalize_fn_sig: Box::new(|fn_sig| fn_sig),
+            diverging_fallback_has_occurred: false,
             autoderef_steps: Box::new(|ty| {
                 debug_assert!(false, "shouldn't be using autoderef_steps outside of typeck");
                 vec![(ty, PredicateObligations::new())]

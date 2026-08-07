@@ -1,10 +1,10 @@
-use crate::{adjusted_display_range, Diagnostic, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: await-outside-of-async
 //
 // This diagnostic is triggered if the `await` keyword is used outside of an async function or block
 pub(crate) fn await_outside_of_async(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::AwaitOutsideOfAsync,
 ) -> Diagnostic {
     let display_range =
@@ -14,6 +14,7 @@ pub(crate) fn await_outside_of_async(
         format!("`await` is used inside {}, which is not an `async` context", d.location),
         display_range,
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ async fn bar() {
     fn await_inside_closure() {
         check_diagnostics(
             r#"
+//- minicore: future
 async fn foo() {}
 
 async fn bar() {
@@ -65,6 +67,7 @@ async fn bar() {
     fn await_inside_async_block() {
         check_diagnostics(
             r#"
+//- minicore: future
 async fn foo() {}
 
 fn bar() {
@@ -78,6 +81,7 @@ fn bar() {
     fn await_in_complex_context() {
         check_diagnostics(
             r#"
+//- minicore: future
 async fn foo() {}
 
 fn bar() {

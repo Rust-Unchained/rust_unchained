@@ -2,21 +2,38 @@
 //! consts.
 use std::ops;
 
+use base_db::SourceDatabase;
 use hir_expand::{InFile, Lookup};
-use la_arena::{Idx, RawIdx};
 use span::Edition;
 use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
-    db::DefDatabase,
-    expander::Expander,
-    expr_store::{lower, pretty, ExpressionStore, ExpressionStoreSourceMap, SelfParamPtr},
+    DefWithBodyId, ExpressionStoreOwnerId, HasModule,
+    expr_store::{
+        ExpressionStore, ExpressionStoreSourceMap, SelfParamPtr, lower::lower_body, pretty,
+    },
     hir::{BindingId, ExprId, PatId},
-    item_tree::AttrOwner,
     src::HasSource,
-    DefWithBodyId, HasModule,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Param<Id> {
+    /// The id of the formal parameter. In analysis, you want to use this: it has a special status as a parameter,
+    /// while [`user_written`][Self::user_written] is just a local variable.
+    pub formal: Id,
+    /// The id that corresponds to the pattern the user wrote. In IDE, you usually want to use this.
+    ///
+    /// It will be different than [`formal`][Self::formal] for coroutine fns (async fn etc.), because we apply
+    /// a desugaring for those that copies the parameter into a local variable.
+    pub user_written: Id,
+}
+
+impl<Id: Copy> Param<Id> {
+    pub(crate) fn new(id: Id) -> Self {
+        Self { formal: id, user_written: id }
+    }
+}
 
 /// The body of an item (function, const etc.).
 #[derive(Debug, Eq, PartialEq)]
@@ -28,15 +45,14 @@ pub struct Body {
     ///
     /// If this `Body` is for the body of a constant, this will just be
     /// empty.
-    pub params: Box<[PatId]>,
-    pub self_param: Option<BindingId>,
-    /// The `ExprId` of the actual body expression.
-    pub body_expr: ExprId,
+    pub params: Box<[Param<PatId>]>,
+    pub self_param: Option<Param<BindingId>>,
 }
 
 impl ops::Deref for Body {
     type Target = ExpressionStore;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.store
     }
@@ -62,48 +78,32 @@ pub struct BodySourceMap {
 impl ops::Deref for BodySourceMap {
     type Target = ExpressionStoreSourceMap;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.store
     }
 }
 
+#[salsa::tracked]
 impl Body {
-    pub(crate) fn body_with_source_map_query(
-        db: &dyn DefDatabase,
+    #[salsa::tracked(lru = 512, returns(ref))]
+    pub fn with_source_map(
+        db: &dyn SourceDatabase,
         def: DefWithBodyId,
-    ) -> (Arc<Body>, Arc<BodySourceMap>) {
+    ) -> (Arc<Body>, BodySourceMap) {
         let _p = tracing::info_span!("body_with_source_map_query").entered();
         let mut params = None;
 
         let mut is_async_fn = false;
+        let mut is_gen_fn = false;
         let InFile { file_id, value: body } = {
             match def {
                 DefWithBodyId::FunctionId(f) => {
-                    let data = db.function_data(f);
                     let f = f.lookup(db);
                     let src = f.source(db);
-                    params = src.value.param_list().map(move |param_list| {
-                        let item_tree = f.id.item_tree(db);
-                        let func = &item_tree[f.id.value];
-                        let krate = f.container.module(db).krate;
-                        let crate_graph = db.crate_graph();
-                        (
-                            param_list,
-                            (0..func.params.len()).map(move |idx| {
-                                item_tree
-                                    .attrs(
-                                        db,
-                                        krate,
-                                        AttrOwner::Param(
-                                            f.id.value,
-                                            Idx::from_raw(RawIdx::from(idx as u32)),
-                                        ),
-                                    )
-                                    .is_cfg_enabled(&crate_graph[krate].cfg_options)
-                            }),
-                        )
-                    });
-                    is_async_fn = data.is_async();
+                    params = src.value.param_list();
+                    is_async_fn = src.value.async_token().is_some();
+                    is_gen_fn = src.value.gen_token().is_some();
                     src.map(|it| it.body().map(ast::Expr::from))
                 }
                 DefWithBodyId::ConstId(c) => {
@@ -119,27 +119,41 @@ impl Body {
                 DefWithBodyId::VariantId(v) => {
                     let s = v.lookup(db);
                     let src = s.source(db);
-                    src.map(|it| it.expr())
+                    src.map(|it| it.const_arg()?.expr())
                 }
-                DefWithBodyId::InTypeConstId(c) => c.lookup(db).id.map(|_| c.source(db).expr()),
             }
         };
         let module = def.module(db);
-        let expander = Expander::new(db, file_id, module);
-        let (body, mut source_map) =
-            lower::lower_body(db, def, expander, params, body, module.krate, is_async_fn);
-        source_map.store.shrink_to_fit();
+        let (body, source_map) =
+            lower_body(db, def, file_id, module, params, body, is_async_fn, is_gen_fn);
 
-        (Arc::new(body), Arc::new(source_map))
+        (Arc::new(body), source_map)
     }
 
-    pub(crate) fn body_query(db: &dyn DefDatabase, def: DefWithBodyId) -> Arc<Body> {
-        db.body_with_source_map(def).0
+    #[salsa::tracked(returns(deref))]
+    pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
+        Self::with_source_map(db, def).0.clone()
+    }
+}
+
+impl Body {
+    pub fn root_expr(&self) -> ExprId {
+        // A `Body` can also contain root expressions that aren't the body (in the param patterns),
+        // but the body always come last.
+        self.store.expr_roots().next_back().unwrap()
+    }
+
+    /// Returns `true` if this is the formal or user-written self param.
+    #[inline]
+    pub fn is_any_self_param(&self, binding: BindingId) -> bool {
+        self.self_param.is_some_and(|self_param| {
+            self_param.formal == binding || self_param.user_written == binding
+        })
     }
 
     pub fn pretty_print(
         &self,
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         owner: DefWithBodyId,
         edition: Edition,
     ) -> String {
@@ -148,18 +162,18 @@ impl Body {
 
     pub fn pretty_print_expr(
         &self,
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         owner: DefWithBodyId,
         expr: ExprId,
         edition: Edition,
     ) -> String {
-        pretty::print_expr_hir(db, self, owner, expr, edition)
+        pretty::print_expr_hir(db, self, owner.into(), expr, edition)
     }
 
     pub fn pretty_print_pat(
         &self,
-        db: &dyn DefDatabase,
-        owner: DefWithBodyId,
+        db: &dyn SourceDatabase,
+        owner: ExpressionStoreOwnerId,
         pat: PatId,
         oneline: bool,
         edition: Edition,

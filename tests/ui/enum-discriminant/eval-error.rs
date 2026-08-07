@@ -6,7 +6,7 @@ union Foo {
 
 enum Bar {
     Boo = {
-        let _: Option<Foo> = None; //~ ERROR evaluation of constant value failed
+        let _: Option<Foo> = None; //~ ERROR `Foo` has an unknown layout
         0
     },
 }
@@ -22,7 +22,7 @@ enum Bar2 {
 }
 
 #[repr(u8, packed)]
-//~^ ERROR attribute should be applied to a struct or union
+//~^ ERROR attribute cannot be used on
 enum Foo3 {
     A
 }

@@ -1,14 +1,19 @@
 use core::slice::memchr;
 
 pub use super::common::Env;
-use crate::ffi::{CStr, OsStr, OsString};
+use crate::ffi::{CStr, OsStr, OsString, c_char};
 use crate::io;
 use crate::os::wasi::prelude::*;
-use crate::sys::common::small_c_string::run_with_cstr;
-use crate::sys::pal::os::{cvt, libc};
+use crate::sys::helpers::run_with_cstr;
+use crate::sys::pal::cvt;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_feature = "atomics")] {
+// This is not available yet in libc.
+unsafe extern "C" {
+    fn __wasilibc_get_environ() -> *mut *mut c_char;
+}
+
+cfg_select! {
+    target_feature = "atomics" => {
         // Access to the environment must be protected by a lock in multi-threaded scenarios.
         use crate::sync::{PoisonError, RwLock};
         static ENV_LOCK: RwLock<()> = RwLock::new(());
@@ -18,7 +23,8 @@ cfg_if::cfg_if! {
         pub fn env_write_lock() -> impl Drop {
             ENV_LOCK.write().unwrap_or_else(PoisonError::into_inner)
         }
-    } else {
+    }
+    _ => {
         // No need for a lock if we are single-threaded.
         pub fn env_read_lock() -> impl Drop {
             Box::new(())
@@ -36,7 +42,7 @@ pub fn env() -> Env {
         // Use `__wasilibc_get_environ` instead of `environ` here so that we
         // don't require wasi-libc to eagerly initialize the environment
         // variables.
-        let mut environ = libc::__wasilibc_get_environ();
+        let mut environ = __wasilibc_get_environ();
 
         let mut result = Vec::new();
         if !environ.is_null() {

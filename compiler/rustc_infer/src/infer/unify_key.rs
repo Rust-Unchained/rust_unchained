@@ -110,6 +110,13 @@ impl<'tcx> ConstVariableValue<'tcx> {
             ConstVariableValue::Known { value } => Some(value),
         }
     }
+
+    pub(crate) fn is_unknown(&self) -> bool {
+        match *self {
+            ConstVariableValue::Unknown { .. } => true,
+            ConstVariableValue::Known { .. } => false,
+        }
+    }
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
@@ -136,6 +143,9 @@ impl<'tcx> UnifyKey for ConstVidKey<'tcx> {
     }
     fn tag() -> &'static str {
         "ConstVidKey"
+    }
+    fn order_roots(a: Self, _: &Self::Value, b: Self, _: &Self::Value) -> Option<(Self, Self)> {
+        if a.vid.as_u32() < b.vid.as_u32() { Some((a, b)) } else { Some((b, a)) }
     }
 }
 

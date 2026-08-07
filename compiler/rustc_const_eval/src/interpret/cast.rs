@@ -1,12 +1,12 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
-use rustc_abi::Integer;
+use rustc_abi::{FieldIdx, Integer};
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use rustc_apfloat::{Float, FloatConvert};
 use rustc_middle::mir::CastKind;
 use rustc_middle::mir::interpret::{InterpResult, PointerArithmetic, Scalar};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::layout::{IntegerExt, LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::{IntegerExt, TyAndLayout};
 use rustc_middle::ty::{self, FloatTy, Ty};
 use rustc_middle::{bug, span_bug};
 use tracing::trace;
@@ -14,9 +14,10 @@ use tracing::trace;
 use super::util::ensure_monomorphic_enough;
 use super::{
     FnVal, ImmTy, Immediate, InterpCx, Machine, OpTy, PlaceTy, err_inval, interp_ok, throw_ub,
-    throw_ub_custom,
+    throw_ub_format,
 };
-use crate::fluent_generated as fluent;
+use crate::enter_trace_span;
+use crate::interpret::{Projectable, Writeable};
 
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub fn cast(
@@ -30,10 +31,66 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // possible.
         let cast_layout =
             if cast_ty == dest.layout.ty { dest.layout } else { self.layout_of(cast_ty)? };
-        // FIXME: In which cases should we trigger UB when the source is uninit?
+
+        // Check that the input is valid.
+        // Can be skipped for transmuts and unsizing as those do validation below.
+        if !matches!(
+            cast_kind,
+            CastKind::Transmute
+                | CastKind::Subtype
+                | CastKind::BoxDerefTransmute
+                | CastKind::PointerCoercion(PointerCoercion::Unsize, _)
+        ) && M::enforce_validity(self, src.layout)
+        {
+            match src.layout.ty.kind() {
+                ty::RawPtr { .. } => {
+                    // We only need to check anything for wide pointers.
+                    if matches!(src.layout.backend_repr, rustc_abi::BackendRepr::ScalarPair { .. })
+                    {
+                        self.deref_pointer(src)?;
+                    }
+                }
+                ty::FnPtr { .. } => {
+                    let ptr = self.read_pointer(src)?;
+                    self.get_ptr_fn(ptr)?;
+                }
+                ty::Closure(_closure, args) => {
+                    // Can only happen for non-capturing closures, which have nothing to validate.
+                    let args = args.as_closure();
+                    assert!(args.upvar_tys().is_empty());
+                }
+                // Types that have no requirements or whose requirements are checked by the actual
+                // cast operation.
+                ty::Int(..)
+                | ty::Uint(..)
+                | ty::Float(..)
+                | ty::Bool
+                | ty::Char
+                | ty::FnDef(..) => {}
+
+                _ => {
+                    span_bug!(
+                        self.cur_span(),
+                        "unexpected input type in non-transmute/unsize cast: {}",
+                        src.layout.ty
+                    )
+                }
+            }
+        }
+
         match cast_kind {
             CastKind::PointerCoercion(PointerCoercion::Unsize, _) => {
                 self.unsize_into(src, cast_layout, dest)?;
+                // Validate the entire thing and reset any padding in the output.
+                // It is enough to validate the output because we are only adding metadata,
+                // not discarding anything from the input that may have been invalid.
+                if M::enforce_validity(self, dest.layout()) {
+                    self.validate_place(
+                        dest,
+                        M::enforce_validity_recursively(self, dest.layout()),
+                        /*reset_provenance_and_padding*/ true,
+                    )?;
+                }
             }
 
             CastKind::PointerExposeProvenance => {
@@ -73,20 +130,23 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 bug!("{cast_kind:?} casts are for borrowck only, not runtime MIR");
             }
 
-            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, _) => {
+            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _) => {
                 // All reifications must be monomorphic, bail out otherwise.
-                ensure_monomorphic_enough(*self.tcx, src.layout.ty)?;
+                ensure_monomorphic_enough(src.layout.ty)?;
 
                 // The src operand does not matter, just its type
                 match *src.layout.ty.kind() {
                     ty::FnDef(def_id, args) => {
-                        let instance = ty::Instance::resolve_for_fn_ptr(
-                            *self.tcx,
-                            self.typing_env,
-                            def_id,
-                            args,
-                        )
-                        .ok_or_else(|| err_inval!(TooGeneric))?;
+                        let instance = {
+                            let _trace = enter_trace_span!(M, resolve::resolve_for_fn_ptr, ?def_id);
+                            ty::Instance::resolve_for_fn_ptr(
+                                *self.tcx,
+                                self.typing_env,
+                                def_id,
+                                args.no_bound_vars().unwrap(),
+                            )
+                            .ok_or_else(|| err_inval!(TooGeneric))?
+                        };
 
                         let fn_ptr = self.fn_ptr(FnVal::Instance(instance));
                         self.write_pointer(fn_ptr, dest)?;
@@ -108,17 +168,20 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
             CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_), _) => {
                 // All reifications must be monomorphic, bail out otherwise.
-                ensure_monomorphic_enough(*self.tcx, src.layout.ty)?;
+                ensure_monomorphic_enough(src.layout.ty)?;
 
                 // The src operand does not matter, just its type
                 match *src.layout.ty.kind() {
                     ty::Closure(def_id, args) => {
-                        let instance = ty::Instance::resolve_closure(
-                            *self.tcx,
-                            def_id,
-                            args,
-                            ty::ClosureKind::FnOnce,
-                        );
+                        let instance = {
+                            let _trace = enter_trace_span!(M, resolve::resolve_closure, ?def_id);
+                            ty::Instance::resolve_closure(
+                                *self.tcx,
+                                def_id,
+                                args,
+                                ty::ClosureKind::FnOnce,
+                            )
+                        };
                         let fn_ptr = self.fn_ptr(FnVal::Instance(instance));
                         self.write_pointer(fn_ptr, dest)?;
                     }
@@ -126,27 +189,13 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 }
             }
 
-            CastKind::PointerCoercion(PointerCoercion::DynStar, _) => {
-                if let ty::Dynamic(data, _, ty::DynStar) = cast_ty.kind() {
-                    // Initial cast from sized to dyn trait
-                    let vtable = self.get_vtable_ptr(src.layout.ty, data)?;
-                    let vtable = Scalar::from_maybe_pointer(vtable, self);
-                    let data = self.read_immediate(src)?.to_scalar();
-                    let _assert_pointer_like = data.to_pointer(self)?;
-                    let val = Immediate::ScalarPair(data, vtable);
-                    self.write_immediate(val, dest)?;
-                } else {
-                    bug!()
-                }
-            }
-
-            CastKind::Transmute => {
+            CastKind::Transmute | CastKind::Subtype | CastKind::BoxDerefTransmute => {
                 assert!(src.layout.is_sized());
                 assert!(dest.layout.is_sized());
                 assert_eq!(cast_ty, dest.layout.ty); // we otherwise ignore `cast_ty` enirely...
                 if src.layout.size != dest.layout.size {
-                    throw_ub_custom!(
-                        fluent::const_eval_invalid_transmute,
+                    throw_ub_format!(
+                        "transmuting from {src_bytes}-byte type to {dest_bytes}-byte type: `{src}` -> `{dest}`",
                         src_bytes = src.layout.size.bytes(),
                         dest_bytes = dest.layout.size.bytes(),
                         src = src.layout.ty,
@@ -154,6 +203,17 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     );
                 }
 
+                if matches!(cast_kind, CastKind::BoxDerefTransmute) {
+                    // Do the extra UB checking by making the input an actual `Box<T>` pointer
+                    // and dereferencing it.
+                    let ptr = self.read_immediate(src)?;
+                    let pointee_ty = cast_ty.builtin_deref(true).unwrap();
+                    let box_ty = Ty::new_box(*self.tcx, pointee_ty);
+                    let ptr = ptr.transmute(self.layout_of(box_ty)?, self)?;
+                    self.deref_pointer(&ptr)?;
+                }
+
+                // This does validation at `src` and `dest` type.
                 self.copy_op_allow_transmute(src, dest)?;
             }
         }
@@ -273,6 +333,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // Let's make sure v is sign-extended *if* it has a signed type.
         let signed = src_layout.backend_repr.is_signed(); // Also asserts that abi is `Scalar`.
 
+        // We go through the actual type of `src` to ensure the value is valid.
         let v = match src_layout.ty.kind() {
             ty::Uint(_) | ty::RawPtr(..) | ty::FnPtr(..) => scalar.to_uint(src_layout.size)?,
             ty::Int(_) => scalar.to_int(src_layout.size)? as u128, // we will cast back to `i128` below if the sign matters
@@ -372,7 +433,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     fn unsize_into_ptr(
         &mut self,
         src: &OpTy<'tcx, M::Provenance>,
-        dest: &PlaceTy<'tcx, M::Provenance>,
+        dest: &impl Writeable<'tcx, M::Provenance>,
         // The pointee types
         source_ty: Ty<'tcx>,
         cast_ty: Ty<'tcx>,
@@ -393,7 +454,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 );
                 self.write_immediate(val, dest)
             }
-            (ty::Dynamic(data_a, _, ty::Dyn), ty::Dynamic(data_b, _, ty::Dyn)) => {
+            (ty::Dynamic(data_a, _), ty::Dynamic(data_b, _)) => {
                 let val = self.read_immediate(src)?;
                 // MIR building generates odd NOP casts, prevent them from causing unexpected trouble.
                 // See <https://github.com/rust-lang/rust/issues/128880>.
@@ -443,7 +504,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let new_vptr = self.get_vtable_ptr(ty, data_b)?;
                 self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)
             }
-            (_, &ty::Dynamic(data, _, ty::Dyn)) => {
+            (_, &ty::Dynamic(data, _)) => {
                 // Initial cast from sized to dyn trait
                 let vtable = self.get_vtable_ptr(src_pointee_ty, data)?;
                 let ptr = self.read_pointer(src)?;
@@ -452,8 +513,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
             _ => {
                 // Do not ICE if we are not monomorphic enough.
-                ensure_monomorphic_enough(*self.tcx, src.layout.ty)?;
-                ensure_monomorphic_enough(*self.tcx, cast_ty)?;
+                ensure_monomorphic_enough(src.layout.ty)?;
+                ensure_monomorphic_enough(cast_ty)?;
 
                 span_bug!(
                     self.cur_span(),
@@ -465,14 +526,21 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
     }
 
+    /// Perform an unsizing coercion. The caller is responsible for checking validity afterwards!
     pub fn unsize_into(
         &mut self,
         src: &OpTy<'tcx, M::Provenance>,
         cast_ty: TyAndLayout<'tcx>,
-        dest: &PlaceTy<'tcx, M::Provenance>,
+        dest: &impl Writeable<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
         trace!("Unsizing {:?} of type {} into {}", *src, src.layout.ty, cast_ty.ty);
         match (src.layout.ty.kind(), cast_ty.ty.kind()) {
+            (&ty::Pat(_, s_pat), &ty::Pat(cast_ty, c_pat)) if s_pat == c_pat => {
+                let src = self.project_field(src, FieldIdx::ZERO)?;
+                let dest = self.project_field(dest, FieldIdx::ZERO)?;
+                let cast_ty = self.layout_of(cast_ty)?;
+                self.unsize_into(&src, cast_ty, &dest)
+            }
             (&ty::Ref(_, s, _), &ty::Ref(_, c, _) | &ty::RawPtr(c, _))
             | (&ty::RawPtr(s, _), &ty::RawPtr(c, _)) => self.unsize_into_ptr(src, dest, s, c),
             (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
@@ -484,12 +552,16 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let mut found_cast_field = false;
                 for i in 0..src.layout.fields.count() {
                     let cast_ty_field = cast_ty.field(self, i);
+                    let i = FieldIdx::from_usize(i);
                     let src_field = self.project_field(src, i)?;
                     let dst_field = self.project_field(dest, i)?;
                     if src_field.layout.is_1zst() && cast_ty_field.is_1zst() {
                         // Skip 1-ZST fields.
                     } else if src_field.layout.ty == cast_ty_field.ty {
-                        self.copy_op(&src_field, &dst_field)?;
+                        // The caller performs validation.
+                        self.copy_op_no_validate(
+                            &src_field, &dst_field, /* allow_transmute */ false,
+                        )?;
                     } else {
                         if found_cast_field {
                             span_bug!(self.cur_span(), "unsize_into: more than one field to cast");
@@ -502,14 +574,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             }
             _ => {
                 // Do not ICE if we are not monomorphic enough.
-                ensure_monomorphic_enough(*self.tcx, src.layout.ty)?;
-                ensure_monomorphic_enough(*self.tcx, cast_ty.ty)?;
+                ensure_monomorphic_enough(src.layout.ty)?;
+                ensure_monomorphic_enough(cast_ty.ty)?;
 
                 span_bug!(
                     self.cur_span(),
                     "unsize_into: invalid conversion: {:?} -> {:?}",
                     src.layout,
-                    dest.layout
+                    dest.layout()
                 )
             }
         }

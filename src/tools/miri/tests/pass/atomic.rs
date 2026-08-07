@@ -1,21 +1,23 @@
-//@revisions: stack tree
+//@revisions: stack tree tree_implicit_writes
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-implicit-writes
 //@[tree]compile-flags: -Zmiri-tree-borrows
 //@compile-flags: -Zmiri-strict-provenance
 
-#![feature(strict_provenance_atomic_ptr)]
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+// FIXME(static_mut_refs): use raw pointers instead of references
 #![allow(static_mut_refs)]
 
 use std::sync::atomic::Ordering::*;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, compiler_fence, fence};
+use std::sync::atomic::*;
 
 fn main() {
     atomic_bool();
     atomic_all_ops();
-    atomic_u64();
     atomic_fences();
     atomic_ptr();
     weak_sometimes_fails();
+
+    #[cfg(target_has_atomic = "64")]
+    atomic_u64();
 }
 
 fn atomic_bool() {
@@ -25,36 +27,21 @@ fn atomic_bool() {
         assert_eq!(*ATOMIC.get_mut(), false);
         ATOMIC.store(true, SeqCst);
         assert_eq!(*ATOMIC.get_mut(), true);
-        ATOMIC.fetch_or(false, SeqCst);
+        assert_eq!(ATOMIC.fetch_or(false, SeqCst), true);
         assert_eq!(*ATOMIC.get_mut(), true);
-        ATOMIC.fetch_and(false, SeqCst);
+        assert_eq!(ATOMIC.fetch_and(false, SeqCst), true);
         assert_eq!(*ATOMIC.get_mut(), false);
-        ATOMIC.fetch_nand(true, SeqCst);
+        assert_eq!(ATOMIC.fetch_nand(true, SeqCst), false);
         assert_eq!(*ATOMIC.get_mut(), true);
-        ATOMIC.fetch_xor(true, SeqCst);
+        assert_eq!(ATOMIC.fetch_xor(true, SeqCst), true);
         assert_eq!(*ATOMIC.get_mut(), false);
     }
-}
-
-// There isn't a trait to use to make this generic, so just use a macro
-macro_rules! compare_exchange_weak_loop {
-    ($atom:expr, $from:expr, $to:expr, $succ_order:expr, $fail_order:expr) => {
-        loop {
-            match $atom.compare_exchange_weak($from, $to, $succ_order, $fail_order) {
-                Ok(n) => {
-                    assert_eq!(n, $from);
-                    break;
-                }
-                Err(n) => assert_eq!(n, $from),
-            }
-        }
-    };
 }
 
 /// Make sure we can handle all the intrinsics
 fn atomic_all_ops() {
     static ATOMIC: AtomicIsize = AtomicIsize::new(0);
-    static ATOMIC_UNSIGNED: AtomicU64 = AtomicU64::new(0);
+    static ATOMIC_UNSIGNED: AtomicUsize = AtomicUsize::new(0);
 
     let load_orders = [Relaxed, Acquire, SeqCst];
     let stored_orders = [Relaxed, Release, SeqCst];
@@ -94,8 +81,25 @@ fn atomic_all_ops() {
     }
 }
 
+#[cfg(target_has_atomic = "64")]
 fn atomic_u64() {
+    use std::sync::atomic::AtomicU64;
     static ATOMIC: AtomicU64 = AtomicU64::new(0);
+
+    // There isn't a trait to use to make this generic, so just use a macro
+    macro_rules! compare_exchange_weak_loop {
+        ($atom:expr, $from:expr, $to:expr, $succ_order:expr, $fail_order:expr) => {
+            loop {
+                match $atom.compare_exchange_weak($from, $to, $succ_order, $fail_order) {
+                    Ok(n) => {
+                        assert_eq!(n, $from);
+                        break;
+                    }
+                    Err(n) => assert_eq!(n, $from),
+                }
+            }
+        };
+    }
 
     ATOMIC.store(1, SeqCst);
     assert_eq!(ATOMIC.compare_exchange(0, 0x100, AcqRel, Acquire), Err(1));
@@ -120,6 +124,19 @@ fn atomic_u64() {
     assert_eq!(ATOMIC.fetch_min(0x1000, SeqCst), 0x1000);
     assert_eq!(ATOMIC.fetch_min(0x100, SeqCst), 0x1000);
     assert_eq!(ATOMIC.fetch_min(0x10, SeqCst), 0x100);
+
+    assert_eq!(ATOMIC.swap(1, SeqCst), 0x10);
+    assert_eq!(ATOMIC.load(Relaxed), 1);
+
+    let atomic_signed = AtomicI64::new(0);
+    assert_eq!(atomic_signed.fetch_min(-1, SeqCst), 0);
+    assert_eq!(atomic_signed.load(SeqCst), -1);
+    assert_eq!(atomic_signed.fetch_min(1, SeqCst), -1);
+    assert_eq!(atomic_signed.load(SeqCst), -1);
+    assert_eq!(atomic_signed.fetch_max(1, SeqCst), -1);
+    assert_eq!(atomic_signed.load(SeqCst), 1);
+    assert_eq!(atomic_signed.fetch_max(-1, SeqCst), 1);
+    assert_eq!(atomic_signed.load(SeqCst), 1);
 }
 
 fn atomic_fences() {
@@ -182,12 +199,12 @@ fn atomic_ptr() {
 }
 
 fn weak_sometimes_fails() {
-    let atomic = AtomicBool::new(false);
+    let atomic = AtomicUsize::new(0);
     let tries = 100;
     for _ in 0..tries {
         let cur = atomic.load(Relaxed);
-        // Try (weakly) to flip the flag.
-        if atomic.compare_exchange_weak(cur, !cur, Relaxed, Relaxed).is_err() {
+        // Try (weakly) to modify the flag.
+        if atomic.compare_exchange_weak(cur, cur + 1, Relaxed, Relaxed).is_err() {
             // We failed, so return and skip the panic.
             return;
         }

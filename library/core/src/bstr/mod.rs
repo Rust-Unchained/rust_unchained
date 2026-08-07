@@ -6,7 +6,7 @@ mod traits;
 pub use traits::{impl_partial_eq, impl_partial_eq_n, impl_partial_eq_ord};
 
 use crate::borrow::{Borrow, BorrowMut};
-use crate::fmt;
+use crate::fmt::{self, Alignment};
 use crate::ops::{Deref, DerefMut, DerefPure};
 
 /// A wrapper for `&[u8]` representing a human-readable string that's conventionally, but not
@@ -63,14 +63,40 @@ impl ByteStr {
     /// ```
     #[inline]
     #[unstable(feature = "bstr", issue = "134915")]
-    pub fn new<B: ?Sized + AsRef<[u8]>>(bytes: &B) -> &Self {
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn new<B: ?Sized + [const] AsRef<[u8]>>(bytes: &B) -> &Self {
         ByteStr::from_bytes(bytes.as_ref())
+    }
+
+    /// Returns the same string as `&ByteStr`.
+    ///
+    /// This method is redundant when used directly on `&ByteStr`, but
+    /// it helps dereferencing other "container" types,
+    /// for example `Box<ByteStr>` or `Arc<ByteStr>`.
+    #[inline]
+    // #[unstable(feature = "str_as_str", issue = "130366")]
+    #[unstable(feature = "bstr", issue = "134915")]
+    pub const fn as_byte_str(&self) -> &ByteStr {
+        self
+    }
+
+    /// Returns the same string as `&mut ByteStr`.
+    ///
+    /// This method is redundant when used directly on `&mut ByteStr`, but
+    /// it helps dereferencing other "container" types,
+    /// for example `Box<ByteStr>` or `MutexGuard<ByteStr>`.
+    #[inline]
+    // #[unstable(feature = "str_as_str", issue = "130366")]
+    #[unstable(feature = "bstr", issue = "134915")]
+    pub const fn as_mut_byte_str(&mut self) -> &mut ByteStr {
+        self
     }
 
     #[doc(hidden)]
     #[unstable(feature = "bstr_internals", issue = "none")]
     #[inline]
-    pub fn from_bytes(slice: &[u8]) -> &Self {
+    #[rustc_const_unstable(feature = "bstr_internals", issue = "none")]
+    pub const fn from_bytes(slice: &[u8]) -> &Self {
         // SAFETY: `ByteStr` is a transparent wrapper around `[u8]`, so we can turn a reference to
         // the wrapped type into a reference to the wrapper type.
         unsafe { &*(slice as *const [u8] as *const Self) }
@@ -79,7 +105,8 @@ impl ByteStr {
     #[doc(hidden)]
     #[unstable(feature = "bstr_internals", issue = "none")]
     #[inline]
-    pub fn from_bytes_mut(slice: &mut [u8]) -> &mut Self {
+    #[rustc_const_unstable(feature = "bstr_internals", issue = "none")]
+    pub const fn from_bytes_mut(slice: &mut [u8]) -> &mut Self {
         // SAFETY: `ByteStr` is a transparent wrapper around `[u8]`, so we can turn a reference to
         // the wrapped type into a reference to the wrapper type.
         unsafe { &mut *(slice as *mut [u8] as *mut Self) }
@@ -88,20 +115,23 @@ impl ByteStr {
     #[doc(hidden)]
     #[unstable(feature = "bstr_internals", issue = "none")]
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
+    #[rustc_const_unstable(feature = "bstr_internals", issue = "none")]
+    pub const fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
     #[doc(hidden)]
     #[unstable(feature = "bstr_internals", issue = "none")]
     #[inline]
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+    #[rustc_const_unstable(feature = "bstr_internals", issue = "none")]
+    pub const fn as_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.0
     }
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl Deref for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl Deref for ByteStr {
     type Target = [u8];
 
     #[inline]
@@ -111,7 +141,8 @@ impl Deref for ByteStr {
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl DerefMut for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl DerefMut for ByteStr {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.0
@@ -143,49 +174,91 @@ impl fmt::Debug for ByteStr {
 #[unstable(feature = "bstr", issue = "134915")]
 impl fmt::Display for ByteStr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn fmt_nopad(this: &ByteStr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            for chunk in this.utf8_chunks() {
+        fn emit(byte_str: &ByteStr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for chunk in byte_str.utf8_chunks() {
                 f.write_str(chunk.valid())?;
                 if !chunk.invalid().is_empty() {
                     f.write_str("\u{FFFD}")?;
                 }
             }
+
             Ok(())
         }
 
-        let Some(align) = f.align() else {
-            return fmt_nopad(self, f);
-        };
-        let nchars: usize = self
-            .utf8_chunks()
-            .map(|chunk| {
-                chunk.valid().chars().count() + if chunk.invalid().is_empty() { 0 } else { 1 }
-            })
-            .sum();
-        let padding = f.width().unwrap_or(0).saturating_sub(nchars);
-        let fill = f.fill();
-        let (lpad, rpad) = match align {
-            fmt::Alignment::Left => (0, padding),
-            fmt::Alignment::Right => (padding, 0),
-            fmt::Alignment::Center => {
-                let half = padding / 2;
-                (half, half + padding % 2)
-            }
-        };
-        for _ in 0..lpad {
-            write!(f, "{fill}")?;
-        }
-        fmt_nopad(self, f)?;
-        for _ in 0..rpad {
-            write!(f, "{fill}")?;
+        let requested_width = f.width().unwrap_or(0);
+        if requested_width == 0 && f.precision().is_none() {
+            // Avoid counting the characters if no truncation or padding was
+            // requested.
+            return emit(self, f);
         }
 
-        Ok(())
+        let (truncated, actual_width) = match f.precision() {
+            // The entire string is truncated away. Weird, but ok.
+            Some(0) => (ByteStr::new(&[]), 0),
+            // Advance through string until we run out of space.
+            Some(precision) => {
+                let mut remaining_width = precision;
+                let mut chunks = self.utf8_chunks();
+                let mut current_width = 0;
+                let mut offset = 0;
+                loop {
+                    let Some(chunk) = chunks.next() else {
+                        // We reached the end of the string without running out
+                        // of space, so print the entire string.
+                        break (self, current_width);
+                    };
+
+                    let mut chars = chunk.valid().char_indices();
+                    let Err(remaining) = chars.advance_by(remaining_width) else {
+                        // We've counted off `precision` characters, so truncate
+                        // the string at the current offset.
+                        break (&self[..offset + chars.offset()], precision);
+                    };
+
+                    offset += chunk.valid().len();
+                    current_width += remaining_width - remaining.get();
+                    remaining_width = remaining.get();
+
+                    // `remaining_width` cannot be zero, there is still space
+                    // remaining. So next, count the � character emitted for
+                    // the invalid chunk (if it exists).
+                    if !chunk.invalid().is_empty() {
+                        offset += chunk.invalid().len();
+                        current_width += 1;
+                        remaining_width -= 1;
+
+                        if remaining_width == 0 {
+                            break (&self[..offset], precision);
+                        }
+                    }
+                }
+            }
+            // The string shouldn't be truncated at all, so just count the number
+            // of characters to calculate the padding.
+            None => {
+                let actual_width = self
+                    .utf8_chunks()
+                    .map(|chunk| {
+                        chunk.valid().chars().count()
+                            + if chunk.invalid().is_empty() { 0 } else { 1 }
+                    })
+                    .sum();
+                (self, actual_width)
+            }
+        };
+
+        // The width is originally stored as a 16-bit number, so this cannot fail.
+        let padding = u16::try_from(requested_width.saturating_sub(actual_width)).unwrap();
+
+        let post_padding = f.padding(padding, Alignment::Left)?;
+        emit(truncated, f)?;
+        post_padding.write(f)
     }
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl AsRef<[u8]> for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsRef<[u8]> for ByteStr {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         &self.0
@@ -193,7 +266,8 @@ impl AsRef<[u8]> for ByteStr {
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl AsRef<ByteStr> for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsRef<ByteStr> for ByteStr {
     #[inline]
     fn as_ref(&self) -> &ByteStr {
         self
@@ -203,7 +277,8 @@ impl AsRef<ByteStr> for ByteStr {
 // `impl AsRef<ByteStr> for [u8]` omitted to avoid widespread inference failures
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl AsRef<ByteStr> for str {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsRef<ByteStr> for str {
     #[inline]
     fn as_ref(&self) -> &ByteStr {
         ByteStr::new(self)
@@ -211,7 +286,8 @@ impl AsRef<ByteStr> for str {
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl AsMut<[u8]> for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsMut<[u8]> for ByteStr {
     #[inline]
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.0
@@ -225,7 +301,8 @@ impl AsMut<[u8]> for ByteStr {
 // `impl Borrow<ByteStr> for str` omitted to avoid widespread inference failures
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl Borrow<[u8]> for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl Borrow<[u8]> for ByteStr {
     #[inline]
     fn borrow(&self) -> &[u8] {
         &self.0
@@ -235,7 +312,8 @@ impl Borrow<[u8]> for ByteStr {
 // `impl BorrowMut<ByteStr> for [u8]` omitted to avoid widespread inference failures
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl BorrowMut<[u8]> for ByteStr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl BorrowMut<[u8]> for ByteStr {
     #[inline]
     fn borrow_mut(&mut self) -> &mut [u8] {
         &mut self.0
@@ -303,7 +381,8 @@ impl<'a> Default for &'a mut ByteStr {
 // }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl<'a> TryFrom<&'a ByteStr> for &'a str {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<'a> TryFrom<&'a ByteStr> for &'a str {
     type Error = crate::str::Utf8Error;
 
     #[inline]
@@ -313,7 +392,8 @@ impl<'a> TryFrom<&'a ByteStr> for &'a str {
 }
 
 #[unstable(feature = "bstr", issue = "134915")]
-impl<'a> TryFrom<&'a mut ByteStr> for &'a mut str {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<'a> TryFrom<&'a mut ByteStr> for &'a mut str {
     type Error = crate::str::Utf8Error;
 
     #[inline]

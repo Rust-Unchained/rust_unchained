@@ -1,9 +1,10 @@
+//@ edition:2015
 mod foo {
     pub struct Bx(pub(in crate::foo) ());
 }
 
 mod bar {
-    use foo::Bx;
+    use crate::foo::Bx;
 
     fn foo() {
         Bx(());

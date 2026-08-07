@@ -1,13 +1,14 @@
+use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{Visitor, walk_expr};
-use rustc_hir::{Block, BlockCheckMode, Closure, Expr, ExprKind, Stmt, StmtKind};
+use rustc_hir::{Block, BlockCheckMode, Closure, Expr, ExprKind, Stmt, StmtKind, TyKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::is_trait_method;
-use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
+use clippy_utils::sym;
 use clippy_utils::ty::has_iter_method;
 
 declare_clippy_lint! {
@@ -55,8 +56,20 @@ declare_lint_pass!(NeedlessForEach => [NEEDLESS_FOR_EACH]);
 
 impl<'tcx> LateLintPass<'tcx> for NeedlessForEach {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'_>) {
-        if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = stmt.kind
-            && let ExprKind::MethodCall(method_name, for_each_recv, [for_each_arg], _) = expr.kind
+        if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = stmt.kind {
+            check_expr(cx, expr, stmt.span);
+        }
+    }
+
+    fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx Block<'_>) {
+        if let Some(expr) = block.expr {
+            check_expr(cx, expr, expr.span);
+        }
+    }
+}
+
+fn check_expr(cx: &LateContext<'_>, expr: &Expr<'_>, outer_span: Span) {
+    if let ExprKind::MethodCall(method_name, for_each_recv, [for_each_arg], _) = expr.kind
             && let ExprKind::MethodCall(_, iter_recv, [], _) = for_each_recv.kind
             // Skip the lint if the call chain is too long. e.g. `v.field.iter().for_each()` or
             // `v.foo().iter().for_each()` must be skipped.
@@ -64,56 +77,100 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessForEach {
                 iter_recv.kind,
                 ExprKind::Array(..) | ExprKind::Call(..) | ExprKind::Path(..)
             )
-            && method_name.ident.name.as_str() == "for_each"
-            && is_trait_method(cx, expr, sym::Iterator)
+            && method_name.ident.name == sym::for_each
+            && cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::Iterator)
             // Checks the type of the `iter` method receiver is NOT a user defined type.
             && has_iter_method(cx, cx.typeck_results().expr_ty(iter_recv)).is_some()
             // Skip the lint if the body is not block because this is simpler than `for` loop.
             // e.g. `v.iter().for_each(f)` is simpler and clearer than using `for` loop.
-            && let ExprKind::Closure(&Closure { body, .. }) = for_each_arg.kind
+            && let ExprKind::Closure(&Closure { body, fn_decl, .. }) = for_each_arg.kind
             && let body = cx.tcx.hir_body(body)
             // Skip the lint if the body is not safe, so as not to suggest `for … in … unsafe {}`
             // and suggesting `for … in … { unsafe { } }` is a little ugly.
-            && let ExprKind::Block(Block { rules: BlockCheckMode::DefaultBlock, .. }, ..) = body.value.kind
+            && !matches!(body.value.kind, ExprKind::Block(Block { rules: BlockCheckMode::UnsafeBlock(_), .. }, ..))
+    {
+        let mut applicability = Applicability::MachineApplicable;
+
+        // If any closure parameter has an explicit type specified, applying the lint would necessarily
+        // remove that specification, possibly breaking type inference
+        if fn_decl
+            .inputs
+            .iter()
+            .any(|input| matches!(input.kind, TyKind::Infer(..)))
         {
-            let mut ret_collector = RetCollector::default();
-            ret_collector.visit_expr(body.value);
+            applicability = Applicability::MaybeIncorrect;
+        }
 
-            // Skip the lint if `return` is used in `Loop` in order not to suggest using `'label`.
-            if ret_collector.ret_in_loop {
-                return;
-            }
+        let mut ret_collector = RetCollector::default();
+        ret_collector.visit_expr(body.value);
 
-            let (mut applicability, ret_suggs) = if ret_collector.spans.is_empty() {
-                (Applicability::MachineApplicable, None)
+        // Skip the lint if `return` is used in `Loop` in order not to suggest using `'label`.
+        if ret_collector.ret_in_loop {
+            return;
+        }
+
+        let ret_suggs = if ret_collector.spans.is_empty() {
+            None
+        } else {
+            applicability = Applicability::MaybeIncorrect;
+            Some(
+                ret_collector
+                    .spans
+                    .into_iter()
+                    .map(|span| (span, "continue".to_string()))
+                    .collect(),
+            )
+        };
+
+        let body_param_sugg = snippet_with_applicability(cx, body.params[0].pat.span, "..", &mut applicability);
+        let for_each_rev_sugg = snippet_with_applicability(cx, for_each_recv.span, "..", &mut applicability);
+        let (body_value_sugg, is_macro_call) =
+            snippet_with_context(cx, body.value.span, for_each_recv.span.ctxt(), "..", &mut applicability);
+
+        let sugg = format!(
+            "for {} in {} {}",
+            body_param_sugg,
+            for_each_rev_sugg,
+            if is_macro_call {
+                format!("{{ {body_value_sugg}; }}")
             } else {
-                (
-                    Applicability::MaybeIncorrect,
-                    Some(
-                        ret_collector
-                            .spans
-                            .into_iter()
-                            .map(|span| (span, "continue".to_string()))
-                            .collect(),
-                    ),
-                )
-            };
+                match body.value.kind {
+                    ExprKind::Block(block, _) if is_let_desugar(block) => {
+                        format!("{{ {body_value_sugg} }}")
+                    },
+                    ExprKind::Block(_, _) => body_value_sugg.to_string(),
+                    _ => format!("{{ {body_value_sugg}; }}"),
+                }
+            }
+        );
 
-            let sugg = format!(
-                "for {} in {} {}",
-                snippet_with_applicability(cx, body.params[0].pat.span, "..", &mut applicability),
-                snippet_with_applicability(cx, for_each_recv.span, "..", &mut applicability),
-                snippet_with_applicability(cx, body.value.span, "..", &mut applicability),
-            );
-
-            span_lint_and_then(cx, NEEDLESS_FOR_EACH, stmt.span, "needless use of `for_each`", |diag| {
-                diag.span_suggestion(stmt.span, "try", sugg, applicability);
+        span_lint_and_then(
+            cx,
+            NEEDLESS_FOR_EACH,
+            outer_span,
+            "needless use of `for_each`",
+            |diag| {
+                diag.span_suggestion(outer_span, "try", sugg, applicability);
                 if let Some(ret_suggs) = ret_suggs {
                     diag.multipart_suggestion("...and replace `return` with `continue`", ret_suggs, applicability);
                 }
-            });
-        }
+            },
+        );
     }
+}
+
+/// Check if the block is a desugared `_ = expr` statement.
+fn is_let_desugar(block: &Block<'_>) -> bool {
+    matches!(
+        block,
+        Block {
+            stmts: [Stmt {
+                kind: StmtKind::Let(_),
+                ..
+            },],
+            ..
+        }
+    )
 }
 
 /// This type plays two roles.

@@ -11,14 +11,14 @@ note: for a trait to be dyn compatible it needs to allow building a vtable
 LL | trait Bar {
    |       --- this trait is not dyn compatible...
 LL |     const X: usize;
-   |           ^ ...because it contains this associated `const`
+   |           ^ ...because it contains associated const `X`
    = help: consider moving `X` to another trait
 
 error[E0790]: cannot refer to the associated constant on trait without specifying the corresponding `impl` type
   --> $DIR/issue-48027.rs:3:32
    |
 LL |     const X: usize;
-   |     --------------- `Bar::X` defined here
+   |     -------------- `Bar::X` defined here
 LL |     fn return_n(&self) -> [u8; Bar::X];
    |                                ^^^^^^ cannot refer to the associated constant of trait
 

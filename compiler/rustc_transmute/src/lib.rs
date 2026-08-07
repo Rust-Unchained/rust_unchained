@@ -1,6 +1,7 @@
 // tidy-alphabetical-start
 #![cfg_attr(test, feature(test))]
 #![feature(never_type)]
+#![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
 pub(crate) use rustc_data_structures::fx::{FxIndexMap as Map, FxIndexSet as Set};
@@ -19,23 +20,29 @@ pub struct Assume {
 /// Either transmutation is allowed, we have an error, or we have an optional
 /// Condition that must hold.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub enum Answer<R> {
+pub enum Answer<R, T> {
     Yes,
-    No(Reason<R>),
-    If(Condition<R>),
+    No(Reason<T>),
+    If(Condition<R, T>),
 }
 
 /// A condition which must hold for safe transmutation to be possible.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub enum Condition<R> {
+pub enum Condition<R, T> {
     /// `Src` is transmutable into `Dst`, if `src` is transmutable into `dst`.
-    IfTransmutable { src: R, dst: R },
+    Transmutable { src: T, dst: T },
+
+    /// The region `long` must outlive `short`.
+    Outlives { long: R, short: R },
+
+    /// The `ty` is immutable.
+    Immutable { ty: T },
 
     /// `Src` is transmutable into `Dst`, if all of the enclosed requirements are met.
-    IfAll(Vec<Condition<R>>),
+    IfAll(Vec<Condition<R, T>>),
 
     /// `Src` is transmutable into `Dst` if any of the enclosed requirements are met.
-    IfAny(Vec<Condition<R>>),
+    IfAny(Vec<Condition<R, T>>),
 }
 
 /// Answers "why wasn't the source type transmutable into the destination type?"
@@ -53,12 +60,16 @@ pub enum Reason<T> {
     DstMayHaveSafetyInvariants,
     /// `Dst` is larger than `Src`, and the excess bytes were not exclusively uninitialized.
     DstIsTooBig,
-    /// A referent of `Dst` is larger than a referent in `Src`.
+    /// `Dst` is larger `Src`.
     DstRefIsTooBig {
         /// The referent of the source type.
         src: T,
+        /// The size of the source type's referent.
+        src_size: usize,
         /// The too-large referent of the destination type.
         dst: T,
+        /// The size of the destination type's referent.
+        dst_size: usize,
     },
     /// Src should have a stricter alignment than Dst, but it does not.
     DstHasStricterAlignment { src_min_align: usize, dst_min_align: usize },
@@ -79,18 +90,9 @@ pub enum Reason<T> {
 #[cfg(feature = "rustc")]
 mod rustc {
     use rustc_hir::lang_items::LangItem;
-    use rustc_middle::ty::{Const, Ty, TyCtxt};
+    use rustc_middle::ty::{Const, Region, Ty, TyCtxt};
 
     use super::*;
-
-    /// The source and destination types of a transmutation.
-    #[derive(Debug, Clone, Copy)]
-    pub struct Types<'tcx> {
-        /// The source type.
-        pub src: Ty<'tcx>,
-        /// The destination type.
-        pub dst: Ty<'tcx>,
-    }
 
     pub struct TransmuteTypeEnv<'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -103,13 +105,12 @@ mod rustc {
 
         pub fn is_transmutable(
             &mut self,
-            types: Types<'tcx>,
+            src: Ty<'tcx>,
+            dst: Ty<'tcx>,
             assume: crate::Assume,
-        ) -> crate::Answer<crate::layout::rustc::Ref<'tcx>> {
-            crate::maybe_transmutable::MaybeTransmutableQuery::new(
-                types.src, types.dst, assume, self.tcx,
-            )
-            .answer()
+        ) -> crate::Answer<Region<'tcx>, Ty<'tcx>> {
+            crate::maybe_transmutable::MaybeTransmutableQuery::new(src, dst, assume, self.tcx)
+                .answer()
         }
     }
 
@@ -119,10 +120,7 @@ mod rustc {
             use rustc_middle::ty::ScalarInt;
             use rustc_span::sym;
 
-            let Some(cv) = ct.try_to_value() else {
-                return None;
-            };
-
+            let cv = ct.try_to_value()?;
             let adt_def = cv.ty.ty_adt_def()?;
 
             if !tcx.is_lang_item(adt_def.did(), LangItem::TransmuteOpts) {
@@ -139,7 +137,7 @@ mod rustc {
             }
 
             let variant = adt_def.non_enum_variant();
-            let fields = cv.valtree.unwrap_branch();
+            let fields = cv.to_branch();
 
             let get_field = |name| {
                 let (field_idx, _) = variant
@@ -148,14 +146,14 @@ mod rustc {
                     .enumerate()
                     .find(|(_, field_def)| name == field_def.name)
                     .unwrap_or_else(|| panic!("There were no fields named `{name}`."));
-                fields[field_idx].unwrap_leaf() == ScalarInt::TRUE
+                fields[field_idx].try_to_leaf().map(|leaf| leaf == ScalarInt::TRUE)
             };
 
             Some(Self {
-                alignment: get_field(sym::alignment),
-                lifetimes: get_field(sym::lifetimes),
-                safety: get_field(sym::safety),
-                validity: get_field(sym::validity),
+                alignment: get_field(sym::alignment)?,
+                lifetimes: get_field(sym::lifetimes)?,
+                safety: get_field(sym::safety)?,
+                validity: get_field(sym::validity)?,
             })
         }
     }

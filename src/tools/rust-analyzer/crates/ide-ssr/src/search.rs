@@ -1,35 +1,34 @@
 //! Searching for matches.
 
 use crate::{
-    matching,
+    Match, MatchFinder, matching,
     resolving::{ResolvedPath, ResolvedPattern, ResolvedRule},
-    Match, MatchFinder,
 };
 use hir::FileRange;
 use ide_db::{
+    FileId, FxHashSet, LocalRoots,
     defs::Definition,
     search::{SearchScope, UsageSearchResult},
-    EditionedFileId, FileId, FxHashSet,
 };
-use syntax::{ast, AstNode, SyntaxKind, SyntaxNode};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
 
 /// A cache for the results of find_usages. This is for when we have multiple patterns that have the
 /// same path. e.g. if the pattern was `foo::Bar` that can parse as a path, an expression, a type
 /// and as a pattern. In each, the usages of `foo::Bar` are the same and we'd like to avoid finding
 /// them more than once.
 #[derive(Default)]
-pub(crate) struct UsageCache {
-    usages: Vec<(Definition, UsageSearchResult)>,
+pub(crate) struct UsageCache<'db> {
+    usages: Vec<(Definition<'db>, UsageSearchResult)>,
 }
 
-impl MatchFinder<'_> {
+impl<'db> MatchFinder<'db> {
     /// Adds all matches for `rule` to `matches_out`. Matches may overlap in ways that make
     /// replacement impossible, so further processing is required in order to properly nest matches
     /// and remove overlapping matches. This is done in the `nesting` module.
     pub(crate) fn find_matches_for_rule(
         &self,
-        rule: &ResolvedRule,
-        usage_cache: &mut UsageCache,
+        rule: &ResolvedRule<'db>,
+        usage_cache: &mut UsageCache<'db>,
         matches_out: &mut Vec<Match>,
     ) {
         if rule.pattern.contains_self {
@@ -50,13 +49,13 @@ impl MatchFinder<'_> {
 
     fn find_matches_for_pattern_tree(
         &self,
-        rule: &ResolvedRule,
-        pattern: &ResolvedPattern,
-        usage_cache: &mut UsageCache,
+        rule: &ResolvedRule<'db>,
+        pattern: &ResolvedPattern<'db>,
+        usage_cache: &mut UsageCache<'db>,
         matches_out: &mut Vec<Match>,
     ) {
         if let Some(resolved_path) = pick_path_for_usages(pattern) {
-            let definition: Definition = resolved_path.resolution.into();
+            let definition: Definition<'db> = resolved_path.resolution.into();
             for file_range in self.find_usages(usage_cache, definition).file_ranges() {
                 for node_to_match in self.find_nodes_to_match(resolved_path, file_range) {
                     if !is_search_permitted_ancestors(&node_to_match) {
@@ -71,7 +70,7 @@ impl MatchFinder<'_> {
 
     fn find_nodes_to_match(
         &self,
-        resolved_path: &ResolvedPath,
+        resolved_path: &ResolvedPath<'db>,
         file_range: FileRange,
     ) -> Vec<SyntaxNode> {
         let file = self.sema.parse(file_range.file_id);
@@ -113,8 +112,8 @@ impl MatchFinder<'_> {
 
     fn find_usages<'a>(
         &self,
-        usage_cache: &'a mut UsageCache,
-        definition: Definition,
+        usage_cache: &'a mut UsageCache<'db>,
+        definition: Definition<'db>,
     ) -> &'a UsageSearchResult {
         // Logically if a lookup succeeds we should just return it. Unfortunately returning it would
         // extend the lifetime of the borrow, then we wouldn't be able to do the insertion on a
@@ -128,7 +127,7 @@ impl MatchFinder<'_> {
         usage_cache.find(&definition).unwrap()
     }
 
-    /// Returns the scope within which we want to search. We don't want un unrestricted search
+    /// Returns the scope within which we want to search. We don't want an unrestricted search
     /// scope, since we don't want to find references in external dependencies.
     fn search_scope(&self) -> SearchScope {
         // FIXME: We should ideally have a test that checks that we edit local roots and not library
@@ -136,16 +135,12 @@ impl MatchFinder<'_> {
         // seems to get put into a single source root.
         let mut files = Vec::new();
         self.search_files_do(|file_id| {
-            files.push(
-                self.sema
-                    .attach_first_edition(file_id)
-                    .unwrap_or_else(|| EditionedFileId::current_edition(file_id)),
-            );
+            files.push(self.sema.attach_first_edition(file_id));
         });
         SearchScope::files(&files)
     }
 
-    fn slow_scan(&self, rule: &ResolvedRule, matches_out: &mut Vec<Match>) {
+    fn slow_scan(&self, rule: &ResolvedRule<'db>, matches_out: &mut Vec<Match>) {
         self.search_files_do(|file_id| {
             let file = self.sema.parse_guess_edition(file_id);
             let code = file.syntax();
@@ -156,10 +151,9 @@ impl MatchFinder<'_> {
     fn search_files_do(&self, mut callback: impl FnMut(FileId)) {
         if self.restrict_ranges.is_empty() {
             // Unrestricted search.
-            use ide_db::base_db::SourceRootDatabase;
-            use ide_db::symbol_index::SymbolsDatabase;
-            for &root in self.sema.db.local_roots().iter() {
-                let sr = self.sema.db.source_root(root);
+            use ide_db::base_db::SourceDatabase;
+            for &root in LocalRoots::get(self.sema.db).roots(self.sema.db).iter() {
+                let sr = self.sema.db.source_root(root).source_root(self.sema.db);
                 for file_id in sr.iter() {
                     callback(file_id);
                 }
@@ -178,7 +172,7 @@ impl MatchFinder<'_> {
     fn slow_scan_node(
         &self,
         code: &SyntaxNode,
-        rule: &ResolvedRule,
+        rule: &ResolvedRule<'db>,
         restrict_range: &Option<FileRange>,
         matches_out: &mut Vec<Match>,
     ) {
@@ -188,16 +182,15 @@ impl MatchFinder<'_> {
         self.try_add_match(rule, code, restrict_range, matches_out);
         // If we've got a macro call, we already tried matching it pre-expansion, which is the only
         // way to match the whole macro, now try expanding it and matching the expansion.
-        if let Some(macro_call) = ast::MacroCall::cast(code.clone()) {
-            if let Some(expanded) = self.sema.expand_macro_call(&macro_call) {
-                if let Some(tt) = macro_call.token_tree() {
-                    // When matching within a macro expansion, we only want to allow matches of
-                    // nodes that originated entirely from within the token tree of the macro call.
-                    // i.e. we don't want to match something that came from the macro itself.
-                    if let Some(range) = self.sema.original_range_opt(tt.syntax()) {
-                        self.slow_scan_node(&expanded, rule, &Some(range), matches_out);
-                    }
-                }
+        if let Some(macro_call) = ast::MacroCall::cast(code.clone())
+            && let Some(expanded) = self.sema.expand_macro_call(&macro_call)
+            && let Some(tt) = macro_call.token_tree()
+        {
+            // When matching within a macro expansion, we only want to allow matches of
+            // nodes that originated entirely from within the token tree of the macro call.
+            // i.e. we don't want to match something that came from the macro itself.
+            if let Some(range) = self.sema.original_range_opt(tt.syntax()) {
+                self.slow_scan_node(&expanded.value, rule, &Some(range), matches_out);
             }
         }
         for child in code.children() {
@@ -207,7 +200,7 @@ impl MatchFinder<'_> {
 
     fn try_add_match(
         &self,
-        rule: &ResolvedRule,
+        rule: &ResolvedRule<'db>,
         code: &SyntaxNode,
         restrict_range: &Option<FileRange>,
         matches_out: &mut Vec<Match>,
@@ -230,7 +223,9 @@ impl MatchFinder<'_> {
         }
         let Some(node_range) = self.sema.original_range_opt(code) else { return false };
         for range in &self.restrict_ranges {
-            if range.file_id == node_range.file_id && range.range.contains_range(node_range.range) {
+            if range.file_id == node_range.file_id.file_id(self.sema.db)
+                && range.range.contains_range(node_range.range)
+            {
                 return true;
             }
         }
@@ -240,10 +235,10 @@ impl MatchFinder<'_> {
 
 /// Returns whether we support matching within `node` and all of its ancestors.
 fn is_search_permitted_ancestors(node: &SyntaxNode) -> bool {
-    if let Some(parent) = node.parent() {
-        if !is_search_permitted_ancestors(&parent) {
-            return false;
-        }
+    if let Some(parent) = node.parent()
+        && !is_search_permitted_ancestors(&parent)
+    {
+        return false;
     }
     is_search_permitted(node)
 }
@@ -257,8 +252,8 @@ fn is_search_permitted(node: &SyntaxNode) -> bool {
     node.kind() != SyntaxKind::USE
 }
 
-impl UsageCache {
-    fn find(&mut self, definition: &Definition) -> Option<&UsageSearchResult> {
+impl<'db> UsageCache<'db> {
+    fn find(&mut self, definition: &Definition<'db>) -> Option<&UsageSearchResult> {
         // We expect a very small number of cache entries (generally 1), so a linear scan should be
         // fast enough and avoids the need to implement Hash for Definition.
         for (d, refs) in &self.usages {
@@ -273,7 +268,9 @@ impl UsageCache {
 /// Returns a path that's suitable for path resolution. We exclude builtin types, since they aren't
 /// something that we can find references to. We then somewhat arbitrarily pick the path that is the
 /// longest as this is hopefully more likely to be less common, making it faster to find.
-fn pick_path_for_usages(pattern: &ResolvedPattern) -> Option<&ResolvedPath> {
+fn pick_path_for_usages<'a, 'db>(
+    pattern: &'a ResolvedPattern<'db>,
+) -> Option<&'a ResolvedPath<'db>> {
     // FIXME: Take the scope of the resolved path into account. e.g. if there are any paths that are
     // private to the current module, then we definitely would want to pick them over say a path
     // from std. Possibly we should go further than this and intersect the search scopes for all

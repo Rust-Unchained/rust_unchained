@@ -1,8 +1,9 @@
 //@ needs-asm-support
 //@ ignore-nvptx64
 //@ ignore-spirv
+//@ reference: attributes.codegen.naked.body
 
-#![feature(asm_unwind, linkage)]
+#![feature(asm_unwind, linkage, rustc_attrs, cfg_target_object_format, abi_custom)]
 #![crate_type = "lib"]
 
 use std::arch::{asm, naked_asm};
@@ -199,7 +200,10 @@ pub extern "C" fn compatible_must_use_attributes() -> u64 {
 }
 
 #[export_name = "exported_function_name"]
-#[link_section = ".custom_section"]
+#[link_section = cfg_select!(
+    target_object_format = "mach-o" =>  "__TEXT,__custom",
+    _ => ".custom",
+)]
 #[unsafe(naked)]
 pub extern "C" fn compatible_ffi_attributes_1() {
     naked_asm!("", options(raw));
@@ -224,4 +228,23 @@ pub extern "C" fn compatible_doc_attributes() {
 #[unsafe(naked)]
 pub extern "C" fn compatible_linkage() {
     naked_asm!("", options(raw));
+}
+
+#[rustc_std_internal_symbol]
+#[unsafe(naked)]
+pub extern "C" fn rustc_std_internal_symbol() {
+    naked_asm!("", options(raw));
+}
+
+#[rustfmt::skip]
+#[unsafe(naked)]
+pub extern "C" fn rustfmt_skip() {
+    naked_asm!("", options(raw));
+}
+
+/// This is here to ensure that for any new target that adds assembly support, we
+/// check whether it can/does support `extern "custom"`.
+#[unsafe(naked)]
+unsafe extern "custom" fn abi_custom() {
+    naked_asm!("")
 }

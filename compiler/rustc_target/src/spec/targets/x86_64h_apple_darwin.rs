@@ -1,10 +1,9 @@
-use crate::spec::base::apple::{Arch, TargetAbi, base};
-use crate::spec::{FramePointer, SanitizerSet, Target, TargetMetadata, TargetOptions};
+use crate::spec::base::apple::{Arch, TargetEnv, base};
+use crate::spec::{Os, SanitizerSet, Target, TargetMetadata, TargetOptions};
 
 pub(crate) fn target() -> Target {
-    let (mut opts, llvm_target, arch) = base("macos", Arch::X86_64h, TargetAbi::Normal);
+    let (mut opts, llvm_target, arch) = base(Os::MacOs, Arch::X86_64h, TargetEnv::Normal);
     opts.max_atomic_width = Some(128);
-    opts.frame_pointer = FramePointer::Always;
     opts.supported_sanitizers =
         SanitizerSet::ADDRESS | SanitizerSet::CFI | SanitizerSet::LEAK | SanitizerSet::THREAD;
 
@@ -18,7 +17,7 @@ pub(crate) fn target() -> Target {
     // It would be nice if this were not the case, but fixing it seems tricky
     // (and given that the main use-case for this target is for use in universal
     // binaries, probably not that important).
-    opts.features = "-rdrnd,-aes,-pclmul,-rtm,-fsgsbase".into();
+    opts.features = "-rdrand,-aes,-pclmulqdq,-rtm,-fsgsbase".into();
     // Double-check that the `cpu` is what we expect (if it's not the list above
     // may need updating).
     assert_eq!(

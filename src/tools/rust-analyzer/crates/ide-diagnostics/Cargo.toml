@@ -10,13 +10,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [lib]
+doctest = false
 
 [dependencies]
-cov-mark = "2.0.0-pre.1"
+cov-mark = "2.0.0"
 either.workspace = true
 itertools.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+smallvec.workspace = true
 
 # local deps
 stdx.workspace = true
@@ -27,11 +29,15 @@ ide-db.workspace = true
 paths.workspace = true
 
 [dev-dependencies]
-expect-test = "1.4.0"
+expect-test = "1.5.1"
 
 # local deps
 test-utils.workspace = true
 test-fixture.workspace = true
+
+[features]
+default = []
+in-rust-tree = []
 
 [lints]
 workspace = true

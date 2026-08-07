@@ -1,5 +1,5 @@
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_macros::{Decodable, Encodable, HashStable, TyDecodable, TyEncodable};
+use rustc_macros::{Decodable, Encodable, StableHash, TyDecodable, TyEncodable};
 
 use crate::ty::{self, GenericArgsRef, Ty, TyCtxt};
 
@@ -8,7 +8,7 @@ use crate::ty::{self, GenericArgsRef, Ty, TyCtxt};
 /// kind of crate, including cdylibs which export very few things.
 /// `Rust` will only be exported if the crate produced is a Rust
 /// dylib.
-#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, StableHash)]
 pub enum SymbolExportLevel {
     C,
     Rust,
@@ -22,7 +22,7 @@ impl SymbolExportLevel {
 }
 
 /// Kind of exported symbols.
-#[derive(Eq, PartialEq, Debug, Copy, Clone, Encodable, Decodable, HashStable)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, Encodable, Decodable, StableHash, Hash)]
 pub enum SymbolExportKind {
     Text,
     Data,
@@ -31,14 +31,21 @@ pub enum SymbolExportKind {
 
 /// The `SymbolExportInfo` of a symbols specifies symbol-related information
 /// that is relevant to code generation and linking.
-#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+///
+/// The difference between `used` and `rustc_std_internal_symbol` is that the
+/// former is exported by LTO while the latter isn't.
+#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, StableHash)]
 pub struct SymbolExportInfo {
     pub level: SymbolExportLevel,
     pub kind: SymbolExportKind,
+    /// Was the symbol marked as `#[used(compiler)]` or `#[used(linker)]`?
     pub used: bool,
+    /// Was the symbol marked as `#[rustc_std_internal_symbol]`?
+    /// We also use this for externally implementable items.
+    pub rustc_std_internal_symbol: bool,
 }
 
-#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, TyEncodable, TyDecodable, StableHash)]
 pub enum ExportedSymbol<'tcx> {
     NonGeneric(DefId),
     Generic(DefId, GenericArgsRef<'tcx>),
@@ -55,16 +62,16 @@ impl<'tcx> ExportedSymbol<'tcx> {
         match *self {
             ExportedSymbol::NonGeneric(def_id) => tcx.symbol_name(ty::Instance::mono(tcx, def_id)),
             ExportedSymbol::Generic(def_id, args) => {
-                tcx.symbol_name(ty::Instance::new(def_id, args))
+                tcx.symbol_name(ty::Instance::new_raw(def_id, args))
             }
             ExportedSymbol::DropGlue(ty) => {
-                tcx.symbol_name(ty::Instance::resolve_drop_in_place(tcx, ty))
+                tcx.symbol_name(ty::Instance::resolve_drop_glue(tcx, ty))
             }
             ExportedSymbol::AsyncDropGlueCtorShim(ty) => {
                 tcx.symbol_name(ty::Instance::resolve_async_drop_in_place(tcx, ty))
             }
             ExportedSymbol::ThreadLocalShim(def_id) => tcx.symbol_name(ty::Instance {
-                def: ty::InstanceKind::ThreadLocalShim(def_id),
+                def: ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(def_id)),
                 args: ty::GenericArgs::empty(),
             }),
             ExportedSymbol::NoDefId(symbol_name) => symbol_name,

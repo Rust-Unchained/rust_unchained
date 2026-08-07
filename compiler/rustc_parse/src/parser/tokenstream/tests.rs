@@ -2,7 +2,7 @@
 
 use rustc_ast::token::{self, IdentIsRaw};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
-use rustc_span::{BytePos, Span, Symbol, create_default_session_globals_then};
+use rustc_span::{BytePos, Span, create_default_session_globals_then, sym};
 
 use crate::parser::tests::string_to_stream;
 
@@ -14,6 +14,10 @@ fn sp(a: u32, b: u32) -> Span {
     Span::with_root_ctxt(BytePos(a), BytePos(b))
 }
 
+fn cmp_token_stream(a: &TokenStream, b: &TokenStream) -> bool {
+    a.iter().eq_by(b.iter(), |x, y| x.eq_unspanned(y))
+}
+
 #[test]
 fn test_concat() {
     create_default_session_globals_then(|| {
@@ -21,11 +25,11 @@ fn test_concat() {
         let test_fst = string_to_ts("foo::bar");
         let test_snd = string_to_ts("::baz");
         let mut eq_res = TokenStream::default();
-        eq_res.push_stream(test_fst);
-        eq_res.push_stream(test_snd);
+        eq_res.push_stream_with_gluing(test_fst);
+        eq_res.push_stream_with_gluing(test_snd);
         assert_eq!(test_res.iter().count(), 5);
         assert_eq!(eq_res.iter().count(), 5);
-        assert_eq!(test_res.eq_unspanned(&eq_res), true);
+        assert_eq!(cmp_token_stream(&test_res, &eq_res), true);
     })
 }
 
@@ -88,7 +92,7 @@ fn test_is_empty() {
     create_default_session_globals_then(|| {
         let test0 = TokenStream::default();
         let test1 =
-            TokenStream::token_alone(token::Ident(Symbol::intern("a"), IdentIsRaw::No), sp(0, 1));
+            TokenStream::token_alone(token::Ident(sym::character('a'), IdentIsRaw::No), sp(0, 1));
         let test2 = string_to_ts("foo(bar::baz)");
 
         assert_eq!(test0.is_empty(), true);
@@ -101,10 +105,10 @@ fn test_is_empty() {
 fn test_dotdotdot() {
     create_default_session_globals_then(|| {
         let mut stream = TokenStream::default();
-        stream.push_tree(TokenTree::token_joint(token::Dot, sp(0, 1)));
-        stream.push_tree(TokenTree::token_joint(token::Dot, sp(1, 2)));
-        stream.push_tree(TokenTree::token_alone(token::Dot, sp(2, 3)));
-        assert!(stream.eq_unspanned(&string_to_ts("...")));
+        stream.push_tree_with_gluing(TokenTree::token_joint(token::Dot, sp(0, 1)));
+        stream.push_tree_with_gluing(TokenTree::token_joint(token::Dot, sp(1, 2)));
+        stream.push_tree_with_gluing(TokenTree::token_alone(token::Dot, sp(2, 3)));
+        assert!(cmp_token_stream(&stream, &string_to_ts("...")));
         assert_eq!(stream.iter().count(), 1);
     })
 }

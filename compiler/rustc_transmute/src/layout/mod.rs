@@ -6,61 +6,61 @@ pub(crate) mod tree;
 pub(crate) use tree::Tree;
 
 pub(crate) mod dfa;
-pub(crate) use dfa::Dfa;
+pub(crate) use dfa::{Dfa, union};
 
 #[derive(Debug)]
 pub(crate) struct Uninhabited;
 
-/// A range of byte values, or the uninit byte.
+/// A range of byte values (including an uninit byte value).
 #[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub(crate) struct Byte {
-    // An inclusive-inclusive range. We use this instead of `RangeInclusive`
-    // because `RangeInclusive: !Copy`.
+    // An inclusive-exclusive range. We use this instead of `Range` because `Range: !Copy`.
     //
-    // `None` means uninit.
-    //
-    // FIXME(@joshlf): Optimize this representation. Some pairs of values (where
-    // `lo > hi`) are illegal, and we could use these to represent `None`.
-    range: Option<(u8, u8)>,
+    // Uninit byte value is represented by 256.
+    pub(crate) start: u16,
+    pub(crate) end: u16,
 }
 
 impl Byte {
+    const UNINIT: u16 = 256;
+
+    #[inline]
     fn new(range: RangeInclusive<u8>) -> Self {
-        Self { range: Some((*range.start(), *range.end())) }
+        let start: u16 = (*range.start()).into();
+        let end: u16 = (*range.end()).into();
+        Byte { start, end: end + 1 }
     }
 
+    #[inline]
     fn from_val(val: u8) -> Self {
-        Self { range: Some((val, val)) }
+        let val: u16 = val.into();
+        Byte { start: val, end: val + 1 }
     }
 
-    pub(crate) fn uninit() -> Byte {
-        Byte { range: None }
+    #[inline]
+    fn uninit() -> Byte {
+        Byte { start: 0, end: Self::UNINIT + 1 }
     }
 
-    /// Returns `None` if `self` is the uninit byte.
-    pub(crate) fn range(&self) -> Option<RangeInclusive<u8>> {
-        self.range.map(|(lo, hi)| lo..=hi)
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 
-    /// Are any of the values in `self` transmutable into `other`?
-    ///
-    /// Note two special cases: An uninit byte is only transmutable into another
-    /// uninit byte. Any byte is transmutable into an uninit byte.
-    pub(crate) fn transmutable_into(&self, other: &Byte) -> bool {
-        match (self.range, other.range) {
-            (None, None) => true,
-            (None, Some(_)) => false,
-            (Some(_), None) => true,
-            (Some((slo, shi)), Some((olo, ohi))) => slo <= ohi && olo <= shi,
-        }
+    #[inline]
+    fn contains_uninit(&self) -> bool {
+        self.start <= Self::UNINIT && Self::UNINIT < self.end
     }
 }
 
 impl fmt::Debug for Byte {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.range {
-            None => write!(f, "uninit"),
-            Some((lo, hi)) => write!(f, "{lo}..={hi}"),
+        if self.start == Self::UNINIT && self.end == Self::UNINIT + 1 {
+            write!(f, "uninit")
+        } else if self.start <= Self::UNINIT && self.end == Self::UNINIT + 1 {
+            write!(f, "{}..{}|uninit", self.start, self.end - 1)
+        } else {
+            write!(f, "{}..{}", self.start, self.end)
         }
     }
 }
@@ -72,21 +72,47 @@ impl From<RangeInclusive<u8>> for Byte {
 }
 
 impl From<u8> for Byte {
+    #[inline]
     fn from(src: u8) -> Self {
         Self::from_val(src)
+    }
+}
+
+/// A reference, i.e., `&'region T` or `&'region mut T`.
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+pub(crate) struct Reference<R, T>
+where
+    R: Region,
+    T: Type,
+{
+    pub(crate) region: R,
+    pub(crate) is_mut: bool,
+    pub(crate) referent: T,
+    pub(crate) referent_size: usize,
+    pub(crate) referent_align: usize,
+}
+
+impl<R, T> fmt::Display for Reference<R, T>
+where
+    R: Region,
+    T: Type,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("&")?;
+        if self.is_mut {
+            f.write_str("mut ")?;
+        }
+        self.referent.fmt(f)
     }
 }
 
 pub(crate) trait Def: Debug + Hash + Eq + PartialEq + Copy + Clone {
     fn has_safety_invariants(&self) -> bool;
 }
-pub trait Ref: Debug + Hash + Eq + PartialEq + Copy + Clone {
-    fn min_align(&self) -> usize;
 
-    fn size(&self) -> usize;
+pub(crate) trait Region: Debug + Hash + Eq + PartialEq + Copy + Clone {}
 
-    fn is_mutable(&self) -> bool;
-}
+pub(crate) trait Type: Debug + Hash + Eq + PartialEq + Copy + Clone {}
 
 impl Def for ! {
     fn has_safety_invariants(&self) -> bool {
@@ -94,79 +120,21 @@ impl Def for ! {
     }
 }
 
-impl Ref for ! {
-    fn min_align(&self) -> usize {
-        unreachable!()
-    }
-    fn size(&self) -> usize {
-        unreachable!()
-    }
-    fn is_mutable(&self) -> bool {
-        unreachable!()
-    }
-}
+impl Region for ! {}
+
+impl Type for ! {}
 
 #[cfg(test)]
-impl<const N: usize> Ref for [(); N] {
-    fn min_align(&self) -> usize {
-        N
-    }
+impl Region for usize {}
 
-    fn size(&self) -> usize {
-        N
-    }
-
-    fn is_mutable(&self) -> bool {
-        false
-    }
-}
+#[cfg(test)]
+impl Type for () {}
 
 #[cfg(feature = "rustc")]
 pub mod rustc {
-    use std::fmt::{self, Write};
-
     use rustc_abi::Layout;
-    use rustc_middle::mir::Mutability;
     use rustc_middle::ty::layout::{HasTyCtxt, LayoutCx, LayoutError};
-    use rustc_middle::ty::{self, Ty};
-
-    /// A reference in the layout.
-    #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-    pub struct Ref<'tcx> {
-        pub lifetime: ty::Region<'tcx>,
-        pub ty: Ty<'tcx>,
-        pub mutability: Mutability,
-        pub align: usize,
-        pub size: usize,
-    }
-
-    impl<'tcx> super::Ref for Ref<'tcx> {
-        fn min_align(&self) -> usize {
-            self.align
-        }
-
-        fn size(&self) -> usize {
-            self.size
-        }
-
-        fn is_mutable(&self) -> bool {
-            match self.mutability {
-                Mutability::Mut => true,
-                Mutability::Not => false,
-            }
-        }
-    }
-    impl<'tcx> Ref<'tcx> {}
-
-    impl<'tcx> fmt::Display for Ref<'tcx> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_char('&')?;
-            if self.mutability == Mutability::Mut {
-                f.write_str("mut ")?;
-            }
-            self.ty.fmt(f)
-        }
-    }
+    use rustc_middle::ty::{self, Region, Ty};
 
     /// A visibility node in the layout.
     #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
@@ -186,12 +154,16 @@ pub mod rustc {
         }
     }
 
+    impl<'tcx> super::Region for Region<'tcx> {}
+
+    impl<'tcx> super::Type for Ty<'tcx> {}
+
     pub(crate) fn layout_of<'tcx>(
         cx: LayoutCx<'tcx>,
         ty: Ty<'tcx>,
     ) -> Result<Layout<'tcx>, &'tcx LayoutError<'tcx>> {
         use rustc_middle::ty::layout::LayoutOf;
-        let ty = cx.tcx().erase_regions(ty);
+        let ty = cx.tcx().erase_and_anonymize_regions(ty);
         cx.layout_of(ty).map(|tl| tl.layout)
     }
 }

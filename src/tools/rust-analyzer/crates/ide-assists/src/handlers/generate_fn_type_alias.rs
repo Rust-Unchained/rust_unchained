@@ -1,8 +1,9 @@
 use either::Either;
-use ide_db::assists::{AssistId, AssistKind, GroupLabel};
+use ide_db::assists::{AssistId, GroupLabel};
 use syntax::{
-    ast::{self, edit::IndentLevel, make, HasGenericParams, HasName},
-    syntax_editor, AstNode,
+    AstNode,
+    ast::{self, HasGenericParams, HasName, edit::IndentLevel},
+    syntax_editor,
 };
 
 use crate::{AssistContext, Assists};
@@ -35,7 +36,7 @@ use crate::{AssistContext, Assists};
 // unsafe fn foo(n: i32) -> i32 { 42i32 }
 // ```
 
-pub(crate) fn generate_fn_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn generate_fn_type_alias(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let func = &name.syntax().parent()?;
     let func_node = ast::Fn::cast(func.clone())?;
@@ -54,8 +55,8 @@ pub(crate) fn generate_fn_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>)
             style.label(),
             func_node.syntax().text_range(),
             |builder| {
-                let mut edit = builder.make_editor(func);
-
+                let editor = builder.make_editor(func);
+                let make = editor.make();
                 let alias_name = format!("{}Fn", stdx::to_camel_case(&name.to_string()));
 
                 let mut fn_params_vec = Vec::new();
@@ -67,24 +68,24 @@ pub(crate) fn generate_fn_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>)
                     let is_mut = self_ty.is_mutable_reference();
 
                     if let Some(adt) = self_ty.strip_references().as_adt() {
-                        let inner_type = make::ty(adt.name(ctx.db()).as_str());
+                        let inner_type = make.ty(adt.name(ctx.db()).as_str());
 
                         let ast_self_ty =
-                            if is_ref { make::ty_ref(inner_type, is_mut) } else { inner_type };
+                            if is_ref { make.ty_ref(inner_type, is_mut) } else { inner_type };
 
-                        fn_params_vec.push(make::unnamed_param(ast_self_ty));
+                        fn_params_vec.push(make.unnamed_param(ast_self_ty));
                     }
                 }
 
                 fn_params_vec.extend(param_list.params().filter_map(|p| match style {
                     ParamStyle::Named => Some(p),
-                    ParamStyle::Unnamed => p.ty().map(make::unnamed_param),
+                    ParamStyle::Unnamed => p.ty().map(|ty| make.unnamed_param(ty)),
                 }));
 
                 let generic_params = func_node.generic_param_list();
 
                 let is_unsafe = func_node.unsafe_token().is_some();
-                let ty = make::ty_fn_ptr(
+                let ty = make.ty_fn_ptr(
                     is_unsafe,
                     func_node.abi(),
                     fn_params_vec.into_iter(),
@@ -92,31 +93,31 @@ pub(crate) fn generate_fn_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>)
                 );
 
                 // Insert new alias
-                let ty_alias = make::ty_alias(
+                let ty_alias = make.ty_alias(
+                    None,
                     &alias_name,
                     generic_params,
                     None,
                     None,
                     Some((ast::Type::FnPtrType(ty), None)),
-                )
-                .clone_for_update();
+                );
 
                 let indent = IndentLevel::from_node(insertion_node);
-                edit.insert_all(
+                editor.insert_all(
                     syntax_editor::Position::before(insertion_node),
                     vec![
                         ty_alias.syntax().clone().into(),
-                        make::tokens::whitespace(&format!("\n\n{indent}")).into(),
+                        make.whitespace(&format!("\n\n{indent}")).into(),
                     ],
                 );
 
-                if let Some(cap) = ctx.config.snippet_cap {
-                    if let Some(name) = ty_alias.name() {
-                        edit.add_annotation(name.syntax(), builder.make_placeholder_snippet(cap));
-                    }
+                if let Some(cap) = ctx.config.snippet_cap
+                    && let Some(name) = ty_alias.name()
+                {
+                    editor.add_annotation(name.syntax(), builder.make_placeholder_snippet(cap));
                 }
 
-                builder.add_file_edits(ctx.file_id(), edit);
+                builder.add_file_edits(ctx.vfs_file_id(), editor);
             },
         );
     }
@@ -138,7 +139,7 @@ impl ParamStyle {
             ParamStyle::Unnamed => "generate_fn_type_alias_unnamed",
         };
 
-        AssistId(s, AssistKind::Generate)
+        AssistId::generate(s)
     }
 
     fn label(&self) -> &'static str {
@@ -262,6 +263,22 @@ fn fo$0o<A: Trait, B: Trait>(a: A, b: B) -> i32 { return 42; }
 type ${0:FooFn}<A: Trait, B: Trait> = fn(A, B) -> i32;
 
 fn foo<A: Trait, B: Trait>(a: A, b: B) -> i32 { return 42; }
+"#,
+            ParamStyle::Unnamed.label(),
+        );
+    }
+
+    #[test]
+    fn generate_fn_alias_unnamed_complex_types() {
+        check_assist_by_label(
+            generate_fn_type_alias,
+            r#"
+fn fo$0o(x: Vec<i32>) {}
+"#,
+            r#"
+type ${0:FooFn} = fn(Vec<i32>);
+
+fn foo(x: Vec<i32>) {}
 "#,
             ParamStyle::Unnamed.label(),
         );
@@ -398,6 +415,22 @@ fn fo$0o<A: Trait, B: Trait>(a: A, b: B) -> i32 { return 42; }
 type ${0:FooFn}<A: Trait, B: Trait> = fn(a: A, b: B) -> i32;
 
 fn foo<A: Trait, B: Trait>(a: A, b: B) -> i32 { return 42; }
+"#,
+            ParamStyle::Named.label(),
+        );
+    }
+
+    #[test]
+    fn generate_fn_alias_named_complex_types() {
+        check_assist_by_label(
+            generate_fn_type_alias,
+            r#"
+fn fo$0o(x: Vec<i32>) {}
+"#,
+            r#"
+type ${0:FooFn} = fn(x: Vec<i32>);
+
+fn foo(x: Vec<i32>) {}
 "#,
             ParamStyle::Named.label(),
         );

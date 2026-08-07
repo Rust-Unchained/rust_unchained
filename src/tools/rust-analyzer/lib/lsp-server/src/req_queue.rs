@@ -18,6 +18,12 @@ impl<I, O> Default for ReqQueue<I, O> {
     }
 }
 
+impl<I, O> ReqQueue<I, O> {
+    pub fn has_pending(&self) -> bool {
+        self.incoming.has_pending() || self.outgoing.has_pending()
+    }
+}
+
 #[derive(Debug)]
 pub struct Incoming<I> {
     pending: HashMap<RequestId, I>,
@@ -41,7 +47,7 @@ impl<I> Incoming<I> {
             message: "canceled by client".to_owned(),
             data: None,
         };
-        Some(Response { id, result: None, error: Some(error) })
+        Some(Response { id, response_result: Err(error) })
     }
 
     pub fn complete(&mut self, id: &RequestId) -> Option<I> {
@@ -50,6 +56,10 @@ impl<I> Incoming<I> {
 
     pub fn is_completed(&self, id: &RequestId) -> bool {
         !self.pending.contains_key(id)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }
 
@@ -63,5 +73,9 @@ impl<O> Outgoing<O> {
 
     pub fn complete(&mut self, id: RequestId) -> Option<O> {
         self.pending.remove(&id)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }

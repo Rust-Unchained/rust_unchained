@@ -5,32 +5,32 @@
 /// This should lint
 /// ```
 /// fn main() {
-//~^ ERROR: needless `fn main` in doctest
+//~^ needless_doctest_main
 ///     unimplemented!();
 /// }
 /// ```
-///
+/// 
 /// With an explicit return type it should lint too
 /// ```edition2015
 /// fn main() -> () {
-//~^ ERROR: needless `fn main` in doctest
+//~^ needless_doctest_main
 ///     unimplemented!();
 /// }
 /// ```
-///
+/// 
 /// This should, too.
 /// ```rust
 /// fn main() {
-//~^ ERROR: needless `fn main` in doctest
+//~^ needless_doctest_main
 ///     unimplemented!();
 /// }
 /// ```
-///
+/// 
 /// This one too.
 /// ```no_run
 /// // the fn is not always the first line
-//~^ ERROR: needless `fn main` in doctest
 /// fn main() {
+//~^ needless_doctest_main
 ///     unimplemented!();
 /// }
 /// ```
@@ -38,12 +38,7 @@ fn bad_doctests() {}
 
 /// # Examples
 ///
-/// This shouldn't lint, because the `main` is empty:
-/// ```
-/// fn main(){}
-/// ```
-///
-/// This shouldn't lint either, because main is async:
+/// This shouldn't lint because main is async:
 /// ```edition2018
 /// async fn main() {
 ///     assert_eq!(42, ANSWER);
@@ -139,7 +134,4 @@ fn no_false_positives() {}
 /// ```
 fn issue_6022() {}
 
-fn main() {
-    bad_doctests();
-    no_false_positives();
-}
+fn main() {}

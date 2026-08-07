@@ -1,14 +1,13 @@
 use std::fmt;
 
+use rustc_data_structures::Limit;
 use rustc_errors::{Diag, E0275, EmissionGuarantee, ErrorGuaranteed, struct_span_code_err};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_infer::traits::{Obligation, PredicateObligation};
 use rustc_middle::ty::print::{FmtPrinter, Print};
-use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::Limit;
+use rustc_middle::ty::{self, TyCtxt, Upcast};
 use rustc_span::Span;
-use rustc_type_ir::Upcast;
 use tracing::debug;
 
 use crate::error_reporting::TypeErrCtxt;
@@ -61,16 +60,16 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     ) -> Diag<'a> {
         fn with_short_path<'tcx, T>(tcx: TyCtxt<'tcx>, value: T) -> String
         where
-            T: fmt::Display + Print<'tcx, FmtPrinter<'tcx, 'tcx>>,
+            T: fmt::Display + for<'b> Print<FmtPrinter<'b, 'tcx>>,
         {
             let s = value.to_string();
             if s.len() > 50 {
                 // We don't need to save the type to a file, we will be talking about this type already
                 // in a separate note when we explain the obligation, so it will be available that way.
-                let mut cx: FmtPrinter<'_, '_> =
-                    FmtPrinter::new_with_limit(tcx, Namespace::TypeNS, rustc_session::Limit(6));
-                value.print(&mut cx).unwrap();
-                cx.into_buffer()
+                let mut p: FmtPrinter<'_, '_> =
+                    FmtPrinter::new_with_limit(tcx, Namespace::TypeNS, Limit(6));
+                value.print(&mut p).unwrap();
+                p.into_buffer()
             } else {
                 s
             }
@@ -79,7 +78,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let mut err = match cause {
             OverflowCause::DeeplyNormalize(alias_term) => {
                 let alias_term = self.resolve_vars_if_possible(alias_term);
-                let kind = alias_term.kind(self.tcx).descr();
+                let kind = alias_term.kind.descr();
                 let alias_str = with_short_path(self.tcx, alias_term);
                 struct_span_code_err!(
                     self.dcx(),
@@ -98,6 +97,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             span,
                             E0275,
                             "overflow assigning `{a}` to `{b}`",
+                        )
+                    }
+                    ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
+                        let term = with_short_path(self.tcx, term);
+                        struct_span_code_err!(
+                            self.dcx(),
+                            span,
+                            E0275,
+                            "overflow evaluating whether `{term}` is well-formed",
                         )
                     }
                     _ => {
@@ -142,7 +150,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             suggest_increasing_limit,
             |err| {
                 self.note_obligation_cause_code(
-                    obligation.cause.body_id,
+                    obligation.cause.body_def_id,
                     err,
                     predicate,
                     obligation.param_env,

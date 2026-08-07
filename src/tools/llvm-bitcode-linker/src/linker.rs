@@ -2,11 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
-use crate::{Optimization, Target};
+use crate::Optimization;
 
 #[derive(Debug)]
 pub struct Session {
-    target: Target,
     cpu: Option<String>,
     feature: Option<String>,
     symbols: Vec<String>,
@@ -32,8 +31,9 @@ impl Session {
         let opt_path = out_path.with_extension("optimized.o");
         let sym_path = out_path.with_extension("symbols.txt");
 
+        tracing::debug!(%target, ?cpu, ?feature, ?out_path, "new session created");
+
         Session {
-            target,
             cpu,
             feature,
             symbols: Vec::new(),
@@ -68,7 +68,7 @@ impl Session {
             .arg("-o")
             .arg(&self.link_path)
             .output()
-            .context("An error occured when calling llvm-link. Make sure the llvm-tools component is installed.")?;
+            .context("An error occurred when calling llvm-link. Make sure the llvm-tools component is installed.")?;
 
         if !llvm_link_output.status.success() {
             tracing::error!(
@@ -86,14 +86,8 @@ impl Session {
     /// Optimize and compile to native format using `opt` and `llc`
     ///
     /// Before this can be called `link` needs to be called
-    fn optimize(&mut self, optimization: Optimization, mut debug: bool) -> anyhow::Result<()> {
+    fn optimize(&mut self, optimization: Optimization, debug: bool) -> anyhow::Result<()> {
         let mut passes = format!("default<{}>", optimization);
-
-        // FIXME(@kjetilkjeka) Debug symbol generation is broken for nvptx64 so we must remove them even in debug mode
-        if debug && self.target == crate::Target::Nvptx64NvidiaCuda {
-            tracing::warn!("nvptx64 target detected - stripping debug symbols");
-            debug = false;
-        }
 
         // We add an internalize pass as the rust compiler as we require exported symbols to be explicitly marked
         passes.push_str(",internalize,globaldce");
@@ -115,7 +109,7 @@ impl Session {
         }
 
         let opt_output = opt_cmd.output().context(
-            "An error occured when calling opt. Make sure the llvm-tools component is installed.",
+            "An error occurred when calling opt. Make sure the llvm-tools component is installed.",
         )?;
 
         if !opt_output.status.success() {
@@ -149,7 +143,7 @@ impl Session {
             .arg(&self.opt_path)
             .arg("-o").arg(&self.out_path)
             .output()
-            .context("An error occured when calling llc. Make sure the llvm-tools component is installed.")?;
+            .context("An error occurred when calling llc. Make sure the llvm-tools component is installed.")?;
 
         if !lcc_output.status.success() {
             tracing::error!(

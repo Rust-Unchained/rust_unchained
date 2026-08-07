@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::borrow_set::BorrowSet;
 use crate::constraints::OutlivesConstraint;
-use crate::type_check::MirTypeckRegionConstraints;
+use crate::handle_placeholders::LoweredConstraints;
 use crate::type_check::free_region_relations::UniversalRegionRelations;
 use crate::universal_regions::UniversalRegions;
 
@@ -43,7 +43,7 @@ pub(crate) fn emit_facts<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     move_data: &MoveData<'tcx>,
     universal_region_relations: &UniversalRegionRelations<'tcx>,
-    constraints: &MirTypeckRegionConstraints<'tcx>,
+    constraints: &LoweredConstraints<'tcx>,
 ) {
     let Some(facts) = facts else {
         // We don't do anything if there are no facts to fill.
@@ -132,9 +132,9 @@ fn emit_move_facts(
 
     // moved_out_at
     // deinitialisation is assumed to always happen!
-    facts
-        .path_moved_at_base
-        .extend(move_data.moves.iter().map(|mo| (mo.path, location_table.mid_index(mo.source))));
+    facts.path_moved_at_base.extend(
+        move_data.move_outs.iter().map(|mo| (mo.path, location_table.mid_index(mo.source))),
+    );
 }
 
 /// Emit universal regions facts, and their relations.
@@ -203,7 +203,7 @@ pub(crate) fn emit_drop_facts<'tcx>(
 fn emit_outlives_facts<'tcx>(
     facts: &mut PoloniusFacts,
     location_table: &PoloniusLocationTable,
-    constraints: &MirTypeckRegionConstraints<'tcx>,
+    constraints: &LoweredConstraints<'tcx>,
 ) {
     facts.subset_base.extend(constraints.outlives_constraints.outlives().iter().flat_map(
         |constraint: &OutlivesConstraint<'_>| {

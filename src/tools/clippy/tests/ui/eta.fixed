@@ -1,16 +1,16 @@
+// we have some HELP annotations -- don't complain about them not being present everywhere
+//@require-annotations-for-level: ERROR
+
 #![warn(clippy::redundant_closure, clippy::redundant_closure_for_method_calls)]
-#![allow(unused)]
-#![allow(
+#![allow(clippy::redundant_closure_call)]
+#![expect(
     clippy::needless_borrow,
     clippy::needless_option_as_deref,
-    clippy::needless_pass_by_value,
     clippy::no_effect,
     clippy::option_map_unit_fn,
-    clippy::redundant_closure_call,
-    clippy::uninlined_format_args,
-    clippy::useless_vec,
     clippy::unnecessary_map_on_constructor,
-    clippy::needless_lifetimes
+    clippy::unnecessary_option_map_or_else,
+    clippy::useless_vec
 )]
 
 use std::path::{Path, PathBuf};
@@ -541,5 +541,149 @@ mod issue_13073 {
         // should lint
         let _field = bind.or_else(get_default).unwrap();
         //~^ redundant_closure
+    }
+}
+
+fn issue_14789() {
+    _ = Some(1u8).map(
+        #[expect(clippy::redundant_closure)]
+        |a| foo(a),
+    );
+
+    _ = Some("foo").map(
+        #[expect(clippy::redundant_closure_for_method_calls)]
+        |s| s.to_owned(),
+    );
+
+    let _: Vec<u8> = None.map_or_else(
+        #[expect(clippy::redundant_closure)]
+        || vec![],
+        std::convert::identity,
+    );
+}
+
+fn issue_15072() {
+    use std::ops::Deref;
+
+    struct Foo;
+    impl Deref for Foo {
+        type Target = fn() -> &'static str;
+
+        fn deref(&self) -> &Self::Target {
+            fn hello() -> &'static str {
+                "Hello, world!"
+            }
+            &(hello as fn() -> &'static str)
+        }
+    }
+
+    fn accepts_fn(f: impl Fn() -> &'static str) {
+        println!("{}", f());
+    }
+
+    fn some_fn() -> &'static str {
+        todo!()
+    }
+
+    let f = &Foo;
+    accepts_fn(**f);
+    //~^ redundant_closure
+
+    let g = &some_fn;
+    accepts_fn(g);
+    //~^ redundant_closure
+
+    struct Bar(Foo);
+    impl Deref for Bar {
+        type Target = Foo;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    let b = &Bar(Foo);
+    accepts_fn(***b);
+    //~^ redundant_closure
+}
+
+fn issue8817() {
+    fn f(_: u32) -> u32 {
+        todo!()
+    }
+    let g = |_: u32| -> u32 { todo!() };
+    struct S(u32);
+    enum MyError {
+        A(S),
+    }
+
+    Some(5)
+        .map(f)
+        //~^ redundant_closure
+        //~| HELP: replace the closure with the function itself
+        .map(g)
+        //~^ redundant_closure
+        //~| HELP: replace the closure with the function itself
+        .map(S)
+        //~^ redundant_closure
+        //~| HELP: replace the closure with the tuple struct itself
+        .map(MyError::A)
+        //~^ redundant_closure
+        //~| HELP: replace the closure with the tuple variant itself
+        .unwrap(); // just for nicer formatting
+}
+
+async fn issue13892<'a, T, F>(maybe: Option<&'a T>, visitor: F)
+where
+    F: AsyncFn(&'a T),
+    T: 'a,
+{
+    maybe.map(|x| visitor(x));
+}
+
+trait Issue16360: Sized {
+    fn method(&self);
+
+    fn ice_machine(array: [Self; 1]) {
+        array.iter().for_each(Self::method);
+        //~^ redundant_closure_for_method_calls
+    }
+}
+
+fn issue16641() {
+    use std::cell::LazyCell;
+
+    let closure = LazyCell::new(|| |x: usize| println!("{x}"));
+
+    (0..10).flat_map(|x| (0..10).map(&*closure)).count();
+    //~^ redundant_closure
+}
+
+mod issue_13094 {
+    fn issue_13094<T>(
+        mat_a: &[Vec<T>],
+        mat_b: &[Vec<T>],
+        add: impl Fn(T, T) -> T,
+        mul: impl Fn(T, T) -> T,
+    ) -> Vec<Vec<T>>
+    where
+        T: Clone,
+    {
+        // C(i,j) = Σ（0,k-1) A(i,k) * B(k,j)
+        let m = mat_a.len();
+        let n = mat_b.len();
+        (0..m)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        (0..m)
+                            .map(|k| mul(mat_a[i][k].clone(), mat_b[k][j].clone()))
+                            .reduce(&add)
+                            //~^ redundant_closure
+                            .expect("Matrix must be qualified!")
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }

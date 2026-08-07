@@ -11,7 +11,6 @@ use crate::{Analysis, GenKill};
 /// At present, this is used as a very limited form of alias analysis. For example,
 /// `MaybeBorrowedLocals` is used to compute which locals are live during a yield expression for
 /// immovable coroutines.
-#[derive(Clone)]
 pub struct MaybeBorrowedLocals;
 
 impl MaybeBorrowedLocals {
@@ -34,7 +33,7 @@ impl<'tcx> Analysis<'tcx> for MaybeBorrowedLocals {
     }
 
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         statement: &Statement<'tcx>,
         location: Location,
@@ -42,14 +41,13 @@ impl<'tcx> Analysis<'tcx> for MaybeBorrowedLocals {
         Self::transfer_function(state).visit_statement(statement, location);
     }
 
-    fn apply_primary_terminator_effect<'mir>(
-        &mut self,
+    fn apply_primary_terminator_effect(
+        &self,
         state: &mut Self::Domain,
-        terminator: &'mir Terminator<'tcx>,
+        terminator: &Terminator<'tcx>,
         location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
+    ) {
         Self::transfer_function(state).visit_terminator(terminator, location);
-        terminator.edges()
     }
 }
 
@@ -79,7 +77,8 @@ where
             // We ignore fake borrows as these get removed after analysis and shouldn't effect
             // the layout of generators.
             Rvalue::RawPtr(_, borrowed_place)
-            | Rvalue::Ref(_, BorrowKind::Mut { .. } | BorrowKind::Shared, borrowed_place) => {
+            | Rvalue::Ref(_, BorrowKind::Mut { .. } | BorrowKind::Shared, borrowed_place)
+            | Rvalue::Reborrow(_, _, borrowed_place) => {
                 if !borrowed_place.is_indirect() {
                     self.trans.gen_(borrowed_place.local);
                 }
@@ -87,13 +86,10 @@ where
 
             Rvalue::Cast(..)
             | Rvalue::Ref(_, BorrowKind::Fake(_), _)
-            | Rvalue::ShallowInitBox(..)
             | Rvalue::Use(..)
             | Rvalue::ThreadLocalRef(..)
             | Rvalue::Repeat(..)
-            | Rvalue::Len(..)
             | Rvalue::BinaryOp(..)
-            | Rvalue::NullaryOp(..)
             | Rvalue::UnaryOp(..)
             | Rvalue::Discriminant(..)
             | Rvalue::Aggregate(..)

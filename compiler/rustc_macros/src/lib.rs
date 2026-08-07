@@ -1,10 +1,14 @@
 // tidy-alphabetical-start
-#![allow(rustc::default_hash_types)]
-#![cfg_attr(bootstrap, feature(let_chains))]
-#![feature(if_let_guard)]
+#![allow(
+    rustc::default_hash_types,
+    reason = "we like performance but can't use `rustc_data_structures`"
+)]
+#![deny(
+    rustc::potential_query_instability,
+    reason = "macros shall produce deterministic output/errors"
+)]
 #![feature(never_type)]
 #![feature(proc_macro_diagnostic)]
-#![feature(proc_macro_span)]
 #![feature(proc_macro_tracked_env)]
 // tidy-alphabetical-end
 
@@ -14,15 +18,15 @@ use synstructure::decl_derive;
 mod current_version;
 mod diagnostics;
 mod extension;
-mod hash_stable;
 mod lift;
 mod print_attribute;
 mod query;
 mod serialize;
+mod stable_hash;
 mod symbols;
-mod try_from;
 mod type_foldable;
 mod type_visitable;
+mod visitable;
 
 // Reads the rust version (e.g. "1.75.0") from the CFG_RELEASE env var and
 // produces a `RustcVersion` literal containing that version (e.g.
@@ -61,27 +65,87 @@ pub fn extension(attr: TokenStream, input: TokenStream) -> TokenStream {
     extension::extension(attr, input)
 }
 
-decl_derive!([HashStable, attributes(stable_hasher)] => hash_stable::hash_stable_derive);
 decl_derive!(
-    [HashStable_Generic, attributes(stable_hasher)] =>
-    hash_stable::hash_stable_generic_derive
+    [StableHash, attributes(stable_hash)] => stable_hash::stable_hash_derive
 );
 decl_derive!(
-    [HashStable_NoContext] =>
-    /// `HashStable` implementation that has no `HashStableContext` bound and
-    /// which adds `where` bounds for `HashStable` based off of fields and not
-    /// generics. This is suitable for use in crates like `rustc_type_ir`.
-    hash_stable::hash_stable_no_context_derive
+    [StableHash_NoContext, attributes(stable_hash)] => stable_hash::stable_hash_no_context_derive
 );
 
-decl_derive!([Decodable_NoContext] => serialize::decodable_nocontext_derive);
+// Encoding and Decoding derives
+decl_derive!([Decodable_NoContext] =>
+    /// See docs on derive [`Decodable`].
+    ///
+    /// Derives `Decodable<D> for T where D: Decoder`.
+    serialize::decodable_nocontext_derive
+);
 decl_derive!([Encodable_NoContext] => serialize::encodable_nocontext_derive);
-decl_derive!([Decodable] => serialize::decodable_derive);
+decl_derive!([Decodable] =>
+    /// Derives `Decodable<D> for T where D: SpanDecoder`
+    ///
+    /// # Deriving decoding traits
+    ///
+    /// > Some shared docs about decoding traits, since this is likely the first trait you find
+    ///
+    /// The difference between these derives can be subtle!
+    /// At a high level, there's the `T: Decodable<D>` trait that says some type `T`
+    /// can be decoded using a decoder `D`. There are various decoders!
+    /// The different derives place different *trait* bounds on this type `D`.
+    ///
+    /// Even though this derive, based on its name, seems like the most vanilla one,
+    /// it actually places a pretty strict bound on `D`: `SpanDecoder`.
+    /// It means that types that derive this can contain spans, among other things,
+    /// and still be decoded. The reason this is hard is that at least in metadata,
+    /// spans can only be decoded later, once some information from the header
+    /// is already decoded to properly deal with spans.
+    ///
+    /// The hierarchy is roughly:
+    ///
+    /// - derive [`Decodable_NoContext`] is the most relaxed bounds that could be placed on `D`,
+    ///   and is only really suited for structs and enums containing primitive types.
+    /// - derive [`BlobDecodable`] may be a better default, than deriving `Decodable`:
+    ///   it places fewer requirements on `D`, while still allowing some complex types to be decoded.
+    /// - derive [`LazyDecodable`]: Only for types containing `Lazy{Array,Table,Value}`.
+    /// - derive [`Decodable`] for structures containing spans. Requires `D: SpanDecoder`
+    /// - derive [`TyDecodable`] for types that require access to the `TyCtxt` while decoding.
+    ///   For example: arena allocated types.
+    serialize::decodable_derive
+);
 decl_derive!([Encodable] => serialize::encodable_derive);
-decl_derive!([TyDecodable] => serialize::type_decodable_derive);
+decl_derive!([TyDecodable] =>
+    /// See docs on derive [`Decodable`].
+    ///
+    /// Derives `Decodable<D> for T where D: TyDecoder`.
+    serialize::type_decodable_derive
+);
 decl_derive!([TyEncodable] => serialize::type_encodable_derive);
-decl_derive!([MetadataDecodable] => serialize::meta_decodable_derive);
-decl_derive!([MetadataEncodable] => serialize::meta_encodable_derive);
+decl_derive!([LazyDecodable] =>
+    /// See docs on derive [`Decodable`].
+    ///
+    /// Derives `Decodable<D> for T where D: LazyDecoder`.
+    /// This constrains the decoder to be specifically the decoder that can decode
+    /// `LazyArray`s, `LazyValue`s amd `LazyTable`s in metadata.
+    /// Therefore, we only need this on things containing LazyArray really.
+    ///
+    /// Most decodable derives mirror an encodable derive.
+    /// [`LazyDecodable`] and [`BlobDecodable`] together roughly mirror [`MetadataEncodable`]
+    serialize::lazy_decodable_derive
+);
+decl_derive!([BlobDecodable] =>
+    /// See docs on derive [`Decodable`].
+    ///
+    /// Derives `Decodable<D> for T where D: BlobDecoder`.
+    ///
+    /// Most decodable derives mirror an encodable derive.
+    /// [`LazyDecodable`] and [`BlobDecodable`] together roughly mirror [`MetadataEncodable`]
+    serialize::blob_decodable_derive
+);
+decl_derive!([MetadataEncodable] =>
+    /// Most encodable derives mirror a decodable derive.
+    /// [`MetadataEncodable`] is roughly mirrored by the combination of [`LazyDecodable`] and [`BlobDecodable`]
+    serialize::meta_encodable_derive
+);
+
 decl_derive!(
     [TypeFoldable, attributes(type_foldable)] =>
     /// Derives `TypeFoldable` for the annotated `struct` or `enum` (`union` is not supported).
@@ -103,6 +167,16 @@ decl_derive!(
     /// visited (and its type is not required to implement `TypeVisitable`).
     type_visitable::type_visitable_derive
 );
+decl_derive!(
+    [Walkable, attributes(visitable)] =>
+    /// Derives `Walkable` for the annotated `struct` or `enum` (`union` is not supported).
+    ///
+    /// Each field of the struct or enum variant will be visited in definition order, using the
+    /// `Walkable` implementation for its type. However, if a field of a struct or an enum
+    /// variant is annotated with `#[visitable(ignore)]` then that field will not be
+    /// visited (and its type is not required to implement `Walkable`).
+    visitable::visitable_derive
+);
 decl_derive!([Lift, attributes(lift)] => lift::lift_derive);
 decl_derive!(
     [Diagnostic, attributes(
@@ -114,7 +188,6 @@ decl_derive!(
         note_once,
         warning,
         // field attributes
-        skip_arg,
         primary_span,
         label,
         subdiagnostic,
@@ -122,25 +195,6 @@ decl_derive!(
         suggestion_short,
         suggestion_hidden,
         suggestion_verbose)] => diagnostics::diagnostic_derive
-);
-decl_derive!(
-    [LintDiagnostic, attributes(
-        // struct attributes
-        diag,
-        help,
-        help_once,
-        note,
-        note_once,
-        warning,
-        // field attributes
-        skip_arg,
-        primary_span,
-        label,
-        subdiagnostic,
-        suggestion,
-        suggestion_short,
-        suggestion_hidden,
-        suggestion_verbose)] => diagnostics::lint_diagnostic_derive
 );
 decl_derive!(
     [Subdiagnostic, attributes(
@@ -159,27 +213,26 @@ decl_derive!(
         multipart_suggestion,
         multipart_suggestion_short,
         multipart_suggestion_hidden,
-        multipart_suggestion_verbose,
         // field attributes
-        skip_arg,
         primary_span,
         suggestion_part,
         applicability)] => diagnostics::subdiagnostic_derive
 );
 
-decl_derive! {
-    [TryFromU32] =>
-    /// Derives `TryFrom<u32>` for the annotated `enum`, which must have no fields.
-    /// Each variant maps to the value it would produce under an `as u32` cast.
-    ///
-    /// The error type is `u32`.
-    try_from::try_from_u32
+/// This macro creates a translatable `DiagMessage` from a fluent format string.
+/// It should be used in places where a translatable message is needed, but struct diagnostics are undesired.
+///
+/// This macro statically checks that the message is valid Fluent, but not that variables in the Fluent message actually exist.
+#[proc_macro]
+pub fn msg(input: TokenStream) -> TokenStream {
+    diagnostics::msg_macro(input)
 }
+
 decl_derive! {
     [PrintAttribute] =>
     /// Derives `PrintAttribute` for `AttributeKind`.
-    /// This macro is pretty specific to `rustc_attr_data_structures` and likely not that useful in
-    /// other places. It's deriving something close to `Debug` without printing some extraenous
+    /// This macro is pretty specific to `rustc_hir::attrs` and likely not that useful in
+    /// other places. It's deriving something close to `Debug` without printing some extraneous
     /// things like spans.
     print_attribute::print_attribute
 }

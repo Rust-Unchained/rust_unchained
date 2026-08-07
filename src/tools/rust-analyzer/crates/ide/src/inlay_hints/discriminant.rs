@@ -6,8 +6,7 @@
 //! ```
 use hir::Semantics;
 use ide_db::text_edit::TextEdit;
-use ide_db::{famous_defs::FamousDefs, RootDatabase};
-use span::EditionedFileId;
+use ide_db::{RootDatabase, famous_defs::FamousDefs};
 use syntax::ast::{self, AstNode, HasName};
 
 use crate::{
@@ -18,8 +17,7 @@ use crate::{
 pub(super) fn enum_hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
-    _: EditionedFileId,
+    config: &InlayHintsConfig<'_>,
     enum_: ast::Enum,
 ) -> Option<()> {
     if let DiscriminantHints::Never = config.discriminant_hints {
@@ -43,12 +41,12 @@ pub(super) fn enum_hints(
 
 fn variant_hints(
     acc: &mut Vec<InlayHint>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     sema: &Semantics<'_, RootDatabase>,
     enum_: &ast::Enum,
     variant: &ast::Variant,
 ) -> Option<()> {
-    if variant.expr().is_some() {
+    if variant.const_arg().is_some() {
         return None;
     }
 
@@ -107,8 +105,8 @@ mod tests {
     use expect_test::expect;
 
     use crate::inlay_hints::{
-        tests::{check_edit, check_with_config, DISABLED_CONFIG},
         DiscriminantHints, InlayHintsConfig,
+        tests::{DISABLED_CONFIG, check_edit, check_with_config},
     };
 
     #[track_caller]

@@ -9,7 +9,7 @@ fn foo() -> Result<String, String> { //~ NOTE expected `String` because of this
         });
     let one = x
         .map(|s| ())
-        .map_err(|e| { //~ NOTE this can't be annotated with `?` because it has type `Result<_, ()>`
+        .map_err(|e| { //~ NOTE this has type `Result<_, ()>`
             e; //~ HELP remove this semicolon
         })
         .map(|()| "")?; //~ ERROR `?` couldn't convert the error to `String`
@@ -35,7 +35,7 @@ fn bar() -> Result<(), String> { //~ NOTE expected `String` because of this
     //~| NOTE the trait `From<()>` is not implemented for `String`
     //~| NOTE the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
     //~| NOTE required for `Result<(), String>` to implement `FromResidual<Result<Infallible, ()>>`
-    //~| HELP the following other types implement trait `From<T>`:
+    //~| HELP `String` implements trait `From<T>`:
     Ok(one)
 }
 

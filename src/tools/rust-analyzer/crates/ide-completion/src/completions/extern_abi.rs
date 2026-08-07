@@ -1,11 +1,11 @@
 //! Completes function abi strings.
 use syntax::{
-    ast::{self, IsString},
     AstNode, AstToken, SmolStr,
+    ast::{self, IsString},
 };
 
 use crate::{
-    completions::Completions, context::CompletionContext, CompletionItem, CompletionItemKind,
+    CompletionItem, CompletionItemKind, completions::Completions, context::CompletionContext,
 };
 
 // Most of these are feature gated, we should filter/add feature gate completions once we have them.
@@ -43,7 +43,7 @@ const SUPPORTED_CALLING_CONVENTIONS: &[&str] = &[
 
 pub(crate) fn complete_extern_abi(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     expanded: &ast::String,
 ) -> Option<()> {
     if !expanded.syntax().parent().is_some_and(|it| ast::Abi::can_cast(it.kind())) {

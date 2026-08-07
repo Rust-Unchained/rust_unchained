@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
+use crate::diagnostics::{CheckId, TidyCtx};
 use crate::iter_header::*;
 use crate::walk::*;
 
@@ -21,7 +22,10 @@ const IGNORES: &[&str] = &[
 const EXTENSIONS: &[&str] = &["stdout", "stderr"];
 const SPECIAL_TEST: &str = "tests/ui/command/need-crate-arg-ignore-tidy.x.rs";
 
-pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
+pub fn check(tests_path: &Path, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx
+        .start_check(CheckId::new("tests_revision_unpaired_stdout_stderr").path(tests_path));
+
     // Recurse over subdirectories under `tests/`
     walk_dir(tests_path.as_ref(), filter, &mut |entry| {
         // We are inspecting a folder. Collect the paths to interesting files `.rs`, `.stderr`,
@@ -38,7 +42,7 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
 
             let sibling_path = sibling.path();
 
-            let Some(ext) = sibling_path.extension().map(OsStr::to_str).flatten() else {
+            let Some(ext) = sibling_path.extension().and_then(OsStr::to_str) else {
                 continue;
             };
 
@@ -84,7 +88,7 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
                 }
             });
 
-            let Some(test_name) = test.file_stem().map(OsStr::to_str).flatten() else {
+            let Some(test_name) = test.file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
 
@@ -102,9 +106,9 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
         // of the form: `test-name.revision.compare_mode.extension`, but our only concern is
         // `test-name.revision` and `extension`.
         for sibling in files_under_inspection.iter().filter(|f| {
-            f.extension().map(OsStr::to_str).flatten().is_some_and(|ext| EXTENSIONS.contains(&ext))
+            f.extension().and_then(OsStr::to_str).is_some_and(|ext| EXTENSIONS.contains(&ext))
         }) {
-            let Some(filename) = sibling.file_name().map(OsStr::to_str).flatten() else {
+            let Some(filename) = sibling.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
 
@@ -122,29 +126,27 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
                 [] | [_] => return,
                 [_, _] if !expected_revisions.is_empty() => {
                     // Found unrevisioned output files for a revisioned test.
-                    tidy_error!(
-                        bad,
+                    check.error(format!(
                         "found unrevisioned output file `{}` for a revisioned test `{}`",
                         sibling.display(),
                         test_path.display(),
-                    );
+                    ));
                 }
                 [_, _] => return,
                 [_, found_revision, .., extension] => {
-                    if !IGNORES.contains(&found_revision)
+                    if !IGNORES.contains(found_revision)
                         && !expected_revisions.contains(*found_revision)
                         // This is from `//@ stderr-per-bitwidth`
-                        && !(*extension == "stderr" && ["32bit", "64bit"].contains(&found_revision))
+                        && !(*extension == "stderr" && ["32bit", "64bit"].contains(found_revision))
                     {
                         // Found some unexpected revision-esque component that is not a known
                         // compare-mode or expected revision.
-                        tidy_error!(
-                            bad,
+                        check.error(format!(
                             "found output file `{}` for unexpected revision `{}` of test `{}`",
                             sibling.display(),
                             found_revision,
                             test_path.display()
-                        );
+                        ));
                     }
                 }
             }

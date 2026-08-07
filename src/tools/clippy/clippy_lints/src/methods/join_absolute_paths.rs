@@ -1,21 +1,20 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::expr_or_init;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::source::snippet;
-use clippy_utils::ty::is_type_diagnostic_item;
-use rustc_ast::ast::LitKind;
+use clippy_utils::{expr_or_init, sym};
+use rustc_ast::ast::{LitKind, StrStyle};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_span::Span;
-use rustc_span::symbol::sym;
 
 use super::JOIN_ABSOLUTE_PATHS;
 
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, recv: &'tcx Expr<'tcx>, join_arg: &'tcx Expr<'tcx>, expr_span: Span) {
     let ty = cx.typeck_results().expr_ty(recv).peel_refs();
-    if (is_type_diagnostic_item(cx, ty, sym::Path) || is_type_diagnostic_item(cx, ty, sym::PathBuf))
+    if matches!(ty.opt_diag_name(cx), Some(sym::Path | sym::PathBuf))
         && let ExprKind::Lit(spanned) = expr_or_init(cx, join_arg).kind
-        && let LitKind::Str(symbol, _) = spanned.node
+        && let LitKind::Str(symbol, style) = spanned.node
         && let sym_str = symbol.as_str()
         && sym_str.starts_with(['/', '\\'])
     {
@@ -29,8 +28,10 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, recv: &'tcx Expr<'tcx>, join_a
 
                 let no_separator = if sym_str.starts_with('/') {
                     arg_str.replacen('/', "", 1)
-                } else {
+                } else if let StrStyle::Raw(_) = style {
                     arg_str.replacen('\\', "", 1)
+                } else {
+                    arg_str.replacen("\\\\", "", 1)
                 };
 
                 diag.note("joining a path starting with separator will replace the path instead")

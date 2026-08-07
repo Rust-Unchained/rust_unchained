@@ -1,12 +1,15 @@
 use hir::InFile;
 use syntax::{AstNode, TextRange};
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_range};
 
 // Diagnostic: incoherent-impl
 //
 // This diagnostic is triggered if the targe type of an impl is from a foreign crate.
-pub(crate) fn incoherent_impl(ctx: &DiagnosticsContext<'_>, d: &hir::IncoherentImpl) -> Diagnostic {
+pub(crate) fn incoherent_impl(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::IncoherentImpl,
+) -> Diagnostic {
     let display_range = adjusted_display_range(ctx, InFile::new(d.file_id, d.impl_), &|node| {
         Some(TextRange::new(
             node.syntax().text_range().start(),
@@ -19,6 +22,7 @@ pub(crate) fn incoherent_impl(ctx: &DiagnosticsContext<'_>, d: &hir::IncoherentI
         "cannot define inherent `impl` for foreign type".to_owned(),
         display_range,
     )
+    .stable()
 }
 
 #[cfg(test)]

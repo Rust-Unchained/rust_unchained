@@ -5,9 +5,10 @@ use std::path::{Component, Path};
 
 use cranelift_codegen::MachSrcLoc;
 use cranelift_codegen::binemit::CodeOffset;
-use gimli::write::{AttributeValue, FileId, FileInfo, LineProgram, LineString, LineStringTable};
+use gimli::write::{FileId, FileInfo, LineProgram, LineString, LineStringTable};
 use rustc_span::{
-    FileName, Pos, SourceFile, SourceFileAndLine, SourceFileHash, SourceFileHashAlgorithm, hygiene,
+    FileName, Pos, RemapPathScopeComponents, SourceFile, SourceFileAndLine,
+    SourceFileHashAlgorithm, hygiene,
 };
 
 use crate::debuginfo::FunctionDebugContext;
@@ -44,21 +45,30 @@ fn osstr_as_utf8_bytes(path: &OsStr) -> &[u8] {
     }
 }
 
-const MD5_LEN: usize = 16;
+fn make_file_info(source_file: &SourceFile, embed_source: bool) -> Option<FileInfo> {
+    let has_md5 = source_file.src_hash.kind == SourceFileHashAlgorithm::Md5;
+    let has_source = embed_source
+        && (source_file.src.is_some() || source_file.external_src.read().get_source().is_some());
 
-fn make_file_info(hash: SourceFileHash) -> Option<FileInfo> {
-    if hash.kind == SourceFileHashAlgorithm::Md5 {
-        let mut buf = [0u8; MD5_LEN];
-        buf.copy_from_slice(hash.hash_bytes());
-        Some(FileInfo {
-            timestamp: 0,
-            size: 0,
-            md5: buf,
-            source: None, // FIXME implement -Zembed-source
-        })
-    } else {
-        None
+    if !has_md5 && !has_source {
+        return None;
     }
+
+    let mut info = FileInfo::default();
+
+    if has_md5 {
+        info.md5.copy_from_slice(source_file.src_hash.hash_bytes());
+    }
+
+    if embed_source {
+        if let Some(src) = &source_file.src {
+            info.source = Some(LineString::String(src.as_bytes().to_vec()));
+        } else if let Some(src) = source_file.external_src.read().get_source() {
+            info.source = Some(LineString::String(src.as_bytes().to_vec()));
+        }
+    }
+
+    Some(info)
 }
 
 impl DebugContext {
@@ -72,26 +82,29 @@ impl DebugContext {
         let span = hygiene::walk_chain_collapsed(span, function_span);
         match tcx.sess.source_map().lookup_line(span.lo()) {
             Ok(SourceFileAndLine { sf: file, line }) => {
-                let file_id = self.add_source_file(&file);
+                let file_id = self.add_source_file(tcx, &file);
                 let line_pos = file.lines()[line];
                 let col = file.relative_position(span.lo()) - line_pos;
 
                 (file_id, u64::try_from(line).unwrap() + 1, u64::from(col.to_u32()) + 1)
             }
-            Err(file) => (self.add_source_file(&file), 0, 0),
+            Err(file) => (self.add_source_file(tcx, &file), 0, 0),
         }
     }
 
-    pub(crate) fn add_source_file(&mut self, source_file: &SourceFile) -> FileId {
+    pub(crate) fn add_source_file(&mut self, tcx: TyCtxt<'_>, source_file: &SourceFile) -> FileId {
         let cache_key = (source_file.stable_id, source_file.src_hash);
         *self.created_files.entry(cache_key).or_insert_with(|| {
+            if self.embed_source && source_file.src.is_none() {
+                tcx.sess.source_map().ensure_source_file_source_present(source_file);
+            }
             let line_program: &mut LineProgram = &mut self.dwarf.unit.line_program;
             let line_strings: &mut LineStringTable = &mut self.dwarf.line_strings;
 
             match &source_file.name {
                 FileName::Real(path) => {
                     let (dir_path, file_name) =
-                        split_path_dir_and_file(path.to_path(self.filename_display_preference));
+                        split_path_dir_and_file(path.path(RemapPathScopeComponents::DEBUGINFO));
                     let dir_name = osstr_as_utf8_bytes(dir_path.as_os_str());
                     let file_name = osstr_as_utf8_bytes(file_name);
 
@@ -105,15 +118,18 @@ impl DebugContext {
                     let file_name =
                         LineString::new(file_name, line_program.encoding(), line_strings);
 
-                    let info = make_file_info(source_file.src_hash);
+                    let info = make_file_info(source_file, self.embed_source);
 
-                    line_program.file_has_md5 &= info.is_some();
+                    let has_md5 = source_file.src_hash.kind == SourceFileHashAlgorithm::Md5;
+                    line_program.file_has_md5 &= has_md5;
                     line_program.add_file(file_name, dir_id, info)
                 }
                 filename => {
+                    // For anonymous sources, create an empty directory instead of using the default
                     let dir_id = line_program.default_directory();
+
                     let dummy_file_name = LineString::new(
-                        filename.display(self.filename_display_preference).to_string().into_bytes(),
+                        filename.prefer_remapped_unconditionally().to_string().into_bytes(),
                         line_program.encoding(),
                         line_strings,
                     );
@@ -167,10 +183,6 @@ impl FunctionDebugContext {
         let func_end = mcr.buffer.total_size();
 
         assert_ne!(func_end, 0);
-
-        let entry = debug_context.dwarf.unit.get_mut(self.entry_id);
-        entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
-        entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(func_end)));
 
         func_end
     }

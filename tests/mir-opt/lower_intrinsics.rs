@@ -1,8 +1,10 @@
 //@ test-mir-pass: LowerIntrinsics
 // EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 
-#![feature(core_intrinsics, intrinsics, rustc_attrs)]
+#![feature(core_intrinsics)]
 #![crate_type = "lib"]
+
+use std::intrinsics::copy_nonoverlapping;
 
 // EMIT_MIR lower_intrinsics.wrapping.LowerIntrinsics.diff
 pub fn wrapping(a: i32, b: i32) {
@@ -38,20 +40,6 @@ pub unsafe fn unchecked(a: i32, b: i32, c: u32) {
     let _l = core::intrinsics::unchecked_shr(a, c);
 }
 
-// EMIT_MIR lower_intrinsics.size_of.LowerIntrinsics.diff
-pub fn size_of<T>() -> usize {
-    // CHECK-LABEL: fn size_of(
-    // CHECK: {{_.*}} = SizeOf(T);
-    core::intrinsics::size_of::<T>()
-}
-
-// EMIT_MIR lower_intrinsics.align_of.LowerIntrinsics.diff
-pub fn align_of<T>() -> usize {
-    // CHECK-LABEL: fn align_of(
-    // CHECK: {{_.*}} = AlignOf(T);
-    core::intrinsics::min_align_of::<T>()
-}
-
 // EMIT_MIR lower_intrinsics.forget.LowerIntrinsics.diff
 pub fn forget<T>(t: T) {
     // CHECK-LABEL: fn forget(
@@ -71,11 +59,13 @@ pub fn unreachable() -> ! {
 // EMIT_MIR lower_intrinsics.non_const.LowerIntrinsics.diff
 pub fn non_const<T>() -> usize {
     // CHECK-LABEL: fn non_const(
-    // CHECK: SizeOf(T);
+    // CHECK: _1 = std::intrinsics::unreachable;
+    // CHECK: unreachable;
+    // CHECK-NEXT: }
 
     // Check that lowering works with non-const operand as a func.
-    let size_of_t = core::intrinsics::size_of::<T>;
-    size_of_t()
+    let unreachable = core::intrinsics::unreachable;
+    unsafe { unreachable() }
 }
 
 // EMIT_MIR lower_intrinsics.transmute_inhabited.LowerIntrinsics.diff
@@ -153,11 +143,6 @@ pub fn discriminant<T>(t: T) {
     core::intrinsics::discriminant_value(&E::B);
 }
 
-// Cannot use `std::intrinsics::copy_nonoverlapping` as that is a wrapper function
-#[rustc_nounwind]
-#[rustc_intrinsic]
-unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
-
 // EMIT_MIR lower_intrinsics.f_copy_nonoverlapping.LowerIntrinsics.diff
 pub fn f_copy_nonoverlapping() {
     // CHECK-LABEL: fn f_copy_nonoverlapping(
@@ -212,17 +197,6 @@ pub fn read_via_copy_uninhabited(r: &Never) -> Never {
     unsafe { core::intrinsics::read_via_copy(r) }
 }
 
-// EMIT_MIR lower_intrinsics.write_via_move_string.LowerIntrinsics.diff
-pub fn write_via_move_string(r: &mut String, v: String) {
-    // CHECK-LABEL: fn write_via_move_string(
-    // CHECK: [[ptr:_.*]] = &raw mut (*_1);
-    // CHECK: [[tmp:_.*]] = move _2;
-    // CHECK: (*[[ptr]]) = move [[tmp]];
-    // CHECK: return;
-
-    unsafe { core::intrinsics::write_via_move(r, v) }
-}
-
 pub enum Never {}
 
 // EMIT_MIR lower_intrinsics.ptr_offset.LowerIntrinsics.diff
@@ -265,4 +239,25 @@ pub fn get_metadata(a: *const i32, b: *const [u8], c: *const dyn std::fmt::Debug
     let _unit = ptr_metadata(a);
     let _usize = ptr_metadata(b);
     let _vtable = ptr_metadata(c);
+}
+
+// EMIT_MIR lower_intrinsics.slice_get.LowerIntrinsics.diff
+pub unsafe fn slice_get<'a, 'b>(
+    r: &'a [i8],
+    rm: &'b mut [i16],
+    p: *const [i32],
+    pm: *mut [i64],
+    i: usize,
+) -> (&'a i8, &'b mut i16, *const i32, *mut i64) {
+    use std::intrinsics::slice_get_unchecked;
+    // CHECK: = &(*_{{[0-9]+}})[_{{[0-9]+}}]
+    // CHECK: = &mut (*_{{[0-9]+}})[_{{[0-9]+}}]
+    // CHECK: = &raw const (*_{{[0-9]+}})[_{{[0-9]+}}]
+    // CHECK: = &raw mut (*_{{[0-9]+}})[_{{[0-9]+}}]
+    (
+        slice_get_unchecked(r, i),
+        slice_get_unchecked(rm, i),
+        slice_get_unchecked(p, i),
+        slice_get_unchecked(pm, i),
+    )
 }

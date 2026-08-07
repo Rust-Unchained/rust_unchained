@@ -1,28 +1,28 @@
 use super::OBFUSCATED_IF_ELSE;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::eager_or_lazy::switch_to_eager_eval;
-use clippy_utils::get_parent_expr;
-use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::source::snippet_with_context;
 use clippy_utils::sugg::Sugg;
+use clippy_utils::{get_parent_expr, sym};
 use rustc_errors::Applicability;
-use rustc_hir as hir;
-use rustc_hir::ExprKind;
+use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
+use rustc_span::Symbol;
 
+#[expect(clippy::needless_pass_by_value)]
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
-    expr: &'tcx hir::Expr<'_>,
-    then_recv: &'tcx hir::Expr<'_>,
-    then_arg: &'tcx hir::Expr<'_>,
-    unwrap_arg: Option<&'tcx hir::Expr<'_>>,
-    then_method_name: &str,
-    unwrap_method_name: &str,
+    expr: &'tcx Expr<'_>,
+    then_recv: &'tcx Expr<'_>,
+    then_arg: &'tcx Expr<'_>,
+    then_method_name: Symbol,
+    unwrap: Unwrap<'tcx>,
 ) {
     let recv_ty = cx.typeck_results().expr_ty(then_recv);
 
     if recv_ty.is_bool() {
         let then_eager = switch_to_eager_eval(cx, then_arg);
-        let unwrap_eager = unwrap_arg.is_none_or(|arg| switch_to_eager_eval(cx, arg));
+        let unwrap_eager = unwrap.arg().is_none_or(|arg| switch_to_eager_eval(cx, arg));
 
         let mut applicability = if then_eager && unwrap_eager {
             Applicability::MachineApplicable
@@ -31,31 +31,32 @@ pub(super) fn check<'tcx>(
         };
 
         let if_then = match then_method_name {
-            "then" if let ExprKind::Closure(closure) = then_arg.kind => {
+            sym::then if let ExprKind::Closure(closure) = then_arg.kind => {
                 let body = cx.tcx.hir_body(closure.body);
-                snippet_with_applicability(cx, body.value.span, "..", &mut applicability)
+                snippet_with_context(cx, body.value.span, expr.span.ctxt(), "..", &mut applicability).0
             },
-            "then_some" => snippet_with_applicability(cx, then_arg.span, "..", &mut applicability),
+            sym::then_some => snippet_with_context(cx, then_arg.span, expr.span.ctxt(), "..", &mut applicability).0,
             _ => return,
         };
 
-        // FIXME: Add `unwrap_or_else` and `unwrap_or_default` symbol
-        let els = match unwrap_method_name {
-            "unwrap_or" => snippet_with_applicability(cx, unwrap_arg.unwrap().span, "..", &mut applicability),
-            "unwrap_or_else" if let ExprKind::Closure(closure) = unwrap_arg.unwrap().kind => {
-                let body = cx.tcx.hir_body(closure.body);
-                snippet_with_applicability(cx, body.value.span, "..", &mut applicability)
+        let els = match unwrap {
+            Unwrap::Or(arg) => snippet_with_context(cx, arg.span, expr.span.ctxt(), "..", &mut applicability).0,
+            Unwrap::OrElse(arg) => match arg.kind {
+                ExprKind::Closure(closure) => {
+                    let body = cx.tcx.hir_body(closure.body);
+                    snippet_with_context(cx, body.value.span, expr.span.ctxt(), "..", &mut applicability).0
+                },
+                ExprKind::Path(_) => {
+                    snippet_with_context(cx, arg.span, expr.span.ctxt(), "_", &mut applicability).0 + "()"
+                },
+                _ => return,
             },
-            "unwrap_or_else" if let ExprKind::Path(_) = unwrap_arg.unwrap().kind => {
-                snippet_with_applicability(cx, unwrap_arg.unwrap().span, "_", &mut applicability) + "()"
-            },
-            "unwrap_or_default" => "Default::default()".into(),
-            _ => return,
+            Unwrap::OrDefault => "Default::default()".into(),
         };
 
         let sugg = format!(
             "if {} {{ {} }} else {{ {} }}",
-            Sugg::hir_with_applicability(cx, then_recv, "..", &mut applicability),
+            Sugg::hir_with_context(cx, then_recv, expr.span.ctxt(), "..", &mut applicability),
             if_then,
             els
         );
@@ -80,5 +81,20 @@ pub(super) fn check<'tcx>(
             sugg,
             applicability,
         );
+    }
+}
+
+pub(super) enum Unwrap<'tcx> {
+    Or(&'tcx Expr<'tcx>),
+    OrElse(&'tcx Expr<'tcx>),
+    OrDefault,
+}
+
+impl<'tcx> Unwrap<'tcx> {
+    fn arg(&self) -> Option<&'tcx Expr<'tcx>> {
+        match self {
+            Self::Or(a) | Self::OrElse(a) => Some(a),
+            Self::OrDefault => None,
+        }
     }
 }

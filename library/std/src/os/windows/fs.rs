@@ -4,10 +4,10 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::fs::{self, Metadata, OpenOptions};
+use crate::fs::{self, Metadata, OpenOptions, Permissions};
+use crate::io::BorrowedCursor;
 use crate::path::Path;
-use crate::sealed::Sealed;
-use crate::sys_common::{AsInner, AsInnerMut, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 use crate::time::SystemTime;
 use crate::{io, sys};
 
@@ -31,7 +31,8 @@ pub trait FileExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs::File;
     /// use std::os::windows::prelude::*;
@@ -48,6 +49,45 @@ pub trait FileExt {
     /// ```
     #[stable(feature = "file_offset", since = "1.15.0")]
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+
+    /// Seeks to a given position and reads some bytes into the buffer.
+    ///
+    /// This is equivalent to the [`seek_read`](FileExt::seek_read) method, except that it is passed
+    /// a [`BorrowedCursor`] rather than `&mut [u8]` to allow use with uninitialized buffers. The
+    /// new data will be appended to any existing contents of `buf`.
+    ///
+    /// Reading beyond the end of the file will always succeed without reading any bytes.
+    ///
+    /// # Examples
+    ///
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
+    /// #![feature(core_io_borrowed_buf)]
+    /// #![feature(read_buf_at)]
+    ///
+    /// use std::io;
+    /// use std::io::BorrowedBuf;
+    /// use std::fs::File;
+    /// use std::mem::MaybeUninit;
+    /// use std::os::windows::prelude::*;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut file = File::open("pi.txt")?;
+    ///
+    ///     // Read some bytes starting from offset 2
+    ///     let mut buf: [MaybeUninit<u8>; 10] = [MaybeUninit::uninit(); 10];
+    ///     let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+    ///     file.seek_read_buf(buf.unfilled(), 2)?;
+    ///
+    ///     assert!(buf.filled().starts_with(b"1"));
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "read_buf_at", issue = "140771")]
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        io::default_read_buf(|b| self.seek_read(b, offset), buf)
+    }
 
     /// Seeks to a given position and writes a number of bytes.
     ///
@@ -66,7 +106,8 @@ pub trait FileExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::File;
     /// use std::os::windows::prelude::*;
     ///
@@ -89,12 +130,18 @@ impl FileExt for fs::File {
         self.as_inner().read_at(buf, offset)
     }
 
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        self.as_inner().read_buf_at(buf, offset)
+    }
+
     fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         self.as_inner().write_at(buf, offset)
     }
 }
 
 /// Windows-specific extensions to [`fs::OpenOptions`].
+// WARNING: This trait is not sealed. DON'T add any new methods!
+// Add them to OpenOptionsExt2 instead.
 #[stable(feature = "open_options_ext", since = "1.10.0")]
 pub trait OpenOptionsExt {
     /// Overrides the `dwDesiredAccess` argument to the call to [`CreateFile`]
@@ -107,7 +154,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::OpenOptions;
     /// use std::os::windows::prelude::*;
     ///
@@ -132,7 +180,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::fs::OpenOptions;
     /// use std::os::windows::prelude::*;
     ///
@@ -158,7 +207,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -196,7 +246,8 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -238,7 +289,8 @@ pub trait OpenOptionsExt {
 
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// # #![allow(unexpected_cfgs)]
     /// # #[cfg(for_demonstration_only)]
     /// extern crate winapi;
@@ -292,6 +344,94 @@ impl OpenOptionsExt for OpenOptions {
     }
 }
 
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+pub impl(self) trait OpenOptionsExt2 {
+    /// If set to `true`, prevent the "last access time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self;
+
+    /// If set to `true`, prevent the "last write time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
+}
+
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+impl OpenOptionsExt2 for OpenOptions {
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_access_time(freeze);
+        self
+    }
+
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_write_time(freeze);
+        self
+    }
+}
+
+/// Windows-specific extensions to [`fs::Permissions`]. This extension trait
+/// provides extra utilities to shows what Windows file attributes are enabled
+/// in [`Permissions`] and to manually set file attributes on [`Permissions`].
+///
+/// See Microsoft's [`File Attribute Constants`] page to know what file
+/// attribute metadata are defined and stored on Windows files.
+///
+/// [`Permissions`]: fs::Permissions
+/// [`File Attribute Constants`]:
+///     https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
+///
+/// # Example
+///
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
+/// #![feature(windows_permissions_ext)]
+/// use std::fs::Permissions;
+/// use std::os::windows::fs::PermissionsExt;
+///
+/// const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+/// const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// let my_file_attr = FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+/// let mut permissions = Permissions::from_file_attributes(my_file_attr);
+/// assert_eq!(permissions.file_attributes(), my_file_attr);
+///
+/// const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+/// let new_file_attr = permissions.file_attributes() | FILE_ATTRIBUTE_HIDDEN;
+/// permissions.set_file_attributes(new_file_attr);
+/// assert_eq!(permissions.file_attributes(), new_file_attr);
+/// ```
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+pub impl(self) trait PermissionsExt {
+    /// Returns the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn file_attributes(&self) -> u32;
+
+    /// Sets the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn set_file_attributes(&mut self, mask: u32);
+
+    /// Creates a new instance from the given file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn from_file_attributes(mask: u32) -> Self;
+}
+
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+impl PermissionsExt for fs::Permissions {
+    fn file_attributes(&self) -> u32 {
+        self.as_inner().file_attributes()
+    }
+
+    fn set_file_attributes(&mut self, mask: u32) {
+        *self = Permissions::from_inner(FromInner::from_inner(mask));
+    }
+
+    fn from_file_attributes(mask: u32) -> Self {
+        Permissions::from_inner(FromInner::from_inner(mask))
+    }
+}
+
 /// Windows-specific extensions to [`fs::Metadata`].
 ///
 /// The data members that this trait exposes correspond to the members
@@ -309,7 +449,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -339,7 +480,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -374,7 +516,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -407,7 +550,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -430,7 +574,8 @@ pub trait MetadataExt {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(windows, doc = "```no_run")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// use std::io;
     /// use std::fs;
     /// use std::os::windows::prelude::*;
@@ -518,7 +663,7 @@ impl MetadataExt for Metadata {
 ///
 /// On Windows, a symbolic link knows whether it is a file or directory.
 #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
-pub trait FileTypeExt: Sealed {
+pub impl(self) trait FileTypeExt {
     /// Returns `true` if this file type is a symbolic link that is also a directory.
     #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_dir(&self) -> bool;
@@ -526,9 +671,6 @@ pub trait FileTypeExt: Sealed {
     #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_file(&self) -> bool;
 }
-
-#[stable(feature = "windows_file_type_ext", since = "1.64.0")]
-impl Sealed for fs::FileType {}
 
 #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
 impl FileTypeExt for fs::FileType {
@@ -542,7 +684,7 @@ impl FileTypeExt for fs::FileType {
 
 /// Windows-specific extensions to [`fs::FileTimes`].
 #[stable(feature = "file_set_times", since = "1.75.0")]
-pub trait FileTimesExt: Sealed {
+pub impl(self) trait FileTimesExt {
     /// Set the creation time of a file.
     #[stable(feature = "file_set_times", since = "1.75.0")]
     fn set_created(self, t: SystemTime) -> Self;
@@ -572,7 +714,8 @@ impl FileTimesExt for fs::FileTimes {
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
 /// use std::os::windows::fs;
 ///
 /// fn main() -> std::io::Result<()> {
@@ -611,7 +754,8 @@ pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io:
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(windows, doc = "```no_run")]
+#[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
 /// use std::os::windows::fs;
 ///
 /// fn main() -> std::io::Result<()> {

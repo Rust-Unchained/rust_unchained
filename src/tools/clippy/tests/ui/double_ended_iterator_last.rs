@@ -2,7 +2,7 @@
 
 // Typical case
 pub fn last_arg(s: &str) -> Option<&str> {
-    s.split(' ').last() //~ ERROR: called `Iterator::last` on a `DoubleEndedIterator`
+    s.split(' ').last() //~ double_ended_iterator_last
 }
 
 fn main() {
@@ -19,7 +19,7 @@ fn main() {
             Some(())
         }
     }
-    let _ = DeIterator.last(); //~ ERROR: called `Iterator::last` on a `DoubleEndedIterator`
+    let _ = DeIterator.last(); //~ double_ended_iterator_last
     // Should not apply to other methods of Iterator
     let _ = DeIterator.count();
 
@@ -81,9 +81,27 @@ fn issue_14139() {
     let (subindex, _) = (index.by_ref().take(3), 42);
     let _ = subindex.last();
     let _ = index.next();
+
+    let mut index = [true, true, false, false, false, true].iter();
+    let subindex = (index.by_ref().take(3), 42);
+    let _ = subindex.0.last();
+    let _ = index.next();
 }
 
 fn drop_order() {
+    struct DropDeIterator(std::vec::IntoIter<S>);
+    impl Iterator for DropDeIterator {
+        type Item = S;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+    }
+    impl DoubleEndedIterator for DropDeIterator {
+        fn next_back(&mut self) -> Option<Self::Item> {
+            self.0.next_back()
+        }
+    }
+
     struct S(&'static str);
     impl std::ops::Drop for S {
         fn drop(&mut self) {
@@ -92,9 +110,15 @@ fn drop_order() {
     }
 
     let v = vec![S("one"), S("two"), S("three")];
-    let v = v.into_iter();
+    let v = DropDeIterator(v.into_iter());
     println!("Last element is {}", v.last().unwrap().0);
     //~^ ERROR: called `Iterator::last` on a `DoubleEndedIterator`
+
+    let v = vec![S("four"), S("five"), S("six")];
+    let v = (DropDeIterator(v.into_iter()), 42);
+    println!("Last element is {}", v.0.last().unwrap().0);
+    //~^ ERROR: called `Iterator::last` on a `DoubleEndedIterator`
+
     println!("Done");
 }
 

@@ -2,12 +2,13 @@ use std::fmt;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext};
+use rustc_type_ir_macros::GenericTypeVisitable;
 
 use self::RegionKind::*;
-use crate::{DebruijnIndex, Interner};
+use crate::{BoundRegion, BoundVarIndexKind, Interner, PlaceholderRegion};
 
 rustc_index::newtype_index! {
     /// A **region** **v**ariable **ID**.
@@ -15,7 +16,7 @@ rustc_index::newtype_index! {
     #[orderable]
     #[debug_format = "'?{}"]
     #[gate_rustc_only]
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     pub struct RegionVid {}
 }
 
@@ -33,26 +34,26 @@ rustc_index::newtype_index! {
 /// In general, the region lattice looks like
 ///
 /// ```text
-/// static ----------+-----...------+       (greatest)
+/// empty(Un) --------                      (smallest)
+/// |                 \
+/// ...                \
+/// |                   \
+/// empty(U1) --         \
+/// |           \         placeholder(Un)
+/// |            \                  |
+/// empty(root)   placeholder(U1)   |
+/// |                |              |
+/// |                |              |
 /// |                |              |
 /// param regions    |              |
 /// |                |              |
-/// |                |              |
-/// |                |              |
-/// empty(root)   placeholder(U1)   |
-/// |            /                  |
-/// |           /         placeholder(Un)
-/// empty(U1) --         /
-/// |                   /
-/// ...                /
-/// |                 /
-/// empty(Un) --------                      (smallest)
+/// static ----------+-----...------+       (greatest)
 /// ```
 ///
-/// Early-bound/free regions are the named lifetimes in scope from the
-/// function declaration. They have relationships to one another
-/// determined based on the declared relationships from the
-/// function.
+/// Lifetimes in scope from a function declaration are represented via
+/// [`RegionKind::ReEarlyParam`]/[`RegionKind::ReLateParam`]. They
+/// have relationships to one another and `'static` based on the
+/// declared relationships from the function.
 ///
 /// Note that inference variables and bound regions are not included
 /// in this diagram. In the case of inference variables, they should
@@ -61,29 +62,36 @@ rustc_index::newtype_index! {
 /// include -- the diagram indicates the relationship between free
 /// regions.
 ///
+/// You can read more about the distinction between early and late bound
+/// parameters in the rustc dev guide: [Early vs Late bound parameters].
+///
+/// A note on subtyping: If we assume that references take their region
+/// covariantly, and use that to define the subtyping relationship of regions,
+/// it may be somewhat surprising that `'empty` is Top and `'static` is Bottom,
+/// and that "`'a` is a subtype of `'b`" is defined as "`'a` is bigger than
+/// `'b`" - good to keep in mind.
+///
 /// ## Inference variables
 ///
 /// During region inference, we sometimes create inference variables,
-/// represented as `ReVar`. These will be inferred by the code in
-/// `infer::lexical_region_resolve` to some free region from the
-/// lattice above (the minimal region that meets the
+/// represented as [`RegionKind::ReVar`]. These will be inferred by
+/// the code in `infer::lexical_region_resolve` to some free region
+/// from the lattice above (the minimal region that meets the
 /// constraints).
 ///
 /// During NLL checking, where regions are defined differently, we
-/// also use `ReVar` -- in that case, the index is used to index into
-/// the NLL region checker's data structures. The variable may in fact
-/// represent either a free region or an inference variable, in that
-/// case.
+/// also use [`RegionKind::ReVar`] -- in that case, the index is used
+/// to index into the NLL region checker's data structures. The
+/// variable may in fact represent either a free region or an
+/// inference variable, in that case.
 ///
 /// ## Bound Regions
 ///
 /// These are regions that are stored behind a binder and must be instantiated
-/// with some concrete region before being used. There are two kind of
-/// bound regions: early-bound, which are bound in an item's `Generics`,
-/// and are instantiated by an `GenericArgs`, and late-bound, which are part of
-/// higher-ranked types (e.g., `for<'a> fn(&'a ())`), and are instantiated by
-/// the likes of `liberate_late_bound_regions`. The distinction exists
-/// because higher-ranked lifetimes aren't supported in all places. See [1][2].
+/// with some concrete region before being used. A type can be wrapped in a
+/// `Binder`, which introduces new type/const/lifetime variables (e.g., `for<'a>
+/// fn(&'a ())`). These parameters are referred to via [`RegionKind::ReBound`].
+/// You can instantiate them by the likes of `liberate_late_bound_regions`.
 ///
 /// Unlike `Param`s, bound regions are not supposed to exist "in the wild"
 /// outside their binder, e.g., in types passed to type inference, and
@@ -122,10 +130,10 @@ rustc_index::newtype_index! {
 /// happen, you can use `leak_check`. This is more clearly explained
 /// by the [rustc dev guide].
 ///
-/// [1]: https://smallcultfollowing.com/babysteps/blog/2013/10/29/intermingled-parameter-lists/
-/// [2]: https://smallcultfollowing.com/babysteps/blog/2013/11/04/intermingled-parameter-lists/
+/// [Early vs Late bound parameters]: https://rustc-dev-guide.rust-lang.org/early-late-parameters.html
 /// [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/hrtb.html
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
+#[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext))]
 pub enum RegionKind<I: Interner> {
     /// A region parameter; for example `'a` in `impl<'a> Trait for &'a ()`.
@@ -147,18 +155,18 @@ pub enum RegionKind<I: Interner> {
     /// Bound regions inside of types **must not** be erased, as they impact trait
     /// selection and the `TypeId` of that type. `for<'a> fn(&'a ())` and
     /// `fn(&'static ())` are different types and have to be treated as such.
-    ReBound(DebruijnIndex, I::BoundRegion),
+    ReBound(BoundVarIndexKind, BoundRegion<I>),
 
     /// Late-bound function parameters are represented using a `ReBound`. When
     /// inside of a function, we convert these bound variables to placeholder
     /// parameters via `tcx.liberate_late_bound_regions`. They are then treated
     /// the same way as `ReEarlyParam` while inside of the function.
     ///
-    /// See <https://rustc-dev-guide.rust-lang.org/early-late-bound-params/early-late-bound-summary.html> for
+    /// See <https://rustc-dev-guide.rust-lang.org/early_late_parameters.html> for
     /// more info about early and late bound lifetime parameters.
     ReLateParam(I::LateParamRegion),
 
-    /// Static data that has an "infinite" lifetime. Top in the region lattice.
+    /// Static data that has an "infinite" lifetime. Bottom in the region lattice.
     ReStatic,
 
     /// A region variable. Should not exist outside of type inference.
@@ -168,7 +176,7 @@ pub enum RegionKind<I: Interner> {
     /// Should not exist outside of type inference.
     ///
     /// Used when instantiating a `forall` binder via `infcx.enter_forall`.
-    RePlaceholder(I::PlaceholderRegion),
+    RePlaceholder(PlaceholderRegion<I>),
 
     /// Erased region, used by trait selection, in MIR and during codegen.
     ReErased,
@@ -176,6 +184,8 @@ pub enum RegionKind<I: Interner> {
     /// A region that resulted from some other error. Used exclusively for diagnostics.
     ReError(I::ErrorGuaranteed),
 }
+
+impl<I: Interner> Eq for RegionKind<I> {}
 
 impl<I: Interner> fmt::Debug for RegionKind<I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -193,7 +203,7 @@ impl<I: Interner> fmt::Debug for RegionKind<I> {
 
             ReVar(vid) => write!(f, "{vid:?}"),
 
-            RePlaceholder(placeholder) => write!(f, "{placeholder:?}"),
+            RePlaceholder(placeholder) => write!(f, "'{placeholder:?}"),
 
             // Use `'{erased}` as the output instead of `'erased` so that its more obviously distinct from
             // a `ReEarlyParam` named `'erased`. Technically that would print as `'erased/#IDX` so this is
@@ -205,34 +215,35 @@ impl<I: Interner> fmt::Debug for RegionKind<I> {
     }
 }
 
+// This impl could be derived with `StableHash_NoContext`, but we instead write it by hand in order
+// to panic on `ReVar`.
 #[cfg(feature = "nightly")]
-// This is not a derived impl because a derive would require `I: HashStable`
-impl<CTX, I: Interner> HashStable<CTX> for RegionKind<I>
+impl<I: Interner> StableHash for RegionKind<I>
 where
-    I::EarlyParamRegion: HashStable<CTX>,
-    I::BoundRegion: HashStable<CTX>,
-    I::LateParamRegion: HashStable<CTX>,
-    I::PlaceholderRegion: HashStable<CTX>,
+    I::EarlyParamRegion: StableHash,
+    I::LateParamRegion: StableHash,
+    I::DefId: StableHash,
+    I::Symbol: StableHash,
 {
     #[inline]
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
-        std::mem::discriminant(self).hash_stable(hcx, hasher);
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        std::mem::discriminant(self).stable_hash(hcx, hasher);
         match self {
             ReErased | ReStatic | ReError(_) => {
                 // No variant fields to hash for these ...
             }
             ReBound(d, r) => {
-                d.hash_stable(hcx, hasher);
-                r.hash_stable(hcx, hasher);
+                d.stable_hash(hcx, hasher);
+                r.stable_hash(hcx, hasher);
             }
             ReEarlyParam(r) => {
-                r.hash_stable(hcx, hasher);
+                r.stable_hash(hcx, hasher);
             }
             ReLateParam(r) => {
-                r.hash_stable(hcx, hasher);
+                r.stable_hash(hcx, hasher);
             }
             RePlaceholder(r) => {
-                r.hash_stable(hcx, hasher);
+                r.stable_hash(hcx, hasher);
             }
             ReVar(_) => {
                 panic!("region variables should not be hashed: {self:?}")

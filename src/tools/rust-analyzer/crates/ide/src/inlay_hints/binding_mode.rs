@@ -8,7 +8,6 @@ use hir::Mutability;
 use ide_db::famous_defs::FamousDefs;
 
 use ide_db::text_edit::TextEditBuilder;
-use span::EditionedFileId;
 use syntax::ast::{self, AstNode};
 
 use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, InlayKind};
@@ -16,8 +15,7 @@ use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, Inla
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
-    _file_id: EditionedFileId,
+    config: &InlayHintsConfig<'_>,
     pat: &ast::Pat,
 ) -> Option<()> {
     if !config.binding_mode_hints {
@@ -128,8 +126,8 @@ mod tests {
     use expect_test::expect;
 
     use crate::{
-        inlay_hints::tests::{check_edit, check_with_config, DISABLED_CONFIG},
         InlayHintsConfig,
+        inlay_hints::tests::{DISABLED_CONFIG, check_edit, check_with_config},
     };
 
     #[test]
@@ -171,13 +169,14 @@ fn __(
     }
     match &(0,) {
         (x,) | (x,) => (),
-      //^^^^^^^^^^^)
-      //^^^^^^^^^^^&(
+      //^^^^&
        //^ ref
               //^ ref
+             //^^^^&
         ((x,) | (x,)) => (),
-      //^^^^^^^^^^^^^&
+       //^^^^&
         //^ ref
+              //^^^^&
                //^ ref
     }
     match &mut (0,) {
@@ -185,7 +184,8 @@ fn __(
       //^^^^ &mut
        //^ ref mut
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -219,8 +219,8 @@ fn main() {
             expect![[r#"
                 fn main() {
                     match &(0,) {
-                        &(&((ref x,) | (ref x,))) => (),
-                        &((ref x,) | (ref x,)) => (),
+                        &(ref x,) | &(ref x,) => (),
+                        (&(ref x,) | &(ref x,)) => (),
                     }
                 }
             "#]],

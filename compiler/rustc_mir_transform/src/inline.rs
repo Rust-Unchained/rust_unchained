@@ -1,11 +1,11 @@
 //! Inlining pass for MIR functions.
 
-use std::assert_matches::debug_assert_matches;
-use std::iter;
 use std::ops::{Range, RangeFrom};
+use std::{debug_assert_matches, iter};
 
 use rustc_abi::{ExternAbi, FieldIdx};
-use rustc_attr_parsing::{InlineAttr, OptimizeAttr};
+use rustc_data_structures::thin_vec::ThinVec;
+use rustc_hir::attrs::{InlineAttr, OptimizeAttr};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::Idx;
@@ -14,16 +14,17 @@ use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, Instance, InstanceKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized,
+};
 use rustc_session::config::{DebugInfo, OptLevel};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::cost_checker::{CostChecker, is_call_like};
-use crate::deref_separator::deref_finder;
-use crate::simplify::simplify_cfg;
+use crate::simplify::{UsedInStmtLocals, simplify_cfg};
 use crate::validate::validate_types;
-use crate::{check_inline, util};
+use crate::{PassPolicy, check_inline, util};
 
 pub(crate) mod cycle;
 
@@ -43,19 +44,18 @@ struct CallSite<'tcx> {
 pub struct Inline;
 
 impl<'tcx> crate::MirPass<'tcx> for Inline {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        if let Some(enabled) = sess.opts.unstable_opts.inline_mir {
-            return enabled;
-        }
-
-        match sess.mir_opt_level() {
-            0 | 1 => false,
-            2 => {
-                (sess.opts.optimize == OptLevel::More || sess.opts.optimize == OptLevel::Aggressive)
-                    && sess.opts.incremental == None
-            }
-            _ => true,
-        }
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        let enabled_by_default =
+            sess.opts.unstable_opts.inline_mir.unwrap_or_else(|| match sess.mir_opt_level() {
+                0 | 1 => false,
+                2 => {
+                    (sess.opts.optimize == OptLevel::More
+                        || sess.opts.optimize == OptLevel::Aggressive)
+                        && sess.opts.incremental == None
+                }
+                _ => true,
+            });
+        PassPolicy::optimization(enabled_by_default)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -64,12 +64,7 @@ impl<'tcx> crate::MirPass<'tcx> for Inline {
         if inline::<NormalInliner<'tcx>>(tcx, body) {
             debug!("running simplify cfg on {:?}", body.source);
             simplify_cfg(tcx, body);
-            deref_finder(tcx, body);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -82,16 +77,9 @@ impl ForceInline {
 }
 
 impl<'tcx> crate::MirPass<'tcx> for ForceInline {
-    fn is_enabled(&self, _: &rustc_session::Session) -> bool {
-        true
-    }
-
-    fn can_be_overridden(&self) -> bool {
-        false
-    }
-
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        // Forced inlining is part of MIR semantics.
+        PassPolicy::Required
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -100,7 +88,6 @@ impl<'tcx> crate::MirPass<'tcx> for ForceInline {
         if inline::<ForceInliner<'tcx>>(tcx, body) {
             debug!("running simplify cfg on {:?}", body.source);
             simplify_cfg(tcx, body);
-            deref_finder(tcx, body);
         }
     }
 }
@@ -248,21 +235,23 @@ impl<'tcx> Inliner<'tcx> for ForceInliner<'tcx> {
     fn on_inline_failure(&self, callsite: &CallSite<'tcx>, reason: &'static str) {
         let tcx = self.tcx();
         let InlineAttr::Force { attr_span, reason: justification } =
-            tcx.codegen_fn_attrs(callsite.callee.def_id()).inline
+            tcx.codegen_instance_attrs(callsite.callee.def).inline
         else {
             bug!("called on item without required inlining");
         };
 
         let call_span = callsite.source_info.span;
-        tcx.dcx().emit_err(crate::errors::ForceInlineFailure {
+        let callee = tcx.def_path_str(callsite.callee.def_id());
+        tcx.dcx().emit_err(crate::diagnostics::ForceInlineFailure {
             call_span,
             attr_span,
             caller_span: tcx.def_span(self.def_id),
             caller: tcx.def_path_str(self.def_id),
             callee_span: tcx.def_span(callsite.callee.def_id()),
-            callee: tcx.def_path_str(callsite.callee.def_id()),
+            callee: callee.clone(),
             reason,
-            justification: justification.map(|sym| crate::errors::ForceInlineJustification { sym }),
+            justification: justification
+                .map(|sym| crate::diagnostics::ForceInlineJustification { sym, callee }),
         });
     }
 }
@@ -413,13 +402,16 @@ impl<'tcx> Inliner<'tcx> for NormalInliner<'tcx> {
 
             let term = blk.terminator();
             let caller_attrs = tcx.codegen_fn_attrs(self.caller_def_id());
-            if let TerminatorKind::Drop { ref place, target, unwind, replace: _ } = term.kind {
+            if let TerminatorKind::Drop { ref place, target, unwind, replace: _, drop: _ } =
+                term.kind
+            {
                 work_list.push(target);
 
                 // If the place doesn't actually need dropping, treat it like a regular goto.
-                let ty = callsite
-                    .callee
-                    .instantiate_mir(tcx, ty::EarlyBinder::bind(&place.ty(callee_body, tcx).ty));
+                let ty = callsite.callee.instantiate_mir(
+                    tcx,
+                    ty::EarlyBinder::bind(tcx, place.ty(callee_body, tcx).ty),
+                );
                 if ty.needs_drop(tcx, self.typing_env())
                     && let UnwindAction::Cleanup(unwind) = unwind
                 {
@@ -554,19 +546,35 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
             }
 
             // To resolve an instance its args have to be fully normalized.
-            let args = tcx.try_normalize_erasing_regions(inliner.typing_env(), args).ok()?;
-            let callee =
+            let args = tcx
+                .try_normalize_erasing_regions(inliner.typing_env(), Unnormalized::new_wip(args))
+                .ok()?
+                .no_bound_vars()
+                .unwrap();
+            let mut callee =
                 Instance::try_resolve(tcx, inliner.typing_env(), def_id, args).ok().flatten()?;
 
-            if let InstanceKind::Virtual(..) | InstanceKind::Intrinsic(_) = callee.def {
+            if let InstanceKind::Virtual(..) = callee.def {
                 return None;
+            }
+            if let InstanceKind::Intrinsic(..) = callee.def {
+                let intrinsic = tcx.intrinsic(def_id).unwrap();
+                if intrinsic.must_be_overridden {
+                    return None; // intrinsic without fallback body
+                }
+                if !tcx.sess.fallback_intrinsics.contains(&intrinsic.name) {
+                    return None; // intrinsic that the backend may want to overwrite
+                }
+                // The callee is the fallback body.
+                debug!("callsite is fallback body: {def_id:?}");
+                callee = ty::Instance { def: ty::InstanceKind::Item(def_id), args: callee.args };
             }
 
             if inliner.history().contains(&callee.def_id()) {
                 return None;
             }
 
-            let fn_sig = tcx.fn_sig(def_id).instantiate(tcx, args);
+            let fn_sig = tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip();
 
             // Additionally, check that the body that we're inlining actually agrees
             // with the ABI of the trait that the item comes from.
@@ -598,10 +606,10 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
     let tcx = inliner.tcx();
     check_mir_is_available(inliner, caller_body, callsite.callee)?;
 
-    let callee_attrs = tcx.codegen_fn_attrs(callsite.callee.def_id());
+    let callee_attrs = tcx.codegen_instance_attrs(callsite.callee.def);
+    let callee_attrs = callee_attrs.as_ref();
     check_inline::is_inline_valid_on_fn(tcx, callsite.callee.def_id())?;
     check_codegen_attributes(inliner, callsite, callee_attrs)?;
-    inliner.check_codegen_attributes_extra(callee_attrs)?;
 
     let terminator = caller_body[callsite.block].terminator.as_ref().unwrap();
     let TerminatorKind::Call { args, destination, .. } = &terminator.kind else { bug!() };
@@ -621,7 +629,7 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
     let Ok(callee_body) = callsite.callee.try_instantiate_mir_and_normalize_erasing_regions(
         tcx,
         inliner.typing_env(),
-        ty::EarlyBinder::bind(callee_body.clone()),
+        ty::EarlyBinder::bind(tcx, callee_body.clone()),
     ) else {
         debug!("failed to normalize callee body");
         return Err("implementation limitation -- could not normalize callee body");
@@ -629,7 +637,7 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
 
     // Normally, this shouldn't be required, but trait normalization failure can create a
     // validation ICE.
-    if !validate_types(tcx, inliner.typing_env(), &callee_body, &caller_body).is_empty() {
+    if !validate_types(tcx, inliner.typing_env(), &callee_body, caller_body).is_empty() {
         debug!("failed to validate callee body");
         return Err("implementation limitation -- callee body failed validation");
     }
@@ -712,7 +720,7 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
             }
         }
         // These have no own callable MIR.
-        InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => {
+        InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..) => {
             debug!("instance without MIR (intrinsic / virtual)");
             return Err("implementation limitation -- cannot inline intrinsic");
         }
@@ -722,25 +730,41 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         // the correct param-env for types being dropped. Stall resolving
         // the MIR for this instance until all of its const params are
         // substituted.
-        InstanceKind::DropGlue(_, Some(ty)) if ty.has_type_flags(TypeFlags::HAS_CT_PARAM) => {
+        InstanceKind::Shim(ShimKind::DropGlue(_, Some(ty)))
+            if ty.has_type_flags(TypeFlags::HAS_CT_PARAM) =>
+        {
             debug!("still needs substitution");
             return Err("implementation limitation -- HACK for dropping polymorphic type");
+        }
+        InstanceKind::Shim(ShimKind::AsyncDropGlue(_, ty))
+        | InstanceKind::Shim(ShimKind::AsyncDropGlueCtor(_, ty)) => {
+            return if ty.still_further_specializable() {
+                Err("still needs substitution")
+            } else {
+                Ok(())
+            };
+        }
+        InstanceKind::Shim(ShimKind::FutureDropPoll(_, ty, ty2)) => {
+            return if ty.still_further_specializable() || ty2.still_further_specializable() {
+                Err("still needs substitution")
+            } else {
+                Ok(())
+            };
         }
 
         // This cannot result in an immediate cycle since the callee MIR is a shim, which does
         // not get any optimizations run on it. Any subsequent inlining may cause cycles, but we
         // do not need to catch this here, we can wait until the inliner decides to continue
         // inlining a second time.
-        InstanceKind::VTableShim(_)
-        | InstanceKind::ReifyShim(..)
-        | InstanceKind::FnPtrShim(..)
-        | InstanceKind::ClosureOnceShim { .. }
-        | InstanceKind::ConstructCoroutineInClosureShim { .. }
-        | InstanceKind::DropGlue(..)
-        | InstanceKind::CloneShim(..)
-        | InstanceKind::ThreadLocalShim(..)
-        | InstanceKind::FnPtrAddrShim(..)
-        | InstanceKind::AsyncDropGlueCtorShim(..) => return Ok(()),
+        InstanceKind::Shim(ShimKind::VTable(_))
+        | InstanceKind::Shim(ShimKind::Reify(..))
+        | InstanceKind::Shim(ShimKind::FnPtr(..))
+        | InstanceKind::Shim(ShimKind::ClosureOnce { .. })
+        | InstanceKind::Shim(ShimKind::ConstructCoroutineInClosure { .. })
+        | InstanceKind::Shim(ShimKind::DropGlue(..))
+        | InstanceKind::Shim(ShimKind::Clone(..))
+        | InstanceKind::Shim(ShimKind::ThreadLocal(..))
+        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Ok(()),
     }
 
     if inliner.tcx().is_constructor(callee_def_id) {
@@ -749,14 +773,18 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         return Ok(());
     }
 
-    if callee_def_id.is_local()
+    if let Some(callee_def_id) = callee_def_id.as_local()
         && !inliner
             .tcx()
             .is_lang_item(inliner.tcx().parent(caller_def_id), rustc_hir::LangItem::FnOnce)
     {
         // If we know for sure that the function we're calling will itself try to
         // call us, then we avoid inlining that function.
-        if inliner.tcx().mir_callgraph_reachable((callee, caller_def_id.expect_local())) {
+        let Some(cyclic_callees) = inliner.tcx().mir_callgraph_cyclic(caller_def_id.expect_local())
+        else {
+            return Err("call graph cycle detection bailed due to recursion limit");
+        };
+        if cyclic_callees.contains(&callee_def_id) {
             debug!("query cycle avoidance");
             return Err("caller might be reachable from callee");
         }
@@ -798,7 +826,7 @@ fn check_codegen_attributes<'tcx, I: Inliner<'tcx>>(
     }
 
     let codegen_fn_attrs = tcx.codegen_fn_attrs(inliner.caller_def_id());
-    if callee_attrs.no_sanitize != codegen_fn_attrs.no_sanitize {
+    if callee_attrs.sanitizers != codegen_fn_attrs.sanitizers {
         return Err("incompatible sanitizer set");
     }
 
@@ -845,6 +873,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
             Some(Terminator {
                 source_info: terminator.source_info,
                 kind: TerminatorKind::Goto { target: block },
+                attributes: ThinVec::new(),
             }),
             caller_body[block].is_cleanup,
         );
@@ -878,10 +907,10 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
         );
         let dest_ty = dest.ty(caller_body, tcx);
         let temp = Place::from(new_call_temp(caller_body, callsite, dest_ty, return_block));
-        caller_body[callsite.block].statements.push(Statement {
-            source_info: callsite.source_info,
-            kind: StatementKind::Assign(Box::new((temp, dest))),
-        });
+        caller_body[callsite.block].statements.push(Statement::new(
+            callsite.source_info,
+            StatementKind::Assign(Box::new((temp, dest))),
+        ));
         tcx.mk_place_deref(temp)
     } else {
         destination
@@ -913,7 +942,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
         in_cleanup_block: false,
         return_block,
         tcx,
-        always_live_locals: DenseBitSet::new_filled(callee_body.local_decls.len()),
+        always_live_locals: UsedInStmtLocals::new(&callee_body).locals,
     };
 
     // Map all `Local`s, `SourceScope`s and `BasicBlock`s to new ones
@@ -925,10 +954,9 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     for local in callee_body.vars_and_temps_iter() {
         if integrator.always_live_locals.contains(local) {
             let new_local = integrator.map_local(local);
-            caller_body[callsite.block].statements.push(Statement {
-                source_info: callsite.source_info,
-                kind: StatementKind::StorageLive(new_local),
-            });
+            caller_body[callsite.block]
+                .statements
+                .push(Statement::new(callsite.source_info, StatementKind::StorageLive(new_local)));
         }
     }
     if let Some(block) = return_block {
@@ -936,22 +964,22 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
         // the slice once.
         let mut n = 0;
         if remap_destination {
-            caller_body[block].statements.push(Statement {
-                source_info: callsite.source_info,
-                kind: StatementKind::Assign(Box::new((
+            caller_body[block].statements.push(Statement::new(
+                callsite.source_info,
+                StatementKind::Assign(Box::new((
                     dest,
-                    Rvalue::Use(Operand::Move(destination_local.into())),
+                    Rvalue::Use(Operand::Move(destination_local.into()), WithRetag::Yes),
                 ))),
-            });
+            ));
             n += 1;
         }
         for local in callee_body.vars_and_temps_iter().rev() {
             if integrator.always_live_locals.contains(local) {
                 let new_local = integrator.map_local(local);
-                caller_body[block].statements.push(Statement {
-                    source_info: callsite.source_info,
-                    kind: StatementKind::StorageDead(new_local),
-                });
+                caller_body[block].statements.push(Statement::new(
+                    callsite.source_info,
+                    StatementKind::StorageDead(new_local),
+                ));
                 n += 1;
             }
         }
@@ -961,27 +989,34 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     // Insert all of the (mapped) parts of the callee body into the caller.
     caller_body.local_decls.extend(callee_body.drain_vars_and_temps());
     caller_body.source_scopes.append(&mut callee_body.source_scopes);
+
+    // only "full" debug promises any variable-level information
     if tcx
         .sess
         .opts
         .unstable_opts
         .inline_mir_preserve_debug
-        .unwrap_or(tcx.sess.opts.debuginfo != DebugInfo::None)
+        .unwrap_or(tcx.sess.opts.debuginfo == DebugInfo::Full)
     {
-        // Note that we need to preserve these in the standard library so that
+        // -Zinline-mir-preserve-debug is enabled when building the standard library, so that
         // people working on rust can build with or without debuginfo while
         // still getting consistent results from the mir-opt tests.
         caller_body.var_debug_info.append(&mut callee_body.var_debug_info);
+    } else {
+        for bb in callee_body.basic_blocks_mut() {
+            bb.drop_debuginfo();
+        }
     }
     caller_body.basic_blocks_mut().append(callee_body.basic_blocks_mut());
 
     caller_body[callsite.block].terminator = Some(Terminator {
         source_info: callsite.source_info,
         kind: TerminatorKind::Goto { target: integrator.map_block(START_BLOCK) },
+        attributes: ThinVec::new(),
     });
 
     // Copy required constants from the callee_body into the caller_body. Although we are only
-    // pushing unevaluated consts to `required_consts`, here they may have been evaluated
+    // pushing constants that still need evaluation to `required_consts`, here they may have been evaluated
     // because we are calling `instantiate_and_normalize_erasing_regions` -- so we filter again.
     caller_body.required_consts.as_mut().unwrap().extend(
         callee_body.required_consts().into_iter().filter(|ct| ct.const_.is_required_const()),
@@ -1040,8 +1075,7 @@ fn make_call_args<'tcx, I: Inliner<'tcx>>(
     //
     // and the vector is `[closure_ref, tmp0, tmp1, tmp2]`.
     if callsite.fn_sig.abi() == ExternAbi::RustCall && callee_body.spread_arg.is_none() {
-        // FIXME(edition_2024): switch back to a normal method call.
-        let mut args = <_>::into_iter(args);
+        let mut args = args.into_iter();
         let self_ = create_temp_if_necessary(
             inliner,
             args.next().unwrap().node,
@@ -1104,10 +1138,10 @@ fn create_temp_if_necessary<'tcx, I: Inliner<'tcx>>(
     trace!("creating temp for argument {:?}", arg);
     let arg_ty = arg.ty(caller_body, inliner.tcx());
     let local = new_call_temp(caller_body, callsite, arg_ty, return_block);
-    caller_body[callsite.block].statements.push(Statement {
-        source_info: callsite.source_info,
-        kind: StatementKind::Assign(Box::new((Place::from(local), Rvalue::Use(arg)))),
-    });
+    caller_body[callsite.block].statements.push(Statement::new(
+        callsite.source_info,
+        StatementKind::Assign(Box::new((Place::from(local), Rvalue::Use(arg, WithRetag::Yes)))),
+    ));
     local
 }
 
@@ -1120,19 +1154,14 @@ fn new_call_temp<'tcx>(
 ) -> Local {
     let local = caller_body.local_decls.push(LocalDecl::new(ty, callsite.source_info.span));
 
-    caller_body[callsite.block].statements.push(Statement {
-        source_info: callsite.source_info,
-        kind: StatementKind::StorageLive(local),
-    });
+    caller_body[callsite.block]
+        .statements
+        .push(Statement::new(callsite.source_info, StatementKind::StorageLive(local)));
 
     if let Some(block) = return_block {
-        caller_body[block].statements.insert(
-            0,
-            Statement {
-                source_info: callsite.source_info,
-                kind: StatementKind::StorageDead(local),
-            },
-        );
+        caller_body[block]
+            .statements
+            .insert(0, Statement::new(callsite.source_info, StatementKind::StorageDead(local)));
     }
 
     local
@@ -1248,16 +1277,6 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
         self.in_cleanup_block = false;
     }
 
-    fn visit_retag(&mut self, kind: &mut RetagKind, place: &mut Place<'tcx>, loc: Location) {
-        self.super_retag(kind, place, loc);
-
-        // We have to patch all inlined retags to be aware that they are no longer
-        // happening on function entry.
-        if *kind == RetagKind::FnEntry {
-            *kind = RetagKind::Default;
-        }
-    }
-
     fn visit_statement(&mut self, statement: &mut Statement<'tcx>, location: Location) {
         if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
             statement.kind
@@ -1345,8 +1364,8 @@ fn try_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: InstanceKind<'tcx>,
 ) -> Result<&'tcx Body<'tcx>, &'static str> {
-    if let ty::InstanceKind::DropGlue(_, Some(ty))
-    | ty::InstanceKind::AsyncDropGlueCtorShim(_, Some(ty)) = instance
+    if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, Some(ty)))
+    | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(_, ty)) = instance
         && let ty::Adt(def, args) = ty.kind()
     {
         let fields = def.all_fields();

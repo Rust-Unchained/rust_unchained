@@ -1,38 +1,56 @@
-error: the `#[proc_macro_derive]` attribute may only be used on bare functions
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:10:1
+error: the `proc_macro_derive` attribute is only usable with crates of the `proc-macro` crate type
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:16:7
    |
-LL | #[proc_macro_derive()]
-   | ^^^^^^^^^^^^^^^^^^^^^^
+LL |     #[proc_macro_derive(Test)] fn f() { }
+   |       ^^^^^^^^^^^^^^^^^
 
-error: the `#[proc_macro_derive]` attribute may only be used on bare functions
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:18:17
+error: the `proc_macro_derive` attribute cannot be used on modules
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:5:3
    |
-LL |     mod inner { #![proc_macro_derive()] }
-   |                 ^^^^^^^^^^^^^^^^^^^^^^^
-
-error: the `#[proc_macro_derive]` attribute is only usable with crates of the `proc-macro` crate type
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:21:5
+LL | #[proc_macro_derive(Test)]
+   |   ^^^^^^^^^^^^^^^^^
    |
-LL |     #[proc_macro_derive()] fn f() { }
-   |     ^^^^^^^^^^^^^^^^^^^^^^
+   = help: the `proc_macro_derive` attribute can only be applied to functions
 
-error: the `#[proc_macro_derive]` attribute may only be used on bare functions
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:24:5
+error: the `proc_macro_derive` attribute cannot be used on modules
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:8:20
    |
-LL |     #[proc_macro_derive()] struct S;
-   |     ^^^^^^^^^^^^^^^^^^^^^^
-
-error: the `#[proc_macro_derive]` attribute may only be used on bare functions
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:27:5
+LL |     mod inner { #![proc_macro_derive(Test)] }
+   |                    ^^^^^^^^^^^^^^^^^
    |
-LL |     #[proc_macro_derive()] type T = S;
-   |     ^^^^^^^^^^^^^^^^^^^^^^
+   = help: the `proc_macro_derive` attribute can only be applied to functions
 
-error: the `#[proc_macro_derive]` attribute may only be used on bare functions
-  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:30:5
+error: the `proc_macro_derive` attribute cannot be used on modules
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:13:20
    |
-LL |     #[proc_macro_derive()] impl S { }
-   |     ^^^^^^^^^^^^^^^^^^^^^^
+LL |     mod inner { #![proc_macro_derive(Test)] }
+   |                    ^^^^^^^^^^^^^^^^^
+   |
+   = help: the `proc_macro_derive` attribute can only be applied to functions
 
-error: aborting due to 6 previous errors
+error: the `proc_macro_derive` attribute cannot be used on structs
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:19:7
+   |
+LL |     #[proc_macro_derive(Test)] struct S;
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = help: the `proc_macro_derive` attribute can only be applied to functions
+
+error: the `proc_macro_derive` attribute cannot be used on type aliases
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:22:7
+   |
+LL |     #[proc_macro_derive(Test)] type T = S;
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = help: the `proc_macro_derive` attribute can only be applied to functions
+
+error: the `proc_macro_derive` attribute cannot be used on inherent impl blocks
+  --> $DIR/issue-43106-gating-of-proc_macro_derive.rs:25:7
+   |
+LL |     #[proc_macro_derive(Test)] impl S { }
+   |       ^^^^^^^^^^^^^^^^^
+   |
+   = help: the `proc_macro_derive` attribute can only be applied to functions
+
+error: aborting due to 7 previous errors
 

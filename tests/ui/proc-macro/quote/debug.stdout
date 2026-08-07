@@ -12,10 +12,9 @@
 
 #![feature(proc_macro_quote)]
 #![crate_type = "proc-macro"]
+extern crate std;
 #[prelude_import]
 use ::std::prelude::rust_2015::*;
-#[macro_use]
-extern crate std;
 
 extern crate proc_macro;
 
@@ -69,5 +68,5 @@ const _: () =
         #[rustc_proc_macro_decls]
         #[used]
         #[allow(deprecated)]
-        static _DECLS: &[proc_macro::bridge::client::ProcMacro] = &[];
+        static _DECLS: &[proc_macro::bridge::client::Client] = &[];
     };

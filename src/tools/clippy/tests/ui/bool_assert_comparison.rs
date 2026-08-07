@@ -1,7 +1,8 @@
-#![allow(unused, clippy::assertions_on_constants, clippy::const_is_empty)]
+#![allow(clippy::assertions_on_constants)]
+#![expect(clippy::const_is_empty)]
 #![warn(clippy::bool_assert_comparison)]
 
-use std::ops::Not;
+use std::ops::{Add, Not};
 
 macro_rules! a {
     () => {
@@ -59,6 +60,14 @@ impl Not for ImplNotTraitWithBool {
 
     fn not(self) -> Self::Output {
         true
+    }
+}
+
+impl Add for ImplNotTraitWithBool {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        self
     }
 }
 
@@ -198,5 +207,26 @@ fn main() {
     debug_assert_ne!("requires negation".is_empty(), true);
     //~^ bool_assert_comparison
     debug_assert_eq!("requires negation".is_empty(), false);
+    //~^ bool_assert_comparison
+    assert_eq!(!b, true);
+    //~^ bool_assert_comparison
+    assert_eq!(!b, false);
+    //~^ bool_assert_comparison
+    assert_eq!(b + b, true);
+    //~^ bool_assert_comparison
+    assert_eq!(b + b, false);
+    //~^ bool_assert_comparison
+}
+
+fn issue16279() {
+    macro_rules! is_empty {
+        ($x:expr) => {
+            $x.is_empty()
+        };
+    }
+
+    assert_eq!(is_empty!("a"), false);
+    //~^ bool_assert_comparison
+    assert_eq!(is_empty!(""), true);
     //~^ bool_assert_comparison
 }

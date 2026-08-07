@@ -1,6 +1,6 @@
 //@ revisions: rpass1 rpass2 rpass3
 //@ compile-flags: -Zincremental-ignore-spans
-#![feature(generic_associated_types)]
+//@ ignore-backends: gcc
 
 // This test unsures that with_opt_const_param returns the
 // def_id of the N param in the Foo::Assoc GAT.

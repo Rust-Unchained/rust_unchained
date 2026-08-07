@@ -1,3 +1,5 @@
+//@ needs-target-std
+//
 // Non-regression test for issue #132920 where multiple versions of the same crate are present in
 // the dependency graph, and an unexpected error in a dependent crate caused an ICE in the
 // unsatisfied bounds diagnostics for traits present in multiple crate versions.
@@ -41,5 +43,5 @@ fn main() {
         .extern_("minibevy", "libminibevy-b.rmeta")
         .extern_("minirapier", "libminirapier.rmeta")
         .run_fail()
-        .assert_stderr_not_contains("error: the compiler unexpectedly panicked. this is a bug");
+        .assert_not_ice();
 }

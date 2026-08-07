@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as os from "os";
 import type { Config } from "./config";
-import { type Env, log, spawnAsync } from "./util";
+import { type Env, log, RUST_TOOLCHAIN_FILES, spawnAsync } from "./util";
 import type { PersistentState } from "./persistent_state";
 import { exec } from "child_process";
 import { TextDecoder } from "node:util";
@@ -15,7 +15,7 @@ export async function bootstrap(
     if (!path) {
         throw new Error(
             "rust-analyzer Language Server is not available. " +
-                "Please, ensure its [proper installation](https://rust-analyzer.github.io/manual.html#installation).",
+                "Please, ensure its [proper installation](https://rust-analyzer.github.io/book/installation.html).",
         );
     }
 
@@ -59,8 +59,12 @@ async function getServer(
             // otherwise check if there is a toolchain override for the current vscode workspace
             // and if the toolchain of this override has a rust-analyzer component
             // if so, use the rust-analyzer component
-            const toolchainUri = vscode.Uri.joinPath(workspaceFolder.uri, "rust-toolchain.toml");
-            if (await hasToolchainFileWithRaDeclared(toolchainUri)) {
+            // Check both rust-toolchain.toml and rust-toolchain files
+            for (const toolchainFile of RUST_TOOLCHAIN_FILES) {
+                const toolchainUri = vscode.Uri.joinPath(workspaceFolder.uri, toolchainFile);
+                if (!(await hasToolchainFileWithRaDeclared(toolchainUri))) {
+                    continue;
+                }
                 const res = await spawnAsync("rustup", ["which", "rust-analyzer"], {
                     env: { ...process.env },
                     cwd: workspaceFolder.uri.fsPath,
@@ -71,6 +75,7 @@ async function getServer(
                         res.stdout.trim(),
                         raVersionResolver,
                     );
+                    break;
                 }
             }
         }
@@ -171,14 +176,24 @@ async function fileExists(uri: vscode.Uri) {
     );
 }
 
+// Captures the elements of a `components` array. They are matched with `[^\]]` rather than `.`
+// so that the array may be spread over several lines, which is just as valid TOML as keeping it
+// on one, while still stopping at the end of the array.
+const COMPONENTS_RE = /components\s*=\s*\[(?<components>[^\]]*)\]/;
+// TOML strings come in both quote flavours.
+const RA_COMPONENT_RE = /["']rust-analyzer["']/;
+
+function declaresRaComponent(toolchainFileContents: string): boolean {
+    const components = toolchainFileContents.match(COMPONENTS_RE)?.groups?.["components"];
+    return components !== undefined && RA_COMPONENT_RE.test(components);
+}
+
 async function hasToolchainFileWithRaDeclared(uri: vscode.Uri): Promise<boolean> {
     try {
         const toolchainFileContents = new TextDecoder().decode(
             await vscode.workspace.fs.readFile(uri),
         );
-        return (
-            toolchainFileContents.match(/components\s*=\s*\[.*"rust-analyzer".*\]/g)?.length === 1
-        );
+        return declaresRaComponent(toolchainFileContents);
     } catch (_) {
         return false;
     }
@@ -187,8 +202,16 @@ async function hasToolchainFileWithRaDeclared(uri: vscode.Uri): Promise<boolean>
 export async function isValidExecutable(path: string, extraEnv: Env): Promise<boolean> {
     log.debug("Checking availability of a binary at", path);
 
+    const newEnv = { ...process.env };
+    for (const [k, v] of Object.entries(extraEnv)) {
+        if (v) {
+            newEnv[k] = v;
+        } else if (k in newEnv) {
+            delete newEnv[k];
+        }
+    }
     const res = await spawnAsync(path, ["--version"], {
-        env: { ...process.env, ...extraEnv },
+        env: newEnv,
     });
 
     if (res.error) {
@@ -283,6 +306,7 @@ async function patchelf(dest: vscode.Uri): Promise<void> {
 }
 
 export const _private = {
+    declaresRaComponent,
     earliestToolchainPath,
     orderFromPath,
 };

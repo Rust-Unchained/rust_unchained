@@ -1,18 +1,18 @@
-use hir::{db::ExpandDatabase, HirFileIdExt, InFile};
+use hir::InFile;
 use ide_db::source_change::SourceChange;
 use ide_db::text_edit::TextEdit;
 use syntax::{
-    ast::{self, HasArgList},
     AstNode, TextRange,
+    ast::{self, HasArgList},
 };
 
-use crate::{fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Assist, Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 
 // Diagnostic: replace-filter-map-next-with-find-map
 //
 // This diagnostic is triggered when `.filter_map(..).next()` is used, rather than the more concise `.find_map(..)`.
 pub(crate) fn replace_filter_map_next_with_find_map(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::ReplaceFilterMapNextWithFindMap,
 ) -> Diagnostic {
     Diagnostic::new_with_syntax_node_ptr(
@@ -21,14 +21,15 @@ pub(crate) fn replace_filter_map_next_with_find_map(
         "replace filter_map(..).next() with find_map(..)",
         InFile::new(d.file, d.next_expr.into()),
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
 }
 
 fn fixes(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::ReplaceFilterMapNextWithFindMap,
 ) -> Option<Vec<Assist>> {
-    let root = ctx.sema.db.parse_or_expand(d.file);
+    let root = d.file.parse_or_expand(ctx.sema.db);
     let next_expr = d.next_expr.to_node(&root);
     let next_call = ast::MethodCallExpr::cast(next_expr.syntax().clone())?;
 
@@ -43,7 +44,8 @@ fn fixes(
 
     let edit = TextEdit::replace(range_to_replace, replacement);
 
-    let source_change = SourceChange::from_text_edit(d.file.original_file(ctx.sema.db), edit);
+    let source_change =
+        SourceChange::from_text_edit(d.file.original_file(ctx.sema.db).file_id(ctx.sema.db), edit);
 
     Some(vec![fix(
         "replace_with_find_map",
@@ -56,8 +58,8 @@ fn fixes(
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{check_diagnostics_with_config, check_fix},
         DiagnosticsConfig,
+        tests::{check_diagnostics_with_config, check_fix},
     };
 
     #[track_caller]

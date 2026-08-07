@@ -1,7 +1,6 @@
-#[prelude_import]
-use ::std::prelude::rust_2015::*;
-#[macro_use]
 extern crate std;
+#[attr = PreludeImport]
+use ::std::prelude::rust_2015::*;
 //@ pretty-compare-only
 //@ pretty-mode:hir
 //@ pp-exact:hir-struct-expr.pp

@@ -3,9 +3,10 @@ mod unit_arg;
 mod unit_cmp;
 mod utils;
 
+use clippy_utils::macros::FormatArgsStorage;
 use rustc_hir::{Expr, LetStmt};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -25,6 +26,27 @@ declare_clippy_lint! {
     pub LET_UNIT_VALUE,
     style,
     "creating a `let` binding to a value of unit type, which usually can't be used afterwards"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for passing a unit value as an argument to a function without using a
+    /// unit literal (`()`).
+    ///
+    /// ### Why is this bad?
+    /// This is likely the result of an accidental semicolon.
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// foo({
+    ///     let a = bar();
+    ///     baz(a);
+    /// })
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub UNIT_ARG,
+    complexity,
+    "passing unit to a function"
 }
 
 declare_clippy_lint! {
@@ -75,32 +97,21 @@ declare_clippy_lint! {
     "comparing unit values"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for passing a unit value as an argument to a function without using a
-    /// unit literal (`()`).
-    ///
-    /// ### Why is this bad?
-    /// This is likely the result of an accidental semicolon.
-    ///
-    /// ### Example
-    /// ```rust,ignore
-    /// foo({
-    ///     let a = bar();
-    ///     baz(a);
-    /// })
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub UNIT_ARG,
-    complexity,
-    "passing unit to a function"
+impl_lint_pass!(UnitTypes => [LET_UNIT_VALUE, UNIT_ARG, UNIT_CMP]);
+
+pub struct UnitTypes {
+    format_args: FormatArgsStorage,
 }
 
-declare_lint_pass!(UnitTypes => [LET_UNIT_VALUE, UNIT_CMP, UNIT_ARG]);
+impl UnitTypes {
+    pub fn new(format_args: FormatArgsStorage) -> Self {
+        Self { format_args }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for UnitTypes {
     fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
-        let_unit_value::check(cx, local);
+        let_unit_value::check(cx, &self.format_args, local);
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {

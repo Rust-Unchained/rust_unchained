@@ -1,4 +1,5 @@
-// skip-filecheck
+//@ compile-flags: -Zmir-opt-level=0
+//@ skip-filecheck
 #![feature(never_type)]
 #![allow(unreachable_code)]
 

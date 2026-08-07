@@ -4,17 +4,35 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_infer::traits::ObligationCauseCode;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{
+    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+};
 use rustc_span::{Span, kw};
+use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits;
 
 use crate::FnCtxt;
 
 enum ClauseFlavor {
-    /// Predicate comes from `predicates_of`.
+    /// Clause comes from `clauses_of`.
     Where,
-    /// Predicate comes from `const_conditions`.
+    /// Clause comes from `const_conditions`.
     Const,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ParamTerm {
+    Ty(ty::ParamTy),
+    Const(ty::ParamConst),
+}
+
+impl ParamTerm {
+    fn index(self) -> usize {
+        match self {
+            ParamTerm::Ty(ty) => ty.index as usize,
+            ParamTerm::Const(ct) => ct.index as usize,
+        }
+    }
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
@@ -22,6 +40,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         error: &mut traits::FulfillmentError<'tcx>,
     ) -> bool {
+        if self.adjust_binop_index_operand(error) {
+            return true;
+        }
+
         let (def_id, hir_id, idx, flavor) = match *error.obligation.cause.code().peel_derives() {
             ObligationCauseCode::WhereClauseInExpr(def_id, _, hir_id, idx) => {
                 (def_id, hir_id, idx, ClauseFlavor::Where)
@@ -32,39 +54,34 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             _ => return false,
         };
 
-        let uninstantiated_pred = match flavor {
-            ClauseFlavor::Where => {
-                if let Some(pred) = self
+        let uninstantiated_clause = match flavor {
+            ClauseFlavor::Where
+                if let Some(clause) = self
                     .tcx
-                    .predicates_of(def_id)
+                    .clauses_of(def_id)
                     .instantiate_identity(self.tcx)
-                    .predicates
+                    .clauses
                     .into_iter()
-                    .nth(idx)
-                {
-                    pred
-                } else {
-                    return false;
-                }
+                    .nth(idx) =>
+            {
+                clause
             }
-            ClauseFlavor::Const => {
+            ClauseFlavor::Const
                 if let Some((pred, _)) = self
                     .tcx
                     .const_conditions(def_id)
                     .instantiate_identity(self.tcx)
                     .into_iter()
-                    .nth(idx)
-                {
-                    pred.to_host_effect_clause(self.tcx, ty::BoundConstness::Maybe)
-                } else {
-                    return false;
-                }
+                    .nth(idx) =>
+            {
+                pred.to_host_effect_clause(self.tcx, ty::BoundConstness::Maybe)
             }
+            _ => return false,
         };
 
         let generics = self.tcx.generics_of(def_id);
         let (predicate_args, predicate_self_type_to_point_at) =
-            match uninstantiated_pred.kind().skip_binder() {
+            match uninstantiated_clause.kind().skip_binder() {
                 ty::ClauseKind::Trait(pred) => {
                     (pred.trait_ref.args.to_vec(), Some(pred.self_ty().into()))
                 }
@@ -77,22 +94,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 _ => return false,
             };
 
-        let find_param_matching = |matches: &dyn Fn(ty::ParamTerm) -> bool| {
+        let find_param_matching = |matches: &dyn Fn(ParamTerm) -> bool| {
             predicate_args.iter().find_map(|arg| {
-                arg.walk().find_map(|arg| {
-                    if let ty::GenericArgKind::Type(ty) = arg.unpack()
-                        && let ty::Param(param_ty) = *ty.kind()
-                        && matches(ty::ParamTerm::Ty(param_ty))
-                    {
-                        Some(arg)
-                    } else if let ty::GenericArgKind::Const(ct) = arg.unpack()
-                        && let ty::ConstKind::Param(param_ct) = ct.kind()
-                        && matches(ty::ParamTerm::Const(param_ct))
-                    {
-                        Some(arg)
-                    } else {
-                        None
+                arg.walk().find(|arg| match arg.kind() {
+                    ty::GenericArgKind::Type(ty) if let ty::Param(param_ty) = ty.kind() => {
+                        matches(ParamTerm::Ty(*param_ty))
                     }
+                    ty::GenericArgKind::Const(ct)
+                        if let ty::ConstKind::Param(param_ct) = ct.kind() =>
+                    {
+                        matches(ParamTerm::Const(param_ct))
+                    }
+                    _ => false,
                 })
             })
         };
@@ -106,14 +119,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // from a trait or impl, for example.
         let mut fallback_param_to_point_at = find_param_matching(&|param_term| {
             self.tcx.parent(generics.param_at(param_term.index(), self.tcx).def_id) != def_id
-                && !matches!(param_term, ty::ParamTerm::Ty(ty) if ty.name == kw::SelfUpper)
+                && !matches!(param_term, ParamTerm::Ty(ty) if ty.name == kw::SelfUpper)
         });
         // Finally, the `Self` parameter is possibly the reason that the predicate
         // is unsatisfied. This is less likely to be true for methods, because
         // method probe means that we already kinda check that the predicates due
         // to the `Self` type are true.
         let mut self_param_to_point_at = find_param_matching(
-            &|param_term| matches!(param_term, ty::ParamTerm::Ty(ty) if ty.name == kw::SelfUpper),
+            &|param_term| matches!(param_term, ParamTerm::Ty(ty) if ty.name == kw::SelfUpper),
         );
 
         // Finally, for ambiguity-related errors, we actually want to look
@@ -147,7 +160,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 .into_iter()
                 .flatten()
                 {
-                    if self.point_at_path_if_possible(error, def_id, param, &qpath) {
+                    if self.point_at_path_if_possible(error, def_id, param, qpath) {
                         return true;
                     }
                 }
@@ -156,6 +169,119 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
 
             _ => false,
+        }
+    }
+
+    fn adjust_binop_index_operand(&self, error: &mut traits::FulfillmentError<'tcx>) -> bool {
+        let ObligationCauseCode::BinOp { lhs_hir_id, rhs_hir_id, .. } =
+            *error.obligation.cause.code().peel_derives()
+        else {
+            return false;
+        };
+        if !matches!(error.code, traits::FulfillmentErrorCode::Ambiguity { .. })
+            || !error.obligation.predicate.has_infer()
+        {
+            return false;
+        }
+
+        let hir::Node::Expr(lhs_expr) = self.tcx.hir_node(lhs_hir_id) else {
+            return false;
+        };
+        let hir::Node::Expr(rhs_expr) = self.tcx.hir_node(rhs_hir_id) else {
+            return false;
+        };
+        let Some(binop) = self.binop_for_operands(lhs_hir_id, rhs_hir_id) else {
+            return false;
+        };
+        let hir::ExprKind::Index(indexed_expr, idx, _) = rhs_expr.kind else {
+            return false;
+        };
+        if !self.resolve_vars_if_possible(self.node_ty(idx.hir_id)).is_ty_var() {
+            return false;
+        }
+        let lhs_ty = self.resolve_vars_if_possible(self.node_ty(lhs_expr.hir_id));
+        let indexed_ty = self.resolve_vars_if_possible(self.node_ty(indexed_expr.hir_id));
+        let rhs_ty = match *indexed_ty.kind() {
+            ty::Array(element_ty, _) | ty::Slice(element_ty) => element_ty,
+            ty::Ref(_, pointee_ty, _) => match *pointee_ty.kind() {
+                ty::Array(element_ty, _) | ty::Slice(element_ty) => element_ty,
+                _ => self.resolve_vars_if_possible(self.node_ty(rhs_expr.hir_id)),
+            },
+            _ => self.resolve_vars_if_possible(self.node_ty(rhs_expr.hir_id)),
+        };
+        if !self.binop_accepts_types(binop.node, lhs_ty, rhs_ty) {
+            return false;
+        }
+
+        error.obligation.cause.span = match idx.kind {
+            hir::ExprKind::MethodCall(segment, ..) => segment.ident.span,
+            _ => idx.span,
+        };
+        true
+    }
+
+    fn binop_for_operands(
+        &self,
+        lhs_hir_id: hir::HirId,
+        rhs_hir_id: hir::HirId,
+    ) -> Option<hir::BinOp> {
+        let hir::Node::Expr(parent_expr) = self.tcx.parent_hir_node(rhs_hir_id) else {
+            return None;
+        };
+        let hir::ExprKind::Binary(binop, lhs_expr, rhs_expr) = parent_expr.kind else {
+            return None;
+        };
+        (lhs_expr.hir_id == lhs_hir_id && rhs_expr.hir_id == rhs_hir_id).then_some(binop)
+    }
+
+    fn binop_accepts_types(
+        &self,
+        binop: hir::BinOpKind,
+        lhs_ty: Ty<'tcx>,
+        rhs_ty: Ty<'tcx>,
+    ) -> bool {
+        let lhs_ty = self.deref_ty_if_possible(lhs_ty);
+        let rhs_ty = self.deref_ty_if_possible(rhs_ty);
+        if lhs_ty.references_error() || rhs_ty.references_error() {
+            return true;
+        }
+
+        match binop {
+            hir::BinOpKind::Shl | hir::BinOpKind::Shr => {
+                lhs_ty.is_integral() && rhs_ty.is_integral()
+            }
+            hir::BinOpKind::Add
+            | hir::BinOpKind::Sub
+            | hir::BinOpKind::Mul
+            | hir::BinOpKind::Div
+            | hir::BinOpKind::Rem => {
+                self.can_eq(self.param_env, lhs_ty, rhs_ty)
+                    && (lhs_ty.is_integral() || lhs_ty.is_floating_point())
+                    && (rhs_ty.is_integral() || rhs_ty.is_floating_point())
+            }
+            hir::BinOpKind::BitXor | hir::BinOpKind::BitAnd | hir::BinOpKind::BitOr => {
+                self.can_eq(self.param_env, lhs_ty, rhs_ty)
+                    && ((lhs_ty.is_integral() && rhs_ty.is_integral())
+                        || (lhs_ty.is_bool() && rhs_ty.is_bool()))
+            }
+            hir::BinOpKind::Eq
+            | hir::BinOpKind::Ne
+            | hir::BinOpKind::Lt
+            | hir::BinOpKind::Le
+            | hir::BinOpKind::Ge
+            | hir::BinOpKind::Gt => {
+                self.can_eq(self.param_env, lhs_ty, rhs_ty)
+                    && lhs_ty.is_scalar()
+                    && rhs_ty.is_scalar()
+            }
+            hir::BinOpKind::And | hir::BinOpKind::Or => lhs_ty.is_bool() && rhs_ty.is_bool(),
+        }
+    }
+
+    fn deref_ty_if_possible(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        match ty.kind() {
+            ty::Ref(_, ty, hir::Mutability::Not) => *ty,
+            _ => ty,
         }
     }
 
@@ -179,14 +305,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 args,
             ) => {
                 if let Some(param) = predicate_self_type_to_point_at
-                    && self.point_at_path_if_possible(error, callee_def_id, param, &qpath)
+                    && self.point_at_path_if_possible(error, callee_def_id, param, qpath)
                 {
                     return true;
                 }
 
-                for param in [param_to_point_at, fallback_param_to_point_at, self_param_to_point_at]
-                    .into_iter()
-                    .flatten()
+                for param in [
+                    predicate_self_type_to_point_at,
+                    param_to_point_at,
+                    fallback_param_to_point_at,
+                    self_param_to_point_at,
+                ]
+                .into_iter()
+                .flatten()
                 {
                     if self.blame_specific_arg_if_possible(
                         error,
@@ -205,7 +336,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .into_iter()
                     .flatten()
                 {
-                    if self.point_at_path_if_possible(error, callee_def_id, param, &qpath) {
+                    if self.point_at_path_if_possible(error, callee_def_id, param, qpath) {
                         return true;
                     }
                 }
@@ -357,7 +488,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         error: &mut traits::FulfillmentError<'tcx>,
         def_id: DefId,
-        param: ty::GenericArg<'tcx>,
+        arg: ty::GenericArg<'tcx>,
         qpath: &hir::QPath<'tcx>,
     ) -> bool {
         match qpath {
@@ -365,7 +496,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 for segment in path.segments.iter().rev() {
                     if let Res::Def(kind, def_id) = segment.res
                         && !matches!(kind, DefKind::Mod | DefKind::ForeignMod)
-                        && self.point_at_generic_if_possible(error, def_id, param, segment)
+                        && self.point_at_generic_if_possible(error, def_id, arg, segment)
                     {
                         return true;
                     }
@@ -373,7 +504,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // Handle `Self` param specifically, since it's separated in
                 // the path representation
                 if let Some(self_ty) = self_ty
-                    && let ty::GenericArgKind::Type(ty) = param.unpack()
+                    && let ty::GenericArgKind::Type(ty) = arg.kind()
                     && ty == self.tcx.types.self_param
                 {
                     error.obligation.cause.span = self_ty
@@ -384,12 +515,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
             }
             hir::QPath::TypeRelative(self_ty, segment) => {
-                if self.point_at_generic_if_possible(error, def_id, param, segment) {
+                if self.point_at_generic_if_possible(error, def_id, arg, segment) {
                     return true;
                 }
                 // Handle `Self` param specifically, since it's separated in
                 // the path representation
-                if let ty::GenericArgKind::Type(ty) = param.unpack()
+                if let ty::GenericArgKind::Type(ty) = arg.kind()
                     && ty == self.tcx.types.self_param
                 {
                     error.obligation.cause.span = self_ty
@@ -399,7 +530,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     return true;
                 }
             }
-            _ => {}
         }
 
         false
@@ -424,10 +554,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // the args list does not, then we should chop off all of the lifetimes,
         // since they're all elided.
         let segment_args = segment.args().args;
-        if matches!(own_args[0].unpack(), ty::GenericArgKind::Lifetime(_))
+        if matches!(own_args[0].kind(), ty::GenericArgKind::Lifetime(_))
             && segment_args.first().is_some_and(|arg| arg.is_ty_or_const())
             && let Some(offset) = own_args.iter().position(|arg| {
-                matches!(arg.unpack(), ty::GenericArgKind::Type(_) | ty::GenericArgKind::Const(_))
+                matches!(arg.kind(), ty::GenericArgKind::Type(_) | ty::GenericArgKind::Const(_))
             })
             && let Some(new_index) = index.checked_sub(offset)
         {
@@ -474,7 +604,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
     ) -> bool {
         if let traits::FulfillmentErrorCode::Select(traits::SelectionError::SignatureMismatch(
-            box traits::SignatureMismatchData { expected_trait_ref, .. },
+            traits::SignatureMismatchData { expected_trait_ref, .. },
         )) = error.code
             && let ty::Closure(def_id, _) | ty::Coroutine(def_id, ..) =
                 expected_trait_ref.self_ty().kind()
@@ -501,7 +631,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .fields
             .iter()
             .filter(|field| {
-                let field_ty = field.ty(self.tcx, identity_args);
+                let field_ty = field.ty(self.tcx, identity_args).skip_norm_wip();
                 find_param_in_ty(field_ty.into(), param_to_point_at)
             })
             .collect();
@@ -514,7 +644,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 {
                     return Some((
                         expr_field.expr,
-                        self.tcx.type_of(field.did).instantiate_identity(),
+                        self.tcx.type_of(field.did).instantiate_identity().skip_norm_wip(),
                     ));
                 }
             }
@@ -524,10 +654,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// - `blame_specific_*` means that the function will recursively traverse the expression,
-    /// looking for the most-specific-possible span to blame.
+    ///   looking for the most-specific-possible span to blame.
     ///
     /// - `point_at_*` means that the function will only go "one level", pointing at the specific
-    /// expression mentioned.
+    ///   expression mentioned.
     ///
     /// `blame_specific_arg_if_possible` will find the most-specific expression anywhere inside
     /// the provided function call expression, and mark it as responsible for the fulfillment
@@ -542,7 +672,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         receiver: Option<&'tcx hir::Expr<'tcx>>,
         args: &'tcx [hir::Expr<'tcx>],
     ) -> bool {
-        let ty = self.tcx.type_of(def_id).instantiate_identity();
+        let ty = self.tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
         if !ty.is_fn() {
             return false;
         }
@@ -590,6 +720,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
      * - want `Vec<i32>: Copy`
      * - because `Option<Vec<i32>>: Copy` needs `Vec<i32>: Copy` because `impl <T: Copy> Copy for Option<T>`
      * - because `(Option<Vec<i32>, bool)` needs `Option<Vec<i32>>: Copy` because `impl <A: Copy, B: Copy> Copy for (A, B)`
+     *
      * then if you pass in `(Some(vec![1, 2, 3]), false)`, this helper `point_at_specific_expr_if_possible`
      * will find the expression `vec![1, 2, 3]` as the "most blameable" reason for this missing constraint.
      *
@@ -691,7 +822,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             )
         } else {
             self.tcx
-                .impl_trait_ref(obligation.impl_or_alias_def_id)
+                .impl_opt_trait_ref(obligation.impl_or_alias_def_id)
                 .map(|impl_def| impl_def.skip_binder())
                 // It is possible that this is absent. In this case, we make no progress.
                 .ok_or(expr)?
@@ -700,19 +831,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // We only really care about the `Self` type itself, which we extract from the ref.
         let impl_self_ty: Ty<'tcx> = impl_trait_self_ref.self_ty();
 
-        let impl_predicates: ty::GenericPredicates<'tcx> =
-            self.tcx.predicates_of(obligation.impl_or_alias_def_id);
-        let Some(impl_predicate_index) = obligation.impl_def_predicate_index else {
+        let impl_clauses: ty::GenericClauses<'tcx> =
+            self.tcx.clauses_of(obligation.impl_or_alias_def_id);
+        let Some(impl_clause_index) = obligation.impl_def_clause_index else {
             // We don't have the index, so we can only guess.
             return Err(expr);
         };
 
-        if impl_predicate_index >= impl_predicates.predicates.len() {
-            // This shouldn't happen, but since this is only a diagnostic improvement, avoid breaking things.
+        if impl_clause_index >= impl_clauses.clauses.len() {
+            // This shouldn't happen, but since this is only a diagnostic improvement, avoid
+            // breaking things.
             return Err(expr);
         }
 
-        match impl_predicates.predicates[impl_predicate_index].0.kind().skip_binder() {
+        match impl_clauses.clauses[impl_clause_index].0.kind().skip_binder() {
             ty::ClauseKind::Trait(broken_trait) => {
                 // ...
                 self.blame_specific_part_of_expr_corresponding_to_generic_param(
@@ -730,6 +862,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// - expr: `(Some(vec![1, 2, 3]), false)`
     /// - param: `T`
     /// - in_ty: `(Option<Vec<T>, bool)`
+    ///
     /// we would drill until we arrive at `vec![1, 2, 3]`.
     ///
     /// If successful, we return `Ok(refined_expr)`. If unsuccessful, we return `Err(partially_refined_expr`),
@@ -750,7 +883,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return Ok(expr);
         }
 
-        let ty::GenericArgKind::Type(in_ty) = in_ty.unpack() else {
+        let ty::GenericArgKind::Type(in_ty) = in_ty.kind() else {
             return Err(expr);
         };
 
@@ -997,7 +1130,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .variant_with_id(variant_def_id)
                     .fields
                     .iter()
-                    .map(|field| field.ty(self.tcx, *in_ty_adt_generic_args))
+                    .map(|field| field.ty(self.tcx, in_ty_adt_generic_args).skip_norm_wip())
                     .enumerate()
                     .filter(|(_index, field_type)| find_param_in_ty((*field_type).into(), param)),
             ) else {
@@ -1045,8 +1178,11 @@ fn find_param_in_ty<'tcx>(
         if arg == param_to_point_at {
             return true;
         }
-        if let ty::GenericArgKind::Type(ty) = arg.unpack()
-            && let ty::Alias(ty::Projection | ty::Inherent, ..) = ty.kind()
+        if let ty::GenericArgKind::Type(ty) = arg.kind()
+            && let ty::Alias(
+                _,
+                ty::AliasTy { kind: ty::Projection { .. } | ty::Inherent { .. }, .. },
+            ) = ty.kind()
         {
             // This logic may seem a bit strange, but typically when
             // we have a projection type in a function signature, the

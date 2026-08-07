@@ -6,7 +6,7 @@ use crate::{CompletionContext, Completions};
 
 pub(crate) fn complete_for_and_where(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     keyword_item: &ast::Item,
 ) {
     let mut add_keyword = |kw, snippet| acc.add_keyword_snippet(ctx, kw, snippet);
@@ -56,6 +56,7 @@ mod tests {
                 kw extern
                 kw fn
                 kw impl
+                kw impl for
                 kw trait
             "#]],
         );
@@ -76,6 +77,7 @@ fn foo(a: A) { a.$0 }
                 kw await                                                           expr.await
                 sn box                                                         Box::new(expr)
                 sn call                                                        function(expr)
+                sn const                                                             const {}
                 sn dbg                                                             dbg!(expr)
                 sn dbgr                                                           dbg!(&expr)
                 sn deref                                                                *expr
@@ -103,6 +105,7 @@ fn foo() {
                 kw await                                                                          expr.await
                 sn box                                                                        Box::new(expr)
                 sn call                                                                       function(expr)
+                sn const                                                                            const {}
                 sn dbg                                                                            dbg!(expr)
                 sn dbgr                                                                          dbg!(&expr)
                 sn deref                                                                               *expr
@@ -132,6 +135,7 @@ fn foo(a: A) { a.$0 }
                 kw await                                                           expr.await
                 sn box                                                         Box::new(expr)
                 sn call                                                        function(expr)
+                sn const                                                             const {}
                 sn dbg                                                             dbg!(expr)
                 sn dbgr                                                           dbg!(&expr)
                 sn deref                                                                *expr
@@ -234,6 +238,88 @@ fn main() {
             r#"
 fn main() {
     let x = if $1 {
+    $2
+} else {
+    $0
+};
+    let y = 92;
+}
+"#,
+        );
+
+        check_edit(
+            "else",
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } $0
+    let y = 92;
+}
+"#,
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } else {
+    $0
+};
+    let y = 92;
+}
+"#,
+        );
+
+        check_edit(
+            "else if",
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } $0 else {};
+}
+"#,
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } else if $1 {
+    $0
+} else {};
+}
+"#,
+        );
+
+        check_edit(
+            "else if",
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } $0 else if true {};
+}
+"#,
+            r#"
+fn main() {
+    let x = if true {
+        ()
+    } else if $1 {
+    $0
+} else if true {};
+}
+"#,
+        );
+
+        check_edit(
+            "else",
+            r#"
+fn main() {
+    let x = 2 $0
+    let y = 92;
+}
+"#,
+            r#"
+fn main() {
+    let x = 2 else {
     $0
 };
     let y = 92;
@@ -252,6 +338,60 @@ fn main() {
             r#"
 fn main() {
     let x = loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = &$0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = &loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = -$0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = -loop {
+    $0
+};
+    bar();
+}
+"#,
+        );
+
+        check_edit(
+            "loop",
+            r#"
+fn main() {
+    let x = 2 + $0
+    bar();
+}
+"#,
+            r#"
+fn main() {
+    let x = 2 + loop {
     $0
 };
     bar();
@@ -332,7 +472,261 @@ fn main() {
     }
 
     #[test]
-    fn completes_let_with_space() {
+    fn if_completion_in_parameter() {
+        check_edit(
+            "if",
+            r"
+fn main() {
+    foo($0)
+}
+",
+            r"
+fn main() {
+    foo(if $1 {
+    $2
+} else {
+    $0
+})
+}
+",
+        );
+
+        check_edit(
+            "if",
+            r"
+fn main() {
+    foo($0, 2)
+}
+",
+            r"
+fn main() {
+    foo(if $1 {
+    $2
+} else {
+    $0
+}, 2)
+}
+",
+        );
+
+        check_edit(
+            "if",
+            r"
+fn main() {
+    foo(2, $0)
+}
+",
+            r"
+fn main() {
+    foo(2, if $1 {
+    $2
+} else {
+    $0
+})
+}
+",
+        );
+
+        check_edit(
+            "if let",
+            r"
+fn main() {
+    foo(2, $0)
+}
+",
+            r"
+fn main() {
+    foo(2, if let $1 = $2 {
+    $3
+} else {
+    $0
+})
+}
+",
+        );
+    }
+
+    #[test]
+    fn if_completion_in_let_statement() {
+        check_edit(
+            "if",
+            r"
+fn main() {
+    let x = $0;
+}
+",
+            r"
+fn main() {
+    let x = if $1 {
+    $2
+} else {
+    $0
+};
+}
+",
+        );
+
+        check_edit(
+            "if let",
+            r"
+fn main() {
+    let x = $0;
+}
+",
+            r"
+fn main() {
+    let x = if let $1 = $2 {
+    $3
+} else {
+    $0
+};
+}
+",
+        );
+    }
+
+    #[test]
+    fn if_completion_in_format() {
+        check_edit(
+            "if",
+            r#"
+//- minicore: fmt
+fn main() {
+    format_args!("{}", $0);
+}
+"#,
+            r#"
+fn main() {
+    format_args!("{}", if $1 {
+    $2
+} else {
+    $0
+});
+}
+"#,
+        );
+
+        check_edit(
+            "if",
+            r#"
+//- minicore: fmt
+fn main() {
+    format_args!("{}", if$0);
+}
+"#,
+            r#"
+fn main() {
+    format_args!("{}", if $1 {
+    $2
+} else {
+    $0
+});
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn if_completion_in_value_expected_expressions() {
+        check_edit(
+            "if",
+            r#"
+fn main() {
+    2 + $0;
+}
+"#,
+            r#"
+fn main() {
+    2 + if $1 {
+    $2
+} else {
+    $0
+};
+}
+"#,
+        );
+
+        check_edit(
+            "if",
+            r#"
+fn main() {
+    -$0;
+}
+"#,
+            r#"
+fn main() {
+    -if $1 {
+    $2
+} else {
+    $0
+};
+}
+"#,
+        );
+
+        check_edit(
+            "if",
+            r#"
+fn main() {
+    return $0;
+}
+"#,
+            r#"
+fn main() {
+    return if $1 {
+    $2
+} else {
+    $0
+};
+}
+"#,
+        );
+
+        check_edit(
+            "if",
+            r#"
+fn main() {
+    loop {
+        break $0;
+    }
+}
+"#,
+            r#"
+fn main() {
+    loop {
+        break if $1 {
+    $2
+} else {
+    $0
+};
+    }
+}
+"#,
+        );
+
+        check_edit(
+            "if",
+            r#"
+struct Foo { x: i32 }
+fn main() {
+    Foo { x: $0 }
+}
+"#,
+            r#"
+struct Foo { x: i32 }
+fn main() {
+    Foo { x: if $1 {
+    $2
+} else {
+    $0
+} }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn completes_let_in_block() {
         check_edit(
             "let",
             r#"
@@ -342,7 +736,7 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let $0
+    let $1 = $0;
 }
 "#,
         );
@@ -355,7 +749,97 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let mut $0
+    let mut $1 = $0;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn completes_let_in_condition() {
+        check_edit(
+            "let",
+            r#"
+fn main() {
+    if $0 {}
+}
+"#,
+            r#"
+fn main() {
+    if let $1 = $0 {}
+}
+"#,
+        );
+        check_edit(
+            "letm",
+            r#"
+fn main() {
+    if $0 {}
+}
+"#,
+            r#"
+fn main() {
+    if let mut $1 = $0 {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn completes_let_in_no_empty_condition() {
+        check_edit(
+            "let",
+            r#"
+fn main() {
+    if $0x {}
+}
+"#,
+            r#"
+fn main() {
+    if let $1 = $0x {}
+}
+"#,
+        );
+        check_edit(
+            "letm",
+            r#"
+fn main() {
+    if $0x {}
+}
+"#,
+            r#"
+fn main() {
+    if let mut $1 = $0x {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn completes_let_in_condition_block() {
+        check_edit(
+            "let",
+            r#"
+fn main() {
+    if { $0 } {}
+}
+"#,
+            r#"
+fn main() {
+    if { let $1 = $0; } {}
+}
+"#,
+        );
+        check_edit(
+            "letm",
+            r#"
+fn main() {
+    if { $0 } {}
+}
+"#,
+            r#"
+fn main() {
+    if { let mut $1 = $0; } {}
 }
 "#,
         );

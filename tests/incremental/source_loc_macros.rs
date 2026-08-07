@@ -4,6 +4,7 @@
 //@ revisions:rpass1 rpass2
 
 //@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 
@@ -22,7 +23,7 @@ fn file_same() {
     let _ = file!();
 }
 
-#[rustc_clean(except="opt_hir_owner_nodes,optimized_mir", cfg="rpass2")]
+#[rustc_clean(except="hir_owner,optimized_mir", cfg="rpass2")]
 fn line_different() {
     #[cfg(rpass1)]
     {
@@ -34,7 +35,7 @@ fn line_different() {
     }
 }
 
-#[rustc_clean(except="opt_hir_owner_nodes,optimized_mir", cfg="rpass2")]
+#[rustc_clean(except="hir_owner,optimized_mir", cfg="rpass2")]
 fn col_different() {
     #[cfg(rpass1)]
     {

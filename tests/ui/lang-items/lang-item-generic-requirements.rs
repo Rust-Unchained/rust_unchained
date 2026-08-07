@@ -4,15 +4,21 @@
 #![feature(lang_items, no_core)]
 #![no_core]
 
+#[lang = "pointee_sized"]
+pub trait MyPointeeSized {}
+
+#[lang = "meta_sized"]
+pub trait MyMetaSized: MyPointeeSized {}
+
 #[lang = "sized"]
-trait MySized {}
+trait MySized: MyMetaSized {}
 
 #[lang = "add"]
 trait MyAdd<'a, T> {}
 //~^^ ERROR: `add` lang item must be applied to a trait with 1 generic argument [E0718]
 
-#[lang = "drop_in_place"]
-//~^ ERROR `drop_in_place` lang item must be applied to a function with at least 1 generic
+#[lang = "drop_glue"]
+//~^ ERROR `drop_glue` lang item must be applied to a function with 1 generic
 fn my_ptr_drop() {}
 
 #[lang = "index"]
@@ -48,16 +54,17 @@ fn ice() {
 
     // Use index
     let arr = [0; 5];
+    //~^ ERROR requires `copy` lang_item
     let _ = arr[2];
+    //~^ ERROR: cannot index into a value of type `[{integer}; 5]`
 
     // Use phantomdata
     let _ = MyPhantomData::<(), i32>;
 
     // Use Foo
     let _: () = Foo;
+    //~^ ERROR: mismatched types
 }
 
 // use `start`
 fn main() {}
-
-//~? ERROR requires `copy` lang_item

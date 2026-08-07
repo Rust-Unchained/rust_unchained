@@ -1,3 +1,4 @@
+//@ edition:2015
 #[derive(Default)]
 enum E {
     A {},
@@ -11,5 +12,6 @@ impl E {
 }
 
 fn main() {
-    E::A::f(); //~ ERROR failed to resolve: `A` is a variant, not a module
+    E::A::f(); //~ ERROR cannot find module `A` in `E`
+    //~^ NOTE: `A` is a variant, not a module
 }

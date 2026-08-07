@@ -1,5 +1,5 @@
+use std::io;
 use std::io::prelude::Write;
-use std::io::{self};
 use std::time::Duration;
 
 use super::OutputFormatter;
@@ -181,6 +181,18 @@ impl<T: Write> OutputFormatter for JunitFormatter<T> {
         self.out.write_all(b"\n")?;
 
         Ok(state.failed == 0)
+    }
+
+    fn write_merged_doctests_times(
+        &mut self,
+        total_time: f64,
+        compilation_time: f64,
+    ) -> io::Result<()> {
+        self.write_message(&format!(
+            "<report total_time=\"{total_time}\" compilation_time=\"{compilation_time}\"></report>",
+        ))?;
+        self.out.write_all(b"\n")?;
+        Ok(())
     }
 }
 

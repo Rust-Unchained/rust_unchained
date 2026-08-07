@@ -1,5 +1,4 @@
-use rustc_ast::ast::{self, BindingMode, ByRef, Pat, PatField, PatKind, RangeEnd, RangeSyntax};
-use rustc_ast::ptr;
+use rustc_ast::ast::{self, BindingMode, ByRef, Pat, PatField, PatKind};
 use rustc_span::{BytePos, Span};
 
 use crate::comment::{FindUncommented, combine_strs_with_missing_comments};
@@ -12,13 +11,16 @@ use crate::lists::{
 };
 use crate::macros::{MacroPosition, rewrite_macro};
 use crate::overflow;
-use crate::pairs::{PairParts, rewrite_pair};
+use crate::range::rewrite_range;
 use crate::rewrite::{Rewrite, RewriteContext, RewriteError, RewriteErrorExt, RewriteResult};
 use crate::shape::Shape;
 use crate::source_map::SpanUtils;
 use crate::spanned::Spanned;
 use crate::types::{PathContext, rewrite_path};
-use crate::utils::{format_mutability, mk_sp, mk_sp_lo_plus_one, rewrite_ident};
+use crate::utils::{
+    format_mutability, format_pinnedness_and_mutability, format_range_end, mk_sp,
+    mk_sp_lo_plus_one, rewrite_ident,
+};
 
 /// Returns `true` if the given pattern is "short".
 /// A short pattern is defined by the following grammar:
@@ -70,27 +72,9 @@ fn is_short_pattern_inner(context: &RewriteContext<'_>, pat: &ast::Pat) -> bool 
         }
         ast::PatKind::Box(ref p)
         | PatKind::Deref(ref p)
-        | ast::PatKind::Ref(ref p, _)
+        | ast::PatKind::Ref(ref p, _, _)
         | ast::PatKind::Paren(ref p) => is_short_pattern_inner(context, &*p),
         PatKind::Or(ref pats) => pats.iter().all(|p| is_short_pattern_inner(context, p)),
-    }
-}
-
-pub(crate) struct RangeOperand<'a, T> {
-    pub operand: &'a Option<ptr::P<T>>,
-    pub span: Span,
-}
-
-impl<'a, T: Rewrite> Rewrite for RangeOperand<'a, T> {
-    fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
-        self.rewrite_result(context, shape).ok()
-    }
-
-    fn rewrite_result(&self, context: &RewriteContext<'_>, shape: Shape) -> RewriteResult {
-        match &self.operand {
-            None => Ok("".to_owned()),
-            Some(ref exp) => exp.rewrite_result(context, shape),
-        }
     }
 }
 
@@ -134,9 +118,13 @@ impl Rewrite for Pat {
             PatKind::Ident(BindingMode(by_ref, mutability), ident, ref sub_pat) => {
                 let mut_prefix = format_mutability(mutability).trim();
 
-                let (ref_kw, mut_infix) = match by_ref {
-                    ByRef::Yes(rmutbl) => ("ref", format_mutability(rmutbl).trim()),
-                    ByRef::No => ("", ""),
+                let (ref_kw, pin_infix, mut_infix) = match by_ref {
+                    ByRef::Yes(pinnedness, rmutbl) => {
+                        let (pin_infix, mut_infix) =
+                            format_pinnedness_and_mutability(pinnedness, rmutbl);
+                        ("ref", pin_infix.trim(), mut_infix.trim())
+                    }
+                    ByRef::No => ("", "", ""),
                 };
                 let id_str = rewrite_ident(context, ident);
                 let sub_pat = match *sub_pat {
@@ -147,6 +135,7 @@ impl Rewrite for Pat {
                             .checked_sub(
                                 mut_prefix.len()
                                     + ref_kw.len()
+                                    + pin_infix.len()
                                     + mut_infix.len()
                                     + id_str.len()
                                     + 2,
@@ -193,18 +182,17 @@ impl Rewrite for Pat {
                     (true, true) => (self.span.lo(), "".to_owned()),
                 };
 
-                // combine result of above and mut
-                let (second_lo, second) = match (first.is_empty(), mut_infix.is_empty()) {
+                // combine result of above and pin
+                let (second_lo, second) = match (first.is_empty(), pin_infix.is_empty()) {
                     (false, false) => {
                         let lo = context.snippet_provider.span_after(self.span, "ref");
-                        let end_span = mk_sp(first_lo, self.span.hi());
-                        let hi = context.snippet_provider.span_before(end_span, "mut");
+                        let hi = context.snippet_provider.span_before(self.span, "pin");
                         (
-                            context.snippet_provider.span_after(end_span, "mut"),
+                            context.snippet_provider.span_after(self.span, "pin"),
                             combine_strs_with_missing_comments(
                                 context,
                                 &first,
-                                mut_infix,
+                                pin_infix,
                                 mk_sp(lo, hi),
                                 shape,
                                 true,
@@ -212,7 +200,33 @@ impl Rewrite for Pat {
                         )
                     }
                     (false, true) => (first_lo, first),
-                    (true, false) => unreachable!("mut_infix necessarily follows a ref"),
+                    (true, false) => unreachable!("pin_infix necessarily follows a ref"),
+                    (true, true) => (self.span.lo(), "".to_owned()),
+                };
+
+                // combine result of above and const|mut
+                let (third_lo, third) = match (second.is_empty(), mut_infix.is_empty()) {
+                    (false, false) => {
+                        let lo = context.snippet_provider.span_after(
+                            self.span,
+                            if pin_infix.is_empty() { "ref" } else { "pin" },
+                        );
+                        let end_span = mk_sp(second_lo, self.span.hi());
+                        let hi = context.snippet_provider.span_before(end_span, mut_infix);
+                        (
+                            context.snippet_provider.span_after(end_span, mut_infix),
+                            combine_strs_with_missing_comments(
+                                context,
+                                &second,
+                                mut_infix,
+                                mk_sp(lo, hi),
+                                shape,
+                                true,
+                            )?,
+                        )
+                    }
+                    (false, true) => (second_lo, second),
+                    (true, false) => unreachable!("mut_infix necessarily follows a pin or ref"),
                     (true, true) => (self.span.lo(), "".to_owned()),
                 };
 
@@ -232,9 +246,9 @@ impl Rewrite for Pat {
 
                 combine_strs_with_missing_comments(
                     context,
-                    &second,
+                    &third,
                     &next,
-                    mk_sp(second_lo, ident.span.lo()),
+                    mk_sp(third_lo, ident.span.lo()),
                     shape,
                     true,
                 )
@@ -260,11 +274,17 @@ impl Rewrite for Pat {
                 }
             }
             PatKind::Never => Err(RewriteError::Unknown),
-            PatKind::Range(ref lhs, ref rhs, ref end_kind) => {
-                rewrite_range_pat(context, shape, lhs, rhs, end_kind, self.span)
-            }
-            PatKind::Ref(ref pat, mutability) => {
-                let prefix = format!("&{}", format_mutability(mutability));
+            PatKind::Range(ref lhs, ref rhs, ref end_kind) => rewrite_range(
+                context,
+                shape,
+                lhs.as_deref(),
+                rhs.as_deref(),
+                format_range_end(end_kind.node),
+            ),
+            PatKind::Ref(ref pat, pinnedness, mutability) => {
+                let (pin_prefix, mut_prefix) =
+                    format_pinnedness_and_mutability(pinnedness, mutability);
+                let prefix = format!("&{}{}", pin_prefix, mut_prefix);
                 rewrite_unary_prefix(context, &prefix, &**pat, shape)
             }
             PatKind::Tuple(ref items) => rewrite_tuple_pat(items, None, self.span, context, shape),
@@ -304,7 +324,7 @@ impl Rewrite for Pat {
                 qself,
                 path,
                 fields,
-                rest == ast::PatFieldsRest::Rest,
+                matches!(rest, ast::PatFieldsRest::Rest(_)),
                 self.span,
                 context,
                 shape,
@@ -313,10 +333,7 @@ impl Rewrite for Pat {
             PatKind::Paren(ref pat) => pat
                 .rewrite_result(
                     context,
-                    shape
-                        .offset_left(1)
-                        .and_then(|s| s.sub_width(1))
-                        .max_width_error(shape.width, self.span)?,
+                    shape.offset_left(1, self.span)?.sub_width(1, self.span)?,
                 )
                 .map(|inner_pat| format!("({})", inner_pat)),
             PatKind::Guard(..) => Ok(context.snippet(self.span).to_string()),
@@ -326,52 +343,8 @@ impl Rewrite for Pat {
     }
 }
 
-pub fn rewrite_range_pat<T: Rewrite>(
-    context: &RewriteContext<'_>,
-    shape: Shape,
-    lhs: &Option<ptr::P<T>>,
-    rhs: &Option<ptr::P<T>>,
-    end_kind: &rustc_span::source_map::Spanned<RangeEnd>,
-    span: Span,
-) -> RewriteResult {
-    let infix = match end_kind.node {
-        RangeEnd::Included(RangeSyntax::DotDotDot) => "...",
-        RangeEnd::Included(RangeSyntax::DotDotEq) => "..=",
-        RangeEnd::Excluded => "..",
-    };
-    let infix = if context.config.spaces_around_ranges() {
-        let lhs_spacing = match lhs {
-            None => "",
-            Some(_) => " ",
-        };
-        let rhs_spacing = match rhs {
-            None => "",
-            Some(_) => " ",
-        };
-        format!("{lhs_spacing}{infix}{rhs_spacing}")
-    } else {
-        infix.to_owned()
-    };
-    let lspan = span.with_hi(end_kind.span.lo());
-    let rspan = span.with_lo(end_kind.span.hi());
-    rewrite_pair(
-        &RangeOperand {
-            operand: lhs,
-            span: lspan,
-        },
-        &RangeOperand {
-            operand: rhs,
-            span: rspan,
-        },
-        PairParts::infix(&infix),
-        context,
-        shape,
-        SeparatorPlace::Front,
-    )
-}
-
 fn rewrite_struct_pat(
-    qself: &Option<ptr::P<ast::QSelf>>,
+    qself: &Option<Box<ast::QSelf>>,
     path: &ast::Path,
     fields: &[ast::PatField],
     ellipsis: bool,
@@ -380,7 +353,7 @@ fn rewrite_struct_pat(
     shape: Shape,
 ) -> RewriteResult {
     // 2 =  ` {`
-    let path_shape = shape.sub_width(2).max_width_error(shape.width, span)?;
+    let path_shape = shape.sub_width(2, span)?;
     let path_str = rewrite_path(context, PathContext::Expr, qself, path, path_shape)?;
 
     if fields.is_empty() && !ellipsis {
@@ -390,9 +363,13 @@ fn rewrite_struct_pat(
     let (ellipsis_str, terminator) = if ellipsis { (", ..", "..") } else { ("", "}") };
 
     // 3 = ` { `, 2 = ` }`.
-    let (h_shape, v_shape) =
-        struct_lit_shape(shape, context, path_str.len() + 3, ellipsis_str.len() + 2)
-            .max_width_error(shape.width, span)?;
+    let (h_shape, v_shape) = struct_lit_shape(
+        shape,
+        context,
+        path_str.len() + 3,
+        ellipsis_str.len() + 2,
+        span,
+    )?;
 
     let items = itemize_list(
         context.snippet_provider,
@@ -505,7 +482,7 @@ impl Rewrite for PatField {
 
 #[derive(Debug)]
 pub(crate) enum TuplePatField<'a> {
-    Pat(&'a ptr::P<ast::Pat>),
+    Pat(&'a ast::Pat),
     Dotdot(Span),
 }
 
@@ -551,7 +528,7 @@ pub(crate) fn can_be_overflowed_pat(
             | ast::PatKind::Tuple(..)
             | ast::PatKind::Struct(..)
             | ast::PatKind::TupleStruct(..) => context.use_block_indent() && len == 1,
-            ast::PatKind::Ref(ref p, _) | ast::PatKind::Box(ref p) => {
+            ast::PatKind::Ref(ref p, _, _) | ast::PatKind::Box(ref p) => {
                 can_be_overflowed_pat(context, &TuplePatField::Pat(p), len)
             }
             ast::PatKind::Expr(ref expr) => can_be_overflowed_expr(context, expr, len),
@@ -562,7 +539,7 @@ pub(crate) fn can_be_overflowed_pat(
 }
 
 fn rewrite_tuple_pat(
-    pats: &[ptr::P<ast::Pat>],
+    pats: &[ast::Pat],
     path_str: Option<String>,
     span: Span,
     context: &RewriteContext<'_>,

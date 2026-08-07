@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::for_each_expr_without_closures;
-use clippy_utils::{eq_expr_value, get_parent_expr};
+use clippy_utils::{eq_expr_value, get_parent_expr, sym};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -22,8 +22,8 @@ pub(super) fn check<'tcx>(
         // If the parent node's `to` argument is the same as the `to` argument
         // of the last replace call in the current chain, don't lint as it was already linted
         if let Some(parent) = get_parent_expr(cx, expr)
-            && let Some(("replace", _, [current_from, current_to], _, _)) = method_call(parent)
-            && eq_expr_value(cx, to, current_to)
+            && let Some((sym::replace, _, [current_from, current_to], _, _)) = method_call(parent)
+            && eq_expr_value(cx, parent.span.ctxt(), to, current_to)
             && from_kind == cx.typeck_results().expr_ty(current_from).peel_refs().kind()
         {
             return;
@@ -46,9 +46,10 @@ fn collect_replace_calls<'tcx>(
     let mut methods = VecDeque::new();
     let mut from_args = VecDeque::new();
 
+    let ctxt = expr.span.ctxt();
     let _: Option<()> = for_each_expr_without_closures(expr, |e| {
-        if let Some(("replace", _, [from, to], _, _)) = method_call(e) {
-            if eq_expr_value(cx, to_arg, to) && cx.typeck_results().expr_ty(from).peel_refs().is_char() {
+        if let Some((sym::replace, _, [from, to], _, _)) = method_call(e) {
+            if eq_expr_value(cx, ctxt, to_arg, to) && cx.typeck_results().expr_ty(from).peel_refs().is_char() {
                 methods.push_front(e);
                 from_args.push_front(from);
                 ControlFlow::Continue(())

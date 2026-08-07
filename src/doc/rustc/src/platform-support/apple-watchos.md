@@ -2,10 +2,13 @@
 
 Apple watchOS targets.
 
-**Tier: 3**
+**Tier: 2 (without Host Tools)**
 
 - `aarch64-apple-watchos`: Apple WatchOS on ARM64.
 - `aarch64-apple-watchos-sim`: Apple WatchOS Simulator on ARM64.
+
+**Tier: 3**
+
 - `x86_64-apple-watchos-sim`: Apple WatchOS Simulator on 64-bit x86.
 - `arm64_32-apple-watchos`: Apple WatchOS on Arm 64_32.
 - `armv7k-apple-watchos`: Apple WatchOS on Armv7k.
@@ -37,30 +40,18 @@ case `WATCHOS_DEPLOYMENT_TARGET`.
 
 ## Building the target
 
-The targets can be built by enabling them for a `rustc` build in
-`bootstrap.toml`, by adding, for example:
-
-```toml
-[build]
-build-stage = 1
-target = ["aarch64-apple-watchos", "aarch64-apple-watchos-sim"]
+The tier 2 targets are distributed through `rustup`, and can be installed using one of:
+```console
+$ rustup target add aarch64-apple-watchos
+$ rustup target add aarch64-apple-watchos-sim
 ```
 
-Using the unstable `-Zbuild-std` with a nightly Cargo may also work.
+See [the instructions for iOS](./apple-ios.md#building-the-target) for how to build the tier 3 targets.
 
 ## Building Rust programs
 
-Rust programs can be built for these targets by specifying `--target`, if
-`rustc` has been built with support for them. For example:
-
-```console
-$ rustc --target aarch64-apple-watchos-sim your-code.rs
-```
+See [the instructions for iOS](./apple-ios.md#building-rust-programs).
 
 ## Testing
 
-There is no support for running the Rust or standard library testsuite at the
-moment. Testing has mostly been done manually with builds of static libraries
-embedded into applications called from Xcode or a simulator.
-
-It hopefully will be possible to improve this in the future.
+See [the instructions for iOS](./apple-ios.md#testing).

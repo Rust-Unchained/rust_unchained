@@ -1,5 +1,4 @@
 {
-  pkgs,
   lib,
   stdenv,
   rustc,
@@ -16,7 +15,6 @@
   # LLVM Deps
   ninja,
   cmake,
-  glibc,
 }:
 stdenv.mkDerivation (self: {
   strictDeps = true;
@@ -76,7 +74,7 @@ stdenv.mkDerivation (self: {
 
   meta = {
     description = "Helper for rust-lang/rust x.py";
-    homepage = "https://github.com/rust-lang/rust/blob/master/src/tools/x";
+    homepage = "https://github.com/rust-lang/rust/blob/HEAD/src/tools/x";
     license = lib.licenses.mit;
     mainProgram = "x";
   };

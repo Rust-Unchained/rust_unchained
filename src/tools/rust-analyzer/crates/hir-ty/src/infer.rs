@@ -2,7 +2,7 @@
 //! the type of each expression and pattern.
 //!
 //! For type inference, compare the implementations in rustc (the various
-//! check_* methods in rustc_hir_analysis/check/mod.rs are a good entry point) and
+//! check_* methods in [`rustc_hir_typeck/check.rs`] are a good entry point) and
 //! IntelliJ-Rust (org.rust.lang.core.types.infer). Our entry point for
 //! inference here is the `infer` function, which infers the types of all
 //! expressions in a given function.
@@ -12,66 +12,100 @@
 //! we might determine that certain variables need to be equal to each other, or
 //! to certain types. To record this, we use the union-find implementation from
 //! the `ena` crate, which is extracted from rustc.
+//!
+//! [`rustc_hir_typeck/check.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/check.rs
 
+mod autoderef;
+mod callee;
 pub(crate) mod cast;
 pub(crate) mod closure;
 mod coerce;
 pub(crate) mod diagnostics;
 mod expr;
+mod fallback;
 mod mutability;
+mod op;
+mod opaques;
 mod pat;
 mod path;
+mod place_op;
 pub(crate) mod unify;
 
-use std::{cell::OnceCell, convert::identity, iter, ops::Index};
-
-use chalk_ir::{
-    cast::Cast,
-    fold::TypeFoldable,
-    interner::HasInterner,
-    visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
-    DebruijnIndex, Mutability, Safety, Scalar, TyKind, TypeFlags, Variance,
+use std::{
+    cell::{OnceCell, RefCell},
+    convert::identity,
+    fmt,
+    hash::Hash,
+    ops::Deref,
 };
+
+use base_db::{Crate, FxIndexMap};
 use either::Either;
 use hir_def::{
-    builtin_type::{BuiltinInt, BuiltinType, BuiltinUint},
-    data::{ConstData, StaticData},
-    expr_store::{Body, HygieneId},
-    hir::{BindingAnnotation, BindingId, ExprId, ExprOrPatId, LabelId, PatId},
-    lang_item::{LangItem, LangItemTarget},
+    AdtId, AssocItemId, AttrDefId, ConstId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
+    FunctionId, GenericDefId, GenericParamId, HasModule, LocalFieldId, Lookup, StaticId, TraitId,
+    TupleFieldId, TupleId, VariantId,
+    attrs::AttrFlags,
+    expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
+    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId},
+    lang_item::LangItems,
     layout::Integer,
-    path::{ModPath, Path},
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
-    type_ref::{LifetimeRef, TypeRefId, TypesMap},
-    AdtId, AssocItemId, DefWithBodyId, FieldId, FunctionId, ImplId, ItemContainerId, Lookup,
-    TraitId, TupleFieldId, TupleId, TypeAliasId, VariantId,
+    signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
+    type_ref::{LifetimeRefId, TypeRefId},
+    unstable_features::UnstableFeatures,
 };
-use hir_expand::name::Name;
+use hir_expand::{mod_path::ModPath, name::Name};
 use indexmap::IndexSet;
-use intern::sym;
-use la_arena::{ArenaMap, Entry};
+use la_arena::ArenaMap;
+use macros::{TypeFoldable, TypeVisitable};
+use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
-use stdx::{always, never};
-use triomphe::Arc;
+use rustc_type_ir::{
+    AliasTyKind, TypeFoldable, TypeVisitableExt,
+    inherent::{GenericArgs as _, IntoKind, Ty as _},
+};
+use salsa::Update;
+use smallvec::SmallVec;
+use span::Edition;
+use stdx::never;
+use thin_vec::ThinVec;
 
 use crate::{
-    db::HirDatabase,
-    fold_tys,
+    ImplTraitId, IncorrectGenericsLenKind, InferBodyId, PathLoweringDiagnostic, Span,
+    TargetFeatures,
+    closure_analysis::PlaceBase,
+    consteval::{create_anon_const, path_to_const},
+    db::{AnonConstId, GeneralConstId, HirDatabase, InternedOpaqueTyId},
     generics::Generics,
     infer::{
-        coerce::CoerceMany,
-        diagnostics::{Diagnostics, InferenceTyLoweringContext as TyLoweringContext},
+        callee::DeferredCallResolution,
+        closure::analysis::{
+            BorrowKind,
+            expr_use_visitor::{FakeReadCause, Place},
+        },
+        coerce::{CoerceMany, DynamicCoerceMany},
+        diagnostics::{
+            Diagnostics, InferenceTyLoweringContext as TyLoweringContext,
+            InferenceTyLoweringVarsCtx,
+        },
         expr::ExprIsRead,
-        unify::InferenceTable,
+        pat::PatOrigin,
+        unify::resolve_completely::WriteBackCtxt,
     },
-    lower::{diagnostics::TyLoweringDiagnostic, ImplTraitLoweringMode},
-    mir::MirSpan,
-    to_assoc_type_id,
-    traits::FnTrait,
-    utils::{InTypeConstIdMetadata, UnevaluatedConstEvaluatorFolder},
-    AliasEq, AliasTy, Binders, ClosureId, Const, DomainGoal, GenericArg, Goal, ImplTraitId,
-    ImplTraitIdx, InEnvironment, Interner, Lifetime, OpaqueTyId, ParamLoweringMode,
-    PathLoweringDiagnostic, ProjectionTy, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
+    lower::{
+        ImplTraitIdx, ImplTraitLoweringMode, LifetimeElisionKind, LifetimeLoweringMode,
+        LoweringMode, diagnostics::TyLoweringDiagnostic,
+    },
+    method_resolution::CandidateId,
+    next_solver::{
+        AliasTy, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArgs, Region, StoredFnSig,
+        StoredGenericArg, StoredGenericArgs, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        abi::Safety,
+        infer::{InferCtxt, ObligationInspector, traits::ObligationCause},
+    },
+    solver_errors::SolverDiagnostic,
+    utils::TargetFeatureIsSafeInTarget,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -83,119 +117,173 @@ pub use coerce::could_coerce;
 pub use unify::{could_unify, could_unify_deeply};
 
 use cast::{CastCheck, CastError};
-pub(crate) use closure::{CaptureKind, CapturedItem, CapturedItemWithoutTy};
 
 /// The entry point of type inference.
-pub(crate) fn infer_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> {
+fn infer_query<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'db> {
+    infer_query_with_inspect(db, def, None, LoweringMode::Analysis)
+}
+
+pub fn infer_query_with_inspect<'db>(
+    db: &'db dyn HirDatabase,
+    def: DefWithBodyId,
+    inspect: Option<ObligationInspector<'db>>,
+    lowering_mode: LoweringMode,
+) -> InferenceResult<'db> {
     let _p = tracing::info_span!("infer_query").entered();
-    let resolver = def.resolver(db.upcast());
-    let body = db.body(def);
-    let mut ctx = InferenceContext::new(db, def, &body, resolver);
+    let resolver = def.resolver(db);
+    let body = Body::of(db, def);
+    let mut ctx = InferenceContext::new(
+        db,
+        InferBodyId::DefWithBodyId(def),
+        ExpressionStoreOwnerId::Body(def),
+        def.generic_def(db),
+        &body.store,
+        resolver,
+        true,
+        lowering_mode,
+    );
+
+    if let Some(inspect) = inspect {
+        ctx.table.infer_ctxt.attach_obligation_inspector(inspect);
+    }
 
     match def {
         DefWithBodyId::FunctionId(f) => {
-            ctx.collect_fn(f);
+            ctx.collect_fn(f, body.self_param.map(|param| param.formal), &body.params)
         }
-        DefWithBodyId::ConstId(c) => ctx.collect_const(&db.const_data(c)),
-        DefWithBodyId::StaticId(s) => ctx.collect_static(&db.static_data(s)),
+        DefWithBodyId::ConstId(c) => ctx.collect_const(c, ConstSignature::of(db, c)),
+        DefWithBodyId::StaticId(s) => ctx.collect_static(s, StaticSignature::of(db, s)),
         DefWithBodyId::VariantId(v) => {
-            ctx.return_ty = TyBuilder::builtin(
-                match db.enum_data(v.lookup(db.upcast()).parent).variant_body_type() {
-                    hir_def::layout::IntegerType::Pointer(signed) => match signed {
-                        true => BuiltinType::Int(BuiltinInt::Isize),
-                        false => BuiltinType::Uint(BuiltinUint::Usize),
+            ctx.return_ty = match EnumSignature::variant_body_type(db, v.lookup(db).parent) {
+                hir_def::layout::IntegerType::Pointer(signed) => match signed {
+                    true => ctx.types.types.isize,
+                    false => ctx.types.types.usize,
+                },
+                hir_def::layout::IntegerType::Fixed(size, signed) => match signed {
+                    true => match size {
+                        Integer::I8 => ctx.types.types.i8,
+                        Integer::I16 => ctx.types.types.i16,
+                        Integer::I32 => ctx.types.types.i32,
+                        Integer::I64 => ctx.types.types.i64,
+                        Integer::I128 => ctx.types.types.i128,
                     },
-                    hir_def::layout::IntegerType::Fixed(size, signed) => match signed {
-                        true => BuiltinType::Int(match size {
-                            Integer::I8 => BuiltinInt::I8,
-                            Integer::I16 => BuiltinInt::I16,
-                            Integer::I32 => BuiltinInt::I32,
-                            Integer::I64 => BuiltinInt::I64,
-                            Integer::I128 => BuiltinInt::I128,
-                        }),
-                        false => BuiltinType::Uint(match size {
-                            Integer::I8 => BuiltinUint::U8,
-                            Integer::I16 => BuiltinUint::U16,
-                            Integer::I32 => BuiltinUint::U32,
-                            Integer::I64 => BuiltinUint::U64,
-                            Integer::I128 => BuiltinUint::U128,
-                        }),
+                    false => match size {
+                        Integer::I8 => ctx.types.types.u8,
+                        Integer::I16 => ctx.types.types.u16,
+                        Integer::I32 => ctx.types.types.u32,
+                        Integer::I64 => ctx.types.types.u64,
+                        Integer::I128 => ctx.types.types.u128,
                     },
                 },
-            );
-        }
-        DefWithBodyId::InTypeConstId(c) => {
-            // FIXME(const-generic-body): We should not get the return type in this way.
-            ctx.return_ty = c
-                .lookup(db.upcast())
-                .expected_ty
-                .box_any()
-                .downcast::<InTypeConstIdMetadata>()
-                .unwrap()
-                .0;
+            };
         }
     }
 
-    ctx.infer_body();
+    ctx.infer_body(body.root_expr());
 
-    ctx.infer_mut_body();
+    ctx.infer_mut_body(body.root_expr());
 
-    ctx.infer_closures();
-
-    Arc::new(ctx.resolve_all())
+    infer_finalize(ctx)
 }
 
-/// Fully normalize all the types found within `ty` in context of `owner` body definition.
-///
-/// This is appropriate to use only after type-check: it assumes
-/// that normalization will succeed, for example.
-pub(crate) fn normalize(db: &dyn HirDatabase, trait_env: Arc<TraitEnvironment>, ty: Ty) -> Ty {
-    // FIXME: TypeFlags::HAS_CT_PROJECTION is not implemented in chalk, so TypeFlags::HAS_PROJECTION only
-    // works for the type case, so we check array unconditionally. Remove the array part
-    // when the bug in chalk becomes fixed.
-    if !ty.data(Interner).flags.intersects(TypeFlags::HAS_PROJECTION)
-        && !matches!(ty.kind(Interner), TyKind::Array(..))
-    {
-        return ty;
+fn infer_cycle_result<'db>(
+    db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: DefWithBodyId,
+) -> InferenceResult<'db> {
+    InferenceResult {
+        has_errors: true,
+        ..InferenceResult::new(Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed))
     }
-    let mut table = unify::InferenceTable::new(db, trait_env);
-
-    let ty_with_vars = table.normalize_associated_types_in(ty);
-    table.resolve_obligations_as_possible();
-    table.propagate_diverging_flag();
-    table.resolve_completely(ty_with_vars)
 }
 
-/// Binding modes inferred for patterns.
-/// <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
-pub enum BindingMode {
-    #[default]
-    Move,
-    Ref(Mutability),
+/// Infer types for an anonymous const expression.
+fn infer_anon_const_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: AnonConstId<'db>,
+) -> InferenceResult<'db> {
+    let _p = tracing::info_span!("infer_anon_const_query").entered();
+    let loc = def.loc(db);
+    let store_owner = loc.owner;
+    let store = ExpressionStore::of(db, store_owner);
+
+    let resolver = store_owner.resolver(db);
+
+    let mut ctx = InferenceContext::new(
+        db,
+        InferBodyId::AnonConstId(def),
+        store_owner,
+        loc.owner.generic_def(db),
+        store,
+        resolver,
+        loc.allow_using_generic_params,
+        LoweringMode::Analysis,
+    );
+
+    ctx.infer_expr(
+        loc.expr,
+        &Expectation::has_type(loc.ty.get().instantiate_identity().skip_norm_wip()),
+        ExprIsRead::Yes,
+    );
+
+    infer_finalize(ctx)
 }
 
-impl BindingMode {
-    fn convert(annotation: BindingAnnotation) -> BindingMode {
-        match annotation {
-            BindingAnnotation::Unannotated | BindingAnnotation::Mutable => BindingMode::Move,
-            BindingAnnotation::Ref => BindingMode::Ref(Mutability::Not),
-            BindingAnnotation::RefMut => BindingMode::Ref(Mutability::Mut),
+fn infer_anon_const_cycle_result<'db>(
+    db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: AnonConstId<'db>,
+) -> InferenceResult<'db> {
+    InferenceResult {
+        has_errors: true,
+        ..InferenceResult::new(Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed))
+    }
+}
+
+fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
+    ctx.handle_opaque_type_uses();
+
+    ctx.type_inference_fallback();
+
+    // Comment from rustc:
+    // Even though coercion casts provide type hints, we check casts after fallback for
+    // backwards compatibility. This makes fallback a stronger type hint than a cast coercion.
+    let cast_checks = std::mem::take(&mut ctx.deferred_cast_checks);
+    for mut cast in cast_checks.into_iter() {
+        if let Err(diag) = cast.check(&mut ctx) {
+            ctx.diagnostics.push(diag);
         }
     }
+
+    ctx.table.select_obligations_where_possible();
+
+    // Closure and coroutine analysis may run after fallback
+    // because they don't constrain other type variables.
+    ctx.closure_analyze();
+    assert!(ctx.deferred_call_resolutions.is_empty());
+
+    ctx.table.select_obligations_where_possible();
+
+    ctx.handle_opaque_type_uses();
+
+    ctx.merge_anon_consts();
+
+    ctx.resolve_all()
 }
 
-#[derive(Debug)]
-pub(crate) struct InferOk<T> {
-    value: T,
-    goals: Vec<InEnvironment<Goal>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByRef {
+    Yes(Mutability),
+    No,
 }
 
-impl<T> InferOk<T> {
-    fn map<U>(self, f: impl FnOnce(T) -> U) -> InferOk<U> {
-        InferOk { value: f(self.value), goals: self.goals }
-    }
-}
+/// The mode of a binding (`mut`, `ref mut`, etc).
+/// Used for both the explicit binding annotations given in the HIR for a binding
+/// and the final binding mode that we infer after type inference/match ergonomics.
+/// `.0` is the by-reference mode (`ref`, `ref mut`, or by value),
+/// `.1` is the mutability of the binding.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BindingMode(pub ByRef, pub Mutability);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum InferenceTyDiagnosticSource {
@@ -205,114 +293,278 @@ pub enum InferenceTyDiagnosticSource {
     Signature,
 }
 
-#[derive(Debug)]
-pub(crate) struct TypeError;
-pub(crate) type InferResult<T> = Result<InferOk<T>, TypeError>;
-
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, TypeVisitable, TypeFoldable)]
 pub enum InferenceDiagnostic {
     NoSuchField {
-        field: ExprOrPatId,
-        private: bool,
+        #[type_visitable(ignore)]
+        field: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
+        private: Option<LocalFieldId>,
+        #[type_visitable(ignore)]
+        variant: VariantId,
+    },
+    MismatchedArrayPatLen {
+        #[type_visitable(ignore)]
+        pat: PatId,
+        #[type_visitable(ignore)]
+        expected: u128,
+        #[type_visitable(ignore)]
+        found: u128,
+        #[type_visitable(ignore)]
+        has_rest: bool,
+    },
+    ArrayPatternWithoutFixedLength {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    ExpectedArrayOrSlicePat {
+        #[type_visitable(ignore)]
+        pat: PatId,
+        found: StoredTy,
+    },
+    InvalidRangePatType {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    DuplicateField {
+        #[type_visitable(ignore)]
+        field: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
         variant: VariantId,
     },
     PrivateField {
+        #[type_visitable(ignore)]
         expr: ExprId,
+        #[type_visitable(ignore)]
         field: FieldId,
     },
     PrivateAssocItem {
-        id: ExprOrPatId,
+        #[type_visitable(ignore)]
+        id: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
         item: AssocItemId,
     },
     UnresolvedField {
+        #[type_visitable(ignore)]
         expr: ExprId,
-        receiver: Ty,
+        receiver: StoredTy,
+        #[type_visitable(ignore)]
         name: Name,
+        #[type_visitable(ignore)]
         method_with_same_name_exists: bool,
     },
     UnresolvedMethodCall {
+        #[type_visitable(ignore)]
         expr: ExprId,
-        receiver: Ty,
+        receiver: StoredTy,
+        #[type_visitable(ignore)]
         name: Name,
         /// Contains the type the field resolves to
-        field_with_same_name: Option<Ty>,
+        field_with_same_name: Option<StoredTy>,
+        #[type_visitable(ignore)]
         assoc_func_with_same_name: Option<FunctionId>,
     },
     UnresolvedAssocItem {
-        id: ExprOrPatId,
+        #[type_visitable(ignore)]
+        id: ExprOrPatIdPacked,
     },
     UnresolvedIdent {
-        id: ExprOrPatId,
+        #[type_visitable(ignore)]
+        id: ExprOrPatIdPacked,
     },
     // FIXME: This should be emitted in body lowering
     BreakOutsideOfLoop {
+        #[type_visitable(ignore)]
         expr: ExprId,
+        #[type_visitable(ignore)]
         is_break: bool,
+        #[type_visitable(ignore)]
         bad_value_break: bool,
     },
+    NonExhaustiveRecordExpr {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+    },
+    NonExhaustiveRecordPat {
+        #[type_visitable(ignore)]
+        pat: PatId,
+        #[type_visitable(ignore)]
+        variant: VariantId,
+    },
+    UnionPatMustHaveExactlyOneField {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    UnionPatHasRest {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    FunctionalRecordUpdateOnNonStruct {
+        #[type_visitable(ignore)]
+        base_expr: ExprId,
+    },
     MismatchedArgCount {
+        #[type_visitable(ignore)]
         call_expr: ExprId,
+        #[type_visitable(ignore)]
         expected: usize,
+        #[type_visitable(ignore)]
         found: usize,
+        /// True when the call goes through the `Fn`/`FnMut`/`FnOnce` trait
+        /// (i.e. arguments were bundled into a tuple). Determines whether the
+        /// diagnostic surface uses E0057 (Fn-trait call) or E0061 (regular call).
+        #[type_visitable(ignore)]
+        is_fn_trait_call: bool,
     },
     MismatchedTupleStructPatArgCount {
-        pat: ExprOrPatId,
+        #[type_visitable(ignore)]
+        pat: PatId,
+        #[type_visitable(ignore)]
         expected: usize,
+        #[type_visitable(ignore)]
         found: usize,
     },
     ExpectedFunction {
+        #[type_visitable(ignore)]
         call_expr: ExprId,
-        found: Ty,
+        found: StoredTy,
+    },
+    CannotBeDereferenced {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        found: StoredTy,
+    },
+    MutRefInImmRefPat {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    CannotImplicitlyDerefTraitObject {
+        #[type_visitable(ignore)]
+        pat: PatId,
+        found: StoredTy,
+    },
+    CannotIndexInto {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        found: StoredTy,
     },
     TypedHole {
+        #[type_visitable(ignore)]
         expr: ExprId,
-        expected: Ty,
+        expected: StoredTy,
     },
     CastToUnsized {
+        #[type_visitable(ignore)]
         expr: ExprId,
-        cast_ty: Ty,
+        cast_ty: StoredTy,
     },
     InvalidCast {
+        #[type_visitable(ignore)]
         expr: ExprId,
+        #[type_visitable(ignore)]
         error: CastError,
-        expr_ty: Ty,
-        cast_ty: Ty,
+        expr_ty: StoredTy,
+        cast_ty: StoredTy,
     },
     TyDiagnostic {
+        #[type_visitable(ignore)]
         source: InferenceTyDiagnosticSource,
+        #[type_visitable(ignore)]
         diag: TyLoweringDiagnostic,
     },
     PathDiagnostic {
-        node: ExprOrPatId,
+        #[type_visitable(ignore)]
+        node: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
         diag: PathLoweringDiagnostic,
+    },
+    MethodCallIncorrectGenericsLen {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        provided_count: u32,
+        #[type_visitable(ignore)]
+        expected_count: u32,
+        #[type_visitable(ignore)]
+        kind: IncorrectGenericsLenKind,
+        #[type_visitable(ignore)]
+        def: GenericDefId,
+    },
+    MethodCallIllegalSizedBound {
+        #[type_visitable(ignore)]
+        call_expr: ExprId,
+    },
+    MethodCallIncorrectGenericsOrder {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        param_id: GenericParamId,
+        #[type_visitable(ignore)]
+        arg_idx: u32,
+        /// Whether the `GenericArgs` contains a `Self` arg.
+        #[type_visitable(ignore)]
+        has_self_arg: bool,
+    },
+    InvalidLhsOfAssignment {
+        #[type_visitable(ignore)]
+        lhs: ExprId,
+    },
+    TypeMustBeKnown {
+        #[type_visitable(ignore)]
+        at_point: Span,
+        top_term: Option<StoredGenericArg>,
+    },
+    UnionExprMustHaveExactlyOneField {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+    },
+    TypeMismatch {
+        #[type_visitable(ignore)]
+        node: ExprOrPatIdPacked,
+        expected: StoredTy,
+        found: StoredTy,
+    },
+    SolverDiagnostic(SolverDiagnostic),
+    ExplicitDropMethodUse {
+        #[type_visitable(ignore)]
+        kind: ExplicitDropMethodUseKind,
+    },
+    MutableRefBinding {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    YieldOutsideCoroutine {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+    },
+    ReturnOutsideFunction {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        kind: ReturnKind,
+    },
+    RecordMissingFields {
+        #[type_visitable(ignore)]
+        record: ExprOrPatId,
+        #[type_visitable(ignore)]
+        variant: VariantId,
+        #[type_visitable(ignore)]
+        missed_fields: Vec<LocalFieldId>,
     },
 }
 
-/// A mismatch between an expected and an inferred type.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct TypeMismatch {
-    pub expected: Ty,
-    pub actual: Ty,
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ReturnKind {
+    ReturnExpr,
+    BecomeExpr,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct InternedStandardTypes {
-    unknown: Ty,
-    bool_: Ty,
-    unit: Ty,
-    never: Ty,
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ExplicitDropMethodUseKind {
+    MethodCall(ExprId),
+    Path(ExprOrPatIdPacked),
 }
 
-impl Default for InternedStandardTypes {
-    fn default() -> Self {
-        InternedStandardTypes {
-            unknown: TyKind::Error.intern(Interner),
-            bool_: TyKind::Scalar(Scalar::Bool).intern(Interner),
-            unit: TyKind::Tuple(0, Substitution::empty(Interner)).intern(Interner),
-            never: TyKind::Never.intern(Interner),
-        }
-    }
-}
 /// Represents coercing a value to a different type of value.
 ///
 /// We transform values by following a number of `Adjust` steps in order.
@@ -356,14 +608,42 @@ impl Default for InternedStandardTypes {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Adjustment {
     pub kind: Adjust,
-    pub target: Ty,
+    pub target: StoredTy,
 }
 
 impl Adjustment {
-    pub fn borrow(m: Mutability, ty: Ty, lt: Lifetime) -> Self {
-        let ty = TyKind::Ref(m, lt.clone(), ty).intern(Interner);
-        Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(lt, m)), target: ty }
+    pub fn borrow<'db>(
+        interner: DbInterner<'db>,
+        m: Mutability,
+        ty: Ty<'db>,
+        lt: Region<'db>,
+    ) -> Self {
+        let ty = Ty::new_ref(interner, lt, ty, m);
+        Adjustment {
+            kind: Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::new(m, AllowTwoPhase::No))),
+            target: ty.store(),
+        }
     }
+}
+
+/// At least for initial deployment, we want to limit two-phase borrows to
+/// only a few specific cases. Right now, those are mostly "things that desugar"
+/// into method calls:
+/// - using `x.some_method()` syntax, where some_method takes `&mut self`,
+/// - using `Foo::some_method(&mut x, ...)` syntax,
+/// - binary assignment operators (`+=`, `-=`, `*=`, etc.).
+///
+/// Anything else should be rejected until generalized two-phase borrow support
+/// is implemented. Right now, dataflow can't handle the general case where there
+/// is more than one use of a mutable borrow, and we don't want to accept too much
+/// new code via two-phase borrows, so we try to limit where we create two-phase
+/// capable mutable borrows.
+/// See #49434 for tracking.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum AllowTwoPhase {
+    // FIXME: We should use this when appropriate.
+    Yes,
+    No,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -381,24 +661,42 @@ pub enum Adjust {
 /// call, with the signature `&'a T -> &'a U` or `&'a mut T -> &'a mut U`.
 /// The target type is `U` in both cases, with the region and mutability
 /// being those shared by both the receiver and the returned reference.
-///
-/// Mutability is `None` when we are not sure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OverloadedDeref(pub Option<Mutability>);
+pub struct OverloadedDeref(pub Mutability);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AutoBorrow {
-    /// Converts from T to &T.
-    Ref(Lifetime, Mutability),
-    /// Converts from T to *T.
-    RawPtr(Mutability),
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AutoBorrowMutability {
+    Mut { allow_two_phase_borrow: AllowTwoPhase },
+    Not,
 }
 
-impl AutoBorrow {
-    fn mutability(&self) -> Mutability {
-        let (AutoBorrow::Ref(_, m) | AutoBorrow::RawPtr(m)) = self;
-        *m
+impl AutoBorrowMutability {
+    /// Creates an `AutoBorrowMutability` from a mutability and allowance of two phase borrows.
+    ///
+    /// Note that when `mutbl.is_not()`, `allow_two_phase_borrow` is ignored
+    pub fn new(mutbl: Mutability, allow_two_phase_borrow: AllowTwoPhase) -> Self {
+        match mutbl {
+            Mutability::Not => Self::Not,
+            Mutability::Mut => Self::Mut { allow_two_phase_borrow },
+        }
     }
+}
+
+impl From<AutoBorrowMutability> for Mutability {
+    fn from(m: AutoBorrowMutability) -> Self {
+        match m {
+            AutoBorrowMutability::Mut { .. } => Mutability::Mut,
+            AutoBorrowMutability::Not => Mutability::Not,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutoBorrow {
+    /// Converts from T to &T.
+    Ref(AutoBorrowMutability),
+    /// Converts from T to *T.
+    RawPtr(Mutability),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -433,48 +731,74 @@ pub enum PointerCast {
     Unsize,
 }
 
+/// Represents an implicit coercion applied to the scrutinee of a match before testing a pattern
+/// against it. Currently, this is used only for implicit dereferences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatAdjustment {
+    pub kind: PatAdjust,
+    /// The type of the scrutinee before the adjustment is applied, or the "adjusted type" of the
+    /// pattern.
+    pub source: StoredTy,
+}
+
+/// Represents implicit coercions of patterns' types, rather than values' types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PatAdjust {
+    /// An implicit dereference before matching, such as when matching the pattern `0` against a
+    /// scrutinee of type `&u8` or `&mut u8`.
+    BuiltinDeref,
+    /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
+    /// pattern `[..]` against a scrutinee of type `Vec<T>`.
+    OverloadedDeref,
+}
+
 /// The result of type inference: A mapping from expressions and patterns to types.
 ///
 /// When you add a field that stores types (including `Substitution` and the like), don't forget
 /// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
 /// not appear in the final inference result.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct InferenceResult {
+#[derive(Clone, PartialEq, Eq, Debug, Update)]
+pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
-    method_resolutions: FxHashMap<ExprId, (FunctionId, Substitution)>,
+    method_resolutions: FxHashMap<ExprId, (FunctionId, StoredGenericArgs)>,
     /// For each field access expr, records the field it resolves to.
     field_resolutions: FxHashMap<ExprId, Either<FieldId, TupleFieldId>>,
     /// For each struct literal or pattern, records the variant it resolves to.
-    variant_resolutions: FxHashMap<ExprOrPatId, VariantId>,
+    variant_resolutions: FxHashMap<ExprOrPatIdPacked, VariantId>,
     /// For each associated item record what it resolves to
-    assoc_resolutions: FxHashMap<ExprOrPatId, (AssocItemId, Substitution)>,
+    assoc_resolutions: FxHashMap<ExprOrPatIdPacked, (CandidateId, StoredGenericArgs)>,
     /// Whenever a tuple field expression access a tuple field, we allocate a tuple id in
     /// [`InferenceContext`] and store the tuples substitution there. This map is the reverse of
     /// that which allows us to resolve a [`TupleFieldId`]s type.
-    pub tuple_field_access_types: FxHashMap<TupleId, Substitution>,
-    /// During inference this field is empty and [`InferenceContext::diagnostics`] is filled instead.
-    pub diagnostics: Vec<InferenceDiagnostic>,
-    pub type_of_expr: ArenaMap<ExprId, Ty>,
+    tuple_field_access_types: ThinVec<StoredTys>,
+
+    pub(crate) type_of_expr: ArenaMap<ExprId, StoredTy>,
     /// For each pattern record the type it resolves to.
     ///
     /// **Note**: When a pattern type is resolved it may still contain
     /// unresolved or missing subpatterns or subpatterns of mismatched types.
-    pub type_of_pat: ArenaMap<PatId, Ty>,
-    pub type_of_binding: ArenaMap<BindingId, Ty>,
-    pub type_of_rpit: ArenaMap<ImplTraitIdx, Ty>,
-    /// Type of the result of `.into_iter()` on the for. `ExprId` is the one of the whole for loop.
-    pub type_of_for_iterator: FxHashMap<ExprId, Ty>,
-    type_mismatches: FxHashMap<ExprOrPatId, TypeMismatch>,
+    pub(crate) type_of_pat: ArenaMap<PatId, StoredTy>,
+    pub(crate) type_of_binding: ArenaMap<BindingId, StoredTy>,
+    pub(crate) type_of_type_placeholder: FxHashMap<TypeRefId, StoredTy>,
+    pub(crate) type_of_opaque: FxHashMap<InternedOpaqueTyId<'db>, StoredTy>,
+
     /// Whether there are any type-mismatching errors in the result.
     // FIXME: This isn't as useful as initially thought due to us falling back placeholders to
     // `TyKind::Error`.
     // Which will then mark this field.
     pub(crate) has_errors: bool,
-    /// Interned common types to return references to.
-    // FIXME: Move this into `InferenceContext`
-    standard_types: InternedStandardTypes,
+    /// During inference this field is empty and [`InferenceContext::diagnostics`] is filled instead.
+    diagnostics: ThinVec<InferenceDiagnostic>,
+    // FIXME: Remove this, change it to be in `InferenceContext`:
+    nodes_with_type_mismatches: Option<Box<FxHashSet<ExprOrPatIdPacked>>>,
+
+    /// Interned `Error` type to return references to.
+    // FIXME: Remove this.
+    error_ty: StoredTy,
+
+    pub(crate) expr_adjustments: FxHashMap<ExprId, Box<[Adjustment]>>,
     /// Stores the types which were implicitly dereferenced in pattern binding modes.
-    pub pat_adjustments: FxHashMap<PatId, Vec<Ty>>,
+    pub(crate) pat_adjustments: FxHashMap<PatId, Vec<PatAdjustment>>,
     /// Stores the binding mode (`ref` in `let ref x = 2`) of bindings.
     ///
     /// This one is tied to the `PatId` instead of `BindingId`, because in some rare cases, a binding in an
@@ -488,17 +812,333 @@ pub struct InferenceResult {
     /// }
     /// ```
     /// the first `rest` has implicit `ref` binding mode, but the second `rest` binding mode is `move`.
-    pub binding_modes: ArenaMap<PatId, BindingMode>,
-    pub expr_adjustments: FxHashMap<ExprId, Vec<Adjustment>>,
-    pub(crate) closure_info: FxHashMap<ClosureId, (Vec<CapturedItem>, FnTrait)>,
-    // FIXME: remove this field
-    pub mutated_bindings_in_closure: FxHashSet<BindingId>,
-    pub coercion_casts: FxHashSet<ExprId>,
+    pub(crate) binding_modes: ArenaMap<PatId, BindingMode>,
+
+    /// Set of reference patterns that match against a match-ergonomics inserted reference
+    /// (as opposed to against a reference in the scrutinee type).
+    skipped_ref_pats: FxHashSet<PatId>,
+
+    pub(crate) coercion_casts: FxHashSet<ExprId>,
+
+    pub closures_data: FxHashMap<ExprId, ClosureData>,
+
+    defined_anon_consts: ThinVec<AnonConstId<'db>>,
 }
 
-impl InferenceResult {
-    pub fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, Substitution)> {
-        self.method_resolutions.get(&expr).cloned()
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClosureData {
+    /// Tracks the minimum captures required for a closure;
+    /// see `MinCaptureInformationMap` for more details.
+    pub min_captures: RootVariableMinCaptureList,
+
+    /// Tracks the fake reads required for a closure and the reason for the fake read.
+    /// When performing pattern matching for closures, there are times we don't end up
+    /// reading places that are mentioned in a closure (because of _ patterns). However,
+    /// to ensure the places are initialized, we introduce fake reads.
+    /// Consider these two examples:
+    /// ```ignore (discriminant matching with only wildcard arm)
+    /// let x: u8;
+    /// let c = || match x { _ => () };
+    /// ```
+    /// In this example, we don't need to actually read/borrow `x` in `c`, and so we don't
+    /// want to capture it. However, we do still want an error here, because `x` should have
+    /// to be initialized at the point where c is created. Therefore, we add a "fake read"
+    /// instead.
+    /// ```ignore (destructured assignments)
+    /// let c = || {
+    ///     let (t1, t2) = t;
+    /// }
+    /// ```
+    /// In the second example, we capture the disjoint fields of `t` (`t.0` & `t.1`), but
+    /// we never capture `t`. This becomes an issue when we build MIR as we require
+    /// information on `t` in order to create place `t.0` and `t.1`. We can solve this
+    /// issue by fake reading `t`.
+    pub fake_reads: Box<[(Place, FakeReadCause, SmallVec<[CaptureSourceStack; 2]>)]>,
+
+    /// For each fn, records the "liberated" types of its arguments
+    /// and return type. Liberated means that all bound regions
+    /// (including late-bound regions) are replaced with free
+    /// equivalents. This table is not used in codegen (since regions
+    /// are erased there) and hence is not serialized to metadata.
+    ///
+    /// This table also contains the "revealed" values for any `impl Trait`
+    /// that appear in the signature and whose values are being inferred
+    /// by this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::fmt::Debug;
+    /// fn foo(x: &u32) -> impl Debug { *x }
+    /// ```
+    ///
+    /// The function signature here would be:
+    ///
+    /// ```ignore (illustrative)
+    /// for<'a> fn(&'a u32) -> Foo
+    /// ```
+    ///
+    /// where `Foo` is an opaque type created for this function.
+    ///
+    ///
+    /// The *liberated* form of this would be
+    ///
+    /// ```ignore (illustrative)
+    /// fn(&'a u32) -> u32
+    /// ```
+    ///
+    /// Note that `'a` is not bound (it would be an `ReLateParam`) and
+    /// that the `Foo` opaque type is replaced by its hidden type.
+    pub liberated_sig: StoredFnSig,
+}
+
+/// Part of `MinCaptureInformationMap`; Maps a root variable to the list of `CapturedPlace`.
+/// Used to track the minimum set of `Place`s that need to be captured to support all
+/// Places captured by the closure starting at a given root variable.
+///
+/// This provides a convenient and quick way of checking if a variable being used within
+/// a closure is a capture of a local variable.
+pub(crate) type RootVariableMinCaptureList = FxIndexMap<BindingId, MinCaptureList>;
+
+/// Part of `MinCaptureInformationMap`; List of `CapturePlace`s.
+pub(crate) type MinCaptureList = Vec<CapturedPlace>;
+
+/// A composite describing a `Place` that is captured by a closure.
+#[derive(Eq, PartialEq, Clone, Debug, Hash)]
+pub struct CapturedPlace {
+    /// The `Place` that is captured.
+    pub place: Place,
+
+    /// `CaptureKind` and expression(s) that resulted in such capture of `place`.
+    pub info: CaptureInfo,
+
+    /// Represents if `place` can be mutated or not.
+    pub mutability: Mutability,
+}
+
+impl CapturedPlace {
+    pub fn is_by_ref(&self) -> bool {
+        match self.info.capture_kind {
+            UpvarCapture::ByValue | UpvarCapture::ByUse => false,
+            UpvarCapture::ByRef(..) => true,
+        }
+    }
+
+    pub fn captured_local(&self) -> BindingId {
+        match self.place.base {
+            PlaceBase::Upvar { var_id: local, .. } | PlaceBase::Local(local) => local,
+            PlaceBase::Rvalue | PlaceBase::StaticItem => {
+                unreachable!("only locals can be captured")
+            }
+        }
+    }
+
+    /// The type of the capture stored in the closure, which is different from the type of the captured place
+    /// if we capture by reference.
+    pub fn captured_ty<'db>(&self, db: &'db dyn HirDatabase) -> Ty<'db> {
+        let place_ty = self.place.ty();
+        let make_ref = |mutbl| {
+            let interner = DbInterner::new_no_crate(db);
+            let region = Region::new_erased(interner);
+            Ty::new_ref(interner, region, place_ty, mutbl)
+        };
+        match self.info.capture_kind {
+            UpvarCapture::ByUse | UpvarCapture::ByValue => place_ty,
+            UpvarCapture::ByRef(kind) => make_ref(kind.to_mutbl_lossy()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CaptureSourceStack(CaptureSourceStackRepr);
+
+#[derive(Clone)]
+enum CaptureSourceStackRepr {
+    One(ExprOrPatIdPacked),
+    Two([ExprOrPatIdPacked; 2]),
+    Many(ThinVec<ExprOrPatIdPacked>),
+}
+
+impl PartialEq for CaptureSourceStack {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for CaptureSourceStack {}
+
+impl std::hash::Hash for CaptureSourceStack {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<CaptureSourceStack>() == 16);
+
+impl Deref for CaptureSourceStack {
+    type Target = [ExprOrPatIdPacked];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            CaptureSourceStackRepr::One(it) => std::slice::from_ref(it),
+            CaptureSourceStackRepr::Two(it) => it,
+            CaptureSourceStackRepr::Many(it) => it,
+        }
+    }
+}
+
+impl fmt::Debug for CaptureSourceStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CaptureSourceStack").field(&&**self).finish()
+    }
+}
+
+impl CaptureSourceStack {
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            CaptureSourceStackRepr::One(_) => 1,
+            CaptureSourceStackRepr::Two(_) => 2,
+            CaptureSourceStackRepr::Many(it) => it.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_single(id: ExprOrPatIdPacked) -> Self {
+        Self(CaptureSourceStackRepr::One(id))
+    }
+
+    #[inline]
+    pub fn final_source(&self) -> ExprOrPatIdPacked {
+        *self.last().expect("should always have a final source")
+    }
+
+    pub fn push(&mut self, new_id: ExprOrPatIdPacked) {
+        match &mut self.0 {
+            CaptureSourceStackRepr::One(old_id) => {
+                self.0 = CaptureSourceStackRepr::Two([*old_id, new_id])
+            }
+            CaptureSourceStackRepr::Two([old_id1, old_id2]) => {
+                self.0 = CaptureSourceStackRepr::Many(ThinVec::from([*old_id1, *old_id2, new_id]));
+            }
+            CaptureSourceStackRepr::Many(old_ids) => old_ids.push(new_id),
+        }
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        debug_assert!(new_len > 0);
+        match &mut self.0 {
+            CaptureSourceStackRepr::One(_) => {}
+            CaptureSourceStackRepr::Two([first, _]) => {
+                if new_len == 1 {
+                    self.0 = CaptureSourceStackRepr::One(*first)
+                }
+            }
+            CaptureSourceStackRepr::Many(ids) => ids.truncate(new_len),
+        }
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        match &mut self.0 {
+            CaptureSourceStackRepr::One(_) | CaptureSourceStackRepr::Two(_) => {}
+            CaptureSourceStackRepr::Many(ids) => match **ids {
+                [one] => self.0 = CaptureSourceStackRepr::One(one),
+                [first, second] => self.0 = CaptureSourceStackRepr::Two([first, second]),
+                _ => ids.shrink_to_fit(),
+            },
+        }
+    }
+}
+
+/// Part of `MinCaptureInformationMap`; describes the capture kind (&, &mut, move)
+/// for a particular capture as well as identifying the part of the source code
+/// that triggered this capture to occur.
+#[derive(Eq, PartialEq, Clone, Debug, Hash)]
+pub struct CaptureInfo {
+    pub sources: SmallVec<[CaptureSourceStack; 2]>,
+
+    /// Capture mode that was selected
+    pub capture_kind: UpvarCapture,
+}
+
+/// Information describing the capture of an upvar. This is computed
+/// during `typeck`, specifically by `regionck`.
+#[derive(Eq, PartialEq, Clone, Debug, Copy, Hash)]
+pub enum UpvarCapture {
+    /// Upvar is captured by value. This is always true when the
+    /// closure is labeled `move`, but can also be true in other cases
+    /// depending on inference.
+    ByValue,
+
+    /// Upvar is captured by use. This is true when the closure is labeled `use`.
+    ByUse,
+
+    /// Upvar is captured by reference.
+    ByRef(BorrowKind),
+}
+
+#[salsa::tracked]
+impl<'db> InferenceResult<'db> {
+    #[salsa::tracked(returns(ref), cycle_result = infer_cycle_result)]
+    fn for_body(db: &dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'_> {
+        infer_query(db, def)
+    }
+
+    /// Infer types for all const expressions in an item's signature.
+    ///
+    /// Returns an `InferenceResult` containing type information for array lengths,
+    /// const generic arguments, and other const expressions appearing in type
+    /// positions within the item's signature.
+    #[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result)]
+    fn for_anon_const(db: &'db dyn HirDatabase, def: AnonConstId<'db>) -> InferenceResult<'db> {
+        infer_anon_const_query(db, def)
+    }
+}
+
+impl<'db> InferenceResult<'db> {
+    #[inline]
+    pub fn of(
+        db: &'db dyn HirDatabase,
+        def: impl Into<InferBodyId<'db>>,
+    ) -> &'db InferenceResult<'db> {
+        match def.into() {
+            InferBodyId::DefWithBodyId(it) => InferenceResult::for_body(db, it),
+            InferBodyId::AnonConstId(it) => InferenceResult::for_anon_const(db, it),
+        }
+    }
+}
+
+impl<'db> InferenceResult<'db> {
+    fn new(error_ty: Ty<'_>) -> Self {
+        Self {
+            method_resolutions: Default::default(),
+            field_resolutions: Default::default(),
+            variant_resolutions: Default::default(),
+            assoc_resolutions: Default::default(),
+            tuple_field_access_types: Default::default(),
+            diagnostics: Default::default(),
+            nodes_with_type_mismatches: Default::default(),
+            type_of_expr: Default::default(),
+            type_of_pat: Default::default(),
+            type_of_binding: Default::default(),
+            type_of_type_placeholder: Default::default(),
+            type_of_opaque: Default::default(),
+            skipped_ref_pats: Default::default(),
+            has_errors: Default::default(),
+            error_ty: error_ty.store(),
+            pat_adjustments: Default::default(),
+            binding_modes: Default::default(),
+            expr_adjustments: Default::default(),
+            coercion_casts: Default::default(),
+            closures_data: Default::default(),
+            defined_anon_consts: Default::default(),
+        }
+    }
+
+    pub fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, GenericArgs<'db>)> {
+        self.method_resolutions.get(&expr).map(|(func, args)| (*func, args.as_ref()))
     }
     pub fn field_resolution(&self, expr: ExprId) -> Option<Either<FieldId, TupleFieldId>> {
         self.field_resolutions.get(&expr).copied()
@@ -515,138 +1155,239 @@ impl InferenceResult {
             ExprOrPatId::PatId(id) => self.variant_resolution_for_pat(id),
         }
     }
-    pub fn assoc_resolutions_for_expr(&self, id: ExprId) -> Option<(AssocItemId, Substitution)> {
-        self.assoc_resolutions.get(&id.into()).cloned()
+    pub fn assoc_resolutions_for_expr<'a>(
+        &self,
+        id: ExprId,
+    ) -> Option<(CandidateId, GenericArgs<'a>)> {
+        self.assoc_resolutions.get(&id.into()).map(|(assoc, args)| (*assoc, args.as_ref()))
     }
-    pub fn assoc_resolutions_for_pat(&self, id: PatId) -> Option<(AssocItemId, Substitution)> {
-        self.assoc_resolutions.get(&id.into()).cloned()
+    pub fn assoc_resolutions_for_pat<'a>(
+        &self,
+        id: PatId,
+    ) -> Option<(CandidateId, GenericArgs<'a>)> {
+        self.assoc_resolutions.get(&id.into()).map(|(assoc, args)| (*assoc, args.as_ref()))
     }
-    pub fn assoc_resolutions_for_expr_or_pat(
+    pub fn assoc_resolutions_for_expr_or_pat<'a>(
         &self,
         id: ExprOrPatId,
-    ) -> Option<(AssocItemId, Substitution)> {
+    ) -> Option<(CandidateId, GenericArgs<'a>)> {
         match id {
             ExprOrPatId::ExprId(id) => self.assoc_resolutions_for_expr(id),
             ExprOrPatId::PatId(id) => self.assoc_resolutions_for_pat(id),
         }
     }
-    pub fn type_mismatch_for_expr(&self, expr: ExprId) -> Option<&TypeMismatch> {
-        self.type_mismatches.get(&expr.into())
+    pub fn expr_or_pat_has_type_mismatch(&self, node: ExprOrPatIdPacked) -> bool {
+        self.nodes_with_type_mismatches.as_ref().is_some_and(|it| it.contains(&node))
     }
-    pub fn type_mismatch_for_pat(&self, pat: PatId) -> Option<&TypeMismatch> {
-        self.type_mismatches.get(&pat.into())
+    pub fn expr_has_type_mismatch(&self, expr: ExprId) -> bool {
+        self.expr_or_pat_has_type_mismatch(expr.into())
     }
-    pub fn type_mismatches(&self) -> impl Iterator<Item = (ExprOrPatId, &TypeMismatch)> {
-        self.type_mismatches.iter().map(|(expr_or_pat, mismatch)| (*expr_or_pat, mismatch))
+    pub fn pat_has_type_mismatch(&self, pat: PatId) -> bool {
+        self.expr_or_pat_has_type_mismatch(pat.into())
     }
-    pub fn expr_type_mismatches(&self) -> impl Iterator<Item = (ExprId, &TypeMismatch)> {
-        self.type_mismatches.iter().filter_map(|(expr_or_pat, mismatch)| match *expr_or_pat {
-            ExprOrPatId::ExprId(expr) => Some((expr, mismatch)),
-            _ => None,
-        })
+    pub fn exprs_have_type_mismatches(&self) -> bool {
+        self.nodes_with_type_mismatches
+            .as_ref()
+            .is_some_and(|it| it.iter().any(|node| node.is_expr()))
     }
-    pub fn closure_info(&self, closure: &ClosureId) -> &(Vec<CapturedItem>, FnTrait) {
-        self.closure_info.get(closure).unwrap()
+    pub fn has_type_mismatches(&self) -> bool {
+        self.nodes_with_type_mismatches.is_some()
     }
-    pub fn type_of_expr_or_pat(&self, id: ExprOrPatId) -> Option<&Ty> {
+    pub fn placeholder_types<'a>(&self) -> impl Iterator<Item = (TypeRefId, Ty<'a>)> {
+        self.type_of_type_placeholder.iter().map(|(&type_ref, ty)| (type_ref, ty.as_ref()))
+    }
+    pub fn type_of_type_placeholder<'a>(&self, type_ref: TypeRefId) -> Option<Ty<'a>> {
+        self.type_of_type_placeholder.get(&type_ref).map(|ty| ty.as_ref())
+    }
+    pub fn type_of_expr_or_pat<'a>(&self, id: ExprOrPatId) -> Option<Ty<'a>> {
         match id {
-            ExprOrPatId::ExprId(id) => self.type_of_expr.get(id),
-            ExprOrPatId::PatId(id) => self.type_of_pat.get(id),
+            ExprOrPatId::ExprId(id) => self.type_of_expr.get(id).map(|it| it.as_ref()),
+            ExprOrPatId::PatId(id) => self.type_of_pat.get(id).map(|it| it.as_ref()),
         }
     }
-}
+    pub fn type_of_expr_with_adjust<'a>(&self, id: ExprId) -> Option<Ty<'a>> {
+        match self.expr_adjustments.get(&id).and_then(|adjustments| {
+            adjustments.iter().rfind(|adj| {
+                // https://github.com/rust-lang/rust/blob/67819923ac8ea353aaa775303f4c3aacbf41d010/compiler/rustc_mir_build/src/thir/cx/expr.rs#L140
+                !matches!(
+                    adj,
+                    Adjustment {
+                        kind: Adjust::NeverToAny,
+                        target,
+                    } if target.as_ref().is_never()
+                )
+            })
+        }) {
+            Some(adjustment) => Some(adjustment.target.as_ref()),
+            None => self.type_of_expr.get(id).map(|it| it.as_ref()),
+        }
+    }
+    pub fn type_of_pat_with_adjust<'a>(&self, id: PatId) -> Ty<'a> {
+        match self.pat_adjustments.get(&id).and_then(|adjustments| adjustments.last()) {
+            Some(adjusted) => adjusted.source.as_ref(),
+            None => self.pat_ty(id),
+        }
+    }
+    pub fn is_erroneous(&self) -> bool {
+        self.has_errors && self.type_of_expr.iter().count() == 0
+    }
 
-impl Index<ExprId> for InferenceResult {
-    type Output = Ty;
+    pub fn diagnostics(&self) -> &[InferenceDiagnostic] {
+        &self.diagnostics
+    }
 
-    fn index(&self, expr: ExprId) -> &Ty {
-        self.type_of_expr.get(expr).unwrap_or(&self.standard_types.unknown)
+    pub fn tuple_field_access_type<'a>(&self, id: TupleId) -> Tys<'a> {
+        self.tuple_field_access_types[id.0 as usize].as_ref()
+    }
+
+    pub fn pat_adjustment(&self, id: PatId) -> Option<&[PatAdjustment]> {
+        self.pat_adjustments.get(&id).map(|it| &**it)
+    }
+
+    pub fn expr_adjustment(&self, id: ExprId) -> Option<&[Adjustment]> {
+        self.expr_adjustments.get(&id).map(|it| &**it)
+    }
+
+    pub fn binding_mode(&self, id: PatId) -> Option<BindingMode> {
+        self.binding_modes.get(id).copied()
+    }
+
+    // This method is consumed by external tools to run rust-analyzer as a library. Don't remove, please.
+    pub fn expression_types<'a>(&self) -> impl Iterator<Item = (ExprId, Ty<'a>)> {
+        self.type_of_expr.iter().map(|(k, v)| (k, v.as_ref()))
+    }
+
+    // This method is consumed by external tools to run rust-analyzer as a library. Don't remove, please.
+    pub fn pattern_types<'a>(&self) -> impl Iterator<Item = (PatId, Ty<'a>)> {
+        self.type_of_pat.iter().map(|(k, v)| (k, v.as_ref()))
+    }
+
+    // This method is consumed by external tools to run rust-analyzer as a library. Don't remove, please.
+    pub fn binding_types<'a>(&self) -> impl Iterator<Item = (BindingId, Ty<'a>)> {
+        self.type_of_binding.iter().map(|(k, v)| (k, v.as_ref()))
+    }
+
+    // This method is consumed by external tools to run rust-analyzer as a library. Don't remove, please.
+    pub fn return_position_impl_trait_types<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+    ) -> impl Iterator<Item = (ImplTraitIdx, Ty<'a>)> {
+        self.type_of_opaque.iter().filter_map(move |(&id, ty)| {
+            let ImplTraitId::ReturnTypeImplTrait(_, rpit_idx) = id.loc(db) else {
+                return None;
+            };
+            Some((rpit_idx, ty.as_ref()))
+        })
+    }
+
+    pub fn expr_ty<'a>(&self, id: ExprId) -> Ty<'a> {
+        self.type_of_expr.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+    }
+
+    pub fn pat_ty<'a>(&self, id: PatId) -> Ty<'a> {
+        self.type_of_pat.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+    }
+
+    pub fn expr_or_pat_ty<'a>(&self, id: ExprOrPatId) -> Ty<'a> {
+        self.type_of_expr_or_pat(id).unwrap_or(self.error_ty.as_ref())
+    }
+
+    pub fn binding_ty<'a>(&self, id: BindingId) -> Ty<'a> {
+        self.type_of_binding.get(id).map_or(self.error_ty.as_ref(), |it| it.as_ref())
+    }
+
+    /// This does not deduplicate, which means you'll get the types once per capture.
+    pub fn closure_captures_tys<'a>(&self, closure: ExprId) -> impl Iterator<Item = Ty<'a>> {
+        self.closures_data[&closure]
+            .min_captures
+            .values()
+            .flat_map(|captures| captures.iter().map(|capture| capture.place.ty()))
+    }
+
+    /// Like [`Self::closure_captures_tys()`], but using [`CapturedPlace::captured_ty()`].
+    pub fn closure_captures_captured_tys<'a>(
+        &self,
+        db: &'a dyn HirDatabase,
+        closure: ExprId,
+    ) -> impl Iterator<Item = Ty<'a>> {
+        self.closures_data[&closure]
+            .min_captures
+            .values()
+            .flat_map(|captures| captures.iter().map(|capture| capture.captured_ty(db)))
+    }
+
+    pub fn is_skipped_ref_pat(&self, pat: PatId) -> bool {
+        self.skipped_ref_pats.contains(&pat)
     }
 }
 
-impl Index<PatId> for InferenceResult {
-    type Output = Ty;
-
-    fn index(&self, pat: PatId) -> &Ty {
-        self.type_of_pat.get(pat).unwrap_or(&self.standard_types.unknown)
-    }
-}
-
-impl Index<ExprOrPatId> for InferenceResult {
-    type Output = Ty;
-
-    fn index(&self, id: ExprOrPatId) -> &Ty {
-        self.type_of_expr_or_pat(id).unwrap_or(&self.standard_types.unknown)
-    }
-}
-
-impl Index<BindingId> for InferenceResult {
-    type Output = Ty;
-
-    fn index(&self, b: BindingId) -> &Ty {
-        self.type_of_binding.get(b).unwrap_or(&self.standard_types.unknown)
-    }
+#[derive(Debug, Clone, Copy)]
+enum DerefPatBorrowMode {
+    Borrow(Mutability),
+    Box,
 }
 
 /// The inference context contains all information needed during type inference.
-#[derive(Clone, Debug)]
-pub(crate) struct InferenceContext<'a> {
-    pub(crate) db: &'a dyn HirDatabase,
-    pub(crate) owner: DefWithBodyId,
-    pub(crate) body: &'a Body,
+#[derive(Debug)]
+pub(crate) struct InferenceContext<'db> {
+    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) owner: InferBodyId<'db>,
+    pub(crate) store_owner: ExpressionStoreOwnerId,
+    pub(crate) generic_def: GenericDefId,
+    pub(crate) store: &'db ExpressionStore,
+    pub(crate) lowering_mode: LoweringMode,
     /// Generally you should not resolve things via this resolver. Instead create a TyLoweringContext
     /// and resolve the path via its methods. This will ensure proper error reporting.
-    pub(crate) resolver: Resolver,
-    generics: OnceCell<Option<Generics>>,
-    table: unify::InferenceTable<'a>,
+    pub(crate) resolver: Resolver<'db>,
+    target_features: OnceCell<(TargetFeatures<'db>, TargetFeatureIsSafeInTarget)>,
+    pub(crate) edition: Edition,
+    allow_using_generic_params: bool,
+    generics: OnceCell<Generics<'db>>,
+    identity_args: OnceCell<GenericArgs<'db>>,
+    pub(crate) table: unify::InferenceTable<'db>,
+    pub(crate) lang_items: &'db LangItems,
+    pub(crate) features: &'db UnstableFeatures,
     /// The traits in scope, disregarding block modules. This is used for caching purposes.
     traits_in_scope: FxHashSet<TraitId>,
-    pub(crate) result: InferenceResult,
+    pub(crate) result: InferenceResult<'db>,
     tuple_field_accesses_rev:
-        IndexSet<Substitution, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+        IndexSet<Tys<'db>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
     /// The return type of the function being inferred, the closure or async block if we're
     /// currently within one.
     ///
     /// We might consider using a nested inference context for checking
     /// closures so we can swap all shared things out at once.
-    return_ty: Ty,
+    return_ty: Ty<'db>,
     /// If `Some`, this stores coercion information for returned
     /// expressions. If `None`, this is in a context where return is
     /// inappropriate, such as a const expression.
-    return_coercion: Option<CoerceMany>,
+    return_coercion: Option<DynamicCoerceMany<'db>>,
     /// The resume type and the yield type, respectively, of the coroutine being inferred.
-    resume_yield_tys: Option<(Ty, Ty)>,
+    resume_yield_tys: Option<(Ty<'db>, Ty<'db>)>,
     diverges: Diverges,
-    breakables: Vec<BreakableContext>,
+    breakables: Vec<BreakableContext<'db>>,
+    types: &'db crate::next_solver::DefaultAny<'db>,
 
     /// Whether we are inside the pattern of a destructuring assignment.
     inside_assignment: bool,
 
-    deferred_cast_checks: Vec<CastCheck>,
+    deferred_cast_checks: Vec<CastCheck<'db>>,
 
-    // fields related to closure capture
-    current_captures: Vec<CapturedItemWithoutTy>,
-    /// A stack that has an entry for each projection in the current capture.
-    ///
-    /// For example, in `a.b.c`, we capture the spans of `a`, `a.b`, and `a.b.c`.
-    /// We do that because sometimes we truncate projections (when a closure captures
-    /// both `a.b` and `a.b.c`), and we want to provide accurate spans in this case.
-    current_capture_span_stack: Vec<MirSpan>,
-    current_closure: Option<ClosureId>,
-    /// Stores the list of closure ids that need to be analyzed before this closure. See the
-    /// comment on `InferenceContext::sort_closures`
-    closure_dependencies: FxHashMap<ClosureId, Vec<ClosureId>>,
-    deferred_closures: FxHashMap<ClosureId, Vec<(Ty, Ty, Vec<Ty>, ExprId)>>,
+    /// The key is an expression defining a closure or a coroutine closure.
+    deferred_call_resolutions: FxHashMap<ExprId, Vec<DeferredCallResolution<'db>>>,
 
     diagnostics: Diagnostics,
+    vars_emitted_type_must_be_known_for: FxHashSet<Term<'db>>,
+
+    defined_anon_consts: RefCell<ThinVec<AnonConstId<'db>>>,
 }
 
 #[derive(Clone, Debug)]
-struct BreakableContext {
+struct BreakableContext<'db> {
     /// Whether this context contains at least one break expression.
     may_break: bool,
     /// The coercion target of the context.
-    coerce: Option<CoerceMany>,
+    coerce: Option<DynamicCoerceMany<'db>>,
     /// The optional label of the context.
     label: Option<LabelId>,
     kind: BreakableKind,
@@ -661,10 +1402,10 @@ enum BreakableKind {
     Border,
 }
 
-fn find_breakable(
-    ctxs: &mut [BreakableContext],
+fn find_breakable<'a, 'db>(
+    ctxs: &'a mut [BreakableContext<'db>],
     label: Option<LabelId>,
-) -> Option<&mut BreakableContext> {
+) -> Option<&'a mut BreakableContext<'db>> {
     let mut ctxs = ctxs
         .iter_mut()
         .rev()
@@ -675,79 +1416,230 @@ fn find_breakable(
     }
 }
 
-fn find_continuable(
-    ctxs: &mut [BreakableContext],
+fn find_continuable<'a, 'db>(
+    ctxs: &'a mut [BreakableContext<'db>],
     label: Option<LabelId>,
-) -> Option<&mut BreakableContext> {
+) -> Option<&'a mut BreakableContext<'db>> {
     match label {
         Some(_) => find_breakable(ctxs, label).filter(|it| matches!(it.kind, BreakableKind::Loop)),
         None => find_breakable(ctxs, label),
     }
 }
 
-enum ImplTraitReplacingMode {
-    ReturnPosition(FxHashSet<Ty>),
-    TypeAlias,
-}
-
-impl<'a> InferenceContext<'a> {
+impl<'db> InferenceContext<'db> {
     fn new(
-        db: &'a dyn HirDatabase,
-        owner: DefWithBodyId,
-        body: &'a Body,
-        resolver: Resolver,
+        db: &'db dyn HirDatabase,
+        owner: InferBodyId<'db>,
+        store_owner: ExpressionStoreOwnerId,
+        generic_def: GenericDefId,
+        store: &'db ExpressionStore,
+        resolver: Resolver<'db>,
+        allow_using_generic_params: bool,
+        lowering_mode: LoweringMode,
     ) -> Self {
-        let trait_env = db.trait_environment_for_body(owner);
+        let trait_env = db.trait_environment(generic_def);
+        let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
+        let types = crate::next_solver::default_types(db);
         InferenceContext {
-            generics: OnceCell::new(),
-            result: InferenceResult::default(),
-            table: unify::InferenceTable::new(db, trait_env),
+            result: InferenceResult::new(types.types.error),
+            return_ty: types.types.error, // set in collect_* calls
+            types,
+            target_features: OnceCell::new(),
+            lang_items: table.interner().lang_items(),
+            features: resolver.top_level_def_map().features(),
+            edition: resolver.krate().data(db).edition,
+            table,
             tuple_field_accesses_rev: Default::default(),
-            return_ty: TyKind::Error.intern(Interner), // set in collect_* calls
             resume_yield_tys: None,
             return_coercion: None,
             db,
             owner,
-            body,
-            traits_in_scope: resolver.traits_in_scope(db.upcast()),
+            store_owner,
+            generic_def,
+            allow_using_generic_params,
+            generics: OnceCell::new(),
+            identity_args: OnceCell::new(),
+            store,
+            traits_in_scope: resolver.traits_in_scope(db),
             resolver,
             diverges: Diverges::Maybe,
             breakables: Vec::new(),
             deferred_cast_checks: Vec::new(),
-            current_captures: Vec::new(),
-            current_capture_span_stack: Vec::new(),
-            current_closure: None,
-            deferred_closures: FxHashMap::default(),
-            closure_dependencies: FxHashMap::default(),
             inside_assignment: false,
             diagnostics: Diagnostics::default(),
+            vars_emitted_type_must_be_known_for: FxHashSet::default(),
+            deferred_call_resolutions: FxHashMap::default(),
+            defined_anon_consts: RefCell::new(ThinVec::new()),
+            lowering_mode,
         }
     }
 
-    pub(crate) fn generics(&self) -> Option<&Generics> {
-        self.generics
-            .get_or_init(|| {
-                self.resolver
-                    .generic_def()
-                    .map(|def| crate::generics::generics(self.db.upcast(), def))
-            })
-            .as_ref()
+    fn merge(&mut self, other: &InferenceResult<'db>) {
+        let InferenceResult {
+            method_resolutions,
+            field_resolutions,
+            variant_resolutions,
+            assoc_resolutions,
+            tuple_field_access_types: _,
+            type_of_expr,
+            type_of_pat,
+            type_of_binding,
+            type_of_type_placeholder,
+            type_of_opaque,
+            has_errors: _,
+            diagnostics: _,
+            error_ty: _,
+            expr_adjustments,
+            pat_adjustments,
+            binding_modes,
+            skipped_ref_pats,
+            coercion_casts,
+            closures_data,
+            nodes_with_type_mismatches,
+            defined_anon_consts: _,
+        } = &mut self.result;
+        merge_hash_maps(method_resolutions, &other.method_resolutions);
+        merge_hash_maps(variant_resolutions, &other.variant_resolutions);
+        merge_hash_maps(assoc_resolutions, &other.assoc_resolutions);
+        field_resolutions.extend(other.field_resolutions.iter().map(
+            |(&field_expr, &field_resolution)| {
+                let mut field_resolution = field_resolution;
+                if let Either::Right(tuple_field) = &mut field_resolution {
+                    let tys = other.tuple_field_access_type(tuple_field.tuple);
+                    tuple_field.tuple =
+                        TupleId(self.tuple_field_accesses_rev.insert_full(tys).0 as u32);
+                };
+                (field_expr, field_resolution)
+            },
+        ));
+        merge_arena_maps(type_of_expr, &other.type_of_expr);
+        merge_arena_maps(type_of_pat, &other.type_of_pat);
+        merge_arena_maps(type_of_binding, &other.type_of_binding);
+        merge_hash_maps(type_of_type_placeholder, &other.type_of_type_placeholder);
+        merge_hash_maps(type_of_opaque, &other.type_of_opaque);
+        merge_hash_maps(expr_adjustments, &other.expr_adjustments);
+        merge_hash_maps(pat_adjustments, &other.pat_adjustments);
+        merge_arena_maps(binding_modes, &other.binding_modes);
+        merge_hash_set(skipped_ref_pats, &other.skipped_ref_pats);
+        merge_hash_set(coercion_casts, &other.coercion_casts);
+        merge_hash_maps(closures_data, &other.closures_data);
+        if let Some(other_nodes_with_type_mismatches) = &other.nodes_with_type_mismatches {
+            merge_hash_set(
+                nodes_with_type_mismatches.get_or_insert_default(),
+                other_nodes_with_type_mismatches,
+            );
+        }
+        self.defined_anon_consts.borrow_mut().extend(other.defined_anon_consts.iter().copied());
+
+        fn merge_hash_set<T: Hash + Eq + Clone>(dest: &mut FxHashSet<T>, source: &FxHashSet<T>) {
+            dest.extend(source.iter().cloned());
+        }
+
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn merge_hash_maps<K: Hash + Eq + Clone, V: Clone + PartialEq>(
+            dest: &mut FxHashMap<K, V>,
+            source: &FxHashMap<K, V>,
+        ) {
+            if cfg!(debug_assertions) {
+                for (key, src) in source {
+                    assert!(dest.get(key).is_none_or(|dst| dst == src));
+                }
+            }
+
+            dest.extend(source.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn merge_arena_maps<K, V: Clone + PartialEq>(
+            dest: &mut ArenaMap<la_arena::Idx<K>, V>,
+            source: &ArenaMap<la_arena::Idx<K>, V>,
+        ) {
+            if cfg!(debug_assertions) {
+                for (key, src) in source.iter() {
+                    assert!(dest.get(key).is_none_or(|dst| dst == src));
+                }
+            }
+
+            dest.extend(source.iter().map(|(k, v)| (k, v.clone())));
+        }
+    }
+
+    #[inline]
+    fn krate(&self) -> Crate {
+        self.resolver.krate()
+    }
+
+    fn target_features(&self) -> (&TargetFeatures<'db>, TargetFeatureIsSafeInTarget) {
+        let (target_features, target_feature_is_safe) = self.target_features.get_or_init(|| {
+            let target_features = match self.store_owner {
+                ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(id)) => {
+                    TargetFeatures::from_fn(self.db, id)
+                }
+                _ => TargetFeatures::default(),
+            };
+            let target_feature_is_safe = match &self.krate().workspace_data(self.db).target {
+                Ok(target) => crate::utils::target_feature_is_safe_in_target(target),
+                Err(_) => TargetFeatureIsSafeInTarget::No,
+            };
+            (target_features, target_feature_is_safe)
+        });
+        (target_features, *target_feature_is_safe)
+    }
+
+    /// How should a deref pattern find the place for its inner pattern to match on?
+    ///
+    /// In most cases, if the pattern recursively contains a `ref mut` binding, we find the inner
+    /// pattern's scrutinee by calling `DerefMut::deref_mut`, and otherwise we call `Deref::deref`.
+    /// However, for boxes we can use a built-in deref instead, which doesn't borrow the scrutinee;
+    /// in this case, we return `DerefPatBorrowMode::Box`.
+    fn deref_pat_borrow_mode(&self, pointer_ty: Ty<'_>, inner: PatId) -> DerefPatBorrowMode {
+        if pointer_ty.is_box() {
+            DerefPatBorrowMode::Box
+        } else {
+            let mutability =
+                if self.pat_has_ref_mut_binding(inner) { Mutability::Mut } else { Mutability::Not };
+            DerefPatBorrowMode::Borrow(mutability)
+        }
+    }
+
+    #[inline]
+    fn set_tainted_by_errors(&mut self) {
+        self.result.has_errors = true;
+    }
+
+    /// Copy the inference of defined anon consts to ourselves, so that we don't need to lookup the defining
+    /// anon const when looking the type of something.
+    fn merge_anon_consts(&mut self) {
+        let mut defined_anon_consts = std::mem::take(&mut *self.defined_anon_consts.borrow_mut());
+        defined_anon_consts.retain(|&konst| {
+            if konst.loc(self.db).owner != self.store_owner {
+                // This comes from the signature, we don't define it.
+                return false;
+            }
+
+            let const_infer = InferenceResult::of(self.db, konst);
+            self.merge(const_infer);
+            true
+        });
+        // Caution, other defined anon consts might have been added by `merge()`!
+        self.defined_anon_consts.borrow_mut().append(&mut defined_anon_consts);
     }
 
     // FIXME: This function should be private in module. It is currently only used in the consteval, since we need
     // `InferenceResult` in the middle of inference. See the fixme comment in `consteval::eval_to_const`. If you
     // used this function for another workaround, mention it here. If you really need this function and believe that
     // there is no problem in it being `pub(crate)`, remove this comment.
-    pub(crate) fn resolve_all(self) -> InferenceResult {
+    fn resolve_all(self) -> InferenceResult<'db> {
         let InferenceContext {
-            mut table,
+            table,
             mut result,
-            mut deferred_cast_checks,
             tuple_field_accesses_rev,
             diagnostics,
+            types,
+            vars_emitted_type_must_be_known_for,
             ..
         } = self;
-        let mut diagnostics = diagnostics.finish();
+        let diagnostics = diagnostics.finish();
         // Destructure every single field so whenever new fields are added to `InferenceResult` we
         // don't forget to handle them here.
         let InferenceResult {
@@ -758,488 +1650,265 @@ impl<'a> InferenceContext<'a> {
             type_of_expr,
             type_of_pat,
             type_of_binding,
-            type_of_rpit,
-            type_of_for_iterator,
-            type_mismatches,
+            type_of_type_placeholder,
+            type_of_opaque,
+            skipped_ref_pats,
+            closures_data,
             has_errors,
-            standard_types: _,
+            error_ty: _,
             pat_adjustments,
             binding_modes: _,
             expr_adjustments,
-            // Types in `closure_info` have already been `resolve_completely()`'d during
-            // `InferenceContext::infer_closures()` (in `HirPlace::ty()` specifically), so no need
-            // to resolve them here.
-            closure_info: _,
-            mutated_bindings_in_closure: _,
-            tuple_field_access_types: _,
-            coercion_casts,
-            diagnostics: _,
+            tuple_field_access_types,
+            coercion_casts: _,
+            diagnostics: result_diagnostics,
+            nodes_with_type_mismatches,
+            defined_anon_consts: result_defined_anon_consts,
         } = &mut result;
-        table.fallback_if_possible();
 
-        // Comment from rustc:
-        // Even though coercion casts provide type hints, we check casts after fallback for
-        // backwards compatibility. This makes fallback a stronger type hint than a cast coercion.
-        let mut apply_adjustments = |expr, adj| {
-            expr_adjustments.insert(expr, adj);
-        };
-        let mut set_coercion_cast = |expr| {
-            coercion_casts.insert(expr);
-        };
-        for cast in deferred_cast_checks.iter_mut() {
-            if let Err(diag) =
-                cast.check(&mut table, &mut apply_adjustments, &mut set_coercion_cast)
-            {
-                diagnostics.push(diag);
-            }
-        }
+        *result_defined_anon_consts = self.defined_anon_consts.into_inner();
+        result_defined_anon_consts.shrink_to_fit();
 
-        // FIXME resolve obligations as well (use Guidance if necessary)
-        table.resolve_obligations_as_possible();
+        let mut resolver =
+            WriteBackCtxt::new(table, diagnostics, vars_emitted_type_must_be_known_for);
 
-        // make sure diverging type variables are marked as such
-        table.propagate_diverging_flag();
+        skipped_ref_pats.shrink_to_fit();
         for ty in type_of_expr.values_mut() {
-            *ty = table.resolve_completely(ty.clone());
-            *has_errors = *has_errors || ty.contains_unknown();
+            resolver.resolve_completely(ty);
         }
+        type_of_expr.shrink_to_fit();
         for ty in type_of_pat.values_mut() {
-            *ty = table.resolve_completely(ty.clone());
-            *has_errors = *has_errors || ty.contains_unknown();
+            resolver.resolve_completely(ty);
         }
+        type_of_pat.shrink_to_fit();
         for ty in type_of_binding.values_mut() {
-            *ty = table.resolve_completely(ty.clone());
-            *has_errors = *has_errors || ty.contains_unknown();
+            resolver.resolve_completely(ty);
         }
-        for ty in type_of_rpit.values_mut() {
-            *ty = table.resolve_completely(ty.clone());
-            *has_errors = *has_errors || ty.contains_unknown();
+        type_of_binding.shrink_to_fit();
+        for ty in type_of_type_placeholder.values_mut() {
+            resolver.resolve_completely(ty);
         }
-        for ty in type_of_for_iterator.values_mut() {
-            *ty = table.resolve_completely(ty.clone());
-            *has_errors = *has_errors || ty.contains_unknown();
+        type_of_type_placeholder.shrink_to_fit();
+        type_of_opaque.shrink_to_fit();
+
+        if let Some(nodes_with_type_mismatches) = nodes_with_type_mismatches {
+            *has_errors = true;
+            nodes_with_type_mismatches.shrink_to_fit();
         }
-
-        *has_errors |= !type_mismatches.is_empty();
-
-        type_mismatches.retain(|_, mismatch| {
-            mismatch.expected = table.resolve_completely(mismatch.expected.clone());
-            mismatch.actual = table.resolve_completely(mismatch.actual.clone());
-            chalk_ir::zip::Zip::zip_with(
-                &mut UnknownMismatch(self.db),
-                Variance::Invariant,
-                &mismatch.expected,
-                &mismatch.actual,
-            )
-            .is_ok()
-        });
-        diagnostics.retain_mut(|diagnostic| {
-            use InferenceDiagnostic::*;
-            match diagnostic {
-                ExpectedFunction { found: ty, .. }
-                | UnresolvedField { receiver: ty, .. }
-                | UnresolvedMethodCall { receiver: ty, .. } => {
-                    *ty = table.resolve_completely(ty.clone());
-                    // FIXME: Remove this when we are on par with rustc in terms of inference
-                    if ty.contains_unknown() {
-                        return false;
-                    }
-
-                    if let UnresolvedMethodCall { field_with_same_name, .. } = diagnostic {
-                        if let Some(ty) = field_with_same_name {
-                            *ty = table.resolve_completely(ty.clone());
-                            if ty.contains_unknown() {
-                                *field_with_same_name = None;
-                            }
-                        }
-                    }
-                }
-                TypedHole { expected: ty, .. } => {
-                    *ty = table.resolve_completely(ty.clone());
-                }
-                _ => (),
-            }
-            true
-        });
         for (_, subst) in method_resolutions.values_mut() {
-            *subst = table.resolve_completely(subst.clone());
-            *has_errors =
-                *has_errors || subst.type_parameters(Interner).any(|ty| ty.contains_unknown());
+            resolver.resolve_completely(subst);
         }
+        method_resolutions.shrink_to_fit();
         for (_, subst) in assoc_resolutions.values_mut() {
-            *subst = table.resolve_completely(subst.clone());
-            *has_errors =
-                *has_errors || subst.type_parameters(Interner).any(|ty| ty.contains_unknown());
+            resolver.resolve_completely(subst);
         }
+        assoc_resolutions.shrink_to_fit();
         for adjustment in expr_adjustments.values_mut().flatten() {
-            adjustment.target = table.resolve_completely(adjustment.target.clone());
-            *has_errors = *has_errors || adjustment.target.contains_unknown();
+            resolver.resolve_completely(&mut adjustment.target);
         }
-        for adjustment in pat_adjustments.values_mut().flatten() {
-            *adjustment = table.resolve_completely(adjustment.clone());
-            *has_errors = *has_errors || adjustment.contains_unknown();
+        expr_adjustments.shrink_to_fit();
+        for adjustments in pat_adjustments.values_mut() {
+            for adjustment in &mut *adjustments {
+                resolver.resolve_completely(&mut adjustment.source);
+            }
+            adjustments.shrink_to_fit();
         }
-        result.tuple_field_access_types = tuple_field_accesses_rev
+        pat_adjustments.shrink_to_fit();
+        for closure_data in closures_data.values_mut() {
+            let ClosureData { min_captures, fake_reads, liberated_sig } = closure_data;
+            let dummy_place = || Place {
+                base_ty: types.types.error.store(),
+                base: closure::analysis::expr_use_visitor::PlaceBase::Rvalue,
+                projections: Vec::new(),
+            };
+
+            for (place, _, sources) in fake_reads {
+                resolver.resolve_completely_with_default(place, dummy_place());
+                place.projections.shrink_to_fit();
+                for source in &mut *sources {
+                    source.shrink_to_fit();
+                }
+                sources.shrink_to_fit();
+            }
+
+            for min_capture in min_captures.values_mut() {
+                for captured in &mut *min_capture {
+                    let CapturedPlace { place, info, mutability: _ } = captured;
+                    resolver.resolve_completely_with_default(place, dummy_place());
+                    let CaptureInfo { sources, capture_kind: _ } = info;
+                    for source in &mut *sources {
+                        source.shrink_to_fit();
+                    }
+                    sources.shrink_to_fit();
+                }
+                min_capture.shrink_to_fit();
+            }
+            min_captures.shrink_to_fit();
+
+            resolver.resolve_completely(liberated_sig);
+        }
+        closures_data.shrink_to_fit();
+        *tuple_field_access_types = tuple_field_accesses_rev
             .into_iter()
-            .enumerate()
-            .map(|(idx, subst)| (TupleId(idx as u32), table.resolve_completely(subst)))
-            .inspect(|(_, subst)| {
-                *has_errors =
-                    *has_errors || subst.type_parameters(Interner).any(|ty| ty.contains_unknown());
+            .map(|mut subst| {
+                resolver.resolve_completely(&mut subst);
+                subst.store()
             })
             .collect();
+        tuple_field_access_types.shrink_to_fit();
 
-        result.diagnostics = diagnostics;
+        let (diagnostics, resolver_has_errors) = resolver.resolve_diagnostics();
+        *result_diagnostics = diagnostics;
+        *has_errors |= resolver_has_errors;
 
         result
     }
 
-    fn collect_const(&mut self, data: &ConstData) {
-        let return_ty =
-            self.make_ty(data.type_ref, &data.types_map, InferenceTyDiagnosticSource::Signature);
-
-        // Constants might be defining usage sites of TAITs.
-        self.make_tait_coercion_table(iter::once(&return_ty));
-
-        self.return_ty = return_ty;
-    }
-
-    fn collect_static(&mut self, data: &StaticData) {
-        let return_ty =
-            self.make_ty(data.type_ref, &data.types_map, InferenceTyDiagnosticSource::Signature);
-
-        // Statics might be defining usage sites of TAITs.
-        self.make_tait_coercion_table(iter::once(&return_ty));
+    fn collect_const(&mut self, id: ConstId, data: &'db ConstSignature) {
+        let return_ty = self.make_ty(
+            data.type_ref,
+            &data.store,
+            InferenceTyDiagnosticSource::Signature,
+            ExpressionStoreOwnerId::Signature(id.into()),
+            LifetimeElisionKind::for_const(self.interner(), id.loc(self.db).container),
+        );
 
         self.return_ty = return_ty;
     }
 
-    fn collect_fn(&mut self, func: FunctionId) {
-        let data = self.db.function_data(func);
-        let mut param_tys =
-            self.with_ty_lowering(&data.types_map, InferenceTyDiagnosticSource::Signature, |ctx| {
-                ctx.type_param_mode(ParamLoweringMode::Placeholder)
-                    .impl_trait_mode(ImplTraitLoweringMode::Param);
-                data.params.iter().map(|&type_ref| ctx.lower_ty(type_ref)).collect::<Vec<_>>()
-            });
+    fn collect_static(&mut self, id: StaticId, data: &'db StaticSignature) {
+        let return_ty = self.make_ty(
+            data.type_ref,
+            &data.store,
+            InferenceTyDiagnosticSource::Signature,
+            ExpressionStoreOwnerId::Signature(id.into()),
+            LifetimeElisionKind::Elided(self.types.regions.statik),
+        );
+
+        self.return_ty = return_ty;
+    }
+
+    fn collect_fn(
+        &mut self,
+        func: FunctionId,
+        self_param: Option<BindingId>,
+        params: &[Param<PatId>],
+    ) {
+        let data = FunctionSignature::of(self.db, func);
+        let mut param_tys = self.with_ty_lowering(
+            &data.store,
+            InferenceTyDiagnosticSource::Signature,
+            ExpressionStoreOwnerId::Signature(func.into()),
+            LifetimeElisionKind::for_fn_params(data),
+            |ctx| data.params.iter().map(|&type_ref| ctx.lower_ty(type_ref)).collect::<Vec<_>>(),
+        );
+
         // Check if function contains a va_list, if it does then we append it to the parameter types
         // that are collected from the function data
         if data.is_varargs() {
             let va_list_ty = match self.resolve_va_list() {
-                Some(va_list) => TyBuilder::adt(self.db, va_list)
-                    .fill_with_defaults(self.db, || self.table.new_type_var())
-                    .build(),
+                Some(va_list) => Ty::new_adt(
+                    self.interner(),
+                    va_list,
+                    GenericArgs::for_item_with_defaults(
+                        self.interner(),
+                        va_list.into(),
+                        |_, id, _| self.table.var_for_def(id, Span::Dummy),
+                    ),
+                ),
                 None => self.err_ty(),
             };
 
             param_tys.push(va_list_ty);
         }
-        let mut param_tys = param_tys.into_iter().chain(iter::repeat(self.table.new_type_var()));
-        if let Some(self_param) = self.body.self_param {
-            if let Some(ty) = param_tys.next() {
-                let ty = self.insert_type_vars(ty);
-                let ty = self.normalize_associated_types_in(ty);
-                self.write_binding_ty(self_param, ty);
-            }
-        }
-        let mut tait_candidates = FxHashSet::default();
-        for (ty, pat) in param_tys.zip(&*self.body.params) {
-            let ty = self.insert_type_vars(ty);
-            let ty = self.normalize_associated_types_in(ty);
-
-            self.infer_top_pat(*pat, &ty, None);
-            if ty
-                .data(Interner)
-                .flags
-                .intersects(TypeFlags::HAS_TY_OPAQUE.union(TypeFlags::HAS_TY_INFER))
-            {
-                tait_candidates.insert(ty);
-            }
-        }
-        let return_ty = data.ret_type;
-
-        let return_ty =
-            self.with_ty_lowering(&data.types_map, InferenceTyDiagnosticSource::Signature, |ctx| {
-                ctx.type_param_mode(ParamLoweringMode::Placeholder)
-                    .impl_trait_mode(ImplTraitLoweringMode::Opaque)
-                    .lower_ty(return_ty)
-            });
-        let return_ty = self.insert_type_vars(return_ty);
-
-        let return_ty = if let Some(rpits) = self.db.return_type_impl_traits(func) {
-            // RPIT opaque types use substitution of their parent function.
-            let fn_placeholders = TyBuilder::placeholder_subst(self.db, func);
-            let mut mode = ImplTraitReplacingMode::ReturnPosition(FxHashSet::default());
-            let result =
-                self.insert_inference_vars_for_impl_trait(return_ty, fn_placeholders, &mut mode);
-            if let ImplTraitReplacingMode::ReturnPosition(taits) = mode {
-                tait_candidates.extend(taits);
-            }
-            let rpits = rpits.skip_binders();
-            for (id, _) in rpits.impl_traits.iter() {
-                if let Entry::Vacant(e) = self.result.type_of_rpit.entry(id) {
-                    never!("Missed RPIT in `insert_inference_vars_for_rpit`");
-                    e.insert(TyKind::Error.intern(Interner));
-                }
-            }
-            result
-        } else {
-            return_ty
-        };
-
-        self.return_ty = self.normalize_associated_types_in(return_ty);
-        self.return_coercion = Some(CoerceMany::new(self.return_ty.clone()));
-
-        // Functions might be defining usage sites of TAITs.
-        // To define an TAITs, that TAIT must appear in the function's signatures.
-        // So, it suffices to check for params and return types.
-        if self
-            .return_ty
-            .data(Interner)
-            .flags
-            .intersects(TypeFlags::HAS_TY_OPAQUE.union(TypeFlags::HAS_TY_INFER))
+        let mut param_tys = param_tys.into_iter();
+        if let Some(self_param) = self_param
+            && let Some(ty) = param_tys.next()
         {
-            tait_candidates.insert(self.return_ty.clone());
+            let ty = self.process_user_written_ty(ty);
+            self.write_binding_ty(self_param, ty);
         }
-        self.make_tait_coercion_table(tait_candidates.iter());
-    }
+        for pat in params {
+            let ty = param_tys.next().unwrap_or_else(|| self.table.next_ty_var(Span::Dummy));
+            let ty = self.process_user_written_ty(ty);
 
-    fn insert_inference_vars_for_impl_trait<T>(
-        &mut self,
-        t: T,
-        placeholders: Substitution,
-        mode: &mut ImplTraitReplacingMode,
-    ) -> T
-    where
-        T: crate::HasInterner<Interner = Interner> + crate::TypeFoldable<Interner>,
-    {
-        fold_tys(
-            t,
-            |ty, _| {
-                let opaque_ty_id = match ty.kind(Interner) {
-                    TyKind::OpaqueType(opaque_ty_id, _) => *opaque_ty_id,
-                    _ => return ty,
-                };
-                let (impl_traits, idx) =
-                    match self.db.lookup_intern_impl_trait_id(opaque_ty_id.into()) {
-                        // We don't replace opaque types from other kind with inference vars
-                        // because `insert_inference_vars_for_impl_traits` for each kinds
-                        // and unreplaced opaque types of other kind are resolved while
-                        // inferencing because of `tait_coercion_table`.
-                        // Moreover, calling `insert_inference_vars_for_impl_traits` with same
-                        // `placeholders` for other kind may cause trouble because
-                        // the substs for the bounds of each impl traits do not match
-                        ImplTraitId::ReturnTypeImplTrait(def, idx) => {
-                            if matches!(mode, ImplTraitReplacingMode::TypeAlias) {
-                                // RPITs don't have `tait_coercion_table`, so use inserted inference
-                                // vars for them.
-                                if let Some(ty) = self.result.type_of_rpit.get(idx) {
-                                    return ty.clone();
-                                }
-                                return ty;
-                            }
-                            (self.db.return_type_impl_traits(def), idx)
-                        }
-                        ImplTraitId::TypeAliasImplTrait(def, idx) => {
-                            if let ImplTraitReplacingMode::ReturnPosition(taits) = mode {
-                                // Gather TAITs while replacing RPITs because TAITs inside RPITs
-                                // may not visited while replacing TAITs
-                                taits.insert(ty.clone());
-                                return ty;
-                            }
-                            (self.db.type_alias_impl_traits(def), idx)
-                        }
-                        _ => unreachable!(),
-                    };
-                let Some(impl_traits) = impl_traits else {
-                    return ty;
-                };
-                let bounds = (*impl_traits)
-                    .map_ref(|its| its.impl_traits[idx].bounds.map_ref(|it| it.iter()));
-                let var = self.table.new_type_var();
-                let var_subst = Substitution::from1(Interner, var.clone());
-                for bound in bounds {
-                    let predicate = bound.map(|it| it.cloned());
-                    let predicate = predicate.substitute(Interner, &placeholders);
-                    let (var_predicate, binders) =
-                        predicate.substitute(Interner, &var_subst).into_value_and_skipped_binders();
-                    always!(binders.is_empty(Interner)); // quantified where clauses not yet handled
-                    let var_predicate = self.insert_inference_vars_for_impl_trait(
-                        var_predicate,
-                        placeholders.clone(),
-                        mode,
-                    );
-                    self.push_obligation(var_predicate.cast(Interner));
-                }
-                self.result.type_of_rpit.insert(idx, var.clone());
-                var
-            },
-            DebruijnIndex::INNERMOST,
-        )
-    }
-
-    /// The coercion of a non-inference var into an opaque type should fail,
-    /// but not in the defining sites of the TAITs.
-    /// In such cases, we insert an proxy inference var for each TAIT,
-    /// and coerce into it instead of TAIT itself.
-    ///
-    /// The inference var stretagy is effective because;
-    ///
-    /// - It can still unify types that coerced into TAITs
-    /// - We are pushing `impl Trait` bounds into it
-    ///
-    /// This function inserts a map that maps the opaque type to that proxy inference var.
-    fn make_tait_coercion_table<'b>(&mut self, tait_candidates: impl Iterator<Item = &'b Ty>) {
-        struct TypeAliasImplTraitCollector<'a, 'b> {
-            db: &'b dyn HirDatabase,
-            table: &'b mut InferenceTable<'a>,
-            assocs: FxHashMap<OpaqueTyId, (ImplId, Ty)>,
-            non_assocs: FxHashMap<OpaqueTyId, Ty>,
+            self.infer_top_pat(pat.formal, ty, PatOrigin::Param);
         }
-
-        impl TypeVisitor<Interner> for TypeAliasImplTraitCollector<'_, '_> {
-            type BreakTy = ();
-
-            fn as_dyn(&mut self) -> &mut dyn TypeVisitor<Interner, BreakTy = Self::BreakTy> {
-                self
+        self.return_ty = match data.ret_type {
+            Some(return_ty) => {
+                let return_ty = self.with_ty_lowering(
+                    &data.store,
+                    InferenceTyDiagnosticSource::Signature,
+                    ExpressionStoreOwnerId::Signature(func.into()),
+                    LifetimeElisionKind::for_fn_ret(self.interner()),
+                    |ctx| {
+                        ctx.impl_trait_mode(ImplTraitLoweringMode::Opaque);
+                        ctx.lower_ty(return_ty)
+                    },
+                );
+                self.process_user_written_ty(return_ty)
             }
-
-            fn interner(&self) -> Interner {
-                Interner
-            }
-
-            fn visit_ty(
-                &mut self,
-                ty: &chalk_ir::Ty<Interner>,
-                outer_binder: DebruijnIndex,
-            ) -> std::ops::ControlFlow<Self::BreakTy> {
-                let ty = self.table.resolve_ty_shallow(ty);
-
-                if let TyKind::OpaqueType(id, _) = ty.kind(Interner) {
-                    if let ImplTraitId::TypeAliasImplTrait(alias_id, _) =
-                        self.db.lookup_intern_impl_trait_id((*id).into())
-                    {
-                        let loc = self.db.lookup_intern_type_alias(alias_id);
-                        match loc.container {
-                            ItemContainerId::ImplId(impl_id) => {
-                                self.assocs.insert(*id, (impl_id, ty.clone()));
-                            }
-                            ItemContainerId::ModuleId(..) | ItemContainerId::ExternBlockId(..) => {
-                                self.non_assocs.insert(*id, ty.clone());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                ty.super_visit_with(self, outer_binder)
-            }
-        }
-
-        let mut collector = TypeAliasImplTraitCollector {
-            db: self.db,
-            table: &mut self.table,
-            assocs: FxHashMap::default(),
-            non_assocs: FxHashMap::default(),
-        };
-        for ty in tait_candidates {
-            let _ = ty.visit_with(collector.as_dyn(), DebruijnIndex::INNERMOST);
-        }
-
-        // Non-assoc TAITs can be define-used everywhere as long as they are
-        // in function signatures or const types, etc
-        let mut taits = collector.non_assocs;
-
-        // assoc TAITs(ATPITs) can be only define-used inside their impl block.
-        // They cannot be define-used in inner items like in the following;
-        //
-        // ```
-        // impl Trait for Struct {
-        //     type Assoc = impl Default;
-        //
-        //     fn assoc_fn() -> Self::Assoc {
-        //         let foo: Self::Assoc = true; // Allowed here
-        //
-        //         fn inner() -> Self::Assoc {
-        //              false                   // Not allowed here
-        //         }
-        //
-        //         foo
-        //     }
-        // }
-        // ```
-        let impl_id = match self.owner {
-            DefWithBodyId::FunctionId(it) => {
-                let loc = self.db.lookup_intern_function(it);
-                if let ItemContainerId::ImplId(impl_id) = loc.container {
-                    Some(impl_id)
-                } else {
-                    None
-                }
-            }
-            DefWithBodyId::ConstId(it) => {
-                let loc = self.db.lookup_intern_const(it);
-                if let ItemContainerId::ImplId(impl_id) = loc.container {
-                    Some(impl_id)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+            None => self.types.types.unit,
         };
 
-        if let Some(impl_id) = impl_id {
-            taits.extend(collector.assocs.into_iter().filter_map(|(id, (impl_, ty))| {
-                if impl_ == impl_id {
-                    Some((id, ty))
-                } else {
-                    None
-                }
-            }));
-        }
+        self.return_coercion = Some(CoerceMany::new(self.return_ty));
+    }
 
-        let tait_coercion_table: FxHashMap<_, _> = taits
-            .into_iter()
-            .filter_map(|(id, ty)| {
-                if let ImplTraitId::TypeAliasImplTrait(alias_id, _) =
-                    self.db.lookup_intern_impl_trait_id(id.into())
-                {
-                    let subst = TyBuilder::placeholder_subst(self.db, alias_id);
-                    let ty = self.insert_inference_vars_for_impl_trait(
-                        ty,
-                        subst,
-                        &mut ImplTraitReplacingMode::TypeAlias,
-                    );
-                    Some((id, ty))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    #[inline]
+    pub(crate) fn interner(&self) -> DbInterner<'db> {
+        self.table.interner()
+    }
 
-        if !tait_coercion_table.is_empty() {
-            self.table.tait_coercion_table = Some(tait_coercion_table);
+    #[inline]
+    pub(crate) fn infcx(&self) -> &InferCtxt<'db> {
+        &self.table.infer_ctxt
+    }
+
+    /// If `ty` is an error, returns an infer var instead. Otherwise, returns it.
+    ///
+    /// "Refreshing" types like this is useful for getting better types, but it is also
+    /// very dangerous: we might create duplicate diagnostics, for example if we try
+    /// to resolve it and fail. rustc doesn't do that for this reason (and is in general
+    /// more strict with how it uses error types; an error type in inputs will almost
+    /// always cause it to infer an error type in output, while we infer some type as much
+    /// as we can).
+    ///
+    /// Unfortunately, we cannot allow ourselves to do that. Not only we more often work
+    /// with incomplete code, we also have assists, for example "Generate constant", that
+    /// will assume the inferred type is the expected type even if the expression itself
+    /// cannot be inferred. Therefore, we choose a middle ground: refresh the type,
+    /// but if we return a new var, mark it so that no diagnostics will be issued on it.
+    fn insert_type_vars_shallow(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if ty.is_ty_error() {
+            let var = self.table.next_ty_var(Span::Dummy);
+
+            // Suppress future errors on this var. Add more things here when we add more diagnostics.
+            self.vars_emitted_type_must_be_known_for.insert(var.into());
+
+            var
+        } else {
+            ty
         }
     }
 
-    fn infer_body(&mut self) {
+    fn infer_body(&mut self, body_expr: ExprId) {
         match self.return_coercion {
-            Some(_) => self.infer_return(self.body.body_expr),
+            Some(_) => self.infer_return(body_expr),
             None => {
                 _ = self.infer_expr_coerce(
-                    self.body.body_expr,
-                    &Expectation::has_type(self.return_ty.clone()),
+                    body_expr,
+                    &Expectation::has_type(self.return_ty),
                     ExprIsRead::Yes,
                 )
             }
         }
     }
 
-    fn write_expr_ty(&mut self, expr: ExprId, ty: Ty) {
-        self.result.type_of_expr.insert(expr, ty);
+    fn write_expr_ty(&mut self, expr: ExprId, ty: Ty<'db>) {
+        self.result.type_of_expr.insert(expr, ty.store());
     }
 
-    fn write_expr_adj(&mut self, expr: ExprId, adjustments: Vec<Adjustment>) {
+    pub(crate) fn write_expr_adj(&mut self, expr: ExprId, adjustments: Box<[Adjustment]>) {
         if adjustments.is_empty() {
             return;
         }
@@ -1265,115 +1934,201 @@ impl<'a> InferenceContext<'a> {
         }
     }
 
-    fn write_method_resolution(&mut self, expr: ExprId, func: FunctionId, subst: Substitution) {
-        self.result.method_resolutions.insert(expr, (func, subst));
+    pub(crate) fn write_method_resolution(
+        &mut self,
+        expr: ExprId,
+        func: FunctionId,
+        subst: GenericArgs<'db>,
+    ) {
+        self.result.method_resolutions.insert(expr, (func, subst.store()));
     }
 
-    fn write_variant_resolution(&mut self, id: ExprOrPatId, variant: VariantId) {
+    fn write_variant_resolution(&mut self, id: ExprOrPatIdPacked, variant: VariantId) {
         self.result.variant_resolutions.insert(id, variant);
     }
 
-    fn write_assoc_resolution(&mut self, id: ExprOrPatId, item: AssocItemId, subs: Substitution) {
-        self.result.assoc_resolutions.insert(id, (item, subs));
+    fn write_assoc_resolution(
+        &mut self,
+        id: ExprOrPatIdPacked,
+        item: CandidateId,
+        subs: GenericArgs<'db>,
+    ) {
+        self.result.assoc_resolutions.insert(id, (item, subs.store()));
     }
 
-    fn write_pat_ty(&mut self, pat: PatId, ty: Ty) {
-        self.result.type_of_pat.insert(pat, ty);
+    fn write_pat_ty(&mut self, pat: PatId, ty: Ty<'db>) {
+        self.result.type_of_pat.insert(pat, ty.store());
     }
 
-    fn write_binding_ty(&mut self, id: BindingId, ty: Ty) {
-        self.result.type_of_binding.insert(id, ty);
+    fn write_binding_ty(&mut self, id: BindingId, ty: Ty<'db>) {
+        self.result.type_of_binding.insert(id, ty.store());
     }
 
-    fn push_diagnostic(&self, diagnostic: InferenceDiagnostic) {
+    pub(crate) fn push_diagnostic(&self, diagnostic: InferenceDiagnostic) {
         self.diagnostics.push(diagnostic);
+    }
+
+    fn record_deferred_call_resolution(
+        &mut self,
+        closure_def_id: ExprId,
+        r: DeferredCallResolution<'db>,
+    ) {
+        self.deferred_call_resolutions.entry(closure_def_id).or_default().push(r);
+    }
+
+    fn remove_deferred_call_resolutions(
+        &mut self,
+        closure_def_id: ExprId,
+    ) -> Vec<DeferredCallResolution<'db>> {
+        self.deferred_call_resolutions.remove(&closure_def_id).unwrap_or_default()
     }
 
     fn with_ty_lowering<R>(
         &mut self,
-        types_map: &TypesMap,
+        store: &'db ExpressionStore,
         types_source: InferenceTyDiagnosticSource,
-        f: impl FnOnce(&mut TyLoweringContext<'_>) -> R,
+        store_owner: ExpressionStoreOwnerId,
+        lifetime_elision: LifetimeElisionKind<'db>,
+        f: impl FnOnce(&mut TyLoweringContext<'db, '_>) -> R,
     ) -> R {
+        let infer_vars = match types_source {
+            InferenceTyDiagnosticSource::Body => Some(&mut InferenceTyLoweringVarsCtx {
+                table: &mut self.table,
+                type_of_type_placeholder: &mut self.result.type_of_type_placeholder,
+            } as _),
+            InferenceTyDiagnosticSource::Signature => None,
+        };
         let mut ctx = TyLoweringContext::new(
             self.db,
             &self.resolver,
-            types_map,
-            self.owner.into(),
+            store,
             &self.diagnostics,
             types_source,
+            store_owner,
+            self.generic_def,
+            &self.generics,
+            lifetime_elision,
+            self.allow_using_generic_params,
+            infer_vars,
+            &self.defined_anon_consts,
+            LifetimeLoweringMode::LateParam,
         );
         f(&mut ctx)
     }
 
-    fn with_body_ty_lowering<R>(&mut self, f: impl FnOnce(&mut TyLoweringContext<'_>) -> R) -> R {
-        self.with_ty_lowering(&self.body.types, InferenceTyDiagnosticSource::Body, f)
+    fn with_body_ty_lowering<R>(
+        &mut self,
+        f: impl FnOnce(&mut TyLoweringContext<'db, '_>) -> R,
+    ) -> R {
+        self.with_ty_lowering(
+            self.store,
+            InferenceTyDiagnosticSource::Body,
+            self.store_owner,
+            LifetimeElisionKind::Infer,
+            f,
+        )
     }
 
     fn make_ty(
         &mut self,
         type_ref: TypeRefId,
-        types_map: &TypesMap,
+        store: &'db ExpressionStore,
         type_source: InferenceTyDiagnosticSource,
-    ) -> Ty {
-        let ty = self.with_ty_lowering(types_map, type_source, |ctx| ctx.lower_ty(type_ref));
-        let ty = self.insert_type_vars(ty);
-        self.normalize_associated_types_in(ty)
-    }
-
-    fn make_body_ty(&mut self, type_ref: TypeRefId) -> Ty {
-        self.make_ty(type_ref, &self.body.types, InferenceTyDiagnosticSource::Body)
-    }
-
-    fn err_ty(&self) -> Ty {
-        self.result.standard_types.unknown.clone()
-    }
-
-    fn make_body_lifetime(&mut self, lifetime_ref: &LifetimeRef) -> Lifetime {
-        let lt = self.with_ty_lowering(TypesMap::EMPTY, InferenceTyDiagnosticSource::Body, |ctx| {
-            ctx.lower_lifetime(lifetime_ref)
+        store_owner: ExpressionStoreOwnerId,
+        lifetime_elision: LifetimeElisionKind<'db>,
+    ) -> Ty<'db> {
+        let ty = self.with_ty_lowering(store, type_source, store_owner, lifetime_elision, |ctx| {
+            ctx.lower_ty(type_ref)
         });
-        self.insert_type_vars(lt)
+        self.process_user_written_ty(ty)
     }
 
-    /// Replaces `Ty::Error` by a new type var, so we can maybe still infer it.
-    fn insert_type_vars_shallow(&mut self, ty: Ty) -> Ty {
-        self.table.insert_type_vars_shallow(ty)
+    pub(crate) fn make_body_ty(&mut self, type_ref: TypeRefId) -> Ty<'db> {
+        self.make_ty(
+            type_ref,
+            self.store,
+            InferenceTyDiagnosticSource::Body,
+            self.store_owner,
+            LifetimeElisionKind::Infer,
+        )
+    }
+
+    fn generics(&self) -> &Generics<'db> {
+        self.generics.get_or_init(|| crate::generics::generics(self.db, self.generic_def))
+    }
+
+    fn identity_args(&self) -> GenericArgs<'db> {
+        *self.identity_args.get_or_init(|| {
+            GenericArgs::identity_for_item(self.interner(), self.generic_def.into())
+        })
+    }
+
+    pub(crate) fn create_body_anon_const(
+        &mut self,
+        expr: ExprId,
+        expected_ty: Ty<'db>,
+        allow_using_generic_params: bool,
+    ) -> Const<'db> {
+        never!(expected_ty.has_infer(), "cannot have infer vars in an anon const's ty");
+        let konst = create_anon_const(
+            self.interner(),
+            self.store_owner,
+            self.store,
+            expr,
+            &self.resolver,
+            expected_ty,
+            &|| self.generics(),
+            Some(&mut |span| self.table.next_const_var(span)),
+            self.lowering_mode,
+            (!(allow_using_generic_params && self.allow_using_generic_params)).then_some(0),
+        );
+
+        if let Ok(konst) = konst
+            && let ConstKind::Unevaluated(konst) = konst.kind()
+            && let GeneralConstId::AnonConstId(konst) = konst.def.0
+        {
+            self.defined_anon_consts.borrow_mut().push(konst);
+        } else {
+            self.write_expr_ty(expr, expected_ty);
+        }
+
+        // FIXME: Report an error if needed.
+        konst.unwrap_or_else(|_| self.table.next_const_var(Span::Dummy))
+    }
+
+    pub(crate) fn make_path_as_body_const(&mut self, path: &Path) -> Const<'db> {
+        let forbid_params_after = if self.allow_using_generic_params { None } else { Some(0) };
+        // FIXME: Report errors.
+        path_to_const(self.db, &self.resolver, &|| self.generics(), forbid_params_after, path)
+            .unwrap_or_else(|_| self.table.next_const_var(Span::Dummy))
+    }
+
+    fn err_ty(&self) -> Ty<'db> {
+        self.types.types.error
+    }
+
+    pub(crate) fn make_body_lifetime(&mut self, lifetime_ref: LifetimeRefId) -> Region<'db> {
+        let lt = self.with_ty_lowering(
+            self.store,
+            InferenceTyDiagnosticSource::Body,
+            self.store_owner,
+            LifetimeElisionKind::Infer,
+            |ctx| ctx.lower_lifetime(lifetime_ref),
+        );
+        self.insert_type_vars(lt)
     }
 
     fn insert_type_vars<T>(&mut self, ty: T) -> T
     where
-        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
+        T: TypeFoldable<DbInterner<'db>>,
     {
         self.table.insert_type_vars(ty)
-    }
-
-    fn push_obligation(&mut self, o: DomainGoal) {
-        self.table.register_obligation(o.cast(Interner));
-    }
-
-    fn unify(&mut self, ty1: &Ty, ty2: &Ty) -> bool {
-        let ty1 = ty1
-            .clone()
-            .try_fold_with(
-                &mut UnevaluatedConstEvaluatorFolder { db: self.db },
-                DebruijnIndex::INNERMOST,
-            )
-            .unwrap();
-        let ty2 = ty2
-            .clone()
-            .try_fold_with(
-                &mut UnevaluatedConstEvaluatorFolder { db: self.db },
-                DebruijnIndex::INNERMOST,
-            )
-            .unwrap();
-        self.table.unify(&ty1, &ty2)
     }
 
     /// Attempts to returns the deeply last field of nested structures, but
     /// does not apply any normalization in its search. Returns the same type
     /// if input `ty` is not a structure at all.
-    fn struct_tail_without_normalization(&mut self, ty: Ty) -> Ty {
+    fn struct_tail_without_normalization(&mut self, ty: Ty<'db>) -> Ty<'db> {
         self.struct_tail_with_normalize(ty, identity)
     }
 
@@ -1386,37 +2141,39 @@ impl<'a> InferenceContext<'a> {
     /// function to indicate no normalization should take place.
     fn struct_tail_with_normalize(
         &mut self,
-        mut ty: Ty,
-        mut normalize: impl FnMut(Ty) -> Ty,
-    ) -> Ty {
+        mut ty: Ty<'db>,
+        mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,
+    ) -> Ty<'db> {
         // FIXME: fetch the limit properly
         let recursion_limit = 10;
         for iteration in 0.. {
             if iteration > recursion_limit {
                 return self.err_ty();
             }
-            match ty.kind(Interner) {
-                TyKind::Adt(chalk_ir::AdtId(hir_def::AdtId::StructId(struct_id)), substs) => {
-                    match self.db.field_types((*struct_id).into()).values().next_back().cloned() {
-                        Some(field) => {
-                            ty = field.substitute(Interner, substs);
+            match ty.kind() {
+                TyKind::Adt(adt_def, substs) => match adt_def.def_id() {
+                    AdtId::StructId(struct_id) => {
+                        match self
+                            .db
+                            .field_types(struct_id.into())
+                            .values()
+                            .next_back()
+                            .map(|it| it.ty())
+                        {
+                            Some(field) => {
+                                ty = field.instantiate(self.interner(), substs).skip_norm_wip();
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
-                }
-                TyKind::Adt(..) => break,
-                TyKind::Tuple(_, substs) => {
-                    match substs
-                        .as_slice(Interner)
-                        .split_last()
-                        .and_then(|(last_ty, _)| last_ty.ty(Interner))
-                    {
-                        Some(last_ty) => ty = last_ty.clone(),
-                        None => break,
-                    }
-                }
+                    _ => break,
+                },
+                TyKind::Tuple(substs) => match substs.as_slice().split_last() {
+                    Some((last_ty, _)) => ty = *last_ty,
+                    None => break,
+                },
                 TyKind::Alias(..) => {
-                    let normalized = normalize(ty.clone());
+                    let normalized = normalize(ty);
                     if ty == normalized {
                         return ty;
                     } else {
@@ -1429,149 +2186,313 @@ impl<'a> InferenceContext<'a> {
         ty
     }
 
-    /// Recurses through the given type, normalizing associated types mentioned
-    /// in it by replacing them by type variables and registering obligations to
-    /// resolve later. This should be done once for every type we get from some
-    /// type annotation (e.g. from a let type annotation, field type or function
-    /// call). `make_ty` handles this already, but e.g. for field types we need
-    /// to do it as well.
-    fn normalize_associated_types_in<T>(&mut self, ty: T) -> T
-    where
-        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
-    {
-        self.table.normalize_associated_types_in(ty)
+    /// Whenever you lower a user-written type, you should call this.
+    fn process_user_written_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        self.table.process_user_written_ty(ty)
     }
 
-    fn resolve_ty_shallow(&mut self, ty: &Ty) -> Ty {
-        self.table.resolve_ty_shallow(ty)
+    /// The difference of this method from `process_user_written_ty()` is that this method doesn't register a well-formed obligation,
+    /// while `process_user_written_ty()` should (but doesn't currently).
+    fn process_remote_user_written_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        self.table.process_remote_user_written_ty(ty)
     }
 
-    fn resolve_associated_type(&mut self, inner_ty: Ty, assoc_ty: Option<TypeAliasId>) -> Ty {
-        self.resolve_associated_type_with_params(inner_ty, assoc_ty, &[])
+    fn shallow_resolve(&self, ty: Ty<'db>) -> Ty<'db> {
+        self.table.shallow_resolve(ty)
     }
 
-    fn resolve_associated_type_with_params(
+    pub(crate) fn resolve_vars_if_possible<T: TypeFoldable<DbInterner<'db>>>(&self, t: T) -> T {
+        self.table.resolve_vars_if_possible(t)
+    }
+
+    pub(crate) fn structurally_resolve_type(
         &mut self,
-        inner_ty: Ty,
-        assoc_ty: Option<TypeAliasId>,
-        // FIXME(GATs): these are args for the trait ref, args for assoc type itself should be
-        // handled when we support them.
-        params: &[GenericArg],
-    ) -> Ty {
-        match assoc_ty {
-            Some(res_assoc_ty) => {
-                let trait_ = match res_assoc_ty.lookup(self.db.upcast()).container {
-                    hir_def::ItemContainerId::TraitId(trait_) => trait_,
-                    _ => panic!("resolve_associated_type called with non-associated type"),
-                };
-                let ty = self.table.new_type_var();
-                let mut param_iter = params.iter().cloned();
-                let trait_ref = TyBuilder::trait_ref(self.db, trait_)
-                    .push(inner_ty)
-                    .fill(|_| param_iter.next().unwrap())
-                    .build();
-                let alias_eq = AliasEq {
-                    alias: AliasTy::Projection(ProjectionTy {
-                        associated_ty_id: to_assoc_type_id(res_assoc_ty),
-                        substitution: trait_ref.substitution.clone(),
-                    }),
-                    ty: ty.clone(),
-                };
-                self.push_obligation(trait_ref.cast(Interner));
-                self.push_obligation(alias_eq.cast(Interner));
-                ty
-            }
-            None => self.err_ty(),
+        node: ExprOrPatIdPacked,
+        ty: Ty<'db>,
+    ) -> Ty<'db> {
+        let result = self.table.try_structurally_resolve_type(node.into(), ty);
+        if result.is_ty_var() { self.type_must_be_known_at_this_point(node, ty) } else { result }
+    }
+
+    pub(crate) fn emit_type_mismatch(
+        &mut self,
+        node: ExprOrPatIdPacked,
+        expected: Ty<'db>,
+        found: Ty<'db>,
+    ) {
+        if self.result.nodes_with_type_mismatches.get_or_insert_default().insert(node) {
+            self.diagnostics.push(InferenceDiagnostic::TypeMismatch {
+                node,
+                expected: expected.store(),
+                found: found.store(),
+            });
         }
+    }
+
+    fn demand_eqtype(
+        &mut self,
+        id: ExprOrPatIdPacked,
+        expected: Ty<'db>,
+        actual: Ty<'db>,
+    ) -> Result<(), ()> {
+        let result = self
+            .table
+            .at(&ObligationCause::new(id))
+            .eq(expected, actual)
+            .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+        if result.is_err() {
+            self.emit_type_mismatch(id, expected, actual);
+        }
+        result.map_err(drop)
+    }
+
+    fn demand_eqtype_fixme_no_diag(
+        &mut self,
+        expected: Ty<'db>,
+        actual: Ty<'db>,
+    ) -> Result<(), ()> {
+        let result = self
+            .table
+            .at(&ObligationCause::dummy())
+            .eq(expected, actual)
+            .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+        result.map_err(drop)
+    }
+
+    fn demand_suptype(
+        &mut self,
+        id: ExprOrPatIdPacked,
+        expected: Ty<'db>,
+        actual: Ty<'db>,
+    ) -> Result<(), ()> {
+        let result = self
+            .table
+            .at(&ObligationCause::new(id))
+            .sup(expected, actual)
+            .map(|infer_ok| self.table.register_infer_ok(infer_ok));
+        if result.is_err() {
+            self.emit_type_mismatch(id, expected, actual);
+        }
+        result.map_err(drop)
+    }
+
+    fn demand_coerce(
+        &mut self,
+        expr: ExprId,
+        checked_ty: Ty<'db>,
+        expected: Ty<'db>,
+        allow_two_phase: AllowTwoPhase,
+        expr_is_read: ExprIsRead,
+    ) -> Ty<'db> {
+        let result = self.coerce(expr, checked_ty, expected, allow_two_phase, expr_is_read);
+        if let Err(_err) = result {
+            // FIXME: Emit diagnostic.
+        }
+        result.unwrap_or(self.types.types.error)
+    }
+
+    pub(crate) fn type_must_be_known_at_this_point(
+        &mut self,
+        node: ExprOrPatIdPacked,
+        ty: Ty<'db>,
+    ) -> Ty<'db> {
+        if self.vars_emitted_type_must_be_known_for.insert(ty.into()) {
+            self.push_diagnostic(InferenceDiagnostic::TypeMustBeKnown {
+                at_point: node.into(),
+                top_term: None,
+            });
+        }
+        self.types.types.error
+    }
+
+    pub(crate) fn require_type_is_sized(&mut self, ty: Ty<'db>, span: Span) {
+        if !ty.references_non_lt_error()
+            && let Some(sized_trait) = self.lang_items.Sized
+        {
+            self.table.register_bound(ty, sized_trait, ObligationCause::new(span));
+        }
+    }
+
+    fn expr_ty(&self, expr: ExprId) -> Ty<'db> {
+        self.result.expr_ty(expr)
+    }
+
+    fn expr_ty_after_adjustments(&self, e: ExprId) -> Ty<'db> {
+        let mut ty = None;
+        if let Some(it) = self.result.expr_adjustments.get(&e)
+            && let Some(it) = it.last()
+        {
+            ty = Some(it.target.as_ref());
+        }
+        ty.unwrap_or_else(|| self.expr_ty(e))
     }
 
     fn resolve_variant(
         &mut self,
-        node: ExprOrPatId,
-        path: Option<&Path>,
+        node: ExprOrPatIdPacked,
+        path: &Path,
         value_ns: bool,
-    ) -> (Ty, Option<VariantId>) {
-        let path = match path {
-            Some(path) => path,
-            None => return (self.err_ty(), None),
+    ) -> (Ty<'db>, Option<VariantId>) {
+        let interner = self.interner();
+        let mut vars_ctx = InferenceTyLoweringVarsCtx {
+            table: &mut self.table,
+            type_of_type_placeholder: &mut self.result.type_of_type_placeholder,
         };
         let mut ctx = TyLoweringContext::new(
             self.db,
             &self.resolver,
-            &self.body.types,
-            self.owner.into(),
+            self.store,
             &self.diagnostics,
             InferenceTyDiagnosticSource::Body,
+            self.store_owner,
+            self.generic_def,
+            &self.generics,
+            LifetimeElisionKind::Infer,
+            self.allow_using_generic_params,
+            Some(&mut vars_ctx),
+            &self.defined_anon_consts,
+            LifetimeLoweringMode::LateParam,
         );
+
+        if let Some(type_anchor) = path.type_anchor() {
+            let mut segments = path.segments();
+            if segments.is_empty() {
+                return (self.types.types.error, None);
+            }
+            let (mut ty, type_ns) = ctx.lower_ty_ext(type_anchor);
+            ty = ctx.expect_table().process_user_written_ty(ty);
+
+            if let Some(TypeNs::SelfType(impl_)) = type_ns
+                && let Some(trait_ref) = self.db.impl_trait(impl_)
+                && let trait_ref = trait_ref.instantiate_identity().skip_norm_wip()
+                && let Some(assoc_type) = trait_ref
+                    .def_id
+                    .0
+                    .trait_items(self.db)
+                    .associated_type_by_name(segments.first().unwrap().name)
+            {
+                // `<Self>::AssocType`
+                let args = ctx.expect_table().infer_ctxt.fill_rest_fresh_args(
+                    node.into(),
+                    assoc_type.into(),
+                    trait_ref.args,
+                );
+                let alias = Ty::new_alias(
+                    interner,
+                    AliasTy::new_from_args(
+                        interner,
+                        AliasTyKind::Projection { def_id: assoc_type.into() },
+                        args,
+                    ),
+                );
+                ty = ctx.expect_table().try_structurally_resolve_type(node.into(), alias);
+                segments = segments.skip(1);
+            }
+
+            let variant = match ty.as_adt() {
+                Some((AdtId::StructId(id), _)) => id.into(),
+                Some((AdtId::UnionId(id), _)) => id.into(),
+                Some((AdtId::EnumId(id), _)) => {
+                    if let Some(segment) = segments.first()
+                        && let enum_data = id.enum_variants(self.db)
+                        && let Some(variant) = enum_data.variant(segment.name)
+                    {
+                        // FIXME: Report error if there are generics on the variant.
+                        segments = segments.skip(1);
+                        variant.into()
+                    } else {
+                        return (self.types.types.error, None);
+                    }
+                }
+                None => return (self.types.types.error, None),
+            };
+
+            if !segments.is_empty() {
+                // FIXME: Report an error.
+                return (self.types.types.error, None);
+            } else {
+                return (ty, Some(variant));
+            }
+        }
+
         let mut path_ctx = ctx.at_path(path, node);
+        let interner = DbInterner::conjure();
         let (resolution, unresolved) = if value_ns {
             let Some(res) = path_ctx.resolve_path_in_value_ns(HygieneId::ROOT) else {
-                return (self.err_ty(), None);
+                return (self.types.types.error, None);
             };
             match res {
-                ResolveValueResult::ValueNs(value, _) => match value {
+                ResolveValueResult::ValueNs(value) => match value {
                     ValueNs::EnumVariantId(var) => {
-                        let substs = path_ctx.substs_from_path(var.into(), true);
+                        let args = path_ctx.substs_from_path(var.into(), true, false, node.into());
                         drop(ctx);
-                        let ty = self.db.ty(var.lookup(self.db.upcast()).parent.into());
-                        let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
+                        let ty = self
+                            .db
+                            .ty(var.lookup(self.db).parent.into())
+                            .instantiate(interner, args)
+                            .skip_norm_wip();
+                        let ty = self.insert_type_vars(ty);
                         return (ty, Some(var.into()));
                     }
                     ValueNs::StructId(strukt) => {
-                        let substs = path_ctx.substs_from_path(strukt.into(), true);
+                        let args =
+                            path_ctx.substs_from_path(strukt.into(), true, false, node.into());
                         drop(ctx);
-                        let ty = self.db.ty(strukt.into());
-                        let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
+                        let ty =
+                            self.db.ty(strukt.into()).instantiate(interner, args).skip_norm_wip();
+                        let ty = self.insert_type_vars(ty);
                         return (ty, Some(strukt.into()));
                     }
                     ValueNs::ImplSelf(impl_id) => (TypeNs::SelfType(impl_id), None),
                     _ => {
                         drop(ctx);
-                        return (self.err_ty(), None);
+                        return (self.types.types.error, None);
                     }
                 },
-                ResolveValueResult::Partial(typens, unresolved, _) => (typens, Some(unresolved)),
+                ResolveValueResult::Partial(typens, unresolved) => (typens, Some(unresolved)),
             }
         } else {
             match path_ctx.resolve_path_in_type_ns() {
                 Some((it, idx)) => (it, idx),
-                None => return (self.err_ty(), None),
+                None => return (self.types.types.error, None),
             }
-        };
-        let Some(mod_path) = path.mod_path() else {
-            never!("resolver should always resolve lang item paths");
-            return (self.err_ty(), None);
         };
         return match resolution {
             TypeNs::AdtId(AdtId::StructId(strukt)) => {
-                let substs = path_ctx.substs_from_path(strukt.into(), true);
+                let args = path_ctx.substs_from_path(strukt.into(), true, false, node.into());
                 drop(ctx);
-                let ty = self.db.ty(strukt.into());
-                let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
-                forbid_unresolved_segments((ty, Some(strukt.into())), unresolved)
+                let ty = self.db.ty(strukt.into()).instantiate(interner, args).skip_norm_wip();
+                let ty = self.insert_type_vars(ty);
+                forbid_unresolved_segments(self, (ty, Some(strukt.into())), unresolved)
             }
             TypeNs::AdtId(AdtId::UnionId(u)) => {
-                let substs = path_ctx.substs_from_path(u.into(), true);
+                let args = path_ctx.substs_from_path(u.into(), true, false, node.into());
                 drop(ctx);
-                let ty = self.db.ty(u.into());
-                let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
-                forbid_unresolved_segments((ty, Some(u.into())), unresolved)
+                let ty = self.db.ty(u.into()).instantiate(interner, args).skip_norm_wip();
+                let ty = self.insert_type_vars(ty);
+                forbid_unresolved_segments(self, (ty, Some(u.into())), unresolved)
             }
             TypeNs::EnumVariantId(var) => {
-                let substs = path_ctx.substs_from_path(var.into(), true);
+                let args = path_ctx.substs_from_path(var.into(), true, false, node.into());
                 drop(ctx);
-                let ty = self.db.ty(var.lookup(self.db.upcast()).parent.into());
-                let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
-                forbid_unresolved_segments((ty, Some(var.into())), unresolved)
+                let ty = self
+                    .db
+                    .ty(var.lookup(self.db).parent.into())
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
+                let ty = self.insert_type_vars(ty);
+                forbid_unresolved_segments(self, (ty, Some(var.into())), unresolved)
             }
             TypeNs::SelfType(impl_id) => {
-                let generics = crate::generics::generics(self.db.upcast(), impl_id.into());
-                let substs = generics.placeholder_subst(self.db);
-                let mut ty = self.db.impl_self_ty(impl_id).substitute(Interner, &substs);
+                let mut ty = self.db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
 
                 let Some(remaining_idx) = unresolved else {
                     drop(ctx);
-                    return self.resolve_variant_on_alias(ty, None, mod_path);
+                    let Some(mod_path) = path.mod_path() else {
+                        never!("resolver should always resolve lang item paths");
+                        return (self.types.types.error, None);
+                    };
+                    return self.resolve_variant_on_alias(node, ty, None, mod_path);
                 };
 
                 let mut remaining_segments = path.segments().skip(remaining_idx);
@@ -1586,8 +2507,10 @@ impl<'a> InferenceContext<'a> {
                 while let Some(current_segment) = remaining_segments.first() {
                     // If we can resolve to an enum variant, it takes priority over associated type
                     // of the same name.
-                    if let Some((AdtId::EnumId(id), _)) = ty.as_adt() {
-                        let enum_data = self.db.enum_data(id);
+                    if let TyKind::Adt(adt_def, _) = ty.kind()
+                        && let AdtId::EnumId(id) = adt_def.def_id()
+                    {
+                        let enum_data = id.enum_variants(self.db);
                         if let Some(variant) = enum_data.variant(current_segment.name) {
                             return if remaining_segments.len() == 1 {
                                 (ty, Some(variant.into()))
@@ -1595,7 +2518,7 @@ impl<'a> InferenceContext<'a> {
                                 // We still have unresolved paths, but enum variants never have
                                 // associated types!
                                 // FIXME: Report an error.
-                                (self.err_ty(), None)
+                                (self.types.types.error, None)
                             };
                         }
                     }
@@ -1609,14 +2532,12 @@ impl<'a> InferenceContext<'a> {
                     // `lower_partly_resolved_path()` returns `None` as type namespace unless
                     // `remaining_segments` is empty, which is never the case here. We don't know
                     // which namespace the new `ty` is in until normalized anyway.
-                    (ty, _) = path_ctx.lower_partly_resolved_path(resolution, false);
+                    (ty, _) = path_ctx.lower_partly_resolved_path(resolution, true, node.into());
                     tried_resolving_once = true;
 
-                    ty = self.table.insert_type_vars(ty);
-                    ty = self.table.normalize_associated_types_in(ty);
-                    ty = self.table.resolve_ty_shallow(&ty);
-                    if ty.is_unknown() {
-                        return (self.err_ty(), None);
+                    ty = path_ctx.expect_table().process_user_written_ty(ty);
+                    if ty.is_ty_error() {
+                        return (self.types.types.error, None);
                     }
 
                     remaining_segments = remaining_segments.skip(1);
@@ -1633,58 +2554,98 @@ impl<'a> InferenceContext<'a> {
                 });
                 (ty, variant)
             }
-            TypeNs::TypeAliasId(it) => {
-                let substs = path_ctx.substs_from_path_segment(it.into(), true, None);
-                drop(ctx);
-                let ty = self.db.ty(it.into());
-                let ty = self.insert_type_vars(ty.substitute(Interner, &substs));
+            TypeNs::TraitId(_) => {
+                let Some(remaining_idx) = unresolved else {
+                    return (self.types.types.error, None);
+                };
 
-                self.resolve_variant_on_alias(ty, unresolved, mod_path)
+                let remaining_segments = path.segments().skip(remaining_idx);
+
+                if remaining_segments.len() >= 2 {
+                    path_ctx.ignore_last_segment();
+                }
+
+                let (mut ty, _) =
+                    path_ctx.lower_partly_resolved_path(resolution, true, node.into());
+                ty = ctx.expect_table().process_user_written_ty(ty);
+
+                if let Some(segment) = remaining_segments.get(1)
+                    && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
+                {
+                    let enum_data = id.enum_variants(self.db);
+                    if let Some(variant) = enum_data.variant(segment.name) {
+                        return if remaining_segments.len() == 2 {
+                            (ty, Some(variant.into()))
+                        } else {
+                            // We still have unresolved paths, but enum variants never have
+                            // associated types!
+                            // FIXME: Report an error.
+                            (self.types.types.error, None)
+                        };
+                    }
+                }
+
+                let variant = ty.as_adt().and_then(|(id, _)| match id {
+                    AdtId::StructId(s) => Some(VariantId::StructId(s)),
+                    AdtId::UnionId(u) => Some(VariantId::UnionId(u)),
+                    AdtId::EnumId(_) => {
+                        // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                        None
+                    }
+                });
+                (ty, variant)
+            }
+            TypeNs::TypeAliasId(it) => {
+                let Some(mod_path) = path.mod_path() else {
+                    never!("resolver should always resolve lang item paths");
+                    return (self.types.types.error, None);
+                };
+                let args =
+                    path_ctx.substs_from_path_segment(it.into(), true, None, false, node.into());
+                let interner = path_ctx.interner();
+                drop(ctx);
+                let ty = self.db.ty(it.into()).instantiate(interner, args).skip_norm_wip();
+                let ty = self.insert_type_vars(ty);
+
+                self.resolve_variant_on_alias(node, ty, unresolved, mod_path)
             }
             TypeNs::AdtSelfType(_) => {
                 // FIXME this could happen in array size expressions, once we're checking them
-                (self.err_ty(), None)
+                (self.types.types.error, None)
             }
             TypeNs::GenericParam(_) => {
                 // FIXME potentially resolve assoc type
-                (self.err_ty(), None)
+                (self.types.types.error, None)
             }
-            TypeNs::AdtId(AdtId::EnumId(_))
-            | TypeNs::BuiltinType(_)
-            | TypeNs::TraitId(_)
-            | TypeNs::TraitAliasId(_) => {
+            TypeNs::AdtId(AdtId::EnumId(_)) | TypeNs::BuiltinType(_) | TypeNs::ModuleId(_) => {
                 // FIXME diagnostic
-                (self.err_ty(), None)
+                (self.types.types.error, None)
             }
         };
 
-        fn forbid_unresolved_segments(
-            result: (Ty, Option<VariantId>),
+        fn forbid_unresolved_segments<'db>(
+            ctx: &InferenceContext<'db>,
+            result: (Ty<'db>, Option<VariantId>),
             unresolved: Option<usize>,
-        ) -> (Ty, Option<VariantId>) {
+        ) -> (Ty<'db>, Option<VariantId>) {
             if unresolved.is_none() {
                 result
             } else {
                 // FIXME diagnostic
-                (TyKind::Error.intern(Interner), None)
+                (ctx.types.types.error, None)
             }
         }
     }
 
     fn resolve_variant_on_alias(
         &mut self,
-        ty: Ty,
+        node: ExprOrPatIdPacked,
+        ty: Ty<'db>,
         unresolved: Option<usize>,
         path: &ModPath,
-    ) -> (Ty, Option<VariantId>) {
+    ) -> (Ty<'db>, Option<VariantId>) {
         let remaining = unresolved.map(|it| path.segments()[it..].len()).filter(|it| it > &0);
-        let ty = match ty.kind(Interner) {
-            TyKind::Alias(AliasTy::Projection(proj_ty)) => {
-                let ty = self.table.normalize_projection_ty(proj_ty.clone());
-                self.table.resolve_ty_shallow(&ty)
-            }
-            _ => ty,
-        };
+        let ty = self.table.try_structurally_resolve_type(node.into(), ty);
         match remaining {
             None => {
                 let variant = ty.as_adt().and_then(|(adt_id, _)| match adt_id {
@@ -1701,7 +2662,7 @@ impl<'a> InferenceContext<'a> {
                 let segment = path.segments().last().unwrap();
                 // this could be an enum variant or associated type
                 if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt() {
-                    let enum_data = self.db.enum_data(enum_id);
+                    let enum_data = enum_id.enum_variants(self.db);
                     if let Some(variant) = enum_data.variant(segment) {
                         return (ty, Some(variant.into()));
                     }
@@ -1716,86 +2677,62 @@ impl<'a> InferenceContext<'a> {
         }
     }
 
-    fn resolve_lang_item(&self, item: LangItem) -> Option<LangItemTarget> {
-        let krate = self.resolver.krate();
-        self.db.lang_item(krate, item)
-    }
-
-    fn resolve_output_on(&self, trait_: TraitId) -> Option<TypeAliasId> {
-        self.db
-            .trait_data(trait_)
-            .associated_type_by_name(&Name::new_symbol_root(sym::Output.clone()))
-    }
-
-    fn resolve_lang_trait(&self, lang: LangItem) -> Option<TraitId> {
-        self.resolve_lang_item(lang)?.as_trait()
-    }
-
-    fn resolve_ops_neg_output(&self) -> Option<TypeAliasId> {
-        self.resolve_output_on(self.resolve_lang_trait(LangItem::Neg)?)
-    }
-
-    fn resolve_ops_not_output(&self) -> Option<TypeAliasId> {
-        self.resolve_output_on(self.resolve_lang_trait(LangItem::Not)?)
-    }
-
-    fn resolve_future_future_output(&self) -> Option<TypeAliasId> {
-        let ItemContainerId::TraitId(trait_) = self
-            .resolve_lang_item(LangItem::IntoFutureIntoFuture)?
-            .as_function()?
-            .lookup(self.db.upcast())
-            .container
-        else {
-            return None;
-        };
-        self.resolve_output_on(trait_)
-    }
-
-    fn resolve_boxed_box(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::OwnedBox)?.as_struct()?;
-        Some(struct_.into())
-    }
-
     fn resolve_range_full(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::RangeFull)?.as_struct()?;
+        let struct_ = self.lang_items.RangeFull?;
         Some(struct_.into())
+    }
+
+    fn has_new_range_feature(&self) -> bool {
+        self.features.new_range
     }
 
     fn resolve_range(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::Range)?.as_struct()?;
+        let struct_ = if self.has_new_range_feature() {
+            self.lang_items.RangeCopy?
+        } else {
+            self.lang_items.Range?
+        };
         Some(struct_.into())
     }
 
     fn resolve_range_inclusive(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::RangeInclusiveStruct)?.as_struct()?;
+        let struct_ = if self.has_new_range_feature() {
+            self.lang_items.RangeInclusiveCopy?
+        } else {
+            self.lang_items.RangeInclusiveStruct?
+        };
         Some(struct_.into())
     }
 
     fn resolve_range_from(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::RangeFrom)?.as_struct()?;
+        let struct_ = if self.has_new_range_feature() {
+            self.lang_items.RangeFromCopy?
+        } else {
+            self.lang_items.RangeFrom?
+        };
         Some(struct_.into())
     }
 
     fn resolve_range_to(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::RangeTo)?.as_struct()?;
+        let struct_ = self.lang_items.RangeTo?;
         Some(struct_.into())
     }
 
     fn resolve_range_to_inclusive(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::RangeToInclusive)?.as_struct()?;
+        let struct_ = if self.has_new_range_feature() {
+            self.lang_items.RangeToInclusiveCopy?
+        } else {
+            self.lang_items.RangeToInclusive?
+        };
         Some(struct_.into())
-    }
-
-    fn resolve_ops_index_output(&self) -> Option<TypeAliasId> {
-        self.resolve_output_on(self.resolve_lang_trait(LangItem::Index)?)
     }
 
     fn resolve_va_list(&self) -> Option<AdtId> {
-        let struct_ = self.resolve_lang_item(LangItem::VaList)?.as_struct()?;
+        let struct_ = self.lang_items.VaList?;
         Some(struct_.into())
     }
 
-    fn get_traits_in_scope(&self) -> Either<FxHashSet<TraitId>, &FxHashSet<TraitId>> {
+    pub(crate) fn get_traits_in_scope(&self) -> Either<FxHashSet<TraitId>, &FxHashSet<TraitId>> {
         let mut b_traits = self.resolver.traits_in_scope_from_block_scopes().peekable();
         if b_traits.peek().is_some() {
             Either::Left(self.traits_in_scope.iter().copied().chain(b_traits).collect())
@@ -1803,24 +2740,28 @@ impl<'a> InferenceContext<'a> {
             Either::Right(&self.traits_in_scope)
         }
     }
+
+    fn has_applicable_non_exhaustive(&self, def: AttrDefId) -> bool {
+        AttrFlags::query(self.db, def).contains(AttrFlags::NON_EXHAUSTIVE)
+            && def.krate(self.db) != self.krate()
+    }
 }
 
 /// When inferring an expression, we propagate downward whatever type hint we
 /// are able in the form of an `Expectation`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Expectation {
+pub(crate) enum Expectation<'db> {
     None,
-    HasType(Ty),
-    #[allow(dead_code)]
-    Castable(Ty),
-    RValueLikeUnsized(Ty),
+    HasType(Ty<'db>),
+    Castable(Ty<'db>),
+    RValueLikeUnsized(Ty<'db>),
 }
 
-impl Expectation {
+impl<'db> Expectation<'db> {
     /// The expectation that the type of the expression needs to equal the given
     /// type.
-    fn has_type(ty: Ty) -> Self {
-        if ty.is_unknown() {
+    fn has_type(ty: Ty<'db>) -> Self {
+        if ty.is_ty_error() {
             // FIXME: get rid of this?
             Expectation::None
         } else {
@@ -1848,9 +2789,11 @@ impl Expectation {
     /// which still is useful, because it informs integer literals and the like.
     /// See the test case `test/ui/coerce-expect-unsized.rs` and #20169
     /// for examples of where this comes up,.
-    fn rvalue_hint(ctx: &mut InferenceContext<'_>, ty: Ty) -> Self {
-        match ctx.struct_tail_without_normalization(ty.clone()).kind(Interner) {
-            TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(_) => Expectation::RValueLikeUnsized(ty),
+    fn rvalue_hint(ctx: &mut InferenceContext<'db>, ty: Ty<'db>) -> Self {
+        match ctx.struct_tail_without_normalization(ty).kind() {
+            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) => {
+                Expectation::RValueLikeUnsized(ty)
+            }
             _ => Expectation::has_type(ty),
         }
     }
@@ -1860,18 +2803,18 @@ impl Expectation {
         Expectation::None
     }
 
-    fn resolve(&self, table: &mut unify::InferenceTable<'_>) -> Expectation {
+    fn resolve(&self, table: &unify::InferenceTable<'db>) -> Expectation<'db> {
         match self {
             Expectation::None => Expectation::None,
-            Expectation::HasType(t) => Expectation::HasType(table.resolve_ty_shallow(t)),
-            Expectation::Castable(t) => Expectation::Castable(table.resolve_ty_shallow(t)),
+            Expectation::HasType(t) => Expectation::HasType(table.shallow_resolve(*t)),
+            Expectation::Castable(t) => Expectation::Castable(table.shallow_resolve(*t)),
             Expectation::RValueLikeUnsized(t) => {
-                Expectation::RValueLikeUnsized(table.resolve_ty_shallow(t))
+                Expectation::RValueLikeUnsized(table.shallow_resolve(*t))
             }
         }
     }
 
-    fn to_option(&self, table: &mut unify::InferenceTable<'_>) -> Option<Ty> {
+    fn to_option(&self, table: &unify::InferenceTable<'db>) -> Option<Ty<'db>> {
         match self.resolve(table) {
             Expectation::None => None,
             Expectation::HasType(t)
@@ -1880,17 +2823,17 @@ impl Expectation {
         }
     }
 
-    fn only_has_type(&self, table: &mut unify::InferenceTable<'_>) -> Option<Ty> {
+    fn only_has_type(&self, table: &mut unify::InferenceTable<'db>) -> Option<Ty<'db>> {
         match self {
-            Expectation::HasType(t) => Some(table.resolve_ty_shallow(t)),
+            Expectation::HasType(t) => Some(table.resolve_vars_if_possible(*t)),
             Expectation::Castable(_) | Expectation::RValueLikeUnsized(_) | Expectation::None => {
                 None
             }
         }
     }
 
-    fn coercion_target_type(&self, table: &mut unify::InferenceTable<'_>) -> Ty {
-        self.only_has_type(table).unwrap_or_else(|| table.new_type_var())
+    fn coercion_target_type(&self, table: &mut unify::InferenceTable<'db>, span: Span) -> Ty<'db> {
+        self.only_has_type(table).unwrap_or_else(|| table.next_ty_var(span))
     }
 
     /// Comment copied from rustc:
@@ -1910,17 +2853,17 @@ impl Expectation {
     /// an expected type. Otherwise, we might write parts of the type
     /// when checking the 'then' block which are incompatible with the
     /// 'else' branch.
-    fn adjust_for_branches(&self, table: &mut unify::InferenceTable<'_>) -> Expectation {
-        match self {
+    fn adjust_for_branches(
+        &self,
+        table: &mut unify::InferenceTable<'db>,
+        span: Span,
+    ) -> Expectation<'db> {
+        match *self {
             Expectation::HasType(ety) => {
-                let ety = table.resolve_ty_shallow(ety);
-                if ety.is_ty_var() {
-                    Expectation::None
-                } else {
-                    Expectation::HasType(ety)
-                }
+                let ety = table.try_structurally_resolve_type(span, ety);
+                if ety.is_ty_var() { Expectation::None } else { Expectation::HasType(ety) }
             }
-            Expectation::RValueLikeUnsized(ety) => Expectation::RValueLikeUnsized(ety.clone()),
+            Expectation::RValueLikeUnsized(ety) => Expectation::RValueLikeUnsized(ety),
             _ => Expectation::None,
         }
     }
@@ -1961,125 +2904,5 @@ impl std::ops::BitAndAssign for Diverges {
 impl std::ops::BitOrAssign for Diverges {
     fn bitor_assign(&mut self, other: Self) {
         *self = *self | other;
-    }
-}
-
-/// A zipper that checks for unequal occurrences of `{unknown}` and unresolved projections
-/// in the two types. Used to filter out mismatch diagnostics that only differ in
-/// `{unknown}` and unresolved projections. These mismatches are usually not helpful.
-/// As the cause is usually an underlying name resolution problem
-struct UnknownMismatch<'db>(&'db dyn HirDatabase);
-impl chalk_ir::zip::Zipper<Interner> for UnknownMismatch<'_> {
-    fn zip_tys(&mut self, variance: Variance, a: &Ty, b: &Ty) -> chalk_ir::Fallible<()> {
-        let zip_substs = |this: &mut Self,
-                          variances,
-                          sub_a: &Substitution,
-                          sub_b: &Substitution| {
-            this.zip_substs(variance, variances, sub_a.as_slice(Interner), sub_b.as_slice(Interner))
-        };
-        match (a.kind(Interner), b.kind(Interner)) {
-            (TyKind::Adt(id_a, sub_a), TyKind::Adt(id_b, sub_b)) if id_a == id_b => zip_substs(
-                self,
-                Some(self.unification_database().adt_variance(*id_a)),
-                sub_a,
-                sub_b,
-            )?,
-            (
-                TyKind::AssociatedType(assoc_ty_a, sub_a),
-                TyKind::AssociatedType(assoc_ty_b, sub_b),
-            ) if assoc_ty_a == assoc_ty_b => zip_substs(self, None, sub_a, sub_b)?,
-            (TyKind::Tuple(arity_a, sub_a), TyKind::Tuple(arity_b, sub_b))
-                if arity_a == arity_b =>
-            {
-                zip_substs(self, None, sub_a, sub_b)?
-            }
-            (TyKind::OpaqueType(opaque_ty_a, sub_a), TyKind::OpaqueType(opaque_ty_b, sub_b))
-                if opaque_ty_a == opaque_ty_b =>
-            {
-                zip_substs(self, None, sub_a, sub_b)?
-            }
-            (TyKind::Slice(ty_a), TyKind::Slice(ty_b)) => self.zip_tys(variance, ty_a, ty_b)?,
-            (TyKind::FnDef(fn_def_a, sub_a), TyKind::FnDef(fn_def_b, sub_b))
-                if fn_def_a == fn_def_b =>
-            {
-                zip_substs(
-                    self,
-                    Some(self.unification_database().fn_def_variance(*fn_def_a)),
-                    sub_a,
-                    sub_b,
-                )?
-            }
-            (TyKind::Ref(mutability_a, _, ty_a), TyKind::Ref(mutability_b, _, ty_b))
-                if mutability_a == mutability_b =>
-            {
-                self.zip_tys(variance, ty_a, ty_b)?
-            }
-            (TyKind::Raw(mutability_a, ty_a), TyKind::Raw(mutability_b, ty_b))
-                if mutability_a == mutability_b =>
-            {
-                self.zip_tys(variance, ty_a, ty_b)?
-            }
-            (TyKind::Array(ty_a, const_a), TyKind::Array(ty_b, const_b)) if const_a == const_b => {
-                self.zip_tys(variance, ty_a, ty_b)?
-            }
-            (TyKind::Closure(id_a, sub_a), TyKind::Closure(id_b, sub_b)) if id_a == id_b => {
-                zip_substs(self, None, sub_a, sub_b)?
-            }
-            (TyKind::Coroutine(coroutine_a, sub_a), TyKind::Coroutine(coroutine_b, sub_b))
-                if coroutine_a == coroutine_b =>
-            {
-                zip_substs(self, None, sub_a, sub_b)?
-            }
-            (
-                TyKind::CoroutineWitness(coroutine_a, sub_a),
-                TyKind::CoroutineWitness(coroutine_b, sub_b),
-            ) if coroutine_a == coroutine_b => zip_substs(self, None, sub_a, sub_b)?,
-            (TyKind::Function(fn_ptr_a), TyKind::Function(fn_ptr_b))
-                if fn_ptr_a.sig == fn_ptr_b.sig && fn_ptr_a.num_binders == fn_ptr_b.num_binders =>
-            {
-                zip_substs(self, None, &fn_ptr_a.substitution.0, &fn_ptr_b.substitution.0)?
-            }
-            (TyKind::Error, TyKind::Error) => (),
-            (TyKind::Error, _)
-            | (_, TyKind::Error)
-            | (TyKind::Alias(AliasTy::Projection(_)) | TyKind::AssociatedType(_, _), _)
-            | (_, TyKind::Alias(AliasTy::Projection(_)) | TyKind::AssociatedType(_, _)) => {
-                return Err(chalk_ir::NoSolution)
-            }
-            _ => (),
-        }
-
-        Ok(())
-    }
-
-    fn zip_lifetimes(&mut self, _: Variance, _: &Lifetime, _: &Lifetime) -> chalk_ir::Fallible<()> {
-        Ok(())
-    }
-
-    fn zip_consts(&mut self, _: Variance, _: &Const, _: &Const) -> chalk_ir::Fallible<()> {
-        Ok(())
-    }
-
-    fn zip_binders<T>(
-        &mut self,
-        variance: Variance,
-        a: &Binders<T>,
-        b: &Binders<T>,
-    ) -> chalk_ir::Fallible<()>
-    where
-        T: Clone
-            + HasInterner<Interner = Interner>
-            + chalk_ir::zip::Zip<Interner>
-            + TypeFoldable<Interner>,
-    {
-        chalk_ir::zip::Zip::zip_with(self, variance, a.skip_binders(), b.skip_binders())
-    }
-
-    fn interner(&self) -> Interner {
-        Interner
-    }
-
-    fn unification_database(&self) -> &dyn chalk_ir::UnificationDatabase<Interner> {
-        &self.0
     }
 }

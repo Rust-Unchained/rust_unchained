@@ -1,12 +1,12 @@
-use hir::{sym, HasSource, Name};
+use hir::{HasSource, Name, sym};
 use syntax::{
-    ast::{self, HasName},
     AstNode,
+    ast::{self, HasName},
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
-    AssistId, AssistKind,
 };
 
 // Assist: generate_is_empty_from_len
@@ -39,7 +39,10 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn generate_is_empty_from_len(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn generate_is_empty_from_len(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     let fn_node = ctx.find_node_at_offset::<ast::Fn>()?;
     let fn_name = fn_node.name()?;
 
@@ -54,13 +57,13 @@ pub(crate) fn generate_is_empty_from_len(acc: &mut Assists, ctx: &AssistContext<
     }
 
     let impl_ = fn_node.syntax().ancestors().find_map(ast::Impl::cast)?;
-    let len_fn = get_impl_method(ctx, &impl_, &Name::new_symbol_root(sym::len.clone()))?;
+    let len_fn = get_impl_method(ctx, &impl_, &Name::new_symbol_root(sym::len))?;
     if !len_fn.ret_type(ctx.sema.db).is_usize() {
         cov_mark::hit!(len_fn_different_return_type);
         return None;
     }
 
-    if get_impl_method(ctx, &impl_, &Name::new_symbol_root(sym::is_empty.clone())).is_some() {
+    if get_impl_method(ctx, &impl_, &Name::new_symbol_root(sym::is_empty)).is_some() {
         cov_mark::hit!(is_empty_already_implemented);
         return None;
     }
@@ -69,7 +72,7 @@ pub(crate) fn generate_is_empty_from_len(acc: &mut Assists, ctx: &AssistContext<
     let range = node.syntax().value.text_range();
 
     acc.add(
-        AssistId("generate_is_empty_from_len", AssistKind::Generate),
+        AssistId::generate("generate_is_empty_from_len"),
         "Generate a is_empty impl from a len function",
         range,
         |builder| {
@@ -86,7 +89,7 @@ pub(crate) fn generate_is_empty_from_len(acc: &mut Assists, ctx: &AssistContext<
 }
 
 fn get_impl_method(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     impl_: &ast::Impl,
     fn_name: &Name,
 ) -> Option<hir::Function> {
@@ -95,7 +98,7 @@ fn get_impl_method(
 
     let scope = ctx.sema.scope(impl_.syntax())?;
     let ty = impl_def.self_ty(db);
-    ty.iterate_method_candidates(db, &scope, None, Some(fn_name), Some)
+    ty.iterate_method_candidates(db, &scope, Some(fn_name), Some)
 }
 
 #[cfg(test)]

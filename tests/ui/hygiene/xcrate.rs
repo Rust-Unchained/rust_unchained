@@ -1,8 +1,8 @@
+//@ edition:2015
 //@ run-pass
 
 //@ aux-build:xcrate.rs
 
-#![feature(decl_macro)]
 
 extern crate xcrate;
 

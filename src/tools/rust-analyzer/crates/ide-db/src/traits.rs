@@ -1,9 +1,9 @@
 //! Functionality for obtaining data related to traits from the DB.
 
-use crate::{defs::Definition, RootDatabase};
-use hir::{db::HirDatabase, AsAssocItem, Semantics};
+use crate::{RootDatabase, defs::Definition};
+use hir::{AsAssocItem, HasCrate, Semantics, db::HirDatabase, sym};
 use rustc_hash::FxHashSet;
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
 /// Given the `impl` block, attempts to find the trait this `impl` corresponds to.
 pub fn resolve_target_trait(
@@ -34,45 +34,62 @@ pub fn get_missing_assoc_items(
     // may share the same name as a function or constant.
     let mut impl_fns_consts = FxHashSet::default();
     let mut impl_type = FxHashSet::default();
-    let edition = imp.module(sema.db).krate().edition(sema.db);
 
     for item in imp.items(sema.db) {
         match item {
             hir::AssocItem::Function(it) => {
-                impl_fns_consts.insert(it.name(sema.db).display(sema.db, edition).to_string());
+                impl_fns_consts.insert(it.name(sema.db));
             }
             hir::AssocItem::Const(it) => {
                 if let Some(name) = it.name(sema.db) {
-                    impl_fns_consts.insert(name.display(sema.db, edition).to_string());
+                    impl_fns_consts.insert(name);
                 }
             }
             hir::AssocItem::TypeAlias(it) => {
-                impl_type.insert(it.name(sema.db).display(sema.db, edition).to_string());
+                impl_type.insert(it.name(sema.db));
             }
         }
     }
 
-    resolve_target_trait(sema, impl_def).map_or(vec![], |target_trait| {
-        target_trait
-            .items(sema.db)
-            .into_iter()
-            .filter(|i| match i {
-                hir::AssocItem::Function(f) => !impl_fns_consts
-                    .contains(&f.name(sema.db).display(sema.db, edition).to_string()),
-                hir::AssocItem::TypeAlias(t) => {
-                    !impl_type.contains(&t.name(sema.db).display(sema.db, edition).to_string())
-                }
-                hir::AssocItem::Const(c) => c
-                    .name(sema.db)
-                    .map(|n| !impl_fns_consts.contains(&n.display(sema.db, edition).to_string()))
-                    .unwrap_or_default(),
-            })
-            .collect()
-    })
+    let Some(target_trait) = imp.trait_(sema.db) else { return Vec::new() };
+
+    // `Drop` has two methods, `drop()` and `pin_drop()`, and you can only implement one of them, so
+    // we consider `pin_drop()` to not exist, unless you already implement it.
+    let drop_trait = hir::Trait::lang(sema.db, imp.krate(sema.db), hir::LangItem::Drop);
+    if let Some(drop_trait) = drop_trait
+        && target_trait == drop_trait
+    {
+        return if impl_fns_consts.is_empty() {
+            // No method implemented, return `drop()`.
+            let drop_drop = drop_trait.function(sema.db, sym::drop);
+            match drop_drop {
+                Some(drop_drop) => vec![hir::AssocItem::Function(drop_drop)],
+                None => Vec::new(),
+            }
+        } else {
+            // Some method is already implemented, leave it.
+            Vec::new()
+        };
+    }
+
+    target_trait
+        .items(sema.db)
+        .into_iter()
+        .filter(|i| match i {
+            hir::AssocItem::Function(f) => !impl_fns_consts.contains(&f.name(sema.db)),
+            hir::AssocItem::TypeAlias(t) => !impl_type.contains(&t.name(sema.db)),
+            hir::AssocItem::Const(c) => {
+                c.name(sema.db).map(|n| !impl_fns_consts.contains(&n)).unwrap_or_default()
+            }
+        })
+        .collect()
 }
 
 /// Converts associated trait impl items to their trait definition counterpart
-pub(crate) fn convert_to_def_in_trait(db: &dyn HirDatabase, def: Definition) -> Definition {
+pub(crate) fn convert_to_def_in_trait<'db>(
+    db: &'db dyn HirDatabase,
+    def: Definition<'db>,
+) -> Definition<'db> {
     (|| {
         let assoc = def.as_assoc_item(db)?;
         let trait_ = assoc.implemented_trait(db)?;
@@ -82,7 +99,10 @@ pub(crate) fn convert_to_def_in_trait(db: &dyn HirDatabase, def: Definition) -> 
 }
 
 /// If this is an trait (impl) assoc item, returns the assoc item of the corresponding trait definition.
-pub(crate) fn as_trait_assoc_def(db: &dyn HirDatabase, def: Definition) -> Option<Definition> {
+pub(crate) fn as_trait_assoc_def<'db>(
+    db: &dyn HirDatabase,
+    def: Definition<'db>,
+) -> Option<Definition<'db>> {
     let assoc = def.as_assoc_item(db)?;
     let trait_ = match assoc.container(db) {
         hir::AssocItemContainer::Trait(_) => return Some(def),
@@ -91,11 +111,11 @@ pub(crate) fn as_trait_assoc_def(db: &dyn HirDatabase, def: Definition) -> Optio
     assoc_item_of_trait(db, assoc, trait_)
 }
 
-fn assoc_item_of_trait(
+fn assoc_item_of_trait<'db>(
     db: &dyn HirDatabase,
     assoc: hir::AssocItem,
     trait_: hir::Trait,
-) -> Option<Definition> {
+) -> Option<Definition<'db>> {
     use hir::AssocItem::*;
     let name = match assoc {
         Function(it) => it.name(db),
@@ -113,9 +133,8 @@ fn assoc_item_of_trait(
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
-    use hir::FilePosition;
-    use hir::Semantics;
+    use expect_test::{Expect, expect};
+    use hir::{EditionedFileId, FilePosition, Semantics};
     use span::Edition;
     use syntax::ast::{self, AstNode};
     use test_fixture::ChangeFixture;
@@ -126,11 +145,13 @@ mod tests {
     pub(crate) fn position(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (RootDatabase, FilePosition) {
-        let change_fixture = ChangeFixture::parse(ra_fixture);
         let mut database = RootDatabase::default();
+        let change_fixture = ChangeFixture::parse(ra_fixture);
         database.apply_change(change_fixture.change);
         let (file_id, range_or_offset) =
             change_fixture.file_position.expect("expected a marker ($0)");
+
+        let file_id = EditionedFileId::from_span_file_id(&database, file_id);
         let offset = range_or_offset.expect_offset();
         (database, FilePosition { file_id, offset })
     }
@@ -138,6 +159,7 @@ mod tests {
     fn check_trait(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let (db, position) = position(ra_fixture);
         let sema = Semantics::new(&db);
+
         let file = sema.parse(position.file_id);
         let impl_block: ast::Impl =
             sema.find_node_at_offset_with_descend(file.syntax(), position.offset).unwrap();
@@ -152,10 +174,12 @@ mod tests {
     fn check_missing_assoc(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let (db, position) = position(ra_fixture);
         let sema = Semantics::new(&db);
+
         let file = sema.parse(position.file_id);
         let impl_block: ast::Impl =
             sema.find_node_at_offset_with_descend(file.syntax(), position.offset).unwrap();
-        let items = crate::traits::get_missing_assoc_items(&sema, &impl_block);
+        let items =
+            hir::attach_db(&db, || crate::traits::get_missing_assoc_items(&sema, &impl_block));
         let actual = items
             .into_iter()
             .map(|item| item.name(&db).unwrap().display(&db, Edition::CURRENT).to_string())

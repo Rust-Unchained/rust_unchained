@@ -1,7 +1,8 @@
-//@no-rustfix
+//@no-rustfix: multiple suggestions add `-> !` to the same fn
 //@aux-build:proc_macros.rs
 
-#![allow(clippy::never_loop)]
+#![feature(gen_blocks)]
+#![expect(clippy::never_loop, clippy::while_let_loop)]
 #![warn(clippy::infinite_loop)]
 
 extern crate proc_macros;
@@ -295,7 +296,7 @@ fn panic_like_macros_1() {
 }
 
 fn panic_like_macros_2() {
-    let mut x = 0;
+    let mut x: i32 = 0;
 
     loop {
         do_something();
@@ -310,7 +311,7 @@ fn panic_like_macros_2() {
     }
     loop {
         do_something();
-        assert!(x % 2 == 0);
+        assert!(x.is_positive());
     }
     loop {
         do_something();
@@ -447,6 +448,151 @@ mod issue_12338 {
                 do_something();
             }
         };
+    }
+}
+
+#[allow(clippy::let_underscore_future, clippy::empty_loop)]
+mod issue_14000 {
+    use super::do_something;
+
+    async fn foo() {
+        let _ = async move {
+            loop {
+                //~^ infinite_loop
+                do_something();
+            }
+        }
+        .await;
+        let _ = async move {
+            loop {
+                //~^ infinite_loop
+                continue;
+            }
+        }
+        .await;
+    }
+
+    fn bar() {
+        let _ = async move {
+            loop {
+                do_something();
+            }
+        };
+
+        let _ = async move {
+            loop {
+                continue;
+            }
+        };
+    }
+}
+
+#[allow(clippy::let_underscore_future)]
+mod tokio_spawn_test {
+    use super::do_something;
+
+    fn install_ticker() {
+        // This should NOT trigger the lint because the async block is spawned, not awaited
+        std::thread::spawn(move || {
+            async move {
+                loop {
+                    // This loop should not trigger infinite_loop lint
+                    do_something();
+                }
+            }
+        });
+    }
+
+    fn spawn_async_block() {
+        // This should NOT trigger the lint because the async block is not awaited
+        let _handle = async move {
+            loop {
+                do_something();
+            }
+        };
+    }
+
+    fn await_async_block() {
+        // This SHOULD trigger the lint because the async block is awaited
+        let _ = async move {
+            loop {
+                do_something();
+            }
+        };
+    }
+}
+
+mod issue15541 {
+    async fn good() -> ! {
+        loop {
+            std::future::pending().await
+        }
+    }
+
+    async fn bad() {
+        //~v infinite_loop
+        loop {
+            std::future::pending().await
+        }
+    }
+}
+
+mod issue16155 {
+    #![allow(clippy::empty_loop)]
+
+    use super::do_something;
+
+    fn let_then_else(cond: bool) {
+        let true = cond else { loop {} };
+        //~^ infinite_loop
+    }
+
+    fn loop_in_one_if_branch(cond: bool) {
+        if cond {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    fn loop_in_one_match_arm(x: Option<i32>) {
+        match x {
+            Some(_) => {},
+            None => loop {},
+            //~^ infinite_loop
+        }
+    }
+
+    fn loop_in_if_let_else(x: Option<i32>) {
+        if let Some(_val) = x {
+            do_something();
+        } else {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    #[expect(clippy::if_same_then_else)]
+    fn all_branches_diverge_if(cond: bool) {
+        if cond {
+            loop {}
+            //~^ infinite_loop
+        } else {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    fn all_branches_diverge_match(x: Option<i32>) {
+        match x {
+            Some(_) => loop {}, //~ infinite_loop
+            None => loop {},    //~ infinite_loop
+        }
+    }
+}
+
+gen fn repeat_zeroes() -> u32 {
+    loop {
+        yield 0;
     }
 }
 

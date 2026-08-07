@@ -1,6 +1,9 @@
-// Only works on Unix targets
-//@ignore-target: windows wasm
-//@only-on-host
+//@revisions: trace notrace
+//@[trace] only-target: x86_64-unknown-linux-gnu i686-unknown-linux-gnu
+//@[trace] compile-flags: -Zmiri-native-lib-enable-tracing
+//@compile-flags: -Zmiri-permissive-provenance
+
+use std::ptr::NonNull;
 
 fn main() {
     test_access_pointer();
@@ -29,11 +32,15 @@ fn test_access_simple() {
 
     extern "C" {
         fn access_simple(s_ptr: *const Simple) -> i32;
+        fn access_simple2(s_ptr: NonNull<Simple>) -> i32;
+        fn access_simple3(s_ptr: Option<NonNull<Simple>>) -> i32;
     }
 
     let simple = Simple { field: -42 };
 
     assert_eq!(unsafe { access_simple(&simple) }, -42);
+    assert_eq!(unsafe { access_simple2(NonNull::from(&simple)) }, -42);
+    assert_eq!(unsafe { access_simple3(Some(NonNull::from(&simple))) }, -42);
 }
 
 /// Test function that dereferences nested struct pointers and accesses fields.

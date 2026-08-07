@@ -1,19 +1,22 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
-use clippy_utils::eq_expr_value;
+use clippy_utils::higher::has_let_expr;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::{SpanExt, snippet_with_context};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
+use clippy_utils::ty::implements_trait;
+use clippy_utils::{eq_expr_value, sym};
 use rustc_ast::ast::LitKind;
-use rustc_attr_parsing::RustcVersion;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{FnKind, Visitor, walk_expr};
+use rustc_hir::attrs::RustcVersion;
 use rustc_hir::{BinOpKind, Body, Expr, ExprKind, FnDecl, UnOp};
-use rustc_lint::{LateContext, LateLintPass, Level};
+use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::{Span, SyntaxContext, sym};
+use rustc_span::{Span, Symbol, SyntaxContext};
+use std::fmt::Write as _;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -28,6 +31,8 @@ declare_clippy_lint! {
     /// Ignores short circuiting behavior of `||` and
     /// `&&`. Ignores `|`, `&` and `^`.
     ///
+    /// Creates a big toll on performance, **only enable sporadically**
+    ///
     /// ### Example
     /// ```ignore
     /// if a && true {}
@@ -41,7 +46,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub NONMINIMAL_BOOL,
-    complexity,
+    pedantic,
     "boolean expressions that can be written more concisely"
 }
 
@@ -55,6 +60,7 @@ declare_clippy_lint! {
     ///
     /// ### Known problems
     /// Ignores short circuiting behavior.
+    /// Creates a big toll on performance, **only enable sporadically**
     ///
     /// ### Example
     /// ```rust,ignore
@@ -68,15 +74,17 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub OVERLY_COMPLEX_BOOL_EXPR,
-    correctness,
+    pedantic,
     "boolean expressions that contain terminals which can be eliminated"
 }
 
+impl_lint_pass!(NonminimalBool => [NONMINIMAL_BOOL, OVERLY_COMPLEX_BOOL_EXPR]);
+
 // For each pairs, both orders are considered.
-const METHODS_WITH_NEGATION: [(Option<RustcVersion>, &str, &str); 3] = [
-    (None, "is_some", "is_none"),
-    (None, "is_err", "is_ok"),
-    (Some(msrvs::IS_NONE_OR), "is_some_and", "is_none_or"),
+const METHODS_WITH_NEGATION: [(Option<RustcVersion>, Symbol, Symbol); 3] = [
+    (None, sym::is_some, sym::is_none),
+    (None, sym::is_err, sym::is_ok),
+    (Some(msrvs::IS_NONE_OR), sym::is_some_and, sym::is_none_or),
 ];
 
 pub struct NonminimalBool {
@@ -88,8 +96,6 @@ impl NonminimalBool {
         Self { msrv: conf.msrv }
     }
 }
-
-impl_lint_pass!(NonminimalBool => [NONMINIMAL_BOOL, OVERLY_COMPLEX_BOOL_EXPR]);
 
 impl<'tcx> LateLintPass<'tcx> for NonminimalBool {
     fn check_fn(
@@ -152,30 +158,30 @@ fn check_inverted_bool_in_condition(
 
     let suggestion = match (left.kind, right.kind) {
         (ExprKind::Unary(UnOp::Not, left_sub), ExprKind::Unary(UnOp::Not, right_sub)) => {
-            let Some(left) = left_sub.span.get_source_text(cx) else {
+            let Some(left) = left_sub.span.get_text(cx) else {
                 return;
             };
-            let Some(right) = right_sub.span.get_source_text(cx) else {
+            let Some(right) = right_sub.span.get_text(cx) else {
                 return;
             };
             let Some(op) = bin_op_eq_str(op) else { return };
             format!("{left} {op} {right}")
         },
         (ExprKind::Unary(UnOp::Not, left_sub), _) => {
-            let Some(left) = left_sub.span.get_source_text(cx) else {
+            let Some(left) = left_sub.span.get_text(cx) else {
                 return;
             };
-            let Some(right) = right.span.get_source_text(cx) else {
+            let Some(right) = right.span.get_text(cx) else {
                 return;
             };
             let Some(op) = inverted_bin_op_eq_str(op) else { return };
             format!("{left} {op} {right}")
         },
         (_, ExprKind::Unary(UnOp::Not, right_sub)) => {
-            let Some(left) = left.span.get_source_text(cx) else {
+            let Some(left) = left.span.get_text(cx) else {
                 return;
             };
-            let Some(right) = right_sub.span.get_source_text(cx) else {
+            let Some(right) = right_sub.span.get_text(cx) else {
                 return;
             };
             let Some(op) = inverted_bin_op_eq_str(op) else { return };
@@ -199,7 +205,7 @@ fn check_simplify_not(cx: &LateContext<'_>, msrv: Msrv, expr: &Expr<'_>) {
         && !expr.span.from_expansion()
         && !inner.span.from_expansion()
         && let Some(suggestion) = simplify_not(cx, msrv, inner)
-        && cx.tcx.lint_level_at_node(NONMINIMAL_BOOL, expr.hir_id).level != Level::Allow
+        && !cx.tcx.lint_level_spec_at_node(NONMINIMAL_BOOL, expr.hir_id).is_allow()
     {
         use clippy_utils::sugg::{Sugg, has_enclosing_paren};
         let maybe_par = if let Some(sug) = Sugg::hir_opt(cx, inner) {
@@ -292,8 +298,9 @@ impl<'v> Hir2Qmm<'_, '_, 'v> {
             return Err("contains never type".to_owned());
         }
 
+        let ctxt = e.span.ctxt();
         for (n, expr) in self.terminals.iter().enumerate() {
-            if eq_expr_value(self.cx, e, expr) {
+            if eq_expr_value(self.cx, ctxt, e, expr) {
                 #[expect(clippy::cast_possible_truncation)]
                 return Ok(Bool::Term(n as u8));
             }
@@ -302,8 +309,8 @@ impl<'v> Hir2Qmm<'_, '_, 'v> {
                 && implements_ord(self.cx, e_lhs)
                 && let ExprKind::Binary(expr_binop, expr_lhs, expr_rhs) = &expr.kind
                 && negate(e_binop.node) == Some(expr_binop.node)
-                && eq_expr_value(self.cx, e_lhs, expr_lhs)
-                && eq_expr_value(self.cx, e_rhs, expr_rhs)
+                && eq_expr_value(self.cx, ctxt, e_lhs, expr_lhs)
+                && eq_expr_value(self.cx, ctxt, e_rhs, expr_rhs)
             {
                 #[expect(clippy::cast_possible_truncation)]
                 return Ok(Bool::Not(Box::new(Bool::Term(n as u8))));
@@ -355,7 +362,7 @@ impl SuggestContext<'_, '_, '_> {
                         if app != Applicability::MachineApplicable {
                             return None;
                         }
-                        self.output.push_str(&(!snip).to_string());
+                        let _cannot_fail = write!(&mut self.output, "{}", !snip);
                     }
                 },
                 True | False | Not(_) => {
@@ -386,12 +393,8 @@ impl SuggestContext<'_, '_, '_> {
                 }
             },
             &Term(n) => {
-                self.output.push_str(
-                    &self.terminals[n as usize]
-                        .span
-                        .source_callsite()
-                        .get_source_text(self.cx)?,
-                );
+                self.output
+                    .push_str(&self.terminals[n as usize].span.source_callsite().get_text(self.cx)?);
             },
         }
         Some(())
@@ -414,45 +417,39 @@ fn simplify_not(cx: &LateContext<'_>, curr_msrv: Msrv, expr: &Expr<'_>) -> Optio
                 BinOpKind::Ge => Some(" < "),
                 _ => None,
             }
-            .and_then(|op| {
-                let lhs_snippet = lhs.span.get_source_text(cx)?;
-                let rhs_snippet = rhs.span.get_source_text(cx)?;
+            .map(|op| {
+                let mut app = Applicability::MachineApplicable;
+                let (lhs_snippet, _) = snippet_with_context(cx, lhs.span, SyntaxContext::root(), "", &mut app);
+                let (rhs_snippet, _) = snippet_with_context(cx, rhs.span, SyntaxContext::root(), "", &mut app);
 
                 if !(lhs_snippet.starts_with('(') && lhs_snippet.ends_with(')'))
                     && let (ExprKind::Cast(..), BinOpKind::Ge) = (&lhs.kind, binop.node)
                 {
                     // e.g. `(a as u64) < b`. Without the parens the `<` is
                     // interpreted as a start of generic arguments for `u64`
-                    return Some(format!("({lhs_snippet}){op}{rhs_snippet}"));
+                    return format!("({lhs_snippet}){op}{rhs_snippet}");
                 }
 
-                Some(format!("{lhs_snippet}{op}{rhs_snippet}"))
+                format!("{lhs_snippet}{op}{rhs_snippet}")
             })
         },
         ExprKind::MethodCall(path, receiver, args, _) => {
             let type_of_receiver = cx.typeck_results().expr_ty(receiver);
-            if !is_type_diagnostic_item(cx, type_of_receiver, sym::Option)
-                && !is_type_diagnostic_item(cx, type_of_receiver, sym::Result)
-            {
+            if !matches!(type_of_receiver.opt_diag_name(cx), Some(sym::Option | sym::Result)) {
                 return None;
             }
             METHODS_WITH_NEGATION
                 .iter()
                 .copied()
                 .flat_map(|(msrv, a, b)| vec![(msrv, a, b), (msrv, b, a)])
-                .find(|&(msrv, a, _)| {
-                    a == path.ident.name.as_str() && msrv.is_none_or(|msrv| curr_msrv.meets(cx, msrv))
-                })
+                .find(|&(msrv, a, _)| a == path.ident.name && msrv.is_none_or(|msrv| curr_msrv.meets(cx, msrv)))
                 .and_then(|(_, _, neg_method)| {
                     let negated_args = args
                         .iter()
                         .map(|arg| simplify_not(cx, curr_msrv, arg))
                         .collect::<Option<Vec<_>>>()?
                         .join(", ");
-                    Some(format!(
-                        "{}.{neg_method}({negated_args})",
-                        receiver.span.get_source_text(cx)?
-                    ))
+                    Some(format!("{}.{neg_method}({negated_args})", receiver.span.get_text(cx)?))
                 })
         },
         ExprKind::Closure(closure) => {
@@ -460,13 +457,13 @@ fn simplify_not(cx: &LateContext<'_>, curr_msrv: Msrv, expr: &Expr<'_>) -> Optio
             let params = body
                 .params
                 .iter()
-                .map(|param| param.span.get_source_text(cx).map(|t| t.to_string()))
+                .map(|param| param.span.get_text(cx).map(|t| t.to_string()))
                 .collect::<Option<Vec<_>>>()?
                 .join(", ");
             let negated = simplify_not(cx, curr_msrv, body.value)?;
             Some(format!("|{params}| {negated}"))
         },
-        ExprKind::Unary(UnOp::Not, expr) => expr.span.get_source_text(cx).map(|t| t.to_string()),
+        ExprKind::Unary(UnOp::Not, expr) => expr.span.get_text(cx).map(|t| t.to_string()),
         _ => None,
     }
 }
@@ -609,7 +606,12 @@ impl<'tcx> NonminimalBoolVisitor<'_, 'tcx> {
                 }
             }
             let nonminimal_bool_lint = |mut suggestions: Vec<_>| {
-                if self.cx.tcx.lint_level_at_node(NONMINIMAL_BOOL, e.hir_id).level != Level::Allow {
+                if !self
+                    .cx
+                    .tcx
+                    .lint_level_spec_at_node(NONMINIMAL_BOOL, e.hir_id)
+                    .is_allow()
+                {
                     suggestions.sort();
                     span_lint_hir_and_then(
                         self.cx,
@@ -648,7 +650,9 @@ impl<'tcx> Visitor<'tcx> for NonminimalBoolVisitor<'_, 'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
         if !e.span.from_expansion() {
             match &e.kind {
-                ExprKind::Binary(binop, _, _) if binop.node == BinOpKind::Or || binop.node == BinOpKind::And => {
+                ExprKind::Binary(binop, _, _)
+                    if binop.node == BinOpKind::Or || binop.node == BinOpKind::And && !has_let_expr(e) =>
+                {
                     self.bool_expr(e);
                 },
                 ExprKind::Unary(UnOp::Not, inner) => {

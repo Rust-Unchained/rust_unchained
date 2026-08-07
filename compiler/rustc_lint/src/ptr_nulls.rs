@@ -1,5 +1,5 @@
 use rustc_ast::LitKind;
-use rustc_hir::{BinOpKind, Expr, ExprKind, TyKind};
+use rustc_hir::{BinOpKind, Expr, ExprKind, TyKind, find_attr};
 use rustc_middle::ty::RawPtr;
 use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::{Span, sym};
@@ -59,7 +59,7 @@ declare_lint! {
 declare_lint_pass!(PtrNullChecks => [USELESS_PTR_NULL_CHECKS, INVALID_NULL_ARGUMENTS]);
 
 /// This function checks if the expression is from a series of consecutive casts,
-/// ie. `(my_fn as *const _ as *mut _).cast_mut()` and whether the original expression is either
+/// i.e. `(my_fn as *const _ as *mut _).cast_mut()` and whether the original expression is either
 /// a fn ptr, a reference, or a function call whose definition is
 /// annotated with `#![rustc_never_returns_null_ptr]`.
 /// If this situation is present, the function returns the appropriate diagnostic.
@@ -72,14 +72,14 @@ fn useless_check<'a, 'tcx: 'a>(
         e = e.peel_blocks();
         if let ExprKind::MethodCall(_, _expr, [], _) = e.kind
             && let Some(def_id) = cx.typeck_results().type_dependent_def_id(e.hir_id)
-            && cx.tcx.has_attr(def_id, sym::rustc_never_returns_null_ptr)
+            && find_attr!(cx.tcx, def_id, RustcNeverReturnsNullPtr)
             && let Some(fn_name) = cx.tcx.opt_item_ident(def_id)
         {
             return Some(UselessPtrNullChecksDiag::FnRet { fn_name });
         } else if let ExprKind::Call(path, _args) = e.kind
             && let ExprKind::Path(ref qpath) = path.kind
             && let Some(def_id) = cx.qpath_res(qpath, path.hir_id).opt_def_id()
-            && cx.tcx.has_attr(def_id, sym::rustc_never_returns_null_ptr)
+            && find_attr!(cx.tcx, def_id, RustcNeverReturnsNullPtr)
             && let Some(fn_name) = cx.tcx.opt_item_ident(def_id)
         {
             return Some(UselessPtrNullChecksDiag::FnRet { fn_name });
@@ -112,7 +112,7 @@ fn useless_check<'a, 'tcx: 'a>(
 
 /// Checks if the given expression is a null pointer (modulo casting)
 fn is_null_ptr<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<Span> {
-    let (expr, _) = peel_casts(cx, expr);
+    let expr = peel_casts(cx, expr);
 
     if let ExprKind::Call(path, []) = expr.kind
         && let ExprKind::Path(ref qpath) = path.kind
@@ -160,12 +160,10 @@ impl<'tcx> LateLintPass<'tcx> for PtrNullChecks {
                 let (arg_indices, are_zsts_allowed): (&[_], _) = match diag_name {
                     sym::ptr_read
                     | sym::ptr_read_unaligned
-                    | sym::ptr_read_volatile
                     | sym::ptr_replace
                     | sym::ptr_write
                     | sym::ptr_write_bytes
-                    | sym::ptr_write_unaligned
-                    | sym::ptr_write_volatile => (&[0], true),
+                    | sym::ptr_write_unaligned => (&[0], true),
                     sym::slice_from_raw_parts | sym::slice_from_raw_parts_mut => (&[0], false),
                     sym::ptr_copy
                     | sym::ptr_copy_nonoverlapping

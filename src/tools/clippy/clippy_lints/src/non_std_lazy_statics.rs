@@ -1,13 +1,15 @@
 use clippy_config::Conf;
-use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use clippy_utils::diagnostics::{span_lint, span_lint_hir_and_then};
 use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::paths::{self, PathNS, find_crates, lookup_path_str};
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::visitors::for_each_expr;
-use clippy_utils::{def_path_def_ids, fn_def_id, is_no_std_crate, path_def_id};
+use clippy_utils::{fn_def_id, is_no_std_crate, sym};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId};
-use rustc_hir::{self as hir, BodyId, Expr, ExprKind, Item, ItemKind};
+use rustc_hir::{self as hir, BodyId, Expr, ExprKind, HirId, Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
@@ -43,12 +45,14 @@ declare_clippy_lint! {
     "lazy static that could be replaced by `std::sync::LazyLock`"
 }
 
+impl_lint_pass!(NonStdLazyStatic => [NON_STD_LAZY_STATICS]);
+
 /// A list containing functions with corresponding replacements in `LazyLock`.
 ///
 /// Some functions could be replaced as well if we have replaced `Lazy` to `LazyLock`,
 /// therefore after suggesting replace the type, we need to make sure the function calls can be
 /// replaced, otherwise the suggestions cannot be applied thus the applicability should be
-/// `Unspecified` or `MaybeIncorret`.
+/// [`Applicability::Unspecified`] or [`Applicability::MaybeIncorrect`].
 static FUNCTION_REPLACEMENTS: &[(&str, Option<&str>)] = &[
     ("once_cell::sync::Lazy::force", Some("std::sync::LazyLock::force")),
     ("once_cell::sync::Lazy::get", None), // `std::sync::LazyLock::get` is experimental
@@ -62,10 +66,7 @@ static FUNCTION_REPLACEMENTS: &[(&str, Option<&str>)] = &[
 
 pub struct NonStdLazyStatic {
     msrv: Msrv,
-    lazy_static_lazy_static: Vec<DefId>,
-    once_cell_crate: Vec<CrateNum>,
-    once_cell_sync_lazy: Vec<DefId>,
-    once_cell_sync_lazy_new: Vec<DefId>,
+    once_cell_crates: Vec<CrateNum>,
     sugg_map: FxIndexMap<DefId, Option<String>>,
     lazy_type_defs: FxIndexMap<DefId, LazyInfo>,
     uses_other_once_cell_types: bool,
@@ -76,10 +77,7 @@ impl NonStdLazyStatic {
     pub fn new(conf: &'static Conf) -> Self {
         Self {
             msrv: conf.msrv,
-            lazy_static_lazy_static: Vec::new(),
-            once_cell_crate: Vec::new(),
-            once_cell_sync_lazy: Vec::new(),
-            once_cell_sync_lazy_new: Vec::new(),
+            once_cell_crates: Vec::new(),
             sugg_map: FxIndexMap::default(),
             lazy_type_defs: FxIndexMap::default(),
             uses_other_once_cell_types: false,
@@ -87,25 +85,21 @@ impl NonStdLazyStatic {
     }
 }
 
-impl_lint_pass!(NonStdLazyStatic => [NON_STD_LAZY_STATICS]);
-
 fn can_use_lazy_cell(cx: &LateContext<'_>, msrv: Msrv) -> bool {
     msrv.meets(cx, msrvs::LAZY_CELL) && !is_no_std_crate(cx)
 }
 
 impl<'hir> LateLintPass<'hir> for NonStdLazyStatic {
     fn check_crate(&mut self, cx: &LateContext<'hir>) {
-        // Fetch def_ids for external paths
-        self.lazy_static_lazy_static = def_path_def_ids(cx.tcx, &["lazy_static", "lazy_static"]).collect();
-        self.once_cell_sync_lazy = def_path_def_ids(cx.tcx, &["once_cell", "sync", "Lazy"]).collect();
-        self.once_cell_sync_lazy_new = def_path_def_ids(cx.tcx, &["once_cell", "sync", "Lazy", "new"]).collect();
-        // And CrateNums for `once_cell` crate
-        self.once_cell_crate = self.once_cell_sync_lazy.iter().map(|d| d.krate).collect();
+        // Add CrateNums for `once_cell` crate
+        self.once_cell_crates = find_crates(cx.tcx, sym::once_cell)
+            .iter()
+            .map(|def_id| def_id.krate)
+            .collect();
 
         // Convert hardcoded fn replacement list into a map with def_id
         for (path, sugg) in FUNCTION_REPLACEMENTS {
-            let path_vec: Vec<&str> = path.split("::").collect();
-            for did in def_path_def_ids(cx.tcx, &path_vec) {
+            for did in lookup_path_str(cx.tcx, PathNS::Value, path) {
                 self.sugg_map.insert(did, sugg.map(ToOwned::to_owned));
             }
         }
@@ -114,7 +108,7 @@ impl<'hir> LateLintPass<'hir> for NonStdLazyStatic {
     fn check_item(&mut self, cx: &LateContext<'hir>, item: &Item<'hir>) {
         if let ItemKind::Static(..) = item.kind
             && let Some(macro_call) = clippy_utils::macros::root_macro_call(item.span)
-            && self.lazy_static_lazy_static.contains(&macro_call.def_id)
+            && paths::LAZY_STATIC.matches(cx, macro_call.def_id)
             && can_use_lazy_cell(cx, self.msrv)
         {
             span_lint(
@@ -130,7 +124,7 @@ impl<'hir> LateLintPass<'hir> for NonStdLazyStatic {
             return;
         }
 
-        if let Some(lazy_info) = LazyInfo::from_item(self, cx, item)
+        if let Some(lazy_info) = LazyInfo::from_item(cx, item)
             && can_use_lazy_cell(cx, self.msrv)
         {
             self.lazy_type_defs.insert(item.owner_id.to_def_id(), lazy_info);
@@ -155,9 +149,9 @@ impl<'hir> LateLintPass<'hir> for NonStdLazyStatic {
         if let rustc_hir::TyKind::Path(qpath) = ty.peel_refs().kind
             && let Some(ty_def_id) = cx.qpath_res(&qpath, ty.hir_id).opt_def_id()
             // Is from `once_cell` crate
-            && self.once_cell_crate.contains(&ty_def_id.krate)
+            && self.once_cell_crates.contains(&ty_def_id.krate)
             // And is NOT `once_cell::sync::Lazy`
-            && !self.once_cell_sync_lazy.contains(&ty_def_id)
+            && !paths::ONCE_CELL_SYNC_LAZY.matches(cx, ty_def_id)
         {
             self.uses_other_once_cell_types = true;
         }
@@ -180,6 +174,8 @@ struct LazyInfo {
     /// //          ^^^^
     /// ```
     ty_span_no_args: Span,
+    /// Item on which the lint must be generated.
+    item_hir_id: HirId,
     /// `Span` and `DefId` of calls on `Lazy` type.
     /// i.e.:
     /// ```ignore
@@ -190,21 +186,21 @@ struct LazyInfo {
 }
 
 impl LazyInfo {
-    fn from_item(state: &NonStdLazyStatic, cx: &LateContext<'_>, item: &Item<'_>) -> Option<Self> {
+    fn from_item(cx: &LateContext<'_>, item: &Item<'_>) -> Option<Self> {
         // Check if item is a `once_cell:sync::Lazy` static.
-        if let ItemKind::Static(_, ty, _, body_id) = item.kind
-            && let Some(path_def_id) = path_def_id(cx, ty)
+        if let ItemKind::Static(_, _, ty, body_id) = item.kind
+            && let Some(path_def_id) = ty.basic_res().opt_def_id()
             && let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = ty.kind
-            && state.once_cell_sync_lazy.contains(&path_def_id)
+            && paths::ONCE_CELL_SYNC_LAZY.matches(cx, path_def_id)
         {
             let ty_span_no_args = path_span_without_args(path);
             let body = cx.tcx.hir_body(body_id);
 
             // visit body to collect `Lazy::new` calls
             let mut new_fn_calls = FxIndexMap::default();
-            for_each_expr::<(), ()>(cx, body, |ex| {
+            for_each_expr::<(), ()>(cx.tcx, body, |ex| {
                 if let Some((fn_did, call_span)) = fn_def_id_and_span_from_body(cx, ex, body_id)
-                    && state.once_cell_sync_lazy_new.contains(&fn_did)
+                    && paths::ONCE_CELL_SYNC_LAZY_NEW.matches(cx, fn_did)
                 {
                     new_fn_calls.insert(call_span, fn_did);
                 }
@@ -213,6 +209,7 @@ impl LazyInfo {
 
             Some(LazyInfo {
                 ty_span_no_args,
+                item_hir_id: item.hir_id(),
                 calls_span_and_id: new_fn_calls,
             })
         } else {
@@ -223,7 +220,7 @@ impl LazyInfo {
     fn lint(&self, cx: &LateContext<'_>, sugg_map: &FxIndexMap<DefId, Option<String>>) {
         // Applicability might get adjusted to `Unspecified` later if any calls
         // in `calls_span_and_id` are not replaceable judging by the `sugg_map`.
-        let mut appl = Applicability::MachineApplicable;
+        let mut app = Applicability::MachineApplicable;
         let mut suggs = vec![(self.ty_span_no_args, "std::sync::LazyLock".to_string())];
 
         for (span, def_id) in &self.calls_span_and_id {
@@ -232,17 +229,18 @@ impl LazyInfo {
                 suggs.push((*span, sugg));
             } else {
                 // If NO suggested replacement, not machine applicable
-                appl = Applicability::Unspecified;
+                app = Applicability::Unspecified;
             }
         }
 
-        span_lint_and_then(
+        span_lint_hir_and_then(
             cx,
             NON_STD_LAZY_STATICS,
+            self.item_hir_id,
             self.ty_span_no_args,
             "this type has been superseded by `LazyLock` in the standard library",
             |diag| {
-                diag.multipart_suggestion("use `std::sync::LazyLock` instead", suggs, appl);
+                diag.multipart_suggestion("use `std::sync::LazyLock` instead", suggs, app);
             },
         );
     }

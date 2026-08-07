@@ -8,22 +8,27 @@ pub mod place;
 
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{DynSend, DynSync, try_par_for_each_in};
-use rustc_hir::def::DefKind;
-use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap, LocalModId};
+use rustc_hir::lints::DelayedLints;
 use rustc_hir::*;
-use rustc_macros::{Decodable, Encodable, HashStable};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::{ErrorGuaranteed, ExpnId, Span};
 
 use crate::query::Providers;
-use crate::ty::{EarlyBinder, ImplSubject, TyCtxt};
+use crate::ty::TyCtxt;
 
 /// Gather the LocalDefId for each item-like within a module, including items contained within
 /// bodies. The Ids are in visitor order. This is used to partition a pass between modules.
-#[derive(Debug, HashStable, Encodable, Decodable)]
+#[derive(Debug, StableHash, Encodable, Decodable)]
 pub struct ModuleItems {
-    submodules: Box<[OwnerId]>,
+    /// Whether this represents the whole crate, in which case we need to add `CRATE_OWNER_ID` to
+    /// the iterators if we want to account for the crate root.
+    add_root: bool,
+    submodules: Box<[LocalModId]>,
     free_items: Box<[ItemId]>,
     trait_items: Box<[TraitItemId]>,
     impl_items: Box<[ImplItemId]>,
@@ -31,6 +36,12 @@ pub struct ModuleItems {
     opaques: Box<[LocalDefId]>,
     body_owners: Box<[LocalDefId]>,
     nested_bodies: Box<[LocalDefId]>,
+
+    /// Statics and functions with an `EiiImpls` or `EiiExternTarget` attribute
+    eiis: Box<[LocalDefId]>,
+
+    // only filled with hir_crate_items, not with hir_module_items
+    proc_macro_decls: Option<LocalDefId>,
 }
 
 impl ModuleItems {
@@ -48,6 +59,15 @@ impl ModuleItems {
         self.trait_items.iter().copied()
     }
 
+    #[inline]
+    pub fn proc_macro_decls(&self) -> Option<LocalDefId> {
+        self.proc_macro_decls
+    }
+
+    pub fn eiis(&self) -> impl Iterator<Item = LocalDefId> {
+        self.eiis.iter().copied()
+    }
+
     /// Returns all items that are associated with some `impl` block (both inherent and trait impl
     /// blocks).
     pub fn impl_items(&self) -> impl Iterator<Item = ImplItemId> {
@@ -59,9 +79,10 @@ impl ModuleItems {
     }
 
     pub fn owners(&self) -> impl Iterator<Item = OwnerId> {
-        self.free_items
-            .iter()
-            .map(|id| id.owner_id)
+        self.add_root
+            .then_some(CRATE_OWNER_ID)
+            .into_iter()
+            .chain(self.free_items.iter().map(|id| id.owner_id))
             .chain(self.trait_items.iter().map(|id| id.owner_id))
             .chain(self.impl_items.iter().map(|id| id.owner_id))
             .chain(self.foreign_items.iter().map(|id| id.owner_id))
@@ -71,12 +92,21 @@ impl ModuleItems {
         self.opaques.iter().copied()
     }
 
+    /// Closures and inline consts
     pub fn nested_bodies(&self) -> impl Iterator<Item = LocalDefId> {
         self.nested_bodies.iter().copied()
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = LocalDefId> {
         self.owners().map(|id| id.def_id)
+    }
+
+    /// Closures and inline consts
+    pub fn par_nested_bodies(
+        &self,
+        f: impl Fn(LocalDefId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.nested_bodies[..], |&&id| f(id))
     }
 
     pub fn par_items(
@@ -116,29 +146,22 @@ impl ModuleItems {
 }
 
 impl<'tcx> TyCtxt<'tcx> {
-    pub fn parent_module(self, id: HirId) -> LocalModDefId {
+    pub fn parent_module(self, id: HirId) -> LocalModId {
         if !id.is_owner() && self.def_kind(id.owner) == DefKind::Mod {
-            LocalModDefId::new_unchecked(id.owner.def_id)
+            LocalModId::new_unchecked(id.owner.def_id)
         } else {
             self.parent_module_from_def_id(id.owner.def_id)
         }
     }
 
-    pub fn parent_module_from_def_id(self, mut id: LocalDefId) -> LocalModDefId {
+    pub fn parent_module_from_def_id(self, mut id: LocalDefId) -> LocalModId {
         while let Some(parent) = self.opt_local_parent(id) {
             id = parent;
             if self.def_kind(id) == DefKind::Mod {
                 break;
             }
         }
-        LocalModDefId::new_unchecked(id)
-    }
-
-    pub fn impl_subject(self, def_id: DefId) -> EarlyBinder<'tcx, ImplSubject<'tcx>> {
-        match self.impl_trait_ref(def_id) {
-            Some(t) => t.map_bound(ImplSubject::Trait),
-            None => self.type_of(def_id).map_bound(ImplSubject::Inherent),
-        }
+        LocalModId::new_unchecked(id)
     }
 
     /// Returns `true` if this is a foreign item (i.e., linked via `extern { ... }`).
@@ -153,47 +176,193 @@ impl<'tcx> TyCtxt<'tcx> {
         bodies: &SortedMap<ItemLocalId, &Body<'_>>,
         attrs: &SortedMap<ItemLocalId, &[Attribute]>,
         define_opaque: Option<&[(Span, LocalDefId)]>,
-    ) -> (Option<Fingerprint>, Option<Fingerprint>) {
-        if self.needs_crate_hash() {
-            self.with_stable_hashing_context(|mut hcx| {
-                let mut stable_hasher = StableHasher::new();
-                node.hash_stable(&mut hcx, &mut stable_hasher);
-                // Bodies are stored out of line, so we need to pull them explicitly in the hash.
-                bodies.hash_stable(&mut hcx, &mut stable_hasher);
-                let h1 = stable_hasher.finish();
+    ) -> Hashes {
+        if !self.needs_hir_hash() {
+            return Hashes { bodies_hash: None, attrs_hash: None };
+        }
 
-                let mut stable_hasher = StableHasher::new();
-                attrs.hash_stable(&mut hcx, &mut stable_hasher);
+        self.with_stable_hashing_context(|mut hcx| {
+            let mut stable_hasher = StableHasher::new();
+            node.stable_hash(&mut hcx, &mut stable_hasher);
+            // Bodies are stored out of line, so we need to pull them explicitly in the hash.
+            bodies.stable_hash(&mut hcx, &mut stable_hasher);
+            let h1 = stable_hasher.finish();
 
-                // Hash the defined opaque types, which are not present in the attrs.
-                define_opaque.hash_stable(&mut hcx, &mut stable_hasher);
+            let mut stable_hasher = StableHasher::new();
+            attrs.stable_hash(&mut hcx, &mut stable_hasher);
 
-                let h2 = stable_hasher.finish();
-                (Some(h1), Some(h2))
-            })
-        } else {
-            (None, None)
+            // Hash the defined opaque types, which are not present in the attrs.
+            define_opaque.stable_hash(&mut hcx, &mut stable_hasher);
+
+            let h2 = stable_hasher.finish();
+
+            Hashes { bodies_hash: Some(h1), attrs_hash: Some(h2) }
+        })
+    }
+
+    pub fn qpath_is_lang_item(self, qpath: QPath<'_>, lang_item: LangItem) -> bool {
+        self.qpath_lang_item(qpath) == Some(lang_item)
+    }
+
+    /// This does not use typeck results since this is intended to be used with generated code.
+    pub fn qpath_lang_item(self, qpath: QPath<'_>) -> Option<LangItem> {
+        if let QPath::Resolved(_, path) = qpath
+            && let Res::Def(_, def_id) = path.res
+        {
+            return self.lang_items().from_def_id(def_id);
+        }
+        None
+    }
+
+    /// Whether this expression constitutes a read of value of the type that
+    /// it evaluates to.
+    ///
+    /// This is used to determine if we should consider the block to diverge
+    /// if the expression evaluates to `!`, and if we should insert a `NeverToAny`
+    /// coercion for values of type `!`.
+    ///
+    /// This function generally returns `false` if the expression is a place
+    /// expression and the *parent* expression is the scrutinee of a match or
+    /// the pointee of an `&` addr-of expression, since both of those parent
+    /// expressions take a *place* and not a value.
+    pub fn expr_guaranteed_to_constitute_read_for_never(self, expr: &Expr<'_>) -> bool {
+        // We only care about place exprs. Anything else returns an immediate
+        // which would constitute a read. We don't care about distinguishing
+        // "syntactic" place exprs since if the base of a field projection is
+        // not a place then it would've been UB to read from it anyways since
+        // that constitutes a read.
+        if !expr.is_syntactic_place_expr() {
+            return true;
+        }
+
+        let parent_node = self.parent_hir_node(expr.hir_id);
+        match parent_node {
+            Node::Expr(parent_expr) => {
+                match parent_expr.kind {
+                    // Addr-of, field projections, and LHS of assignment don't constitute reads.
+                    // Assignment does call `drop_glue`, though, but its safety requirements are
+                    // not the same.
+                    ExprKind::AddrOf(..) | ExprKind::Field(..) => false,
+
+                    // Place-preserving expressions only constitute reads if their
+                    // parent expression constitutes a read.
+                    ExprKind::Type(..) | ExprKind::UnsafeBinderCast(..) => {
+                        self.expr_guaranteed_to_constitute_read_for_never(parent_expr)
+                    }
+
+                    ExprKind::Assign(lhs, _, _) => {
+                        // Only the LHS does not constitute a read
+                        expr.hir_id != lhs.hir_id
+                    }
+
+                    // See note on `PatKind::Or` in `Pat::is_guaranteed_to_constitute_read_for_never`
+                    // for why this is `all`.
+                    ExprKind::Match(scrutinee, arms, _) => {
+                        assert_eq!(scrutinee.hir_id, expr.hir_id);
+                        arms.iter().all(|arm| arm.pat.is_guaranteed_to_constitute_read_for_never())
+                    }
+                    ExprKind::Let(LetExpr { init, pat, .. }) => {
+                        assert_eq!(init.hir_id, expr.hir_id);
+                        pat.is_guaranteed_to_constitute_read_for_never()
+                    }
+
+                    // Any expression child of these expressions constitute reads.
+                    ExprKind::Array(_)
+                    | ExprKind::Call(_, _)
+                    | ExprKind::Use(_, _)
+                    | ExprKind::MethodCall(_, _, _, _)
+                    | ExprKind::Tup(_)
+                    | ExprKind::Binary(_, _, _)
+                    | ExprKind::Unary(_, _)
+                    | ExprKind::Cast(_, _)
+                    | ExprKind::DropTemps(_)
+                    | ExprKind::If(_, _, _)
+                    | ExprKind::Closure(_)
+                    | ExprKind::Block(_, _)
+                    | ExprKind::AssignOp(_, _, _)
+                    | ExprKind::Index(_, _, _)
+                    | ExprKind::Break(_, _)
+                    | ExprKind::Ret(_)
+                    | ExprKind::Become(_)
+                    | ExprKind::InlineAsm(_)
+                    | ExprKind::Struct(_, _, _)
+                    | ExprKind::Repeat(_, _)
+                    | ExprKind::Yield(_, _) => true,
+
+                    // These expressions have no (direct) sub-exprs.
+                    ExprKind::ConstBlock(_)
+                    | ExprKind::Loop(_, _, _, _)
+                    | ExprKind::Lit(_)
+                    | ExprKind::Path(_)
+                    | ExprKind::Continue(_)
+                    | ExprKind::OffsetOf(_, _)
+                    | ExprKind::Err(_) => unreachable!("no sub-expr expected for {:?}", expr.kind),
+                }
+            }
+
+            // If we have a subpattern that performs a read, we want to consider this
+            // to diverge for compatibility to support something like `let x: () = *never_ptr;`.
+            Node::LetStmt(LetStmt { init: Some(target), pat, .. }) => {
+                assert_eq!(target.hir_id, expr.hir_id);
+                pat.is_guaranteed_to_constitute_read_for_never()
+            }
+
+            // These nodes (if they have a sub-expr) do constitute a read.
+            Node::Block(_)
+            | Node::Arm(_)
+            | Node::ExprField(_)
+            | Node::AnonConst(_)
+            | Node::ConstBlock(_)
+            | Node::ConstArg(_)
+            | Node::Stmt(_)
+            | Node::Item(Item { kind: ItemKind::Const(..) | ItemKind::Static(..), .. })
+            | Node::TraitItem(TraitItem { kind: TraitItemKind::Const(..), .. })
+            | Node::ImplItem(ImplItem { kind: ImplItemKind::Const(..), .. }) => true,
+
+            Node::TyPat(_) | Node::Pat(_) => {
+                self.dcx().span_delayed_bug(expr.span, "place expr not allowed in pattern");
+                true
+            }
+
+            // These nodes do not have direct sub-exprs.
+            Node::Param(_)
+            | Node::Item(_)
+            | Node::ForeignItem(_)
+            | Node::TraitItem(_)
+            | Node::ImplItem(_)
+            | Node::Variant(_)
+            | Node::Field(_)
+            | Node::PathSegment(_)
+            | Node::Ty(_)
+            | Node::AssocItemConstraint(_)
+            | Node::TraitRef(_)
+            | Node::PatField(_)
+            | Node::PatExpr(_)
+            | Node::LetStmt(_)
+            | Node::Synthetic
+            | Node::Err(_)
+            | Node::Ctor(_)
+            | Node::Lifetime(_)
+            | Node::GenericParam(_)
+            | Node::Crate(_)
+            | Node::Infer(_)
+            | Node::WherePredicate(_)
+            | Node::PreciseCapturingNonLifetimeArg(_)
+            | Node::ConstArgExprField(_)
+            | Node::OpaqueTy(_) => {
+                unreachable!("no sub-expr expected for {parent_node:?}")
+            }
         }
     }
-}
 
-pub fn provide(providers: &mut Providers) {
-    providers.hir_crate_items = map::hir_crate_items;
-    providers.crate_hash = map::crate_hash;
-    providers.hir_module_items = map::hir_module_items;
-    providers.local_def_id_to_hir_id = |tcx, def_id| match tcx.hir_crate(()).owners[def_id] {
-        MaybeOwner::Owner(_) => HirId::make_owner(def_id),
-        MaybeOwner::NonOwner(hir_id) => hir_id,
-        MaybeOwner::Phantom => bug!("No HirId for {:?}", def_id),
-    };
-    providers.opt_hir_owner_nodes =
-        |tcx, id| tcx.hir_crate(()).owners.get(id)?.as_owner().map(|i| &i.nodes);
-    providers.hir_owner_parent = |tcx, owner_id| {
-        tcx.opt_local_parent(owner_id.def_id).map_or(CRATE_HIR_ID, |parent_def_id| {
-            let parent_owner_id = tcx.local_def_id_to_hir_id(parent_def_id).owner;
+    #[inline]
+    fn hir_owner_parent_impl(self, owner_id: OwnerId) -> HirId {
+        self.opt_local_parent(owner_id.def_id).map_or(CRATE_HIR_ID, |parent_def_id| {
+            let parent_owner_id = self.local_def_id_to_hir_id(parent_def_id).owner;
             HirId {
                 owner: parent_owner_id,
-                local_id: tcx.hir_crate(()).owners[parent_owner_id.def_id]
+                local_id: self
+                    .hir_owner(parent_owner_id.def_id)
                     .unwrap()
                     .parenting
                     .get(&owner_id.def_id)
@@ -201,17 +370,108 @@ pub fn provide(providers: &mut Providers) {
                     .unwrap_or(ItemLocalId::ZERO),
             }
         })
-    };
-    providers.hir_attr_map = |tcx, id| {
-        tcx.hir_crate(()).owners[id.def_id].as_owner().map_or(AttributeMap::EMPTY, |o| &o.attrs)
-    };
+    }
+
+    /// Optimization of `hir_owner_parent` query as an inlined function
+    /// in case of non-incremental build. The query itself renamed to `hir_owner_parent_q`.
+    #[inline]
+    pub fn hir_owner_parent(self, owner_id: OwnerId) -> HirId {
+        if self.dep_graph.is_fully_enabled() {
+            self.hir_owner_parent_q(owner_id)
+        } else {
+            self.hir_owner_parent_impl(owner_id)
+        }
+    }
+}
+
+/// Hashes computed by [`TyCtxt::hash_owner_nodes`] if necessary.
+#[derive(Clone, Copy, Debug)]
+pub struct Hashes {
+    pub bodies_hash: Option<Fingerprint>,
+    pub attrs_hash: Option<Fingerprint>,
+}
+
+/// Unites some of `OwnerInfo`'s fields into same struct that is used by `hir_owner` query.
+/// `AttributeMap` is handled separately as placing it in this struct led to perf regressions:
+/// <https://github.com/rust-lang/rust/pull/155678#issuecomment-4304597871>.
+/// This struct is created mainly for uniting/splitting fields of `OwnerInfo` so they are
+/// stored/invalidated together in incremental compilation.
+/// For comments about each field see `OwnerInfo` struct.
+#[derive(Clone, Copy, Debug, StableHash)]
+pub struct ProjectedOwnerInfo<'tcx> {
+    nodes: &'tcx OwnerNodes<'tcx>,
+    parenting: &'tcx LocalDefIdMap<ItemLocalId>,
+    trait_map: &'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>,
+
+    #[stable_hash(ignore)]
+    delayed_lints: &'tcx Steal<DelayedLints>,
+}
+
+impl<'tcx> ProjectedOwnerInfo<'tcx> {
+    pub fn new(
+        nodes: &'tcx OwnerNodes<'tcx>,
+        parenting: &'tcx LocalDefIdMap<ItemLocalId>,
+        trait_map: &'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>,
+        delayed_lints: &'tcx Steal<DelayedLints>,
+    ) -> ProjectedOwnerInfo<'tcx> {
+        ProjectedOwnerInfo { nodes, parenting, trait_map, delayed_lints }
+    }
+}
+
+#[derive(Clone, Copy, Debug, StableHash)]
+pub enum ProjectedMaybeOwner<'tcx> {
+    Owner(ProjectedOwnerInfo<'tcx>),
+    NonOwner(HirId),
+}
+
+impl<'tcx> ProjectedMaybeOwner<'tcx> {
+    pub fn new(value: MaybeOwner<'tcx>) -> Self {
+        match value {
+            MaybeOwner::Owner(o) => ProjectedMaybeOwner::Owner(ProjectedOwnerInfo {
+                nodes: &o.nodes,
+                parenting: &o.parenting,
+                trait_map: &o.trait_map,
+                delayed_lints: &o.delayed_lints,
+            }),
+            MaybeOwner::NonOwner(hir_id) => ProjectedMaybeOwner::NonOwner(hir_id),
+        }
+    }
+
+    pub fn as_owner(&self) -> Option<&ProjectedOwnerInfo<'tcx>> {
+        match self {
+            ProjectedMaybeOwner::Owner(i) => Some(i),
+            ProjectedMaybeOwner::NonOwner(_) => None,
+        }
+    }
+
+    pub fn unwrap(&'tcx self) -> &'tcx ProjectedOwnerInfo<'tcx> {
+        self.as_owner().unwrap_or_else(|| panic!("Not a HIR owner"))
+    }
+}
+
+pub fn provide(providers: &mut Providers) {
+    providers.hir_crate_items = map::hir_crate_items;
+    providers.crate_hash = map::crate_hash;
+    providers.hir_module_items = map::hir_module_items;
+    providers.hir_attr_map =
+        |tcx, id| tcx.lower_to_hir(id).as_owner().map_or(AttributeMap::EMPTY, |o| &o.attrs);
+    providers.hir_owner = |tcx, def_id| ProjectedMaybeOwner::new(tcx.lower_to_hir(def_id));
+    providers.hir_owner_parent_q = |tcx, owner_id| tcx.hir_owner_parent_impl(owner_id);
     providers.def_span = |tcx, def_id| tcx.hir_span(tcx.local_def_id_to_hir_id(def_id));
     providers.def_ident_span = |tcx, def_id| {
         let hir_id = tcx.local_def_id_to_hir_id(def_id);
         tcx.hir_opt_ident_span(hir_id)
     };
+    providers.ty_span = |tcx, def_id| {
+        let node = tcx.hir_node_by_def_id(def_id);
+        match node.ty() {
+            Some(ty) => ty.span,
+            None => bug!("{def_id:?} doesn't have a type: {node:#?}"),
+        }
+    };
     providers.fn_arg_idents = |tcx, def_id| {
-        if let Some(body_id) = tcx.hir_node_by_def_id(def_id).body_id() {
+        let node = tcx.hir_node_by_def_id(def_id);
+        if let Some(body_id) = node.body_id() {
             tcx.arena.alloc_from_iter(tcx.hir_body_param_idents(body_id))
         } else if let Node::TraitItem(&TraitItem {
             kind: TraitItemKind::Fn(_, TraitFn::Required(idents)),
@@ -220,7 +480,7 @@ pub fn provide(providers: &mut Providers) {
         | Node::ForeignItem(&ForeignItem {
             kind: ForeignItemKind::Fn(_, idents, _),
             ..
-        }) = tcx.hir_node(tcx.local_def_id_to_hir_id(def_id))
+        }) = node
         {
             idents
         } else {
@@ -236,7 +496,4 @@ pub fn provide(providers: &mut Providers) {
         |tcx, trait_id| tcx.resolutions(()).trait_impls.get(&trait_id).map_or(&[], |xs| &xs[..]);
     providers.expn_that_defined =
         |tcx, id| tcx.resolutions(()).expn_that_defined.get(&id).copied().unwrap_or(ExpnId::root());
-    providers.in_scope_traits_map = |tcx, id| {
-        tcx.hir_crate(()).owners[id.def_id].as_owner().map(|owner_info| &owner_info.trait_map)
-    };
 }

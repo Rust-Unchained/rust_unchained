@@ -5,15 +5,16 @@
 // The win64 ABI is used. It differs from the sysv64 ABI, so we must use a windows target with
 // LLVM. "x86_64-unknown-windows" is used to get the minimal subset of windows-specific features.
 
-use crate::callconv::Conv;
-use crate::spec::{RustcAbi, Target, TargetMetadata, base};
+use rustc_abi::{CanonAbi, X86Call};
+
+use crate::spec::{Arch, RustcAbi, Target, TargetMetadata, base};
 
 pub(crate) fn target() -> Target {
     let mut base = base::uefi_msvc::opts();
     base.cpu = "x86-64".into();
     base.plt_by_default = false;
     base.max_atomic_width = Some(64);
-    base.entry_abi = Conv::X86_64Win64;
+    base.entry_abi = CanonAbi::X86(X86Call::Win64);
 
     // We disable MMX and SSE for now, even though UEFI allows using them. Problem is, you have to
     // enable these CPU features explicitly before their first use, otherwise their instructions
@@ -26,7 +27,7 @@ pub(crate) fn target() -> Target {
     // If you initialize FP units yourself, you can override these flags with custom linker
     // arguments, thus giving you access to full MMX/SSE acceleration.
     base.features = "-mmx,-sse,+soft-float".into();
-    base.rustc_abi = Some(RustcAbi::X86Softfloat);
+    base.rustc_abi = Some(RustcAbi::Softfloat);
 
     Target {
         llvm_target: "x86_64-unknown-windows".into(),
@@ -39,7 +40,7 @@ pub(crate) fn target() -> Target {
         pointer_width: 64,
         data_layout:
             "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),
-        arch: "x86_64".into(),
+        arch: Arch::X86_64,
 
         options: base,
     }

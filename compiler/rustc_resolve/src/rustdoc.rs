@@ -2,27 +2,27 @@ use std::mem;
 use std::ops::Range;
 
 use itertools::Itertools;
+/// Re-export the markdown parser used by rustdoc.
+pub use pulldown_cmark;
 use pulldown_cmark::{
     BrokenLink, BrokenLinkCallback, CowStr, Event, LinkType, Options, Parser, Tag,
 };
 use rustc_ast as ast;
 use rustc_ast::attr::AttributeExt;
+use rustc_ast::join_path_syms;
+use rustc_ast::token::DocFragmentKind;
 use rustc_ast::util::comments::beautify_doc_string;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::unord::UnordSet;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::DefId;
-use rustc_span::{DUMMY_SP, InnerSpan, Span, Symbol, kw, sym};
+use rustc_span::source_map::SourceMap;
+use rustc_span::{DUMMY_SP, InnerSpan, Span, Symbol, sym};
 use thin_vec::ThinVec;
 use tracing::{debug, trace};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DocFragmentKind {
-    /// A doc fragment created from a `///` or `//!` doc comment.
-    SugaredDoc,
-    /// A doc fragment created from a "raw" `#[doc=""]` attribute.
-    RawDoc,
-}
+#[cfg(test)]
+mod tests;
 
 /// A portion of documentation, extracted from a `#[doc]` attribute.
 ///
@@ -45,6 +45,9 @@ pub struct DocFragment {
     pub doc: Symbol,
     pub kind: DocFragmentKind,
     pub indent: usize,
+    /// Because we tamper with the spans context, this information cannot be correctly retrieved
+    /// later on. So instead, we compute it and store it here.
+    pub from_expansion: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +118,7 @@ pub fn unindent_doc_fragments(docs: &mut [DocFragment]) {
     //
     // In this case, you want "hello! another" and not "hello!  another".
     let add = if docs.windows(2).any(|arr| arr[0].kind != arr[1].kind)
-        && docs.iter().any(|d| d.kind == DocFragmentKind::SugaredDoc)
+        && docs.iter().any(|d| d.kind.is_sugared())
     {
         // In case we have a mix of sugared doc comments and "raw" ones, we want the sugared one to
         // "decide" how much the minimum indent will be.
@@ -145,8 +148,7 @@ pub fn unindent_doc_fragments(docs: &mut [DocFragment]) {
                     // Compare against either space or tab, ignoring whether they are
                     // mixed or not.
                     let whitespace = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-                    whitespace
-                        + (if fragment.kind == DocFragmentKind::SugaredDoc { 0 } else { add })
+                    whitespace + (if fragment.kind.is_sugared() { 0 } else { add })
                 })
                 .min()
                 .unwrap_or(usize::MAX)
@@ -157,11 +159,11 @@ pub fn unindent_doc_fragments(docs: &mut [DocFragment]) {
     };
 
     for fragment in docs {
-        if fragment.doc == kw::Empty {
+        if fragment.doc == sym::empty {
             continue;
         }
 
-        let indent = if fragment.kind != DocFragmentKind::SugaredDoc && min_indent > 0 {
+        let indent = if !fragment.kind.is_sugared() && min_indent > 0 {
             min_indent - add
         } else {
             min_indent
@@ -177,7 +179,7 @@ pub fn unindent_doc_fragments(docs: &mut [DocFragment]) {
 ///
 /// Note: remove the trailing newline where appropriate
 pub fn add_doc_fragment(out: &mut String, frag: &DocFragment) {
-    if frag.doc == kw::Empty {
+    if frag.doc == sym::empty {
         out.push('\n');
         return;
     }
@@ -199,27 +201,30 @@ pub fn attrs_to_doc_fragments<'a, A: AttributeExt + Clone + 'a>(
     attrs: impl Iterator<Item = (&'a A, Option<DefId>)>,
     doc_only: bool,
 ) -> (Vec<DocFragment>, ThinVec<A>) {
-    let mut doc_fragments = Vec::new();
-    let mut other_attrs = ThinVec::<A>::new();
+    let (min_size, max_size) = attrs.size_hint();
+    let size_hint = max_size.unwrap_or(min_size);
+    let mut doc_fragments = Vec::with_capacity(size_hint);
+    let mut other_attrs = ThinVec::<A>::with_capacity(if doc_only { 0 } else { size_hint });
     for (attr, item_id) in attrs {
-        if let Some((doc_str, comment_kind)) = attr.doc_str_and_comment_kind() {
-            let doc = beautify_doc_string(doc_str, comment_kind);
-            let (span, kind) = if attr.is_doc_comment() {
-                (attr.span(), DocFragmentKind::SugaredDoc)
-            } else {
-                (
-                    attr.value_span()
-                        .map(|i| i.with_ctxt(attr.span().ctxt()))
-                        .unwrap_or(attr.span()),
-                    DocFragmentKind::RawDoc,
-                )
+        if let Some((doc_str, fragment_kind)) = attr.doc_str_and_fragment_kind() {
+            let doc = beautify_doc_string(doc_str, fragment_kind.comment_kind());
+            let attr_span = attr.span();
+            let (span, from_expansion) = match fragment_kind {
+                DocFragmentKind::Sugared(_) => (attr_span, attr_span.from_expansion()),
+                DocFragmentKind::Raw(value_span) => {
+                    (value_span.with_ctxt(attr_span.ctxt()), value_span.from_expansion())
+                }
             };
-            let fragment = DocFragment { span, doc, kind, item_id, indent: 0 };
+            let fragment =
+                DocFragment { span, doc, kind: fragment_kind, item_id, indent: 0, from_expansion };
             doc_fragments.push(fragment);
         } else if !doc_only {
             other_attrs.push(attr.clone());
         }
     }
+
+    doc_fragments.shrink_to_fit();
+    other_attrs.shrink_to_fit();
 
     unindent_doc_fragments(&mut doc_fragments);
 
@@ -251,7 +256,7 @@ pub fn main_body_opts() -> Options {
         | Options::ENABLE_SMART_PUNCTUATION
 }
 
-fn strip_generics_from_path_segment(segment: Vec<char>) -> Result<String, MalformedGenerics> {
+fn strip_generics_from_path_segment(segment: Vec<char>) -> Result<Symbol, MalformedGenerics> {
     let mut stripped_segment = String::new();
     let mut param_depth = 0;
 
@@ -276,7 +281,7 @@ fn strip_generics_from_path_segment(segment: Vec<char>) -> Result<String, Malfor
     }
 
     if param_depth == 0 {
-        Ok(stripped_segment)
+        Ok(Symbol::intern(&stripped_segment))
     } else {
         // The segment has unbalanced angle brackets, e.g. `Vec<T` or `Vec<T>>`
         Err(MalformedGenerics::UnbalancedAngleBrackets)
@@ -338,9 +343,8 @@ pub fn strip_generics_from_path(path_str: &str) -> Result<Box<str>, MalformedGen
 
     debug!("path_str: {path_str:?}\nstripped segments: {stripped_segments:?}");
 
-    let stripped_path = stripped_segments.join("::");
-
-    if !stripped_path.is_empty() {
+    if !stripped_segments.is_empty() {
+        let stripped_path = join_path_syms(stripped_segments);
         Ok(stripped_path.into())
     } else {
         Err(MalformedGenerics::MissingType)
@@ -352,39 +356,38 @@ pub fn strip_generics_from_path(path_str: &str) -> Result<Box<str>, MalformedGen
 /// If there are no doc-comments, return true.
 /// FIXME(#78591): Support both inner and outer attributes on the same item.
 pub fn inner_docs(attrs: &[impl AttributeExt]) -> bool {
-    attrs.iter().find(|a| a.doc_str().is_some()).is_none_or(|a| a.style() == ast::AttrStyle::Inner)
+    for attr in attrs {
+        if let Some(attr_style) = attr.doc_resolution_scope() {
+            return attr_style == ast::AttrStyle::Inner;
+        }
+    }
+    true
 }
 
-/// Has `#[rustc_doc_primitive]` or `#[doc(keyword)]`.
-pub fn has_primitive_or_keyword_docs(attrs: &[impl AttributeExt]) -> bool {
+/// Has `#[rustc_doc_primitive]` or `#[doc(keyword)]` or `#[doc(attribute)]`.
+pub fn has_primitive_or_keyword_or_attribute_docs(attrs: &[impl AttributeExt]) -> bool {
     for attr in attrs {
-        if attr.has_name(sym::rustc_doc_primitive) {
+        if attr.is_rustc_doc_primitive() || attr.is_doc_keyword_or_attribute() {
             return true;
-        } else if attr.has_name(sym::doc)
-            && let Some(items) = attr.meta_item_list()
-        {
-            for item in items {
-                if item.has_name(sym::keyword) {
-                    return true;
-                }
-            }
         }
     }
     false
 }
 
 /// Simplified version of the corresponding function in rustdoc.
-/// If the rustdoc version returns a successful result, this function must return the same result.
-/// Otherwise this function may return anything.
 fn preprocess_link(link: &str) -> Box<str> {
+    // IMPORTANT: To be kept in sync with the corresponding function in rustdoc.
+    // Namely, whenever the rustdoc function returns a successful result for a given input,
+    // this function *MUST* return a link that's equal to `PreprocessingInfo.path_str`!
+
     let link = link.replace('`', "");
     let link = link.split('#').next().unwrap();
     let link = link.trim();
-    let link = link.rsplit('@').next().unwrap();
-    let link = link.strip_suffix("()").unwrap_or(link);
-    let link = link.strip_suffix("{}").unwrap_or(link);
-    let link = link.strip_suffix("[]").unwrap_or(link);
-    let link = if link != "!" { link.strip_suffix('!').unwrap_or(link) } else { link };
+    let link = link.split_once('@').map_or(link, |(_, rhs)| rhs);
+    let link = link.trim_suffix("()");
+    let link = link.trim_suffix("{}");
+    let link = link.trim_suffix("[]");
+    let link = if link != "!" { link.trim_suffix('!') } else { link };
     let link = link.trim();
     strip_generics_from_path(link).unwrap_or_else(|_| link.into())
 }
@@ -406,11 +409,19 @@ pub fn may_be_doc_link(link_type: LinkType) -> bool {
 
 /// Simplified version of `preprocessed_markdown_links` from rustdoc.
 /// Must return at least the same links as it, but may add some more links on top of that.
-pub(crate) fn attrs_to_preprocessed_links<A: AttributeExt + Clone>(attrs: &[A]) -> Vec<Box<str>> {
-    let (doc_fragments, _) = attrs_to_doc_fragments(attrs.iter().map(|attr| (attr, None)), true);
-    let doc = prepare_to_doc_link_resolution(&doc_fragments).into_values().next().unwrap();
+pub(crate) fn attrs_to_preprocessed_links(attrs: &[ast::Attribute]) -> Vec<Box<str>> {
+    let (doc_fragments, other_attrs) =
+        attrs_to_doc_fragments(attrs.iter().map(|attr| (attr, None)), false);
+    let doc = prepare_to_doc_link_resolution(&doc_fragments).into_values().next();
+    let mut links = doc.as_deref().map(parse_links).unwrap_or_default();
 
-    parse_links(&doc)
+    for attr in other_attrs {
+        if let Some(note) = attr.deprecation_note() {
+            links.extend(parse_links(note.as_str()));
+        }
+    }
+
+    links
 }
 
 /// Similar version of `markdown_links` from rustdoc.
@@ -498,15 +509,15 @@ fn collect_link_data<'input, F: BrokenLinkCallback<'input>>(
 
 /// Returns a span encompassing all the document fragments.
 pub fn span_of_fragments(fragments: &[DocFragment]) -> Option<Span> {
-    if fragments.is_empty() {
+    let (first_fragment, last_fragment) = match fragments {
+        [] => return None,
+        [first, .., last] => (first, last),
+        [first] => (first, first),
+    };
+    if first_fragment.span == DUMMY_SP {
         return None;
     }
-    let start = fragments[0].span;
-    if start == DUMMY_SP {
-        return None;
-    }
-    let end = fragments.last().expect("no doc strings provided").span;
-    Some(start.to(end))
+    Some(first_fragment.span.to(last_fragment.span))
 }
 
 /// Attempts to match a range of bytes from parsed markdown to a `Span` in the source code.
@@ -514,40 +525,108 @@ pub fn span_of_fragments(fragments: &[DocFragment]) -> Option<Span> {
 /// This method does not always work, because markdown bytes don't necessarily match source bytes,
 /// like if escapes are used in the string. In this case, it returns `None`.
 ///
-/// This method will return `Some` only if:
+/// `markdown` is typically the entire documentation for an item,
+/// after combining fragments.
+///
+/// This method will return `Some` only if one of the following is true:
 ///
 /// - The doc is made entirely from sugared doc comments, which cannot contain escapes
-/// - The doc is entirely from a single doc fragment, with a string literal, exactly equal
+/// - The doc is entirely from a single doc fragment with a string literal exactly equal to
+///   `markdown`.
 /// - The doc comes from `include_str!`
+/// - The doc includes exactly one substring matching `markdown[md_range]` which is contained in a
+///   single doc fragment.
+///
+/// This function is defined in the compiler so it can be used by both `rustdoc` and `clippy`.
+///
+/// It returns a tuple containing a span encompassing all the document fragments and a boolean that
+/// is `true` if any of the *matched* fragments are from a macro expansion.
 pub fn source_span_for_markdown_range(
     tcx: TyCtxt<'_>,
     markdown: &str,
     md_range: &Range<usize>,
     fragments: &[DocFragment],
-) -> Option<Span> {
+) -> Option<(Span, bool)> {
+    let map = tcx.sess.source_map();
+    source_span_for_markdown_range_inner(map, markdown, md_range, fragments)
+}
+
+// inner function used for unit testing
+pub fn source_span_for_markdown_range_inner(
+    map: &SourceMap,
+    markdown: &str,
+    md_range: &Range<usize>,
+    fragments: &[DocFragment],
+) -> Option<(Span, bool)> {
+    use rustc_span::BytePos;
+
     if let &[fragment] = &fragments
-        && fragment.kind == DocFragmentKind::RawDoc
-        && let Ok(snippet) = tcx.sess.source_map().span_to_snippet(fragment.span)
+        && !fragment.kind.is_sugared()
+        && let Ok(snippet) = map.span_to_snippet(fragment.span)
         && snippet.trim_end() == markdown.trim_end()
         && let Ok(md_range_lo) = u32::try_from(md_range.start)
         && let Ok(md_range_hi) = u32::try_from(md_range.end)
     {
         // Single fragment with string that contains same bytes as doc.
-        return Some(Span::new(
-            fragment.span.lo() + rustc_span::BytePos(md_range_lo),
-            fragment.span.lo() + rustc_span::BytePos(md_range_hi),
-            fragment.span.ctxt(),
-            fragment.span.parent(),
+        return Some((
+            Span::new(
+                fragment.span.lo() + rustc_span::BytePos(md_range_lo),
+                fragment.span.lo() + rustc_span::BytePos(md_range_hi),
+                fragment.span.ctxt(),
+                fragment.span.parent(),
+            ),
+            fragment.from_expansion,
         ));
     }
 
-    let is_all_sugared_doc = fragments.iter().all(|frag| frag.kind == DocFragmentKind::SugaredDoc);
+    let is_all_sugared_doc = fragments.iter().all(|frag| frag.kind.is_sugared());
 
     if !is_all_sugared_doc {
+        // This case ignores the markdown outside of the range so that it can
+        // work in cases where the markdown is made from several different
+        // doc fragments, but the target range does not span across multiple
+        // fragments.
+        let mut match_data = None;
+        let pat = &markdown[md_range.clone()];
+        // This heirustic doesn't make sense with a zero-sized range.
+        if pat.is_empty() {
+            return None;
+        }
+        for (i, fragment) in fragments.iter().enumerate() {
+            if let Ok(snippet) = map.span_to_snippet(fragment.span)
+                && let Some(match_start) = snippet.find(pat)
+            {
+                // If there is either a match in a previous fragment, or
+                // multiple matches in this fragment, there is ambiguity.
+                // the snippet cannot be zero-sized, because it matches
+                // the pattern, which is checked to not be zero sized.
+                if match_data.is_none()
+                    && !snippet.as_bytes()[match_start + 1..]
+                        .windows(pat.len())
+                        .any(|s| s == pat.as_bytes())
+                {
+                    match_data = Some((i, match_start));
+                } else {
+                    // Heuristic produced ambiguity, return nothing.
+                    return None;
+                }
+            }
+        }
+        if let Some((i, match_start)) = match_data {
+            let fragment = &fragments[i];
+            let sp = fragment.span;
+            // we need to calculate the span start,
+            // then use that in our calculations for the span end
+            let lo = sp.lo() + BytePos(match_start as u32);
+            return Some((
+                sp.with_lo(lo).with_hi(lo + BytePos((md_range.end - md_range.start) as u32)),
+                fragment.from_expansion,
+            ));
+        }
         return None;
     }
 
-    let snippet = tcx.sess.source_map().span_to_snippet(span_of_fragments(fragments)?).ok()?;
+    let snippet = map.span_to_snippet(span_of_fragments(fragments)?).ok()?;
 
     let starting_line = markdown[..md_range.start].matches('\n').count();
     let ending_line = starting_line + markdown[md_range.start..md_range.end].matches('\n').count();
@@ -562,42 +641,104 @@ pub fn source_span_for_markdown_range(
     let mut start_bytes = 0;
     let mut end_bytes = 0;
 
+    let span_of_all_fragments: Span = span_of_fragments(fragments)?;
+
+    let mut prev_lines_bytes = 0;
     'outer: for (line_no, md_line) in md_lines.enumerate() {
         loop {
             let source_line = src_lines.next()?;
-            match source_line.find(md_line) {
-                Some(offset) => {
-                    if line_no == starting_line {
-                        start_bytes += offset;
-
-                        if starting_line == ending_line {
-                            break 'outer;
-                        }
-                    } else if line_no == ending_line {
-                        end_bytes += offset;
-                        break 'outer;
-                    } else if line_no < starting_line {
-                        start_bytes += source_line.len() - md_line.len();
-                    } else {
-                        end_bytes += source_line.len() - md_line.len();
-                    }
-                    break;
+            let source_line_len = u32::try_from(source_line.len()).unwrap();
+            let source_line_span =
+                span_of_all_fragments.split_at(prev_lines_bytes).1.split_at(source_line_len).0;
+            let fragment = fragments
+                .iter()
+                // `source_line_span` might contain indentation that `fragment.span` doesn't contain
+                .find(|fragment| fragment.span.overlaps(source_line_span));
+            // Since we're counting bytes, `prev_line_bytes` includes the "\n".
+            prev_lines_bytes += source_line_len + 1;
+            if let Some(fragment) = fragment
+                && let Some(offset) = source_line.find(md_line)
+            {
+                if fragment.span.lo() > source_line_span.lo()
+                    && source_line
+                        [..usize::try_from(fragment.span.lo().0 - source_line_span.lo().0).unwrap()]
+                        .chars()
+                        .any(|c| !c.is_whitespace())
+                {
+                    // Make sure anything between the start of this line and the fragment itself is just indentation.
+                    // Because source_line is built by splitting the span that covers all fragments, this only finds
+                    // characters *between* doc comments, not characters before or after doc comments.
+                    //
+                    //     1| /** doc */
+                    //     2| #[inline] /** doc2 */
+                    //        ^^^^^^^^^
+                    //        | this
+                    //
+                    //     3| fn foo() {}
+                    return None;
                 }
-                None => {
-                    // Since this is a source line that doesn't include a markdown line,
-                    // we have to count the newline that we split from earlier.
-                    if line_no <= starting_line {
-                        start_bytes += source_line.len() + 1;
-                    } else {
-                        end_bytes += source_line.len() + 1;
+                if fragment.span.hi() < source_line_span.hi()
+                    && source_line
+                        [usize::try_from(fragment.span.hi().0 - source_line_span.lo().0).unwrap()..]
+                        .chars()
+                        .any(|c| !c.is_whitespace())
+                {
+                    // Make sure anything between the start of this line and the fragment itself is just indentation.
+                    // Because source_line is built by splitting the span that covers all fragments, this only finds
+                    // characters *between* doc comments, not characters before or after doc comments.
+                    //     1| /** doc */ #[inline]
+                    //                   ^^^^^^^^^
+                    //                   | this
+                    //
+                    //     2| /** doc2 */
+                    //     3| fn foo() {}
+                    return None;
+                }
+                if line_no == starting_line {
+                    start_bytes += offset;
+
+                    if starting_line == ending_line {
+                        break 'outer;
                     }
+                } else if line_no == ending_line {
+                    end_bytes += offset;
+                    break 'outer;
+                } else if line_no < starting_line {
+                    start_bytes += source_line.len() - md_line.len();
+                } else {
+                    end_bytes += source_line.len() - md_line.len();
+                }
+                break;
+            } else {
+                // Since this is a source line that doesn't include a markdown line,
+                // we have to count it and its newline as non-markdown bytes.
+                if line_no <= starting_line {
+                    start_bytes += source_line.len() + 1;
+                } else if source_line.chars().any(|c| !c.is_whitespace()) {
+                    // We're past the first line, but haven't found the last line,
+                    // but we found a non-empty non-markdown line.
+                    // This could be an attribute, and we don't want a diagnostic
+                    // suggesting to delete that attribute, so we return None to be safe.
+                    //     1| /** doc */
+                    //     2 | #[inline]
+                    //          ^^^^^^^^^
+                    //          | this
+                    //     3| /** doc2 */
+                    //     4| fn foo() {}
+                    return None;
+                } else {
+                    end_bytes += source_line.len() + 1;
                 }
             }
         }
     }
 
-    Some(span_of_fragments(fragments)?.from_inner(InnerSpan::new(
+    let src_span = span_of_all_fragments.from_inner(InnerSpan::new(
         md_range.start + start_bytes,
         md_range.end + start_bytes + end_bytes,
-    )))
+    ));
+    Some((
+        src_span,
+        fragments.iter().any(|frag| frag.span.overlaps(src_span) && frag.from_expansion),
+    ))
 }

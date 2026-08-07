@@ -10,12 +10,13 @@
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::find_attr;
 use rustc_middle::bug;
 use rustc_middle::ty::fast_reject::{SimplifiedType, TreatParams, simplify_type};
 use rustc_middle::ty::{self, CrateInherentImpls, Ty, TyCtxt};
 use rustc_span::ErrorGuaranteed;
 
-use crate::errors;
+use crate::diagnostics;
 
 /// On-demand query: yields a map containing all types mapped to their inherent impls.
 pub(crate) fn crate_inherent_impls(
@@ -105,7 +106,7 @@ impl<'tcx> InherentCollect<'tcx> {
 
         let id = id.owner_id.def_id;
         let item_span = self.tcx.def_span(id);
-        let self_ty = self.tcx.type_of(id).instantiate_identity();
+        let self_ty = self.tcx.type_of(id).instantiate_identity().skip_norm_wip();
         let mut self_ty = self.tcx.peel_off_free_alias_tys(self_ty);
         // We allow impls on pattern types exactly when we allow impls on the base type.
         // FIXME(pattern_types): Figure out the exact coherence rules we want here.
@@ -119,7 +120,7 @@ impl<'tcx> InherentCollect<'tcx> {
                 self.check_def_id(id, self_ty, data.principal_def_id().unwrap())
             }
             ty::Dynamic(..) => {
-                Err(self.tcx.dcx().emit_err(errors::InherentDyn { span: item_span }))
+                Err(self.tcx.dcx().emit_err(diagnostics::InherentDyn { span: item_span }))
             }
             ty::Pat(_, _) => unreachable!(),
             ty::Bool
@@ -136,15 +137,22 @@ impl<'tcx> InherentCollect<'tcx> {
             | ty::FnPtr(..)
             | ty::Tuple(..)
             | ty::UnsafeBinder(_) => self.check_primitive_impl(id, self_ty),
-            ty::Alias(ty::Projection | ty::Inherent | ty::Opaque, _) | ty::Param(_) => {
-                Err(self.tcx.dcx().emit_err(errors::InherentNominal { span: item_span }))
+            ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Opaque { .. },
+                    ..
+                },
+            )
+            | ty::Param(_) => {
+                Err(self.tcx.dcx().emit_err(diagnostics::InherentNominal { span: item_span }))
             }
             ty::FnDef(..)
             | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
-            | ty::Alias(ty::Free, _)
+            | ty::Alias(_, ty::AliasTy { kind: ty::Free { .. }, .. })
             | ty::Bound(..)
             | ty::Placeholder(_)
             | ty::Infer(_) => {

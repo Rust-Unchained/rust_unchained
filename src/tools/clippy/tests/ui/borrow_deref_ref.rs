@@ -1,7 +1,5 @@
 //@aux-build: proc_macros.rs
 
-#![allow(dead_code, unused_variables)]
-
 extern crate proc_macros;
 use proc_macros::with_span;
 
@@ -122,5 +120,76 @@ mod issue_11346 {
         s.foo(); // To avoid a warning about `s` not needing to be mutable
         (&*s).foo();
         //~^ borrow_deref_ref
+    }
+}
+
+fn issue_14934() {
+    let x: &'static str = "x";
+    let y = "y".to_string();
+    {
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = &*x; // Do not lint
+        *x = &*y;
+    }
+    {
+        let mut x = &*x;
+        //~^ borrow_deref_ref
+        x = &*y;
+    }
+    {
+        #[expect(clippy::toplevel_ref_arg, clippy::needless_borrow)]
+        let ref x = &*x;
+        //~^ borrow_deref_ref
+    }
+    {
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = &*std::convert::identity(x);
+        //~^ borrow_deref_ref
+        *x = &*y;
+    }
+    {
+        #[derive(Clone)]
+        struct S(&'static str);
+        let s = S("foo");
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = &*s.0; // Do not lint
+        *x = "bar";
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = &*s.clone().0;
+        //~^ borrow_deref_ref
+        *x = "bar";
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = &*std::convert::identity(&s).0;
+        *x = "bar";
+    }
+    {
+        let y = &1;
+        #[expect(clippy::toplevel_ref_arg)]
+        let ref mut x = { &*y };
+        //~^ borrow_deref_ref
+    }
+}
+
+mod issue16556 {
+    use std::pin::Pin;
+
+    async fn async_main() {
+        for_each_city(|city| {
+            Box::pin(async {
+                // Do not lint, as it would not compile without reborrowing
+                let city = &*city;
+                println!("{city}")
+            })
+        })
+        .await;
+    }
+
+    async fn for_each_city<F>(mut f: F)
+    where
+        F: for<'c> FnMut(&'c str) -> Pin<Box<dyn Future<Output = ()> + Send + 'c>>,
+    {
+        for x in ["New York", "London", "Tokyo"] {
+            f(x).await;
+        }
     }
 }

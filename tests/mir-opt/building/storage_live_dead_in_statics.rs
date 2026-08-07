@@ -1,4 +1,5 @@
-// skip-filecheck
+//@ compile-flags: -Zmir-opt-level=0
+//@ skip-filecheck
 // Check that when we compile the static `XXX` into MIR, we do not
 // generate `StorageStart` or `StorageEnd` statements.
 

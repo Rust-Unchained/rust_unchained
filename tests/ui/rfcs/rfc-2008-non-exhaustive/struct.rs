@@ -27,7 +27,7 @@ fn main() {
     //~^ ERROR `..` required with struct marked as non-exhaustive
 
     let us = UnitStruct;
-    //~^ ERROR expected value, found struct `UnitStruct` [E0423]
+    //~^ ERROR cannot find value `UnitStruct` in this scope [E0423]
 
     let us_explicit = structs::UnitStruct;
     //~^ ERROR unit struct `UnitStruct` is private [E0603]
@@ -39,7 +39,7 @@ fn main() {
 // Everything below this is expected to compile successfully.
 
 // We only test matching here as we cannot create non-exhaustive
-// structs from another crate. ie. they'll never pass in run-pass tests.
+// structs from another crate. i.e. they'll never pass in run-pass tests.
 fn match_structs(ns: NormalStruct, ts: TupleStruct, us: UnitStruct) {
     let NormalStruct { first_field, second_field, .. } = ns;
 

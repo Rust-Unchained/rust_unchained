@@ -1,7 +1,5 @@
 # Goals and clauses
 
-<!-- toc -->
-
 In logic programming terms, a **goal** is something that you must
 prove and a **clause** is something that you know is true. As
 described in the [lowering to logic](./lowering-to-logic.html)
@@ -44,7 +42,7 @@ In terms of code, these types are defined in
 [`chalk-ir/src/lib.rs`][chalk_ir] in chalk.
 
 [pphhf]: https://rust-lang.github.io/chalk/book/bibliography.html#pphhf
-[traits_mod]: https://github.com/rust-lang/rust/blob/master/compiler/rustc_middle/src/traits/mod.rs
+[traits_mod]: https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_middle/src/traits/mod.rs
 [chalk_ir]: https://github.com/rust-lang/chalk/blob/master/chalk-ir/src/lib.rs
 
 <a id="domain-goals"></a>

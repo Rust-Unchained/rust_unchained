@@ -1,8 +1,7 @@
 use crate::io;
-use crate::sys::anonymous_pipe::{AnonPipe, pipe as pipe_inner};
-use crate::sys_common::{FromInner, IntoInner};
+use crate::sys::{FromInner, IntoInner, pipe as imp};
 
-/// Create an anonymous pipe.
+/// Creates an anonymous pipe.
 ///
 /// # Behavior
 ///
@@ -38,30 +37,42 @@ use crate::sys_common::{FromInner, IntoInner};
 /// > not rely on a particular capacity: an application should be designed so that a reading process
 /// > consumes data as soon as it is available, so that a writing process does not remain blocked.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```no_run
-/// # #[cfg(miri)] fn main() {}
-/// # #[cfg(not(miri))]
 /// # fn main() -> std::io::Result<()> {
+/// use std::io::{Read, Write, pipe};
 /// use std::process::Command;
-/// use std::io::{pipe, Read, Write};
-/// let (ping_rx, mut ping_tx) = pipe()?;
-/// let (mut pong_rx, pong_tx) = pipe()?;
+/// let (ping_reader, mut ping_writer) = pipe()?;
+/// let (mut pong_reader, pong_writer) = pipe()?;
 ///
-/// // Spawn a process that echoes its input.
-/// let mut echo_server = Command::new("cat").stdin(ping_rx).stdout(pong_tx).spawn()?;
+/// // Spawn a child process that echoes its input.
+/// let mut echo_command = Command::new("cat");
+/// echo_command.stdin(ping_reader);
+/// echo_command.stdout(pong_writer);
+/// let mut echo_child = echo_command.spawn()?;
 ///
-/// ping_tx.write_all(b"hello")?;
-/// // Close to unblock echo_server's reader.
-/// drop(ping_tx);
+/// // Send input to the child process. Note that because we're writing all the input before we
+/// // read any output, this could deadlock if the child's input and output pipe buffers both
+/// // filled up. Those buffers are usually at least a few KB, so "hello" is fine, but for longer
+/// // inputs we'd need to read and write at the same time, e.g. using threads.
+/// ping_writer.write_all(b"hello")?;
+///
+/// // `cat` exits when it reads EOF from stdin, but that can't happen while any ping writer
+/// // remains open. We need to drop our ping writer, or read_to_string will deadlock below.
+/// drop(ping_writer);
+///
+/// // The pong reader can't report EOF while any pong writer remains open. Our Command object is
+/// // holding a pong writer, and again read_to_string will deadlock if we don't drop it.
+/// drop(echo_command);
 ///
 /// let mut buf = String::new();
-/// // Block until echo_server's writer is closed.
-/// pong_rx.read_to_string(&mut buf)?;
+/// // Block until `cat` closes its stdout (a pong writer).
+/// pong_reader.read_to_string(&mut buf)?;
 /// assert_eq!(&buf, "hello");
 ///
-/// echo_server.wait()?;
+/// // At this point we know `cat` has exited, but we still need to wait to clean up the "zombie".
+/// echo_child.wait()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -70,51 +81,49 @@ use crate::sys_common::{FromInner, IntoInner};
 #[stable(feature = "anonymous_pipe", since = "1.87.0")]
 #[inline]
 pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
-    pipe_inner().map(|(reader, writer)| (PipeReader(reader), PipeWriter(writer)))
+    imp::pipe().map(|(reader, writer)| (PipeReader(reader), PipeWriter(writer)))
 }
 
 /// Read end of an anonymous pipe.
 #[stable(feature = "anonymous_pipe", since = "1.87.0")]
 #[derive(Debug)]
-pub struct PipeReader(pub(crate) AnonPipe);
+pub struct PipeReader(pub(crate) imp::Pipe);
 
 /// Write end of an anonymous pipe.
 #[stable(feature = "anonymous_pipe", since = "1.87.0")]
 #[derive(Debug)]
-pub struct PipeWriter(pub(crate) AnonPipe);
+pub struct PipeWriter(pub(crate) imp::Pipe);
 
-impl FromInner<AnonPipe> for PipeReader {
-    fn from_inner(inner: AnonPipe) -> Self {
+impl FromInner<imp::Pipe> for PipeReader {
+    fn from_inner(inner: imp::Pipe) -> Self {
         Self(inner)
     }
 }
 
-impl IntoInner<AnonPipe> for PipeReader {
-    fn into_inner(self) -> AnonPipe {
+impl IntoInner<imp::Pipe> for PipeReader {
+    fn into_inner(self) -> imp::Pipe {
         self.0
     }
 }
 
-impl FromInner<AnonPipe> for PipeWriter {
-    fn from_inner(inner: AnonPipe) -> Self {
+impl FromInner<imp::Pipe> for PipeWriter {
+    fn from_inner(inner: imp::Pipe) -> Self {
         Self(inner)
     }
 }
 
-impl IntoInner<AnonPipe> for PipeWriter {
-    fn into_inner(self) -> AnonPipe {
+impl IntoInner<imp::Pipe> for PipeWriter {
+    fn into_inner(self) -> imp::Pipe {
         self.0
     }
 }
 
 impl PipeReader {
-    /// Create a new [`PipeReader`] instance that shares the same underlying file description.
+    /// Creates a new [`PipeReader`] instance that shares the same underlying file description.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # #[cfg(miri)] fn main() {}
-    /// # #[cfg(not(miri))]
     /// # fn main() -> std::io::Result<()> {
     /// use std::fs;
     /// use std::io::{pipe, Write};
@@ -167,13 +176,11 @@ impl PipeReader {
 }
 
 impl PipeWriter {
-    /// Create a new [`PipeWriter`] instance that shares the same underlying file description.
+    /// Creates a new [`PipeWriter`] instance that shares the same underlying file description.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # #[cfg(miri)] fn main() {}
-    /// # #[cfg(not(miri))]
     /// # fn main() -> std::io::Result<()> {
     /// use std::process::Command;
     /// use std::io::{pipe, Read};
@@ -220,7 +227,7 @@ impl io::Read for &PipeReader {
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.0.read_to_end(buf)
     }
-    fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.0.read_buf(buf)
     }
 }
@@ -240,7 +247,7 @@ impl io::Read for PipeReader {
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.0.read_to_end(buf)
     }
-    fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.0.read_buf(buf)
     }
 }

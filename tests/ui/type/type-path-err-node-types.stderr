@@ -1,4 +1,4 @@
-error[E0412]: cannot find type `Nonexistent` in this scope
+error[E0425]: cannot find type `Nonexistent` in this scope
   --> $DIR/type-path-err-node-types.rs:7:12
    |
 LL |     let _: Nonexistent<u8, Assoc = u16>;
@@ -16,7 +16,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
 LL |     nonexistent.nonexistent::<u8>();
    |     ^^^^^^^^^^^ not found in this scope
 
-error[E0433]: failed to resolve: use of undeclared type `NonExistent`
+error[E0433]: cannot find type `NonExistent` in this scope
   --> $DIR/type-path-err-node-types.rs:15:5
    |
 LL |     NonExistent::Assoc::<u8>;
@@ -35,5 +35,5 @@ LL |     let _ = |a: /* Type */, b: _| -> _ { 0 };
 
 error: aborting due to 5 previous errors
 
-Some errors have detailed explanations: E0282, E0412, E0425, E0433, E0576.
+Some errors have detailed explanations: E0282, E0425, E0433, E0576.
 For more information about an error, try `rustc --explain E0282`.

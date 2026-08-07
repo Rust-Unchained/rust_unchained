@@ -1,37 +1,38 @@
-//@ min-lldb-version: 1800
+// LLDB 1800+ tests were not tested in CI, broke, and now are disabled
+//@ ignore-lldb
 
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:run
+//@ gdb-command:run
 
-// gdb-command:print *the_a
-// gdb-check:$1 = unique_enum::ABC::TheA{x: 0, y: 8970181431921507452}
+//@ gdb-command:print *the_a
+//@ gdb-check:$1 = unique_enum::ABC::TheA{x: 0, y: 8970181431921507452}
 
-// gdb-command:print *the_b
-// gdb-check:$2 = unique_enum::ABC::TheB(0, 286331153, 286331153)
+//@ gdb-command:print *the_b
+//@ gdb-check:$2 = unique_enum::ABC::TheB(0, 286331153, 286331153)
 
-// gdb-command:print *univariant
-// gdb-check:$3 = unique_enum::Univariant::TheOnlyCase(123234)
+//@ gdb-command:print *univariant
+//@ gdb-check:$3 = unique_enum::Univariant::TheOnlyCase(123234)
 
 
 // === LLDB TESTS ==================================================================================
 
-// lldb-command:run
+//@ lldb-command:run
 
-// lldb-command:v *the_a
-// lldb-check:(unique_enum::ABC) *the_a = { value = { x = 0 y = 8970181431921507452 } $discr$ = 0 }
+//@ lldb-command:v *the_a
+//@ lldb-check:(unique_enum::ABC) *the_a = TheA{x:0, y:8970181431921507452} { x = 0 y = 8970181431921507452 }
 
-// lldb-command:v *the_b
-// lldb-check:(unique_enum::ABC) *the_b = { value = { 0 = 0 1 = 286331153 2 = 286331153 } $discr$ = 1 }
+//@ lldb-command:v *the_b
+//@ lldb-check:(unique_enum::ABC) *the_b = TheB(0, 286331153, 286331153)
 
-// lldb-command:v *univariant
-// lldb-check:(unique_enum::Univariant) *univariant = { value = { 0 = 123234 } }
+//@ lldb-command:v *univariant
+//@ lldb-check:(unique_enum::Univariant) *univariant = TheOnlyCase(123234)
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 // The first element is to ensure proper alignment, irrespective of the machines word size. Since
 // the size of the discriminant value is machine dependent, this has be taken into account when

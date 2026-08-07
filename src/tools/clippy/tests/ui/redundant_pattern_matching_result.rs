@@ -1,10 +1,10 @@
 #![warn(clippy::redundant_pattern_matching)]
-#![allow(deprecated)]
+#![expect(deprecated)]
 #![allow(
     clippy::if_same_then_else,
     clippy::match_like_matches_macro,
     clippy::needless_bool,
-    clippy::needless_if,
+    clippy::needless_ifs,
     clippy::uninlined_format_args,
     clippy::unnecessary_wraps
 )]
@@ -204,4 +204,28 @@ fn issue10803() {
 
     // Don't lint
     let _ = matches!(x, Err(16));
+}
+
+fn wrongly_unmangled_macros() {
+    macro_rules! test_expr {
+        ($val:expr) => {
+            Ok::<i32, i32>($val)
+        };
+    }
+
+    let _ = match test_expr!(42) {
+        //~^ redundant_pattern_matching
+        Ok(_) => true,
+        Err(_) => false,
+    };
+
+    macro_rules! test_guard {
+        ($val:expr) => {
+            ($val + 1) > 0
+        };
+    }
+
+    let x: Result<i32, ()> = Ok(42);
+    let _ = matches!(x, Ok(_) if test_guard!(42));
+    //~^ redundant_pattern_matching
 }

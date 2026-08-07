@@ -6,7 +6,7 @@ use std::str::{self, FromStr};
 
 use parser::Edition;
 
-use crate::{validation, AstNode, SourceFile, TextRange};
+use crate::{AstNode, SourceFile, TextRange, validation};
 
 fn check_file_invariants(file: &SourceFile) {
     let root = file.syntax();
@@ -42,7 +42,7 @@ impl CheckReparse {
         let delete =
             TextRange::at(delete_start.try_into().unwrap(), delete_len.try_into().unwrap());
         let edited_text =
-            format!("{}{}{}", &text[..delete_start], &insert, &text[delete_start + delete_len..]);
+            format!("{}{}{}", &text[..delete_start], insert, &text[delete_start + delete_len..]);
         Some(CheckReparse { text, insert, delete, edited_text })
     }
 

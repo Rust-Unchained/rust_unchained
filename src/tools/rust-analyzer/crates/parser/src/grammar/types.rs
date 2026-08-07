@@ -1,3 +1,5 @@
+use crate::grammar::entry::prefix::pat_top;
+
 use super::*;
 
 pub(super) const TYPE_FIRST: TokenSet = paths::PATH_FIRST.union(TokenSet::new(&[
@@ -20,10 +22,15 @@ pub(super) const TYPE_FIRST: TokenSet = paths::PATH_FIRST.union(TokenSet::new(&[
 
 pub(super) const TYPE_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![')'],
+    // test_err type_in_array_recover
+    // const _: [&];
+    T![']'],
+    T!['}'],
     T![>],
     T![,],
     // test_err struct_field_recover
     // struct S { f pub g: () }
+    // struct S { f: pub g: () }
     T![pub],
 ]);
 
@@ -49,9 +56,14 @@ fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {
         T![dyn] => dyn_trait_type(p),
         // Some path types are not allowed to have bounds (no plus)
         T![<] => path_type_bounds(p, allow_bounds),
-        T![ident] if !p.edition().at_least_2018() && is_dyn_weak(p) => dyn_trait_type_weak(p),
+        T![ident] if !p.current_edition().at_least_2018() && is_dyn_weak(p) => {
+            dyn_trait_type_weak(p)
+        }
         _ if paths::is_path_start(p) => path_or_macro_type(p, allow_bounds),
         LIFETIME_IDENT if p.nth_at(1, T![+]) => bare_dyn_trait_type(p),
+        T!['{'] => {
+            p.err_recover("expected type, found `{`", TYPE_RECOVERY_SET);
+        }
         _ => {
             p.err_recover("expected type", TYPE_RECOVERY_SET);
         }
@@ -244,13 +256,14 @@ fn fn_ptr_type(p: &mut Parser<'_>) {
 }
 
 pub(super) fn for_binder(p: &mut Parser<'_>) {
-    assert!(p.at(T![for]));
+    let m = p.start();
     p.bump(T![for]);
     if p.at(T![<]) {
-        generic_params::opt_generic_param_list(p);
+        generic_params::generic_param_list(p);
     } else {
         p.error("expected `<`");
     }
+    m.complete(p, FOR_BINDER);
 }
 
 // test for_type
@@ -325,20 +338,15 @@ fn bare_dyn_trait_type(p: &mut Parser<'_>) {
     m.complete(p, DYN_TRAIT_TYPE);
 }
 
-// test path_type
-// type A = Foo;
-// type B = ::Foo;
-// type C = self::Foo;
-// type D = super::Foo;
-pub(super) fn path_type(p: &mut Parser<'_>) {
-    path_type_bounds(p, true);
-}
-
 // test macro_call_type
 // type A = foo!();
 // type B = crate::foo!();
 fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
     assert!(paths::is_path_start(p));
+    if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
+        pattern_type(p);
+        return;
+    }
     let r = p.start();
     let m = p.start();
 
@@ -360,6 +368,11 @@ fn path_or_macro_type(p: &mut Parser<'_>, allow_bounds: bool) {
     }
 }
 
+// test path_type
+// type A = Foo;
+// type B = ::Foo;
+// type C = self::Foo;
+// type D = super::Foo;
 pub(super) fn path_type_bounds(p: &mut Parser<'_>, allow_bounds: bool) {
     assert!(paths::is_path_start(p));
     let m = p.start();
@@ -380,11 +393,17 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
     p: &mut Parser<'_>,
     type_marker: CompletedMarker,
 ) -> CompletedMarker {
-    assert!(matches!(
-        type_marker.kind(),
-        SyntaxKind::PATH_TYPE | SyntaxKind::FOR_TYPE | SyntaxKind::MACRO_TYPE
-    ));
+    assert!(matches!(type_marker.kind(), PATH_TYPE | FOR_TYPE | MACRO_TYPE));
     if !p.at(T![+]) {
+        return type_marker;
+    }
+
+    // test_err macro_as_type_bound
+    // fn main() { let x: foo!() + bar!() + baz!(); }
+
+    // `foo!() + ...` is invalid syntax for type bounds,
+    // gracefully exit and let the caller handle the error
+    if type_marker.kind() == MACRO_TYPE {
         return type_marker;
     }
 
@@ -403,4 +422,24 @@ pub(super) fn opt_type_bounds_as_dyn_trait_type(
 
     // Finally precede everything with DYN_TRAIT_TYPE
     m.precede(p).complete(p, DYN_TRAIT_TYPE)
+}
+
+// test pattern_type
+// type T = builtin#pattern_type (u8 is 0..10);
+fn pattern_type(p: &mut Parser<'_>) {
+    let m = p.start();
+    p.bump_remap(T![builtin]);
+    p.bump(T![#]);
+    if p.eat_contextual_kw(T![pattern_type]) {
+        p.expect(T!['(']);
+        type_(p);
+        if !p.eat_contextual_kw(T![is]) {
+            p.error("expected `is`")
+        }
+        pat_top(p);
+        p.expect(T![')']);
+        m.complete(p, PATTERN_TYPE);
+    } else {
+        m.abandon(p);
+    }
 }

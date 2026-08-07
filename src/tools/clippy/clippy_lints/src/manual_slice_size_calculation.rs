@@ -1,12 +1,14 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::{expr_or_init, is_in_const_context, std_or_core};
+use clippy_utils::ty::peel_and_count_ty_refs;
+use clippy_utils::{expr_or_init, is_in_const_context, std_or_core, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
-use rustc_session::declare_lint_pass;
-use rustc_span::symbol::sym;
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -36,20 +38,34 @@ declare_clippy_lint! {
     complexity,
     "manual slice size calculation"
 }
-declare_lint_pass!(ManualSliceSizeCalculation => [MANUAL_SLICE_SIZE_CALCULATION]);
+
+impl_lint_pass!(ManualSliceSizeCalculation => [MANUAL_SLICE_SIZE_CALCULATION]);
+
+pub struct ManualSliceSizeCalculation {
+    msrv: Msrv,
+}
+
+impl ManualSliceSizeCalculation {
+    pub fn new(conf: &Conf) -> Self {
+        Self { msrv: conf.msrv }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for ManualSliceSizeCalculation {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if let ExprKind::Binary(ref op, left, right) = expr.kind
             && BinOpKind::Mul == op.node
             && !expr.span.from_expansion()
-            // Does not apply inside const because size_of_val is not cost in stable.
-            && !is_in_const_context(cx)
             && let Some((receiver, refs_count)) = simplify(cx, left, right)
+            && (!is_in_const_context(cx) || self.msrv.meets(cx, msrvs::CONST_SIZE_OF_VAL))
         {
             let ctxt = expr.span.ctxt();
             let mut app = Applicability::MachineApplicable;
-            let deref = "*".repeat(refs_count - 1);
+            let deref = if refs_count > 0 {
+                "*".repeat(refs_count - 1)
+            } else {
+                "&".into()
+            };
             let val_name = snippet_with_context(cx, receiver.span, ctxt, "slice", &mut app).0;
             let Some(sugg) = std_or_core(cx) else { return };
 
@@ -87,7 +103,7 @@ fn simplify_half<'tcx>(
         && let ExprKind::MethodCall(method_path, receiver, [], _) = expr1.kind
         && method_path.ident.name == sym::len
         && let receiver_ty = cx.typeck_results().expr_ty(receiver)
-        && let (receiver_ty, refs_count) = clippy_utils::ty::walk_ptrs_ty_depth(receiver_ty)
+        && let (receiver_ty, refs_count, _) = peel_and_count_ty_refs(receiver_ty)
         && let ty::Slice(ty1) = receiver_ty.kind()
         // expr2 is `size_of::<T2>()`?
         && let ExprKind::Call(func, []) = expr2.kind

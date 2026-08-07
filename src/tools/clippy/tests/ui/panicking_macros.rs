@@ -1,5 +1,5 @@
-#![allow(clippy::assertions_on_constants, clippy::eq_op, clippy::let_unit_value)]
-#![warn(clippy::unimplemented, clippy::unreachable, clippy::todo, clippy::panic)]
+#![warn(clippy::panic, clippy::todo, clippy::unimplemented, clippy::unreachable)]
+#![expect(clippy::assertions_on_constants, clippy::eq_op, clippy::let_unit_value)]
 
 extern crate core;
 
@@ -18,6 +18,20 @@ fn inline_const() {
 }
 
 fn panic() {
+    let a = 2;
+    panic!();
+    //~^ panic
+
+    panic!("message");
+    //~^ panic
+
+    panic!("{} {}", "panic with", "multiple arguments");
+    //~^ panic
+
+    let b = a + 2;
+}
+
+const fn panic_const() {
     let a = 2;
     panic!();
     //~^ panic
@@ -112,14 +126,4 @@ fn debug_assert_msg() {
     debug_assert_ne!(true, false, "test");
 }
 
-fn main() {
-    panic();
-    todo();
-    unimplemented();
-    unreachable();
-    core_versions();
-    assert();
-    assert_msg();
-    debug_assert();
-    debug_assert_msg();
-}
+fn main() {}

@@ -11,40 +11,10 @@ use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for out of bounds array indexing with a constant
-    /// index.
-    ///
-    /// ### Why is this bad?
-    /// This will always panic at runtime.
-    ///
-    /// ### Example
-    /// ```rust,no_run
-    /// let x = [1, 2, 3, 4];
-    ///
-    /// x[9];
-    /// &x[2..9];
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # let x = [1, 2, 3, 4];
-    /// // Index within bounds
-    ///
-    /// x[0];
-    /// x[3];
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub OUT_OF_BOUNDS_INDEXING,
-    correctness,
-    "out of bounds constant indexing"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Checks for usage of indexing or slicing that may panic at runtime.
     ///
     /// This lint does not report on indexing or slicing operations
-    /// that always panic, clippy's `out_of_bound_indexing` already
+    /// that always panic, [out_of_bounds_indexing](#out_of_bounds_indexing) already
     /// handles those cases.
     ///
     /// ### Why restrict this?
@@ -92,6 +62,36 @@ declare_clippy_lint! {
     "indexing/slicing usage"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for out of bounds array indexing with a constant
+    /// index.
+    ///
+    /// ### Why is this bad?
+    /// This will always panic at runtime.
+    ///
+    /// ### Example
+    /// ```rust,no_run
+    /// let x = [1, 2, 3, 4];
+    ///
+    /// x[9];
+    /// &x[2..9];
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # let x = [1, 2, 3, 4];
+    /// // Index within bounds
+    ///
+    /// x[0];
+    /// x[3];
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub OUT_OF_BOUNDS_INDEXING,
+    correctness,
+    "out of bounds constant indexing"
+}
+
 impl_lint_pass!(IndexingSlicing => [INDEXING_SLICING, OUT_OF_BOUNDS_INDEXING]);
 
 pub struct IndexingSlicing {
@@ -124,7 +124,7 @@ impl<'tcx> LateLintPass<'tcx> for IndexingSlicing {
             let note = "the suggestion might not be applicable in constant blocks";
             let ty = cx.typeck_results().expr_ty(array).peel_refs();
             let allowed_in_tests = self.allow_indexing_slicing_in_tests && is_in_test(cx.tcx, expr.hir_id);
-            if let Some(range) = higher::Range::hir(index) {
+            if let Some(range) = higher::Range::hir(cx, index) {
                 // Ranged indexes, i.e., &x[n..m], &x[n..], &x[..n] and &x[..]
                 if let ty::Array(_, s) = ty.kind() {
                     let size: u128 = if let Some(size) = s.try_to_target_usize(cx.tcx) {
@@ -245,7 +245,7 @@ fn to_const_range(cx: &LateContext<'_>, range: higher::Range<'_>, array_size: u1
     let e = range.end.map(|expr| ecx.eval(expr));
     let end = match e {
         Some(Some(Constant::Int(x))) => {
-            if range.limits == RangeLimits::Closed {
+            if range.ty.limits() == RangeLimits::Closed {
                 Some(x + 1)
             } else {
                 Some(x)

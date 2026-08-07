@@ -1,8 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::msrvs::Msrv;
+use clippy_utils::qualify_min_const_fn::is_stable_const_fn;
+use clippy_utils::source::SpanExt;
 use clippy_utils::ty::implements_trait;
 use clippy_utils::visitors::for_each_expr_without_closures;
-use clippy_utils::{binop_traits, eq_expr_value, trait_ref_of_method};
+use clippy_utils::{binop_traits, eq_expr_value, is_in_const_context, trait_ref_of_method};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -19,6 +21,7 @@ pub(super) fn check<'tcx>(
     expr: &'tcx hir::Expr<'_>,
     assignee: &'tcx hir::Expr<'_>,
     e: &'tcx hir::Expr<'_>,
+    msrv: Msrv,
 ) {
     if let hir::ExprKind::Binary(op, l, r) = &e.kind {
         let lint = |assignee: &hir::Expr<'_>, rhs: &hir::Expr<'_>| {
@@ -26,7 +29,7 @@ pub(super) fn check<'tcx>(
             let rty = cx.typeck_results().expr_ty(rhs);
             if let Some((_, lang_item)) = binop_traits(op.node)
                 && let Some(trait_id) = cx.tcx.lang_items().get(lang_item)
-                && let parent_fn = cx.tcx.hir_get_parent_item(e.hir_id).def_id
+                && let parent_fn = cx.tcx.hir_get_parent_item(e.hir_id)
                 && trait_ref_of_method(cx, parent_fn).is_none_or(|t| t.path.res.def_id() != trait_id)
                 && implements_trait(cx, ty, trait_id, &[rty.into()])
             {
@@ -40,14 +43,39 @@ pub(super) fn check<'tcx>(
                         return;
                     }
                 }
+
+                // Skip if the trait or the implementation is not stable in const contexts
+                if is_in_const_context(cx) {
+                    if cx
+                        .tcx
+                        .associated_item_def_ids(trait_id)
+                        .first()
+                        .is_none_or(|binop_id| !is_stable_const_fn(cx, *binop_id, msrv))
+                    {
+                        return;
+                    }
+
+                    let impls = cx.tcx.non_blanket_impls_for_ty(trait_id, rty).collect::<Vec<_>>();
+                    if impls.is_empty()
+                        || impls.into_iter().any(|impl_id| {
+                            cx.tcx
+                                .associated_item_def_ids(impl_id)
+                                .first()
+                                .is_none_or(|fn_id| !is_stable_const_fn(cx, *fn_id, msrv))
+                        })
+                    {
+                        return;
+                    }
+                }
+
                 span_lint_and_then(
                     cx,
                     ASSIGN_OP_PATTERN,
                     expr.span,
                     "manual implementation of an assign operation",
                     |diag| {
-                        if let Some(snip_a) = assignee.span.get_source_text(cx)
-                            && let Some(snip_r) = rhs.span.get_source_text(cx)
+                        if let Some(snip_a) = assignee.span.get_text(cx)
+                            && let Some(snip_r) = rhs.span.get_text(cx)
                         {
                             diag.span_suggestion(
                                 expr.span,
@@ -61,9 +89,10 @@ pub(super) fn check<'tcx>(
             }
         };
 
+        let ctxt = expr.span.ctxt();
         let mut found = false;
         let found_multiple = for_each_expr_without_closures(e, |e| {
-            if eq_expr_value(cx, assignee, e) {
+            if eq_expr_value(cx, ctxt, assignee, e) {
                 if found {
                     return ControlFlow::Break(());
                 }
@@ -75,12 +104,12 @@ pub(super) fn check<'tcx>(
 
         if found && !found_multiple {
             // a = a op b
-            if eq_expr_value(cx, assignee, l) {
+            if eq_expr_value(cx, ctxt, assignee, l) {
                 lint(assignee, r);
             }
             // a = b commutative_op a
             // Limited to primitive type as these ops are know to be commutative
-            if eq_expr_value(cx, assignee, r) && cx.typeck_results().expr_ty(assignee).is_primitive_ty() {
+            if eq_expr_value(cx, ctxt, assignee, r) && cx.typeck_results().expr_ty(assignee).is_primitive_ty() {
                 match op.node {
                     hir::BinOpKind::Add
                     | hir::BinOpKind::Mul

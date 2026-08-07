@@ -6,15 +6,18 @@ use std::path::Path;
 
 use ignore::DirEntry;
 
+use crate::diagnostics::{CheckId, TidyCtx};
 use crate::walk::walk;
 
 // Array containing `("beginning of tag", "end of tag")`.
 const TAGS: &[(&str, &str)] = &[("{#", "#}"), ("{%", "%}"), ("{{", "}}")];
 
-pub fn check(librustdoc_path: &Path, bad: &mut bool) {
+pub fn check(librustdoc_path: &Path, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx.start_check(CheckId::new("rustdoc_templates").path(librustdoc_path));
+
     walk(
         &librustdoc_path.join("html/templates"),
-        |path, is_dir| is_dir || !path.extension().is_some_and(|ext| ext == OsStr::new("html")),
+        |path, is_dir| is_dir || path.extension().is_none_or(|ext| ext != OsStr::new("html")),
         &mut |path: &DirEntry, file_content: &str| {
             let mut lines = file_content.lines().enumerate().peekable();
 
@@ -23,10 +26,10 @@ pub fn check(librustdoc_path: &Path, bad: &mut bool) {
                 if let Some(need_next_line_check) = TAGS.iter().find_map(|(tag, end_tag)| {
                     // We first check if the line ends with a jinja tag.
                     if !line.ends_with(end_tag) {
-                        return None;
+                        None
                     // Then we check if this a comment tag.
                     } else if *tag != "{#" {
-                        return Some(false);
+                        Some(false)
                     // And finally we check if the comment is empty (ie, only there to strip
                     // extra whitespace characters).
                     } else if let Some(start_pos) = line.rfind(tag) {
@@ -46,12 +49,11 @@ pub fn check(librustdoc_path: &Path, bad: &mut bool) {
                         })
                     {
                         // It seems like ending this line with a jinja tag is not needed after all.
-                        tidy_error!(
-                            bad,
+                        check.error(format!(
                             "`{}` at line {}: unneeded `{{# #}}` tag at the end of the line",
                             path.path().display(),
                             pos + 1,
-                        );
+                        ));
                     }
                     continue;
                 }
@@ -67,12 +69,11 @@ pub fn check(librustdoc_path: &Path, bad: &mut bool) {
                 }) {
                     None => {
                         // No it's not, let's error.
-                        tidy_error!(
-                            bad,
+                        check.error(format!(
                             "`{}` at line {}: missing `{{# #}}` at the end of the line",
                             path.path().display(),
                             pos + 1,
-                        );
+                        ));
                     }
                     Some(end_tag) => {
                         // We skip the tag.

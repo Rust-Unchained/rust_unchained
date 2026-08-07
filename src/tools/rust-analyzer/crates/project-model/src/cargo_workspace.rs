@@ -1,21 +1,24 @@
 //! See [`CargoWorkspace`].
 
-use std::ops;
-use std::str::from_utf8;
+use std::{borrow::Cow, ops, str::from_utf8};
 
 use anyhow::Context;
 use base_db::Env;
-use cargo_metadata::{CargoOpt, MetadataCommand};
+use cargo_metadata::{CargoOpt, MetadataCommand, PackageId};
 use la_arena::{Arena, Idx};
-use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
+use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_derive::Deserialize;
 use serde_json::from_value;
 use span::Edition;
-use toolchain::Tool;
+use stdx::process::spawn_with_streaming_output;
+use toolchain::{NO_RUSTUP_AUTO_INSTALL_ENV, Tool};
+use triomphe::Arc;
 
-use crate::{CfgOverrides, InvocationStrategy};
-use crate::{ManifestPath, Sysroot};
+use crate::{
+    CfgOverrides, InvocationStrategy, ManifestPath, Sysroot,
+    cargo_config_file::{LockfileCopy, LockfileUsage, make_lockfile_copy},
+};
 
 /// [`CargoWorkspace`] represents the logical structure of, well, a Cargo
 /// workspace. It pretty closely mirrors `cargo metadata` output.
@@ -35,8 +38,12 @@ pub struct CargoWorkspace {
     target_directory: AbsPathBuf,
     manifest_path: ManifestPath,
     is_virtual_workspace: bool,
-    /// Environment variables set in the `.cargo/config` file.
-    config_env: Env,
+    /// Whether this workspace represents the sysroot workspace.
+    is_sysroot: bool,
+    /// Environment variables set in the `.cargo/config` file and the extraEnv
+    /// configuration option.
+    env: Env,
+    requires_rustc_private: bool,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -79,6 +86,29 @@ impl Default for CargoFeatures {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TargetDirectoryConfig {
+    #[default]
+    None,
+    UseSubdirectory,
+    Directory(Utf8PathBuf),
+}
+
+impl TargetDirectoryConfig {
+    pub fn target_dir<'a>(
+        &'a self,
+        ws_target_dir: Option<&'a Utf8Path>,
+    ) -> Option<Cow<'a, Utf8Path>> {
+        match self {
+            TargetDirectoryConfig::None => None,
+            TargetDirectoryConfig::UseSubdirectory => {
+                Some(Cow::Owned(ws_target_dir?.join("rust-analyzer")))
+            }
+            TargetDirectoryConfig::Directory(dir) => Some(Cow::Borrowed(dir)),
+        }
+    }
+}
+
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CargoConfig {
     /// Whether to pass `--all-targets` to cargo invocations.
@@ -101,12 +131,19 @@ pub struct CargoConfig {
     pub run_build_script_command: Option<Vec<String>>,
     /// Extra args to pass to the cargo command.
     pub extra_args: Vec<String>,
+    /// Extra args passed only to `cargo metadata`, not other cargo commands.
+    pub metadata_extra_args: Vec<String>,
+    /// Path to an extra config file passed to every cargo invocation via `--config`.
+    pub config_path: Option<AbsPathBuf>,
     /// Extra env vars to set when invoking the cargo command
-    pub extra_env: FxHashMap<String, String>,
+    pub extra_env: FxHashMap<String, Option<String>>,
     pub invocation_strategy: InvocationStrategy,
     /// Optional path to use instead of `target` when building
-    pub target_dir: Option<Utf8PathBuf>,
+    pub target_dir_config: TargetDirectoryConfig,
+    /// Gate `#[test]` behind `#[cfg(test)]`
     pub set_test: bool,
+    /// Load the project without any dependencies
+    pub no_deps: bool,
 }
 
 pub type Package = Idx<PackageData>;
@@ -138,8 +175,8 @@ pub struct PackageData {
     pub features: FxHashMap<String, Vec<String>>,
     /// List of features enabled on this package
     pub active_features: Vec<String>,
-    /// String representation of package id
-    pub id: String,
+    /// Package id
+    pub id: Arc<PackageId>,
     /// Authors as given in the `Cargo.toml`
     pub authors: Vec<String>,
     /// Description as given in the `Cargo.toml`
@@ -156,6 +193,10 @@ pub struct PackageData {
     pub rust_version: Option<semver::Version>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
+    /// If this package is a member of the workspace, store all direct and transitive
+    /// dependencies as long as they are workspace members, to track dependency relationships
+    /// between members.
+    pub all_member_deps: Option<FxHashSet<Package>>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone, Eq, PartialEq)]
@@ -224,21 +265,26 @@ pub enum TargetKind {
     Example,
     Test,
     Bench,
+    /// Cargo calls this kind `custom-build`
     BuildScript,
     Other,
 }
 
 impl TargetKind {
-    fn new(kinds: &[String]) -> TargetKind {
+    pub fn new(kinds: &[cargo_metadata::TargetKind]) -> TargetKind {
         for kind in kinds {
-            return match kind.as_str() {
-                "bin" => TargetKind::Bin,
-                "test" => TargetKind::Test,
-                "bench" => TargetKind::Bench,
-                "example" => TargetKind::Example,
-                "custom-build" => TargetKind::BuildScript,
-                "proc-macro" => TargetKind::Lib { is_proc_macro: true },
-                _ if kind.contains("lib") => TargetKind::Lib { is_proc_macro: false },
+            return match kind {
+                cargo_metadata::TargetKind::Bin => TargetKind::Bin,
+                cargo_metadata::TargetKind::Test => TargetKind::Test,
+                cargo_metadata::TargetKind::Bench => TargetKind::Bench,
+                cargo_metadata::TargetKind::Example => TargetKind::Example,
+                cargo_metadata::TargetKind::CustomBuild => TargetKind::BuildScript,
+                cargo_metadata::TargetKind::ProcMacro => TargetKind::Lib { is_proc_macro: true },
+                cargo_metadata::TargetKind::Lib
+                | cargo_metadata::TargetKind::DyLib
+                | cargo_metadata::TargetKind::CDyLib
+                | cargo_metadata::TargetKind::StaticLib
+                | cargo_metadata::TargetKind::RLib => TargetKind::Lib { is_proc_macro: false },
                 _ => continue,
             };
         }
@@ -252,6 +298,22 @@ impl TargetKind {
     pub fn is_proc_macro(self) -> bool {
         matches!(self, TargetKind::Lib { is_proc_macro: true })
     }
+
+    /// If this is a valid cargo target, returns the name cargo uses in command line arguments
+    /// and output, otherwise None.
+    /// <https://docs.rs/cargo_metadata/latest/cargo_metadata/enum.TargetKind.html>
+    pub fn as_cargo_target(self) -> Option<&'static str> {
+        match self {
+            TargetKind::Bin => Some("bin"),
+            TargetKind::Lib { is_proc_macro: true } => Some("proc-macro"),
+            TargetKind::Lib { is_proc_macro: false } => Some("lib"),
+            TargetKind::Example => Some("example"),
+            TargetKind::Test => Some("test"),
+            TargetKind::Bench => Some("bench"),
+            TargetKind::BuildScript => Some("custom-build"),
+            TargetKind::Other => None,
+        }
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -262,8 +324,17 @@ pub struct CargoMetadataConfig {
     pub targets: Vec<String>,
     /// Extra args to pass to the cargo command.
     pub extra_args: Vec<String>,
+    /// Extra args passed directly to `cargo metadata` without filtering.
+    pub metadata_extra_args: Vec<String>,
+    /// Path to an extra config file passed to `cargo metadata` via `--config`.
+    pub config_path: Option<AbsPathBuf>,
     /// Extra env vars to set when invoking the cargo command
-    pub extra_env: FxHashMap<String, String>,
+    pub extra_env: FxHashMap<String, Option<String>>,
+    /// What kind of metadata are we fetching: workspace, rustc, or sysroot.
+    pub kind: &'static str,
+    /// The toolchain version, if known.
+    /// Used to conditionally enable unstable cargo features.
+    pub toolchain_version: Option<semver::Version>,
 }
 
 // Deserialize helper for the cargo metadata
@@ -274,150 +345,11 @@ struct PackageMetadata {
 }
 
 impl CargoWorkspace {
-    /// Fetches the metadata for the given `cargo_toml` manifest.
-    /// A successful result may contain another metadata error if the initial fetching failed but
-    /// the `--no-deps` retry succeeded.
-    ///
-    /// The sysroot is used to set the `RUSTUP_TOOLCHAIN` env var when invoking cargo
-    /// to ensure that the rustup proxy uses the correct toolchain.
-    pub fn fetch_metadata(
-        cargo_toml: &ManifestPath,
-        current_dir: &AbsPath,
-        config: &CargoMetadataConfig,
-        sysroot: &Sysroot,
-        locked: bool,
-        progress: &dyn Fn(String),
-    ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
-        let res = Self::fetch_metadata_(
-            cargo_toml,
-            current_dir,
-            config,
-            sysroot,
-            locked,
-            false,
-            progress,
-        );
-        if let Ok((_, Some(ref e))) = res {
-            tracing::warn!(
-                %cargo_toml,
-                ?e,
-                "`cargo metadata` failed, but retry with `--no-deps` succeeded"
-            );
-        }
-        res
-    }
-
-    fn fetch_metadata_(
-        cargo_toml: &ManifestPath,
-        current_dir: &AbsPath,
-        config: &CargoMetadataConfig,
-        sysroot: &Sysroot,
-        locked: bool,
-        no_deps: bool,
-        progress: &dyn Fn(String),
-    ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
-        let cargo = sysroot.tool(Tool::Cargo, current_dir);
-        let mut meta = MetadataCommand::new();
-        meta.cargo_path(cargo.get_program());
-        cargo.get_envs().for_each(|(var, val)| _ = meta.env(var, val.unwrap_or_default()));
-        config.extra_env.iter().for_each(|(var, val)| _ = meta.env(var, val));
-        meta.manifest_path(cargo_toml.to_path_buf());
-        match &config.features {
-            CargoFeatures::All => {
-                meta.features(CargoOpt::AllFeatures);
-            }
-            CargoFeatures::Selected { features, no_default_features } => {
-                if *no_default_features {
-                    meta.features(CargoOpt::NoDefaultFeatures);
-                }
-                if !features.is_empty() {
-                    meta.features(CargoOpt::SomeFeatures(features.clone()));
-                }
-            }
-        }
-        meta.current_dir(current_dir);
-
-        let mut other_options = vec![];
-        // cargo metadata only supports a subset of flags of what cargo usually accepts, and usually
-        // the only relevant flags for metadata here are unstable ones, so we pass those along
-        // but nothing else
-        let mut extra_args = config.extra_args.iter();
-        while let Some(arg) = extra_args.next() {
-            if arg == "-Z" {
-                if let Some(arg) = extra_args.next() {
-                    other_options.push("-Z".to_owned());
-                    other_options.push(arg.to_owned());
-                }
-            }
-        }
-
-        if !config.targets.is_empty() {
-            other_options.extend(
-                config.targets.iter().flat_map(|it| ["--filter-platform".to_owned(), it.clone()]),
-            );
-        }
-        // The manifest is a rust file, so this means its a script manifest
-        if cargo_toml.is_rust_manifest() {
-            // Deliberately don't set up RUSTC_BOOTSTRAP or a nightly override here, the user should
-            // opt into it themselves.
-            other_options.push("-Zscript".to_owned());
-        }
-        if locked {
-            other_options.push("--locked".to_owned());
-        }
-        if no_deps {
-            other_options.push("--no-deps".to_owned());
-        }
-        meta.other_options(other_options);
-
-        // FIXME: Fetching metadata is a slow process, as it might require
-        // calling crates.io. We should be reporting progress here, but it's
-        // unclear whether cargo itself supports it.
-        progress("metadata".to_owned());
-
-        (|| -> anyhow::Result<(_, _)> {
-            let output = meta.cargo_command().output()?;
-            if !output.status.success() {
-                let error = cargo_metadata::Error::CargoMetadata {
-                    stderr: String::from_utf8(output.stderr)?,
-                }
-                .into();
-                if !no_deps {
-                    // If we failed to fetch metadata with deps, try again without them.
-                    // This makes r-a still work partially when offline.
-                    if let Ok((metadata, _)) = Self::fetch_metadata_(
-                        cargo_toml,
-                        current_dir,
-                        config,
-                        sysroot,
-                        locked,
-                        true,
-                        progress,
-                    ) {
-                        return Ok((metadata, Some(error)));
-                    }
-                }
-                return Err(error);
-            }
-            let stdout = from_utf8(&output.stdout)?
-                .lines()
-                .find(|line| line.starts_with('{'))
-                .ok_or(cargo_metadata::Error::NoJson)?;
-            Ok((cargo_metadata::MetadataCommand::parse(stdout)?, None))
-        })()
-        .map(|(metadata, error)| {
-            (
-                metadata,
-                error.map(|e| e.context(format!("Failed to run `{:?}`", meta.cargo_command()))),
-            )
-        })
-        .with_context(|| format!("Failed to run `{:?}`", meta.cargo_command()))
-    }
-
     pub fn new(
         mut meta: cargo_metadata::Metadata,
         ws_manifest_path: ManifestPath,
-        cargo_config_env: Env,
+        cargo_env: Env,
+        is_sysroot: bool,
     ) -> CargoWorkspace {
         let mut pkg_by_id = FxHashMap::default();
         let mut packages = Arena::default();
@@ -428,6 +360,9 @@ impl CargoWorkspace {
         let workspace_root = AbsPathBuf::assert(meta.workspace_root);
         let target_directory = AbsPathBuf::assert(meta.target_directory);
         let mut is_virtual_workspace = true;
+        let mut requires_rustc_private = false;
+
+        let mut members = FxHashSet::default();
 
         meta.packages.sort_by(|a, b| a.id.cmp(&b.id));
         for meta_pkg in meta.packages {
@@ -451,12 +386,13 @@ impl CargoWorkspace {
                 rust_version,
                 ..
             } = meta_pkg;
+            let id = Arc::new(id);
             let meta = from_value::<PackageMetadata>(metadata).unwrap_or_default();
             let edition = match edition {
                 cargo_metadata::Edition::E2015 => Edition::Edition2015,
                 cargo_metadata::Edition::E2018 => Edition::Edition2018,
                 cargo_metadata::Edition::E2021 => Edition::Edition2021,
-                cargo_metadata::Edition::_E2024 => Edition::Edition2024,
+                cargo_metadata::Edition::E2024 => Edition::Edition2024,
                 _ => {
                     tracing::error!("Unsupported edition `{:?}`", edition);
                     Edition::CURRENT
@@ -470,8 +406,8 @@ impl CargoWorkspace {
             let manifest = ManifestPath::try_from(AbsPathBuf::assert(manifest_path)).unwrap();
             is_virtual_workspace &= manifest != ws_manifest_path;
             let pkg = packages.alloc(PackageData {
-                id: id.repr.clone(),
-                name,
+                id: id.clone(),
+                name: name.to_string(),
                 version,
                 manifest: manifest.clone(),
                 targets: Vec::new(),
@@ -490,8 +426,13 @@ impl CargoWorkspace {
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
                 metadata: meta.rust_analyzer.unwrap_or_default(),
+                all_member_deps: None,
             });
+            if is_member {
+                members.insert(pkg);
+            }
             let pkg_data = &mut packages[pkg];
+            requires_rustc_private |= pkg_data.metadata.rustc_private;
             pkg_by_id.insert(id, pkg);
             for meta_tgt in meta_targets {
                 let cargo_metadata::Target { name, kind, required_features, src_path, .. } =
@@ -526,10 +467,49 @@ impl CargoWorkspace {
                 .flat_map(|dep| DepKind::iter(&dep.dep_kinds).map(move |kind| (dep, kind)));
             for (dep_node, kind) in dependencies {
                 let &pkg = pkg_by_id.get(&dep_node.pkg).unwrap();
-                let dep = PackageDependency { name: dep_node.name.clone(), pkg, kind };
+                let dep = PackageDependency { name: dep_node.name.to_string(), pkg, kind };
                 packages[source].dependencies.push(dep);
             }
-            packages[source].active_features.extend(node.features);
+            packages[source]
+                .active_features
+                .extend(node.features.into_iter().map(|it| it.to_string()));
+        }
+
+        fn saturate_all_member_deps(
+            packages: &mut Arena<PackageData>,
+            to_visit: Package,
+            visited: &mut FxHashSet<Package>,
+            members: &FxHashSet<Package>,
+        ) {
+            let pkg_data = &mut packages[to_visit];
+
+            if !visited.insert(to_visit) {
+                return;
+            }
+
+            let deps: Vec<_> = pkg_data
+                .dependencies
+                .iter()
+                .filter_map(|dep| {
+                    let pkg = dep.pkg;
+                    if members.contains(&pkg) { Some(pkg) } else { None }
+                })
+                .collect();
+
+            let mut all_member_deps = FxHashSet::from_iter(deps.iter().copied());
+            for dep in deps {
+                saturate_all_member_deps(packages, dep, visited, members);
+                if let Some(transitives) = &packages[dep].all_member_deps {
+                    all_member_deps.extend(transitives);
+                }
+            }
+
+            packages[to_visit].all_member_deps = Some(all_member_deps);
+        }
+
+        let mut visited = FxHashSet::default();
+        for member in members.iter() {
+            saturate_all_member_deps(&mut packages, *member, &mut visited, &members);
         }
 
         CargoWorkspace {
@@ -539,7 +519,9 @@ impl CargoWorkspace {
             target_directory,
             manifest_path: ws_manifest_path,
             is_virtual_workspace,
-            config_env: cargo_config_env,
+            requires_rustc_private,
+            is_sysroot,
+            env: cargo_env,
         }
     }
 
@@ -596,7 +578,7 @@ impl CargoWorkspace {
         // this pkg is inside this cargo workspace, fallback to workspace root
         if found {
             return Some(vec![
-                ManifestPath::try_from(self.workspace_root().join("Cargo.toml")).ok()?
+                ManifestPath::try_from(self.workspace_root().join("Cargo.toml")).ok()?,
             ]);
         }
 
@@ -630,6 +612,227 @@ impl CargoWorkspace {
     }
 
     pub fn env(&self) -> &Env {
-        &self.config_env
+        &self.env
+    }
+
+    pub fn is_sysroot(&self) -> bool {
+        self.is_sysroot
+    }
+
+    pub fn requires_rustc_private(&self) -> bool {
+        self.requires_rustc_private
+    }
+}
+
+pub(crate) struct FetchMetadata {
+    command: cargo_metadata::MetadataCommand,
+    #[expect(dead_code)]
+    manifest_path: ManifestPath,
+    lockfile_copy: Option<LockfileCopy>,
+    #[expect(dead_code)]
+    kind: &'static str,
+    no_deps: bool,
+    no_deps_result: anyhow::Result<cargo_metadata::Metadata>,
+    other_options: Vec<String>,
+}
+
+impl FetchMetadata {
+    /// Builds a command to fetch metadata for the given `cargo_toml` manifest.
+    ///
+    /// Performs a lightweight pre-fetch using the `--no-deps` option,
+    /// available via `FetchMetadata::no_deps_metadata`, to gather basic
+    /// information such as the `target-dir`.
+    ///
+    /// The provided sysroot is used to set the `RUSTUP_TOOLCHAIN`
+    /// environment variable when invoking Cargo, ensuring that the
+    /// rustup proxy selects the correct toolchain.
+    pub(crate) fn new(
+        cargo_toml: &ManifestPath,
+        current_dir: &AbsPath,
+        config: &CargoMetadataConfig,
+        sysroot: &Sysroot,
+        no_deps: bool,
+    ) -> Self {
+        let cargo = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
+        let mut command = MetadataCommand::new();
+        command.env(NO_RUSTUP_AUTO_INSTALL_ENV.0, NO_RUSTUP_AUTO_INSTALL_ENV.1);
+        command.cargo_path(cargo.get_program());
+        cargo.get_envs().for_each(|(var, val)| _ = command.env(var, val.unwrap_or_default()));
+        command.manifest_path(cargo_toml.to_path_buf());
+        match &config.features {
+            CargoFeatures::All => {
+                command.features(CargoOpt::AllFeatures);
+            }
+            CargoFeatures::Selected { features, no_default_features } => {
+                if *no_default_features {
+                    command.features(CargoOpt::NoDefaultFeatures);
+                }
+                if !features.is_empty() {
+                    command.features(CargoOpt::SomeFeatures(features.clone()));
+                }
+            }
+        }
+        command.current_dir(current_dir);
+
+        let mut other_options = vec![];
+        // cargo metadata only supports a subset of flags of what cargo usually accepts, and usually
+        // the only relevant flags for metadata here are unstable ones, so we pass those along
+        // but nothing else
+        let mut extra_args = config.extra_args.iter();
+        while let Some(arg) = extra_args.next() {
+            if arg == "-Z"
+                && let Some(arg) = extra_args.next()
+            {
+                other_options.push("-Z".to_owned());
+                other_options.push(arg.to_owned());
+            }
+        }
+        other_options.extend(config.metadata_extra_args.iter().cloned());
+        if let Some(config_path) = &config.config_path {
+            other_options.push("--config".to_owned());
+            other_options.push(config_path.to_string());
+        }
+
+        let mut lockfile_copy = None;
+        if cargo_toml.is_rust_manifest() {
+            other_options.push("-Zscript".to_owned());
+        } else if let Some(v) = config.toolchain_version.as_ref() {
+            lockfile_copy = make_lockfile_copy(
+                v,
+                &<_ as AsRef<Utf8Path>>::as_ref(cargo_toml).with_extension("lock"),
+            );
+        }
+
+        if !config.targets.is_empty() {
+            other_options.extend(
+                config.targets.iter().flat_map(|it| ["--filter-platform".to_owned(), it.clone()]),
+            );
+        }
+
+        command.other_options(other_options.clone());
+
+        // Pre-fetch basic metadata using `--no-deps`, which:
+        // - avoids fetching registries like crates.io,
+        // - skips dependency resolution and does not modify lockfiles,
+        // - and thus doesn't require progress reporting or copying lockfiles.
+        //
+        // Useful as a fast fallback to extract info like `target-dir`.
+        let cargo_command;
+        let no_deps_result = if no_deps {
+            command.no_deps();
+            cargo_command = command.cargo_command();
+            command.exec()
+        } else {
+            let mut no_deps_command = command.clone();
+            no_deps_command.no_deps();
+            cargo_command = no_deps_command.cargo_command();
+            no_deps_command.exec()
+        }
+        .with_context(|| format!("Failed to run `{cargo_command:?}`"));
+
+        Self {
+            manifest_path: cargo_toml.clone(),
+            command,
+            lockfile_copy,
+            kind: config.kind,
+            no_deps,
+            no_deps_result,
+            other_options,
+        }
+    }
+
+    /// Executes the metadata-fetching command.
+    ///
+    /// A successful result may still contain a metadata error if the full fetch failed,
+    /// but the fallback `--no-deps` pre-fetch succeeded during command construction.
+    pub(crate) fn exec(
+        self,
+        locked: bool,
+        progress: &dyn Fn(String),
+    ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
+        let Self {
+            mut command,
+            manifest_path: _,
+            lockfile_copy,
+            kind: _,
+            no_deps,
+            no_deps_result,
+            mut other_options,
+        } = self;
+
+        if no_deps {
+            return no_deps_result.map(|m| (m, None));
+        }
+
+        let mut using_lockfile_copy = false;
+        if let Some(lockfile_copy) = &lockfile_copy {
+            match lockfile_copy.usage {
+                LockfileUsage::WithFlag => {
+                    other_options.push("--lockfile-path".to_owned());
+                    other_options.push(lockfile_copy.path.to_string());
+                }
+                LockfileUsage::WithEnvVarUnstable => {
+                    other_options.push("-Zlockfile-path".to_owned());
+                    command.env("CARGO_RESOLVER_LOCKFILE_PATH", lockfile_copy.path.as_os_str());
+                }
+                LockfileUsage::WithEnvVar => {
+                    command.env("CARGO_RESOLVER_LOCKFILE_PATH", lockfile_copy.path.as_os_str());
+                }
+            }
+            using_lockfile_copy = true;
+        }
+        if using_lockfile_copy || other_options.iter().any(|it| it.starts_with("-Z")) {
+            command.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
+            other_options.push("-Zunstable-options".to_owned());
+        }
+        // No need to lock it if we copied the lockfile, we won't modify the original after all/
+        // This way cargo cannot error out on us if the lockfile requires updating.
+        if !using_lockfile_copy && locked {
+            other_options.push("--locked".to_owned());
+        }
+        command.other_options(other_options);
+
+        progress("cargo metadata: started".to_owned());
+
+        let res = (|| -> anyhow::Result<(_, _)> {
+            let mut errored = false;
+            tracing::debug!("Running `{:?}`", command.cargo_command());
+            let output =
+                spawn_with_streaming_output(command.cargo_command(), &mut |_| (), &mut |line| {
+                    errored = errored || line.starts_with("error") || line.starts_with("warning");
+                    if errored {
+                        progress("cargo metadata: ?".to_owned());
+                        return;
+                    }
+                    progress(format!("cargo metadata: {line}"));
+                })?;
+            if !output.status.success() {
+                progress(format!("cargo metadata: failed {}", output.status));
+                let error = cargo_metadata::Error::CargoMetadata {
+                    stderr: String::from_utf8(output.stderr)?,
+                }
+                .into();
+                if !no_deps {
+                    // If we failed to fetch metadata with deps, return pre-fetched result without them.
+                    // This makes r-a still work partially when offline.
+                    if let Ok(metadata) = no_deps_result {
+                        tracing::warn!(
+                            ?error,
+                            "`cargo metadata` failed and returning succeeded result with `--no-deps`"
+                        );
+                        return Ok((metadata, Some(error)));
+                    }
+                }
+                return Err(error);
+            }
+            let stdout = from_utf8(&output.stdout)?
+                .lines()
+                .find(|line| line.starts_with('{'))
+                .ok_or(cargo_metadata::Error::NoJson)?;
+            Ok((cargo_metadata::MetadataCommand::parse(stdout)?, None))
+        })()
+        .with_context(|| format!("Failed to run `{:?}`", command.cargo_command()));
+        progress("cargo metadata: finished".to_owned());
+        res
     }
 }

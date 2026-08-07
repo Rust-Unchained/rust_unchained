@@ -1,5 +1,5 @@
-#![allow(unused_variables, clippy::disallowed_names)]
 #![warn(clippy::op_ref)]
+#![expect(clippy::disallowed_names)]
 use std::collections::HashSet;
 use std::ops::{BitAnd, Mul};
 
@@ -109,4 +109,38 @@ mod issue_2597 {
     pub fn ex2<T: Ord + PartialOrd>(array: &[T], val: &T, idx: usize) -> bool {
         &array[idx] < val
     }
+}
+
+#[allow(clippy::needless_ifs)]
+fn issue15063() {
+    use std::ops::BitAnd;
+
+    macro_rules! mac {
+        ($e:expr) => {
+            $e.clone()
+        };
+    }
+
+    let x = 1;
+    if &x == &mac!(1) {}
+    //~^ op_ref
+
+    #[derive(Copy, Clone)]
+    struct Y(i32);
+    impl BitAnd for Y {
+        type Output = Y;
+        fn bitand(self, rhs: Y) -> Y {
+            Y(self.0 & rhs.0)
+        }
+    }
+    impl<'a> BitAnd<&'a Y> for Y {
+        type Output = Y;
+        fn bitand(self, rhs: &'a Y) -> Y {
+            Y(self.0 & rhs.0)
+        }
+    }
+    let x = Y(1);
+    let y = Y(2);
+    let z = x & &mac!(y);
+    //~^ op_ref
 }

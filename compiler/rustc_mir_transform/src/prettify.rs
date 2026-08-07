@@ -11,6 +11,8 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 
+use crate::PassPolicy;
+
 /// Rearranges the basic blocks into a *reverse post-order*.
 ///
 /// Thus after this pass, all the successors of a block are later than it in the
@@ -18,8 +20,8 @@ use rustc_session::Session;
 pub(super) struct ReorderBasicBlocks;
 
 impl<'tcx> crate::MirPass<'tcx> for ReorderBasicBlocks {
-    fn is_enabled(&self, _session: &Session) -> bool {
-        false
+    fn policy(&self, _session: &Session) -> PassPolicy {
+        PassPolicy::optional_non_optimization(false)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -35,10 +37,6 @@ impl<'tcx> crate::MirPass<'tcx> for ReorderBasicBlocks {
 
         permute(body.basic_blocks.as_mut(), &updater.map);
     }
-
-    fn is_required(&self) -> bool {
-        false
-    }
 }
 
 /// Rearranges the locals into *use* order.
@@ -50,8 +48,8 @@ impl<'tcx> crate::MirPass<'tcx> for ReorderBasicBlocks {
 pub(super) struct ReorderLocals;
 
 impl<'tcx> crate::MirPass<'tcx> for ReorderLocals {
-    fn is_enabled(&self, _session: &Session) -> bool {
-        false
+    fn policy(&self, _session: &Session) -> PassPolicy {
+        PassPolicy::optional_non_optimization(false)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -89,10 +87,6 @@ impl<'tcx> crate::MirPass<'tcx> for ReorderLocals {
 
         permute(&mut body.local_decls, &updater.map);
     }
-
-    fn is_required(&self) -> bool {
-        false
-    }
 }
 
 fn permute<I: rustc_index::Idx + Ord, T>(data: &mut IndexVec<I, T>, map: &IndexSlice<I, I>) {
@@ -115,9 +109,7 @@ impl<'tcx> MutVisitor<'tcx> for BasicBlockUpdater<'tcx> {
     }
 
     fn visit_terminator(&mut self, terminator: &mut Terminator<'tcx>, _location: Location) {
-        for succ in terminator.successors_mut() {
-            *succ = self.map[*succ];
-        }
+        terminator.successors_mut(|succ| *succ = self.map[*succ]);
     }
 }
 

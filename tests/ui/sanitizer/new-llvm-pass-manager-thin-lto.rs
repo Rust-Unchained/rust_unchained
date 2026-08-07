@@ -6,13 +6,16 @@
 //@ needs-sanitizer-address
 //@ ignore-cross-compile
 //
+//@ compile-flags: -C unsafe-allow-abi-mismatch=sanitizer
+//
 //@ no-prefer-dynamic
 //@ revisions: opt0 opt1
 //@ compile-flags: -Zsanitizer=address -Clto=thin
 //@[opt0]compile-flags: -Copt-level=0
 //@[opt1]compile-flags: -Copt-level=1
-//@ run-fail
+//@ run-fail-or-crash
 //@ error-pattern: ERROR: AddressSanitizer: stack-use-after-scope
+//@ ignore-backends: gcc
 
 static mut P: *mut usize = std::ptr::null_mut();
 

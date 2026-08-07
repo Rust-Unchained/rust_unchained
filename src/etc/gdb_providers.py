@@ -18,6 +18,12 @@ def unwrap_unique_or_non_null(unique_or_nonnull):
     return ptr if ptr.type.code == gdb.TYPE_CODE_PTR else ptr[ptr.type.fields()[0]]
 
 
+def unwrap_scalar_wrappers(wrapper):
+    while not wrapper.type.is_scalar:
+        wrapper = wrapper[wrapper.type.fields()[0]]
+    return wrapper
+
+
 # GDB 14 has a tag class that indicates that extension methods are ok
 # to call.  Use of this tag only requires that printers hide local
 # attributes and methods by prefixing them with "_".
@@ -128,9 +134,26 @@ class StdSliceProvider(printer_base):
             self._data_ptr + index for index in xrange(self._length)
         )
 
+    def num_children(self):
+        return self._length
+
     @staticmethod
     def display_hint():
         return "array"
+
+
+class StdBoxStrProvider(printer_base):
+    def __init__(self, valobj):
+        self._valobj = valobj
+        self._length = int(valobj["length"])
+        self._data_ptr = valobj["data_ptr"]
+
+    def to_string(self):
+        return self._data_ptr.lazy_string(encoding="utf-8", length=self._length)
+
+    @staticmethod
+    def display_hint():
+        return "string"
 
 
 class StdVecProvider(printer_base):
@@ -149,6 +172,9 @@ class StdVecProvider(printer_base):
             self._data_ptr + index for index in xrange(self._length)
         )
 
+    def num_children(self):
+        return self._length
+
     @staticmethod
     def display_hint():
         return "array"
@@ -157,7 +183,13 @@ class StdVecProvider(printer_base):
 class StdVecDequeProvider(printer_base):
     def __init__(self, valobj):
         self._valobj = valobj
-        self._head = int(valobj["head"])
+
+        head = valobj["head"]
+
+        # BACKCOMPAT: rust 1.95
+        if head.type.code != gdb.TYPE_CODE_INT:
+            head = head[ZERO_FIELD]
+        self._head = int(head)
         self._size = int(valobj["len"])
         # BACKCOMPAT: rust 1.75
         cap = valobj["buf"]["inner"]["cap"]
@@ -177,6 +209,9 @@ class StdVecDequeProvider(printer_base):
             for index in xrange(self._size)
         )
 
+    def num_children(self):
+        return self._size
+
     @staticmethod
     def display_hint():
         return "array"
@@ -188,8 +223,14 @@ class StdRcProvider(printer_base):
         self._is_atomic = is_atomic
         self._ptr = unwrap_unique_or_non_null(valobj["ptr"])
         self._value = self._ptr["data" if is_atomic else "value"]
-        self._strong = self._ptr["strong"]["v" if is_atomic else "value"]["value"]
-        self._weak = self._ptr["weak"]["v" if is_atomic else "value"]["value"] - 1
+        # FIXME(shua): the debuginfo template type should be 'str' not 'u8'
+        if self._ptr.type.target().name == "alloc::rc::RcInner<str>":
+            length = self._valobj["ptr"]["pointer"]["length"]
+            u8_ptr_ty = gdb.Type.pointer(gdb.lookup_type("u8"))
+            ptr = self._value.address.reinterpret_cast(u8_ptr_ty)
+            self._value = ptr.lazy_string(encoding="utf-8", length=length)
+        self._strong = unwrap_scalar_wrappers(self._ptr["strong"])
+        self._weak = unwrap_scalar_wrappers(self._ptr["weak"]) - 1
 
     def to_string(self):
         if self._is_atomic:
@@ -252,15 +293,15 @@ class StdNonZeroNumberProvider(printer_base):
     def __init__(self, valobj):
         fields = valobj.type.fields()
         assert len(fields) == 1
-        field = list(fields)[0]
+        field = fields[0]
 
-        inner_valobj = valobj[field.name]
+        inner_valobj = valobj[field]
 
         inner_fields = inner_valobj.type.fields()
         assert len(inner_fields) == 1
-        inner_field = list(inner_fields)[0]
+        inner_field = inner_fields[0]
 
-        self._value = str(inner_valobj[inner_field.name])
+        self._value = inner_valobj[inner_field]
 
     def to_string(self):
         return self._value
@@ -289,7 +330,7 @@ def children_of_btree_map(map):
 
         for i in xrange(0, length + 1):
             if height > 0:
-                child_ptr = edges[i]["value"]["value"]
+                child_ptr = edges[i]["value"]["value"][ZERO_FIELD]
                 for child in children_of_node(child_ptr, height - 1):
                     yield child
             if i < length:
@@ -297,12 +338,12 @@ def children_of_btree_map(map):
                 key_type_size = keys.type.sizeof
                 val_type_size = vals.type.sizeof
                 key = (
-                    keys[i]["value"]["value"]
+                    keys[i]["value"]["value"][ZERO_FIELD]
                     if key_type_size > 0
                     else gdb.parse_and_eval("()")
                 )
                 val = (
-                    vals[i]["value"]["value"]
+                    vals[i]["value"]["value"][ZERO_FIELD]
                     if val_type_size > 0
                     else gdb.parse_and_eval("()")
                 )
@@ -477,6 +518,12 @@ class StdHashMapProvider(printer_base):
                 yield "val{}".format(index), element[FIRST_FIELD]
             else:
                 yield "[{}]".format(index), element[ZERO_FIELD]
+
+    def num_children(self):
+        result = self._size
+        if self._show_values:
+            result *= 2
+        return result
 
     def display_hint(self):
         return "map" if self._show_values else "array"

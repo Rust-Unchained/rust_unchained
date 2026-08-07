@@ -1,12 +1,12 @@
 use crate::spec::{
-    LinkSelfContainedDefault, LinkerFlavor, MergeFunctions, PanicStrategy, Target, TargetMetadata,
-    TargetOptions,
+    Arch, LinkSelfContainedDefault, LinkerFlavor, MergeFunctions, Os, PanicStrategy, Target,
+    TargetMetadata, TargetOptions, cvs,
 };
 
 pub(crate) fn target() -> Target {
     Target {
-        arch: "nvptx64".into(),
-        data_layout: "e-p6:32:32-i64:64-i128:128-v16:16-v32:32-n16:32:64".into(),
+        arch: Arch::Nvptx64,
+        data_layout: "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64".into(),
         llvm_target: "nvptx64-nvidia-cuda".into(),
         metadata: TargetMetadata {
             description: Some("--emit=asm generates PTX code that runs on NVIDIA GPUs".into()),
@@ -17,14 +17,20 @@ pub(crate) fn target() -> Target {
         pointer_width: 64,
 
         options: TargetOptions {
-            os: "cuda".into(),
+            os: Os::Cuda,
             vendor: "nvidia".into(),
-            linker_flavor: LinkerFlavor::Ptx,
-            // The linker can be installed from `crates.io`.
-            linker: Some("rust-ptx-linker".into()),
+            linker_flavor: LinkerFlavor::Llbc,
 
-            // With `ptx-linker` approach, it can be later overridden via link flags.
-            cpu: "sm_30".into(),
+            cpu: "sm_70".into(),
+
+            // No longer supported architectures
+            unsupported_cpus: cvs!(
+                "sm_20", "sm_21", "sm_30", "sm_32", "sm_35", "sm_37", "sm_50", "sm_52", "sm_53",
+                "sm_60", "sm_61", "sm_62"
+            ),
+
+            // crates with different `target-cpu`s are not link-compatible for NVPTX
+            requires_consistent_cpu: true,
 
             // FIXME: create tests for the atomics.
             max_atomic_width: Some(64),
@@ -42,6 +48,9 @@ pub(crate) fn target() -> Target {
             // Let the `ptx-linker` to handle LLVM lowering into MC / assembly.
             obj_is_bitcode: true,
 
+            // Clearly a GPU
+            is_like_gpu: true,
+
             // Convenient and predicable naming scheme.
             dll_prefix: "".into(),
             dll_suffix: ".ptx".into(),
@@ -57,6 +66,9 @@ pub(crate) fn target() -> Target {
 
             // Support using `self-contained` linkers like the llvm-bitcode-linker
             link_self_contained: LinkSelfContainedDefault::True,
+
+            // Static initializers must not have cycles on this target
+            static_initializer_must_be_acyclic: true,
 
             ..Default::default()
         },

@@ -1,38 +1,63 @@
 //@compile-flags: -Zmiri-disable-isolation
+//@run-native
 
 #![feature(io_error_more)]
 #![feature(io_error_uncategorized)]
+#![cfg_attr(unix, feature(unix_file_vectored_at))]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{
-    File, OpenOptions, canonicalize, create_dir, read_dir, remove_dir, remove_dir_all, remove_file,
-    rename,
+    self, File, OpenOptions, create_dir, read_dir, remove_dir, remove_dir_all, remove_file, rename,
 };
-use std::io::{Error, ErrorKind, IsTerminal, Read, Result, Seek, SeekFrom, Write};
+use std::io::{
+    Error, ErrorKind, IoSlice, IoSliceMut, IsTerminal, Read, Result, Seek, SeekFrom, Write,
+};
 use std::path::Path;
 
 #[path = "../../utils/mod.rs"]
 mod utils;
+use utils::check_nondet;
 
 fn main() {
     test_path_conversion();
+    test_file();
+    // Partial reads/writes are apparently not a thing on Windows.
+    if cfg!(not(windows)) {
+        test_file_partial_reads_writes();
+    }
     test_file_create_new();
+    test_metadata();
+    test_seek();
+    test_errors();
+    test_from_raw_os_error();
+    test_file_clone();
+    test_file_set_len();
+    test_file_sync();
+    test_rename();
+    // Only these targets lower `File::set_times` to the `futimens` shim (macOS/Windows differ).
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "android"
+    )) {
+        test_file_set_times();
+    }
     // Windows file handling is very incomplete.
     if cfg!(not(windows)) {
-        test_file();
-        test_seek();
-        test_file_clone();
-        test_metadata();
-        test_file_set_len();
-        test_file_sync();
-        test_errors();
-        test_rename();
         test_directory();
         test_canonicalize();
-        test_from_raw_os_error();
+        #[cfg(not(target_os = "solaris"))] // does not have flock
+        test_flock();
+        test_hard_link();
+
+        test_readv_writev();
         #[cfg(unix)]
         test_pread_pwrite();
+        #[cfg(all(unix, not(target_os = "solaris")))]
+        test_preadv_pwritev();
     }
 }
 
@@ -48,11 +73,12 @@ fn test_file() {
 
     // Test creating, writing and closing a file (closing is tested when `file` is dropped).
     let mut file = File::create(&path).unwrap();
+    assert!(!file.metadata().unwrap().permissions().readonly()); // new file shouldn't be read-only
     // Writing 0 bytes should not change the file contents.
     file.write(&mut []).unwrap();
     assert_eq!(file.metadata().unwrap().len(), 0);
 
-    file.write(bytes).unwrap();
+    file.write_all(bytes).unwrap();
     assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
     // Test opening, reading and closing a file.
     let mut file = File::open(&path).unwrap();
@@ -65,8 +91,43 @@ fn test_file() {
 
     assert!(!file.is_terminal());
 
+    // Writing to a file opened for reading should error (and not stop interpretation). std does not
+    // categorize the error so we don't check for details.
+    file.write(&[0]).unwrap_err();
+    // However, writing 0 bytes can succeed or fail.
+    let _ignore = file.write(&[]);
+
+    // Test calling File::create on an existing file, since that uses a different code path
+    File::create(&path).unwrap();
+
     // Removing file should succeed.
     remove_file(&path).unwrap();
+}
+
+fn test_file_partial_reads_writes() {
+    if !cfg!(miri) {
+        // This test is not expected to work natively.
+        return;
+    }
+
+    let path1 = utils::prepare_with_content("miri_test_fs_file1.txt", b"abcdefg");
+    let path2 = utils::prepare_with_content("miri_test_fs_file2.txt", b"abcdefg");
+
+    // Ensure we sometimes do incomplete writes.
+    check_nondet(|| {
+        let mut file = File::create(&path1).unwrap();
+        file.write(&[0; 4]).unwrap() == 4
+    });
+    // Ensure we sometimes do incomplete reads.
+    check_nondet(|| {
+        let mut file = File::open(&path2).unwrap();
+        let mut buf = [0; 4];
+        file.read(&mut buf).unwrap() == 4
+    });
+
+    // Clean up
+    remove_file(&path1).unwrap();
+    remove_file(&path2).unwrap();
 }
 
 fn test_file_clone() {
@@ -176,7 +237,13 @@ fn test_file_set_len() {
 
     // Can't use set_len on a file not opened for writing
     let file = OpenOptions::new().read(true).open(&path).unwrap();
-    assert_eq!(ErrorKind::InvalidInput, file.set_len(14).unwrap_err().kind());
+    // Due to https://github.com/rust-lang/miri/issues/4457, we have to assume the failure could
+    // be either of the Windows or Unix kind, no matter which platform we're on.
+    let err = file.set_len(14).unwrap_err();
+    assert!(
+        [ErrorKind::PermissionDenied, ErrorKind::InvalidInput].contains(&err.kind()),
+        "unexpected error: {err}"
+    );
 
     remove_file(&path).unwrap();
 }
@@ -190,10 +257,44 @@ fn test_file_sync() {
     file.sync_data().unwrap();
     file.sync_all().unwrap();
 
-    // Test that we can call sync_data and sync_all on a file opened for reading.
+    // Test that we can call sync_data and sync_all on a file opened for reading on unix, but not
+    // on Windows
     let file = File::open(&path).unwrap();
-    file.sync_data().unwrap();
-    file.sync_all().unwrap();
+    if cfg!(unix) {
+        file.sync_data().unwrap();
+        file.sync_all().unwrap();
+    } else {
+        file.sync_data().unwrap_err();
+        file.sync_all().unwrap_err();
+    }
+
+    remove_file(&path).unwrap();
+}
+
+fn test_file_set_times() {
+    use std::fs::FileTimes;
+    use std::time::{Duration, SystemTime};
+
+    let path = utils::prepare_with_content("miri_test_fs_set_times.txt", b"hello");
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+
+    // Use fixed, whole-second timestamps to avoid sub-second granularity differences between
+    // file systems.
+    let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567_890);
+
+    // Setting both timestamps round-trips through the file's metadata.
+    file.set_times(FileTimes::new().set_accessed(accessed).set_modified(modified)).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.accessed().unwrap(), accessed);
+    assert_eq!(metadata.modified().unwrap(), modified);
+
+    // Setting only the modification time (`UTIME_OMIT` for access) leaves the access time alone.
+    let newer_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    file.set_times(FileTimes::new().set_modified(newer_modified)).unwrap();
+    let metadata = file.metadata().unwrap();
+    assert_eq!(metadata.accessed().unwrap(), accessed);
+    assert_eq!(metadata.modified().unwrap(), newer_modified);
 
     remove_file(&path).unwrap();
 }
@@ -240,7 +341,7 @@ fn test_canonicalize() {
     let path = dir_path.join("test_file");
     drop(File::create(&path).unwrap());
 
-    let p = canonicalize(format!("{}/./test_file", dir_path.to_string_lossy())).unwrap();
+    let p = fs::canonicalize(format!("{}/./test_file", dir_path.to_string_lossy())).unwrap();
     assert_eq!(p.to_string_lossy().find("/./"), None);
 
     remove_dir_all(&dir_path).unwrap();
@@ -350,4 +451,136 @@ fn test_pread_pwrite() {
     // Ensure that cursor position is not changed
     f.read_exact(&mut buf1).unwrap();
     assert_eq!(&buf1, b"  m");
+}
+
+// Solaris does not support per-handle file locking.
+#[cfg(not(target_os = "solaris"))]
+fn test_flock() {
+    let bytes = b"Hello, World!\n";
+    let path = utils::prepare_with_content("miri_test_fs_flock.txt", bytes);
+    let file1 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let file2 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+
+    // Test that we can apply many shared locks.
+    file1.lock_shared().unwrap();
+    file2.lock_shared().unwrap();
+    // Test that shared lock prevents exclusive lock.
+    assert!(matches!(file1.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
+    // Unlock both files.
+    file1.unlock().unwrap();
+    file2.unlock().unwrap();
+
+    // Take exclusive lock.
+    file1.lock().unwrap();
+    // Test that shared lock prevents exclusive and shared locks.
+    assert!(matches!(file2.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
+    assert!(matches!(file2.try_lock_shared().unwrap_err(), fs::TryLockError::WouldBlock));
+    // Unlock exclusive lock.
+    file1.unlock().unwrap();
+}
+
+/// Test vectored reads and vectored writes.
+fn test_readv_writev() {
+    let bytes = b"hello world!";
+    let path = utils::prepare_with_content("miri_test_fs_readv_writev.txt", bytes);
+    let mut f = OpenOptions::new().read(true).write(true).open(path).unwrap();
+
+    let mut read_buffer = [0u8; 10];
+    let (buffer1, buffer2) = read_buffer.split_at_mut(5);
+
+    let bytes_read =
+        f.read_vectored(&mut [IoSliceMut::new(buffer1), IoSliceMut::new(buffer2)]).unwrap();
+
+    // Vectored read should read at least a byte.
+    assert!(bytes_read > 0);
+    assert_eq!(read_buffer[0..bytes_read], bytes[0..bytes_read]);
+
+    let write_buffer = b"some additional bytes";
+    let (buffer1, buffer2) = write_buffer.split_at(write_buffer.len() / 2);
+
+    let bytes_written = f.write_vectored(&[IoSlice::new(buffer1), IoSlice::new(buffer2)]).unwrap();
+
+    // Vectored write should write at least a byte.
+    assert!(bytes_written > 0);
+
+    // Reset file cursor to read the written bytes.
+    f.seek(SeekFrom::Start(bytes_read as u64)).unwrap();
+    let mut written_bytes = vec![0u8; bytes_written];
+    f.read_exact(&mut written_bytes).unwrap();
+    assert_eq!(written_bytes.as_slice(), &write_buffer[0..bytes_written]);
+}
+
+/// Test vectored reads and vectored writes with byte offsets.
+///
+/// **Note**: We skip this test on Solaris targets because Solaris doesn't
+/// have `preadv`/`pwritev`.
+#[cfg(all(unix, not(target_os = "solaris")))]
+fn test_preadv_pwritev() {
+    use std::os::unix::fs::FileExt;
+
+    let bytes = b"hello world!";
+    let path = utils::prepare_with_content("miri_test_fs_preadv_pwritev.txt", bytes);
+    let mut f = OpenOptions::new().read(true).write(true).open(path).unwrap();
+
+    const OFFSET: usize = 2;
+
+    let mut read_buffer = [0u8; 10];
+    let (buffer1, buffer2) = read_buffer.split_at_mut(5);
+
+    let bytes_read = f
+        .read_vectored_at(&mut [IoSliceMut::new(buffer1), IoSliceMut::new(buffer2)], OFFSET as u64)
+        .unwrap();
+
+    // Vectored read should read at least a byte at the provided offset.
+    assert!(bytes_read > 0);
+    assert_eq!(read_buffer[0..bytes_read], bytes[OFFSET..(bytes_read + OFFSET)]);
+
+    let write_buffer = b"some additional bytes";
+    let (buffer1, buffer2) = write_buffer.split_at(write_buffer.len() / 2);
+
+    let bytes_written = f
+        .write_vectored_at(
+            &[IoSlice::new(buffer1), IoSlice::new(buffer2)],
+            (bytes.len() + OFFSET) as u64,
+        )
+        .unwrap();
+
+    // Vectored write should write at least a byte at the provided offset.
+    assert!(bytes_written > 0);
+
+    // Reset file cursor to read the written bytes. We move the cursor
+    // to include the offset.
+    f.seek(SeekFrom::Start((bytes.len() + OFFSET) as u64)).unwrap();
+    let mut written_bytes = vec![0u8; bytes_written];
+    f.read_exact(&mut written_bytes).unwrap();
+    assert_eq!(written_bytes.as_slice(), &write_buffer[0..bytes_written]);
+}
+
+fn test_hard_link() {
+    let source = utils::prepare_with_content("miri_test_fs_hard_link_source.txt", b"hello");
+    let link = utils::prepare("miri_test_fs_hard_link_link.txt");
+
+    fs::hard_link(&source, &link).unwrap();
+
+    // Verify that the hard link works:
+    // Modifications to one are visible through the other.
+    fs::write(&source, b"hello world").unwrap();
+    let contents = fs::read(&link).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    // Only on Unix: verify both files have same inode
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let link_meta = std::fs::metadata(&link).unwrap();
+        assert_eq!(source_meta.ino(), link_meta.ino());
+    }
+
+    // Test error: link already exists
+    assert_eq!(ErrorKind::AlreadyExists, fs::hard_link(&source, &link).unwrap_err().kind());
+
+    // Cleanup after test
+    remove_file(&source).unwrap();
+    remove_file(&link).unwrap();
 }

@@ -1,17 +1,17 @@
 //! Completion of paths and keywords at item list position.
 
 use crate::{
-    context::{ItemListKind, PathCompletionCtx, PathExprCtx, Qualified},
     CompletionContext, Completions,
+    context::{ItemListKind, PathCompletionCtx, PathExprCtx, Qualified},
 };
 
 pub(crate) mod trait_impl;
 
 pub(crate) fn complete_item_list_in_expr(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx: &PathCompletionCtx,
-    expr_ctx: &PathExprCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx: &PathCompletionCtx<'_>,
+    expr_ctx: &PathExprCtx<'_>,
 ) {
     if !expr_ctx.in_block_expr {
         return;
@@ -24,8 +24,8 @@ pub(crate) fn complete_item_list_in_expr(
 
 pub(crate) fn complete_item_list(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     kind: &ItemListKind,
 ) {
     let _p = tracing::info_span!("complete_item_list").entered();
@@ -72,7 +72,11 @@ pub(crate) fn complete_item_list(
     }
 }
 
-fn add_keywords(acc: &mut Completions, ctx: &CompletionContext<'_>, kind: Option<&ItemListKind>) {
+fn add_keywords(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_, '_>,
+    kind: Option<&ItemListKind>,
+) {
     let mut add_keyword = |kw, snippet| acc.add_keyword_snippet(ctx, kw, snippet);
 
     let in_item_list = matches!(kind, Some(ItemListKind::SourceFile | ItemListKind::Module) | None);
@@ -87,6 +91,9 @@ fn add_keywords(acc: &mut Completions, ctx: &CompletionContext<'_>, kind: Option
     let in_block = kind.is_none();
 
     let no_vis_qualifiers = ctx.qualifier_ctx.vis_node.is_none();
+    let no_abi_qualifiers = ctx.qualifier_ctx.abi_node.is_none();
+    let has_extern_kw =
+        ctx.qualifier_ctx.abi_node.as_ref().is_some_and(|it| it.string_token().is_none());
     let has_unsafe_kw = ctx.qualifier_ctx.unsafe_tok.is_some();
     let has_async_kw = ctx.qualifier_ctx.async_tok.is_some();
     let has_safe_kw = ctx.qualifier_ctx.safe_tok.is_some();
@@ -114,10 +121,11 @@ fn add_keywords(acc: &mut Completions, ctx: &CompletionContext<'_>, kind: Option
             add_keyword("trait", "trait $1 {\n    $0\n}");
             if no_vis_qualifiers {
                 add_keyword("impl", "impl $1 {\n    $0\n}");
+                add_keyword("impl for", "impl $1 for $2 {\n    $0\n}");
             }
         }
 
-        if !has_async_kw && no_vis_qualifiers && in_item_list {
+        if !has_async_kw && no_vis_qualifiers && no_abi_qualifiers && in_item_list {
             add_keyword("extern", "extern $0");
         }
 
@@ -141,9 +149,10 @@ fn add_keywords(acc: &mut Completions, ctx: &CompletionContext<'_>, kind: Option
         add_keyword("struct", "struct $0");
         add_keyword("trait", "trait $1 {\n    $0\n}");
         add_keyword("union", "union $1 {\n    $0\n}");
-        add_keyword("use", "use $0");
+        add_keyword("use", "use $0;");
         if no_vis_qualifiers {
             add_keyword("impl", "impl $1 {\n    $0\n}");
+            add_keyword("impl for", "impl $1 for $2 {\n    $0\n}");
         }
     }
 
@@ -157,10 +166,13 @@ fn add_keywords(acc: &mut Completions, ctx: &CompletionContext<'_>, kind: Option
         add_keyword("static", "static $1: $2;");
     } else {
         if !in_inherent_impl {
-            if !in_trait {
+            if !in_trait && no_abi_qualifiers {
                 add_keyword("extern", "extern $0");
             }
             add_keyword("type", "type $0");
+        }
+        if has_extern_kw {
+            add_keyword("crate", "crate $0;");
         }
 
         add_keyword("fn", "fn $1($2) {\n    $0\n}");

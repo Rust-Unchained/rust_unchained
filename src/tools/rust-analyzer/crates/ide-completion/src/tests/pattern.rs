@@ -122,10 +122,45 @@ fn foo() {
             st Record
             st Tuple
             st Unit
-            ev TupleV
             bn Record {…} Record { field$1 }$0
             bn Tuple(…)            Tuple($1)$0
             bn TupleV(…)          TupleV($1)$0
+            kw mut
+            kw ref
+        "#]],
+    );
+}
+
+#[test]
+fn refutable_in_record_pat_field() {
+    check(
+        r#"
+enum Bar { Value, Nil }
+struct Foo { x: Bar }
+fn foo(foo: Foo) { match foo { Foo { x: $0 } } }
+"#,
+        expect![[r#"
+            en Bar
+            st Foo
+            bn Foo {…} Foo { x$1 }$0
+            kw mut
+            kw ref
+        "#]],
+    );
+
+    check(
+        r#"
+enum Bar { Value, Nil }
+use Bar::*;
+struct Foo { x: Bar }
+fn foo(foo: Foo) { match foo { Foo { x: $0 } } }
+"#,
+        expect![[r#"
+            en Bar
+            st Foo
+            bn Foo {…} Foo { x$1 }$0
+            bn Nil             Nil$0
+            bn Value         Value$0
             kw mut
             kw ref
         "#]],
@@ -151,7 +186,6 @@ fn foo() {
             st Record
             st Tuple
             st Unit
-            ev Variant
             bn Record {…} Record { field$1 }$0
             bn Tuple(…)            Tuple($1)$0
             bn Variant               Variant$0
@@ -317,6 +351,34 @@ fn func() {
 }
 
 #[test]
+fn enum_unqualified() {
+    check_with_base_items(
+        r#"
+use Enum::*;
+fn func() {
+    if let $0 = unknown {}
+}
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…)      macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            bn Record {…}   Record { field$1 }$0
+            bn RecordV {…} RecordV { field$1 }$0
+            bn Tuple(…)              Tuple($1)$0
+            bn TupleV(…)            TupleV($1)$0
+            bn UnitV                     UnitV$0
+            kw mut
+            kw ref
+        "#]],
+    );
+}
+
+#[test]
 fn completes_in_record_field_pat() {
     check(
         r#"
@@ -392,6 +454,25 @@ fn foo($0) {}
             st Foo
             bn Bar(…)        Bar($1): Bar$0
             bn Foo {…} Foo { bar$1 }: Foo$0
+            kw mut
+            kw ref
+        "#]],
+    )
+}
+
+#[test]
+fn completes_in_fn_param_in_nested_pattern() {
+    check(
+        r#"
+struct Foo { num: u32 }
+struct Bar(Foo);
+fn foo(Bar($0)) {}
+"#,
+        expect![[r#"
+            st Bar
+            st Foo
+            bn Bar(…)        Bar($1)$0
+            bn Foo {…} Foo { num$1 }$0
             kw mut
             kw ref
         "#]],
@@ -634,6 +715,7 @@ fn f(u: U) {
 
     check(
         r#"
+//- /core.rs crate:core
 #![rustc_coherence_is_core]
 #[lang = "u32"]
 impl u32 {
@@ -759,6 +841,37 @@ fn f(x: EnumAlias<u8>) {
         expect![[r#"
             bn Tuple(…) Tuple($1)$0
             bn Unit          Unit$0
+        "#]],
+    );
+}
+
+#[test]
+fn through_alias_it_self() {
+    check(
+        r#"
+enum Enum<T> {
+    Unit,
+    Tuple(T),
+}
+
+type EnumAlias<T> = Enum<T>;
+
+fn f(x: EnumAlias<u8>) {
+    match x {
+        $0 => (),
+        _ => (),
+    }
+
+}
+
+"#,
+        expect![[r#"
+            en Enum
+            ta EnumAlias
+            bn Enum::Tuple(…) Enum::Tuple($1)$0
+            bn Enum::Unit          Enum::Unit$0
+            kw mut
+            kw ref
         "#]],
     );
 }

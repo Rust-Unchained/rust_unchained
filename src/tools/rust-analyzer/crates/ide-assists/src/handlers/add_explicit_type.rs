@@ -1,8 +1,9 @@
+use either::Either;
 use hir::HirDisplay;
 use ide_db::syntax_helpers::node_ext::walk_ty;
 use syntax::ast::{self, AstNode, LetStmt, Param};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: add_explicit_type
 //
@@ -19,8 +20,9 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     let x: i32 = 92;
 // }
 // ```
-pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let (ascribed_ty, expr, pat) = if let Some(let_stmt) = ctx.find_node_at_offset::<LetStmt>() {
+pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
+    let syntax_node = ctx.find_node_at_offset::<Either<LetStmt, Param>>()?;
+    let (ascribed_ty, expr, pat) = if let Either::Left(let_stmt) = syntax_node {
         let cursor_in_range = {
             let eq_range = let_stmt.eq_token()?.text_range();
             ctx.offset() < eq_range.start()
@@ -31,7 +33,7 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         }
 
         (let_stmt.ty(), let_stmt.initializer(), let_stmt.pat()?)
-    } else if let Some(param) = ctx.find_node_at_offset::<Param>() {
+    } else if let Either::Right(param) = syntax_node {
         if param.syntax().ancestors().nth(2).and_then(ast::ClosureExpr::cast).is_none() {
             cov_mark::hit!(add_explicit_type_not_applicable_in_fn_param);
             return None;
@@ -71,7 +73,7 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
 
     let inferred_type = ty.display_source_code(ctx.db(), module.into(), false).ok()?;
     acc.add(
-        AssistId("add_explicit_type", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("add_explicit_type"),
         format!("Insert explicit type `{inferred_type}`"),
         pat_range,
         |builder| match ascribed_ty {
@@ -206,8 +208,6 @@ fn main() {
 }
 "#,
         );
-        // note: this may break later if we add more consteval. it just needs to be something that our
-        // consteval engine doesn't understand
         check_assist_not_applicable(
             add_explicit_type,
             r#"
@@ -297,6 +297,20 @@ fn f() {
     |y: i32| {
         let x: i32 = y;
     };
+}
+"#,
+        );
+
+        check_assist(
+            add_explicit_type,
+            r#"
+fn f() {
+    let f: fn(i32) = |y$0| {};
+}
+"#,
+            r#"
+fn f() {
+    let f: fn(i32) = |y: i32| {};
 }
 "#,
         );

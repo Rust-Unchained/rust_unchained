@@ -11,8 +11,10 @@ use rustc_span::def_id::{DefId, LocalDefId};
 use tracing::{debug, instrument};
 
 use super::ItemCtxt;
-use super::predicates_of::assert_only_contains_predicates_from;
-use crate::hir_ty_lowering::{HirTyLowerer, PredicateFilter};
+use super::clauses_of::assert_only_contains_clauses_from;
+use crate::hir_ty_lowering::{
+    HirTyLowerer, ImpliedBoundsContext, OverlappingAsssocItemConstraints, PredicateFilter,
+};
 
 /// For associated types we include both bounds written on the type
 /// (`type X: Trait`) and predicates from the trait: `where Self::X: Trait`.
@@ -31,51 +33,84 @@ fn associated_type_bounds<'tcx>(
     ty::print::with_reduced_queries!({
         let item_ty = Ty::new_projection_from_args(
             tcx,
+            ty::IsRigid::No,
             assoc_item_def_id.to_def_id(),
             GenericArgs::identity_for_item(tcx, assoc_item_def_id),
         );
 
         let icx = ItemCtxt::new(tcx, assoc_item_def_id);
         let mut bounds = Vec::new();
-        icx.lowerer().lower_bounds(item_ty, hir_bounds, &mut bounds, ty::List::empty(), filter);
-        // Implicit bounds are added to associated types unless a `?Trait` bound is found
+        icx.lowerer().lower_bounds(
+            item_ty,
+            hir_bounds,
+            &mut bounds,
+            ty::List::empty(),
+            filter,
+            OverlappingAsssocItemConstraints::Allowed,
+        );
+
         match filter {
             PredicateFilter::All
             | PredicateFilter::SelfOnly
             | PredicateFilter::SelfTraitThatDefines(_)
             | PredicateFilter::SelfAndAssociatedTypeBounds => {
-                icx.lowerer().add_default_traits(&mut bounds, item_ty, hir_bounds, None, span);
+                // Implicit bounds are added to associated types unless a `?Trait` bound is found.
+                icx.lowerer().add_implicit_sizedness_bounds(
+                    &mut bounds,
+                    item_ty,
+                    hir_bounds,
+                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
+                    span,
+                );
+                icx.lowerer().add_default_traits(
+                    &mut bounds,
+                    item_ty,
+                    hir_bounds,
+                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
+                    span,
+                );
+
+                // Also collect `where Self::Assoc: Trait` from the parent trait's where clauses.
+                let trait_def_id = tcx.local_parent(assoc_item_def_id);
+                let trait_clauses = tcx.trait_explicit_clauses_and_bounds(trait_def_id);
+
+                let item_trait_ref =
+                    ty::TraitRef::identity(tcx, tcx.parent(assoc_item_def_id.to_def_id()));
+                bounds.extend(trait_clauses.clauses.iter().copied().filter_map(
+                    |(clause, span)| {
+                        remap_gat_vars_and_recurse_into_nested_projections(
+                            tcx,
+                            filter,
+                            item_trait_ref,
+                            assoc_item_def_id,
+                            span,
+                            clause,
+                        )
+                    },
+                ));
             }
-            // `ConstIfConst` is only interested in `~const` bounds.
-            PredicateFilter::ConstIfConst | PredicateFilter::SelfConstIfConst => {}
+            // `ConstIfConst` is only interested in `[const]` bounds.
+            PredicateFilter::ConstIfConst | PredicateFilter::SelfConstIfConst => {
+                // FIXME(const_trait_impl): We *could* uplift the
+                // `where Self::Assoc: [const] Trait` bounds from the parent trait
+                // here too, but we'd need to split `const_conditions` into two
+                // queries (like we do for `trait_explicit_clauses_and_bounds`)
+                // since we need to also filter the clauses *out* of the const
+                // conditions or they lead to cycles in the trait solver when
+                // utilizing these bounds. For now, let's do nothing.
+            }
         }
 
-        let trait_def_id = tcx.local_parent(assoc_item_def_id);
-        let trait_predicates = tcx.trait_explicit_predicates_and_bounds(trait_def_id);
-
-        let item_trait_ref = ty::TraitRef::identity(tcx, tcx.parent(assoc_item_def_id.to_def_id()));
-        let bounds_from_parent =
-            trait_predicates.predicates.iter().copied().filter_map(|(clause, span)| {
-                remap_gat_vars_and_recurse_into_nested_projections(
-                    tcx,
-                    filter,
-                    item_trait_ref,
-                    assoc_item_def_id,
-                    span,
-                    clause,
-                )
-            });
-
-        let all_bounds = tcx.arena.alloc_from_iter(bounds.into_iter().chain(bounds_from_parent));
+        let bounds = tcx.arena.alloc_from_iter(bounds);
         debug!(
             "associated_type_bounds({}) = {:?}",
             tcx.def_path_str(assoc_item_def_id.to_def_id()),
-            all_bounds
+            bounds
         );
 
-        assert_only_contains_predicates_from(filter, all_bounds, item_ty);
+        assert_only_contains_clauses_from(filter, bounds, item_ty);
 
-        all_bounds
+        bounds
     })
 }
 
@@ -104,13 +139,18 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'tcx>(
         ty::ClauseKind::Trait(tr) => tr.self_ty(),
         ty::ClauseKind::Projection(proj) => proj.projection_term.self_ty(),
         ty::ClauseKind::TypeOutlives(outlives) => outlives.0,
+        ty::ClauseKind::HostEffect(host) => host.self_ty(),
         _ => return None,
     };
 
     let gat_vars = loop {
-        if let ty::Alias(ty::Projection, alias_ty) = *clause_ty.kind() {
+        if let ty::Alias(
+            _,
+            alias_ty @ ty::AliasTy { kind: ty::Projection { def_id: alias_ty_def_id }, .. },
+        ) = *clause_ty.kind()
+        {
             if alias_ty.trait_ref(tcx) == item_trait_ref
-                && alias_ty.def_id == assoc_item_def_id.to_def_id()
+                && alias_ty_def_id == assoc_item_def_id.to_def_id()
             {
                 // We have found the GAT in question...
                 // Return the vars, since we may need to remap them.
@@ -151,27 +191,28 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'tcx>(
     let mut mapping = FxIndexMap::default();
     let generics = tcx.generics_of(assoc_item_def_id);
     for (param, var) in std::iter::zip(&generics.own_params, gat_vars) {
-        let existing = match var.unpack() {
+        let existing = match var.kind() {
             ty::GenericArgKind::Lifetime(re) => {
-                if let ty::RegionKind::ReBound(ty::INNERMOST, bv) = re.kind() {
-                    mapping.insert(bv.var, tcx.mk_param_from_def(param))
-                } else {
+                let ty::RegionKind::ReBound(ty::BoundVarIndexKind::Bound(ty::INNERMOST), bv) =
+                    re.kind()
+                else {
                     return None;
-                }
+                };
+                mapping.insert(bv.var, tcx.mk_param_from_def(param))
             }
             ty::GenericArgKind::Type(ty) => {
-                if let ty::Bound(ty::INNERMOST, bv) = *ty.kind() {
-                    mapping.insert(bv.var, tcx.mk_param_from_def(param))
-                } else {
+                let ty::Bound(ty::BoundVarIndexKind::Bound(ty::INNERMOST), bv) = *ty.kind() else {
                     return None;
-                }
+                };
+                mapping.insert(bv.var, tcx.mk_param_from_def(param))
             }
             ty::GenericArgKind::Const(ct) => {
-                if let ty::ConstKind::Bound(ty::INNERMOST, bv) = ct.kind() {
-                    mapping.insert(bv, tcx.mk_param_from_def(param))
-                } else {
+                let ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(ty::INNERMOST), bv) =
+                    ct.kind()
+                else {
                     return None;
-                }
+                };
+                mapping.insert(bv.var, tcx.mk_param_from_def(param))
             }
         };
 
@@ -205,7 +246,7 @@ struct MapAndCompressBoundVars<'tcx> {
     binder: ty::DebruijnIndex,
     /// List of bound vars that remain unsubstituted because they were not
     /// mentioned in the GAT's args.
-    still_bound_vars: Vec<ty::BoundVariableKind>,
+    still_bound_vars: Vec<ty::BoundVariableKind<'tcx>>,
     /// Subtle invariant: If the `GenericArg` is bound, then it should be
     /// stored with the debruijn index of `INNERMOST` so it can be shifted
     /// correctly during substitution.
@@ -232,7 +273,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for MapAndCompressBoundVars<'tcx> {
             return ty;
         }
 
-        if let ty::Bound(binder, old_bound) = *ty.kind()
+        if let ty::Bound(ty::BoundVarIndexKind::Bound(binder), old_bound) = *ty.kind()
             && self.binder == binder
         {
             let mapped = if let Some(mapped) = self.mapping.get(&old_bound.var) {
@@ -258,7 +299,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for MapAndCompressBoundVars<'tcx> {
     }
 
     fn fold_region(&mut self, re: ty::Region<'tcx>) -> ty::Region<'tcx> {
-        if let ty::ReBound(binder, old_bound) = re.kind()
+        if let ty::ReBound(ty::BoundVarIndexKind::Bound(binder), old_bound) = re.kind()
             && self.binder == binder
         {
             let mapped = if let Some(mapped) = self.mapping.get(&old_bound.var) {
@@ -286,16 +327,17 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for MapAndCompressBoundVars<'tcx> {
             return ct;
         }
 
-        if let ty::ConstKind::Bound(binder, old_var) = ct.kind()
+        if let ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(binder), old_bound) = ct.kind()
             && self.binder == binder
         {
-            let mapped = if let Some(mapped) = self.mapping.get(&old_var) {
+            let mapped = if let Some(mapped) = self.mapping.get(&old_bound.var) {
                 mapped.expect_const()
             } else {
                 let var = ty::BoundVar::from_usize(self.still_bound_vars.len());
                 self.still_bound_vars.push(ty::BoundVariableKind::Const);
-                let mapped = ty::Const::new_bound(self.tcx, ty::INNERMOST, var);
-                self.mapping.insert(old_var, mapped.into());
+                let mapped =
+                    ty::Const::new_bound(self.tcx, ty::INNERMOST, ty::BoundConst::new(var));
+                self.mapping.insert(old_bound.var, mapped.into());
                 mapped
             };
 
@@ -326,16 +368,36 @@ fn opaque_type_bounds<'tcx>(
     ty::print::with_reduced_queries!({
         let icx = ItemCtxt::new(tcx, opaque_def_id);
         let mut bounds = Vec::new();
-        icx.lowerer().lower_bounds(item_ty, hir_bounds, &mut bounds, ty::List::empty(), filter);
+        icx.lowerer().lower_bounds(
+            item_ty,
+            hir_bounds,
+            &mut bounds,
+            ty::List::empty(),
+            filter,
+            OverlappingAsssocItemConstraints::Allowed,
+        );
         // Implicit bounds are added to opaque types unless a `?Trait` bound is found
         match filter {
             PredicateFilter::All
             | PredicateFilter::SelfOnly
             | PredicateFilter::SelfTraitThatDefines(_)
             | PredicateFilter::SelfAndAssociatedTypeBounds => {
-                icx.lowerer().add_default_traits(&mut bounds, item_ty, hir_bounds, None, span);
+                icx.lowerer().add_implicit_sizedness_bounds(
+                    &mut bounds,
+                    item_ty,
+                    hir_bounds,
+                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
+                    span,
+                );
+                icx.lowerer().add_default_traits(
+                    &mut bounds,
+                    item_ty,
+                    hir_bounds,
+                    ImpliedBoundsContext::AssociatedTypeOrImplTrait,
+                    span,
+                );
             }
-            //`ConstIfConst` is only interested in `~const` bounds.
+            //`ConstIfConst` is only interested in `[const]` bounds.
             PredicateFilter::ConstIfConst | PredicateFilter::SelfConstIfConst => {}
         }
         debug!(?bounds);
@@ -370,7 +432,7 @@ pub(super) fn explicit_item_bounds_with_filter(
             let opaque_ty = tcx.hir_node_by_def_id(opaque_def_id.expect_local()).expect_opaque_ty();
             let bounds =
                 associated_type_bounds(tcx, def_id, opaque_ty.bounds, opaque_ty.span, filter);
-            return ty::EarlyBinder::bind(bounds);
+            return ty::EarlyBinder::bind_iter(bounds);
         }
         Some(ty::ImplTraitInTraitData::Impl { .. }) => {
             span_bug!(tcx.def_span(def_id), "RPITIT in impl should not have item bounds")
@@ -397,13 +459,13 @@ pub(super) fn explicit_item_bounds_with_filter(
                 in_trait_or_impl: Some(hir::RpitContext::Trait),
             } => {
                 let args = GenericArgs::identity_for_item(tcx, def_id);
-                let item_ty = Ty::new_opaque(tcx, def_id.to_def_id(), args);
+                let item_ty = Ty::new_opaque(tcx, ty::IsRigid::No, def_id.to_def_id(), args);
                 let bounds = &*tcx.arena.alloc_slice(
                     &opaque_type_bounds(tcx, def_id, bounds, item_ty, *span, filter)
                         .to_vec()
                         .fold_with(&mut AssocTyToOpaque { tcx, fn_def_id: parent.to_def_id() }),
                 );
-                assert_only_contains_predicates_from(filter, bounds, item_ty);
+                assert_only_contains_clauses_from(filter, bounds, item_ty);
                 bounds
             }
             rustc_hir::OpaqueTyOrigin::FnReturn {
@@ -416,9 +478,9 @@ pub(super) fn explicit_item_bounds_with_filter(
             }
             | rustc_hir::OpaqueTyOrigin::TyAlias { parent: _, .. } => {
                 let args = GenericArgs::identity_for_item(tcx, def_id);
-                let item_ty = Ty::new_opaque(tcx, def_id.to_def_id(), args);
+                let item_ty = Ty::new_opaque(tcx, ty::IsRigid::No, def_id.to_def_id(), args);
                 let bounds = opaque_type_bounds(tcx, def_id, bounds, item_ty, *span, filter);
-                assert_only_contains_predicates_from(filter, bounds, item_ty);
+                assert_only_contains_clauses_from(filter, bounds, item_ty);
                 bounds
             }
         },
@@ -426,7 +488,7 @@ pub(super) fn explicit_item_bounds_with_filter(
         node => bug!("item_bounds called on {def_id:?} => {node:?}"),
     };
 
-    ty::EarlyBinder::bind(bounds)
+    ty::EarlyBinder::bind_iter(bounds)
 }
 
 pub(super) fn item_bounds(tcx: TyCtxt<'_>, def_id: DefId) -> ty::EarlyBinder<'_, ty::Clauses<'_>> {
@@ -455,9 +517,12 @@ pub(super) fn item_non_self_bounds(
     let all_bounds: FxIndexSet<_> = tcx.item_bounds(def_id).skip_binder().iter().collect();
     let own_bounds: FxIndexSet<_> = tcx.item_self_bounds(def_id).skip_binder().iter().collect();
     if all_bounds.len() == own_bounds.len() {
-        ty::EarlyBinder::bind(ty::ListWithCachedTypeInfo::empty())
+        ty::EarlyBinder::bind(tcx, ty::ListWithCachedTypeInfo::empty())
     } else {
-        ty::EarlyBinder::bind(tcx.mk_clauses_from_iter(all_bounds.difference(&own_bounds).copied()))
+        ty::EarlyBinder::bind(
+            tcx,
+            tcx.mk_clauses_from_iter(all_bounds.difference(&own_bounds).copied()),
+        )
     }
 }
 
@@ -467,17 +532,15 @@ pub(super) fn impl_super_outlives(
     tcx: TyCtxt<'_>,
     def_id: DefId,
 ) -> ty::EarlyBinder<'_, ty::Clauses<'_>> {
-    tcx.impl_trait_header(def_id).expect("expected an impl of trait").trait_ref.map_bound(
-        |trait_ref| {
-            let clause: ty::Clause<'_> = trait_ref.upcast(tcx);
-            tcx.mk_clauses_from_iter(util::elaborate(tcx, [clause]).filter(|clause| {
-                matches!(
-                    clause.kind().skip_binder(),
-                    ty::ClauseKind::TypeOutlives(_) | ty::ClauseKind::RegionOutlives(_)
-                )
-            }))
-        },
-    )
+    tcx.impl_trait_header(def_id).trait_ref.map_bound(|trait_ref| {
+        let clause: ty::Clause<'_> = trait_ref.upcast(tcx);
+        tcx.mk_clauses_from_iter(util::elaborate(tcx, [clause]).filter(|clause| {
+            matches!(
+                clause.kind().skip_binder(),
+                ty::ClauseKind::TypeOutlives(_) | ty::ClauseKind::RegionOutlives(_)
+            )
+        }))
+    })
 }
 
 struct AssocTyToOpaque<'tcx> {
@@ -491,12 +554,15 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTyToOpaque<'tcx> {
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(ty::Projection, projection_ty) = ty.kind()
+        if let &ty::Alias(
+            _,
+            ty::AliasTy { kind: ty::Projection { def_id: projection_ty_def_id }, args, .. },
+        ) = ty.kind()
             && let Some(ty::ImplTraitInTraitData::Trait { fn_def_id, .. }) =
-                self.tcx.opt_rpitit_info(projection_ty.def_id)
+                self.tcx.opt_rpitit_info(projection_ty_def_id)
             && fn_def_id == self.fn_def_id
         {
-            self.tcx.type_of(projection_ty.def_id).instantiate(self.tcx, projection_ty.args)
+            self.tcx.type_of(projection_ty_def_id).instantiate(self.tcx, args).skip_norm_wip()
         } else {
             ty.super_fold_with(self)
         }

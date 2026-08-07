@@ -1,7 +1,7 @@
 use std::fmt;
 
 use rustc_ast::Mutability;
-use rustc_macros::HashStable;
+use rustc_macros::StableHash;
 use rustc_type_ir::elaborate;
 
 use crate::mir::interpret::{
@@ -9,7 +9,7 @@ use crate::mir::interpret::{
 };
 use crate::ty::{self, Instance, TraitRef, Ty, TyCtxt};
 
-#[derive(Clone, Copy, PartialEq, HashStable)]
+#[derive(Clone, Copy, PartialEq, StableHash)]
 pub enum VtblEntry<'tcx> {
     /// destructor of this type (used in vtable header)
     MetadataDropInPlace,
@@ -89,7 +89,7 @@ pub(super) fn vtable_allocation_provider<'tcx>(
 
     let vtable_entries = if let Some(poly_trait_ref) = poly_trait_ref {
         let trait_ref = poly_trait_ref.with_self_ty(tcx, ty);
-        let trait_ref = tcx.erase_regions(trait_ref);
+        let trait_ref = tcx.erase_and_anonymize_regions(trait_ref);
 
         tcx.vtable_entries(trait_ref)
     } else {
@@ -99,18 +99,19 @@ pub(super) fn vtable_allocation_provider<'tcx>(
     // This confirms that the layout computation for &dyn Trait has an accurate sizing.
     assert!(vtable_entries.len() >= vtable_min_entries(tcx, poly_trait_ref));
 
-    let layout = tcx
-        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))
-        .expect("failed to build vtable representation");
+    let layout = match tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)) {
+        Ok(layout) => layout,
+        Err(e) => tcx.dcx().fatal(e.to_string()),
+    };
     assert!(layout.is_sized(), "can't create a vtable for an unsized type");
     let size = layout.size.bytes();
-    let align = layout.align.abi.bytes();
+    let align = layout.align.bytes();
 
-    let ptr_size = tcx.data_layout.pointer_size;
-    let ptr_align = tcx.data_layout.pointer_align.abi;
+    let ptr_size = tcx.data_layout.pointer_size();
+    let ptr_align = tcx.data_layout.pointer_align().abi;
 
     let vtable_size = ptr_size * u64::try_from(vtable_entries.len()).unwrap();
-    let mut vtable = Allocation::new(vtable_size, ptr_align, AllocInit::Uninit);
+    let mut vtable = Allocation::new(vtable_size, ptr_align, AllocInit::Uninit, ());
 
     // No need to do any alignment checks on the memory accesses below, because we know the
     // allocation is correctly aligned as we created it above. Also we're only offsetting by
@@ -121,7 +122,7 @@ pub(super) fn vtable_allocation_provider<'tcx>(
         let scalar = match *entry {
             VtblEntry::MetadataDropInPlace => {
                 if ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
-                    let instance = ty::Instance::resolve_drop_in_place(tcx, ty);
+                    let instance = ty::Instance::resolve_drop_glue(tcx, ty);
                     let fn_alloc_id = tcx.reserve_and_set_fn_alloc(instance, CTFE_ALLOC_SALT);
                     let fn_ptr = Pointer::from(fn_alloc_id);
                     Scalar::from_pointer(fn_ptr, &tcx)

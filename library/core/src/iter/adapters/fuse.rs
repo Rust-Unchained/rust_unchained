@@ -4,6 +4,7 @@ use crate::iter::adapters::zip::try_get_unchecked;
 use crate::iter::{
     FusedIterator, TrustedFused, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
 };
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that yields `None` forever after the underlying iterator
@@ -21,7 +22,7 @@ pub struct Fuse<I> {
     iter: Option<I>,
 }
 impl<I> Fuse<I> {
-    pub(in crate::iter) fn new(iter: I) -> Fuse<I> {
+    pub(in crate::iter) const fn new(iter: I) -> Fuse<I> {
         Fuse { iter: Some(iter) }
     }
 
@@ -48,6 +49,10 @@ where
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         FuseImpl::next(self)
+    }
+
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        FuseImpl::advance_by(self, n)
     }
 
     #[inline]
@@ -198,8 +203,30 @@ impl<I: Default> Default for Fuse<I> {
     /// let iter: Fuse<slice::Iter<'_, u8>> = Default::default();
     /// assert_eq!(iter.len(), 0);
     /// ```
+    ///
+    /// This is equivalent to `I::default().fuse()`[^fuse_note]; e.g. if
+    /// `I::default()` is not an empty iterator, then this will not be
+    /// an empty iterator.
+    ///
+    /// ```
+    /// # use std::iter::Fuse;
+    /// #[derive(Default)]
+    /// struct Fourever;
+    ///
+    /// impl Iterator for Fourever {
+    ///     type Item = u32;
+    ///     fn next(&mut self) -> Option<u32> {
+    ///         Some(4)
+    ///     }
+    /// }
+    ///
+    /// let mut iter: Fuse<Fourever> = Default::default();
+    /// assert_eq!(iter.next(), Some(4));
+    /// ```
+    ///
+    /// [^fuse_note]: if `I` does not override `Iterator::fuse`'s default implementation
     fn default() -> Self {
-        Fuse { iter: Default::default() }
+        Fuse { iter: Some(I::default()) }
     }
 }
 
@@ -237,6 +264,7 @@ trait FuseImpl<I> {
 
     // Functions specific to any normal Iterators
     fn next(&mut self) -> Option<Self::Item>;
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>>;
     fn nth(&mut self, n: usize) -> Option<Self::Item>;
     fn try_fold<Acc, Fold, R>(&mut self, acc: Acc, fold: Fold) -> R
     where
@@ -277,6 +305,22 @@ where
     #[inline]
     default fn next(&mut self) -> Option<<I as Iterator>::Item> {
         and_then_or_clear(&mut self.iter, Iterator::next)
+    }
+
+    #[inline]
+    default fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        let Some(iter) = &mut self.iter else {
+            return match NonZero::new(n) {
+                Some(n) => Err(n),
+                None => Ok(()),
+            };
+        };
+
+        let res = iter.advance_by(n);
+        if res.is_err() {
+            self.iter = None;
+        }
+        res
     }
 
     #[inline]
@@ -357,6 +401,17 @@ where
     #[inline]
     fn next(&mut self) -> Option<<I as Iterator>::Item> {
         self.iter.as_mut()?.next()
+    }
+
+    #[inline]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        match &mut self.iter {
+            Some(iter) => iter.advance_by(n),
+            None => match NonZero::new(n) {
+                Some(n) => Err(n),
+                None => Ok(()),
+            },
+        }
     }
 
     #[inline]

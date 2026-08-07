@@ -1,6 +1,12 @@
 use core::ffi::CStr;
 
 #[test]
+fn const_default() {
+    const S: &CStr = <_>::default();
+    assert_eq!(S, c"");
+}
+
+#[test]
 fn compares_as_u8s() {
     let a: &CStr = c"Hello!"; // Starts with ascii
     let a_bytes: &[u8] = a.to_bytes();
@@ -17,5 +23,11 @@ fn compares_as_u8s() {
 #[test]
 fn debug() {
     let s = c"abc\x01\x02\n\xE2\x80\xA6\xFF";
-    assert_eq!(format!("{s:?}"), r#""abc\x01\x02\n\xe2\x80\xa6\xff""#);
+    assert_eq!(format!("{s:?}"), r#""abc\x01\x02\n…\xff""#);
+}
+
+#[test]
+fn display() {
+    let s = c"\xf0\x28\x8c\xbc";
+    assert_eq!(format!("{}", s.display()), "�(��");
 }

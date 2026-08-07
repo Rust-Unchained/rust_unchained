@@ -1,5 +1,22 @@
+cfg_select! {
+    any(
+        target_os = "linux", target_os = "android",
+        target_os = "hurd",
+        target_os = "dragonfly", target_os = "freebsd",
+        target_os = "openbsd", target_os = "netbsd",
+        target_os = "solaris", target_os = "illumos",
+        target_os = "haiku", target_os = "nto",
+        target_os = "qnx", target_os = "cygwin",
+    ) => {
+        use libc::MSG_NOSIGNAL;
+    }
+    _ => {
+        const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
+    }
+}
+
 use super::{SocketAddr, sockaddr_un};
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use super::{SocketAncillary, recv_vectored_with_ancillary_from, send_vectored_with_ancillary_to};
 #[cfg(any(
     target_os = "android",
@@ -9,6 +26,7 @@ use super::{SocketAncillary, recv_vectored_with_ancillary_from, send_vectored_wi
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "nto",
+    target_os = "qnx",
     target_vendor = "apple",
     target_os = "cygwin"
 ))]
@@ -18,17 +36,16 @@ use crate::io::{self, IoSlice, IoSliceMut};
 use crate::net::Shutdown;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::path::Path;
-use crate::sealed::Sealed;
-use crate::sys::cvt;
 use crate::sys::net::Socket;
-use crate::sys_common::{AsInner, FromInner};
+use crate::sys::{AsInner, FromInner, cvt};
 use crate::time::Duration;
 
 /// A Unix stream socket.
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(target_family = "unix", doc = "```no_run")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
 /// use std::os::unix::net::UnixStream;
 /// use std::io::prelude::*;
 ///
@@ -41,12 +58,21 @@ use crate::time::Duration;
 ///     Ok(())
 /// }
 /// ```
+///
+/// # `SOCK_CLOEXEC`
+///
+/// On platforms that support it, we pass the close-on-exec flag to atomically create the socket and
+/// set it as CLOEXEC. On Linux, this was added in 2.6.27. See [`socket(2)`] for more information.
+///
+/// [`socket(2)`]: https://www.man7.org/linux/man-pages/man2/socket.2.html#:~:text=SOCK_CLOEXEC
+///
+/// # `SIGPIPE`
+///
+/// Writes to the underlying socket in `SOCK_STREAM` mode are made with `MSG_NOSIGNAL` flag.
+/// This suppresses the emission of the  `SIGPIPE` signal when writing to disconnected socket.
+/// In some cases getting a `SIGPIPE` would trigger process termination.
 #[stable(feature = "unix_socket", since = "1.10.0")]
 pub struct UnixStream(pub(super) Socket);
-
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl Sealed for UnixStream {}
 
 #[stable(feature = "unix_socket", since = "1.10.0")]
 impl fmt::Debug for UnixStream {
@@ -68,7 +94,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// let socket = match UnixStream::connect("/tmp/sock") {
@@ -82,7 +109,7 @@ impl UnixStream {
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
         unsafe {
-            let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_STREAM)?;
+            let inner = Socket::new(libc::AF_UNIX, libc::SOCK_STREAM)?;
             let (addr, len) = sockaddr_un(path.as_ref())?;
 
             cvt(libc::connect(inner.as_raw_fd(), (&raw const addr) as *const _, len))?;
@@ -96,7 +123,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixListener, UnixStream};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -112,11 +140,11 @@ impl UnixStream {
     ///     };
     ///     Ok(())
     /// }
-    /// ````
+    /// ```
     #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn connect_addr(socket_addr: &SocketAddr) -> io::Result<UnixStream> {
         unsafe {
-            let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_STREAM)?;
+            let inner = Socket::new(libc::AF_UNIX, libc::SOCK_STREAM)?;
             cvt(libc::connect(
                 inner.as_raw_fd(),
                 (&raw const socket_addr.addr) as *const _,
@@ -132,7 +160,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// let (sock1, sock2) = match UnixStream::pair() {
@@ -158,7 +187,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -176,7 +206,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -194,7 +225,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -212,7 +244,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(peer_credentials_unix_socket)]
     /// use std::os::unix::net::UnixStream;
     ///
@@ -222,7 +255,7 @@ impl UnixStream {
     ///     Ok(())
     /// }
     /// ```
-    #[unstable(feature = "peer_credentials_unix_socket", issue = "42839", reason = "unstable")]
+    #[unstable(feature = "peer_credentials_unix_socket", issue = "42839")]
     #[cfg(any(
         target_os = "android",
         target_os = "linux",
@@ -231,6 +264,7 @@ impl UnixStream {
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "nto",
+        target_os = "qnx",
         target_vendor = "apple",
         target_os = "cygwin"
     ))]
@@ -248,7 +282,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
@@ -262,7 +297,8 @@ impl UnixStream {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
@@ -290,7 +326,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
@@ -305,13 +342,14 @@ impl UnixStream {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
-    /// use std::net::UdpSocket;
+    /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
-    ///     let socket = UdpSocket::bind("127.0.0.1:34254")?;
+    ///     let socket = UnixStream::connect("/tmp/sock")?;
     ///     let result = socket.set_write_timeout(Some(Duration::new(0, 0)));
     ///     let err = result.unwrap_err();
     ///     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -327,7 +365,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
@@ -347,7 +386,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
@@ -368,7 +408,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -411,7 +452,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -438,7 +480,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::net::Shutdown;
     ///
@@ -462,7 +505,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixStream;
@@ -485,8 +529,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixStream, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -516,7 +566,7 @@ impl UnixStream {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary(
         &self,
@@ -534,8 +584,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixStream, SocketAncillary};
     /// use std::io::IoSlice;
@@ -559,7 +615,7 @@ impl UnixStream {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary(
         &self,
@@ -576,7 +632,7 @@ impl io::Read for UnixStream {
         io::Read::read(&mut &*self, buf)
     }
 
-    fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
         io::Read::read_buf(&mut &*self, buf)
     }
 
@@ -596,7 +652,7 @@ impl<'a> io::Read for &'a UnixStream {
         self.0.read(buf)
     }
 
-    fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+    fn read_buf(&mut self, buf: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.0.read_buf(buf)
     }
 
@@ -633,7 +689,7 @@ impl io::Write for UnixStream {
 #[stable(feature = "unix_socket", since = "1.10.0")]
 impl<'a> io::Write for &'a UnixStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.0.send_with_flags(buf, MSG_NOSIGNAL)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {

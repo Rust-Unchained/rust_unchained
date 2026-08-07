@@ -1,11 +1,10 @@
-#![allow(
-    unused,
-    clippy::unused_unit,
-    clippy::unnecessary_operation,
-    clippy::no_effect,
-    clippy::single_element_loop
-)]
 #![warn(clippy::semicolon_outside_block)]
+#![expect(
+    clippy::no_effect,
+    clippy::single_element_loop,
+    clippy::unnecessary_operation,
+    clippy::unused_unit
+)]
 
 macro_rules! m {
     (()) => {
@@ -95,4 +94,29 @@ fn main() {
     }
 
     unit_fn_block()
+}
+
+fn issue14926() {
+    macro_rules! gen_code {
+        [$l:lifetime: $b:block, $b2: block $(,)?] => {
+            $l: loop {
+                $b
+                break $l;
+            }
+            $l: loop {
+                $b2
+                break $l;
+            }
+        };
+    }
+
+    gen_code! {
+        'root:
+        {
+            println!("Block1");
+        },
+        {
+            println!("Block2");
+        },
+    }
 }

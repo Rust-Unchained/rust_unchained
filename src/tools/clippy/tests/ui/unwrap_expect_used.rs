@@ -66,3 +66,32 @@ fn main() {
         SOME.expect("Still not three?");
     }
 }
+
+mod with_expansion {
+    macro_rules! open {
+        ($file:expr) => {
+            std::fs::File::open($file)
+        };
+    }
+
+    fn test(file: &str) {
+        use std::io::Read;
+        let mut s = String::new();
+        let _ = open!(file).unwrap(); //~ unwrap_used
+        let _ = open!(file).expect("can open"); //~ expect_used
+        let _ = open!(file).unwrap_err(); //~ unwrap_used
+        let _ = open!(file).expect_err("can open"); //~ expect_used
+    }
+}
+
+fn issue16484() {
+    let opt = Some(());
+    Option::unwrap(opt); //~ unwrap_used
+    Option::expect(opt, "error message"); //~ expect_used
+
+    let res: Result<(), i32> = Ok(());
+    Result::unwrap(res); //~ unwrap_used
+    Result::expect(res, "error message"); //~ expect_used
+    Result::unwrap_err(res); //~ unwrap_used
+    Result::expect_err(res, "error message"); //~ expect_used
+}

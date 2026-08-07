@@ -1,19 +1,18 @@
-use std::iter::repeat;
+use std::iter::repeat_n;
 use std::ops::ControlFlow;
 
 use hir::intravisit::{self, Visitor};
 use rustc_ast::Recovered;
-use rustc_errors::{Applicability, Diag, EmissionGuarantee, Subdiagnostic, SuggestionStyle};
+use rustc_errors::{Applicability, Diag, EmissionGuarantee, Subdiagnostic, SuggestionStyle, msg};
 use rustc_hir::{self as hir, HirIdSet};
-use rustc_macros::{LintDiagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::adjustment::Adjust;
 use rustc_middle::ty::significant_drop_order::{
     extract_component_with_significant_dtor, ty_dtor_span,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::lint::{FutureIncompatibilityReason, LintId};
+use rustc_session::lint::{LintId, fcw};
 use rustc_session::{declare_lint, impl_lint_pass};
-use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Span};
 use smallvec::SmallVec;
 
@@ -86,8 +85,7 @@ declare_lint! {
     "`if let` assigns a shorter lifetime to temporary values being pattern-matched against in Edition 2024 and \
     rewriting in `match` is an option to preserve the semantics up to Edition 2021",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionSemanticsChange(Edition::Edition2024),
-        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2024/temporary-if-let-scope.html>",
+        reason: fcw!(EditionSemanticsChange 2024 "temporary-if-let-scope"),
     };
 }
 
@@ -230,7 +228,7 @@ impl IfLetRescope {
                     }
                 }
             }
-            // At this point, any `if let` fragment in the cascade is definitely preceeded by `else`,
+            // At this point, any `if let` fragment in the cascade is definitely preceded by `else`,
             // so a opening bracket is mandatory before each `match`.
             add_bracket_to_match_head = true;
             if let Some(alt) = alt {
@@ -271,7 +269,7 @@ impl_lint_pass!(
 impl<'tcx> LateLintPass<'tcx> for IfLetRescope {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         if expr.span.edition().at_least_rust_2024()
-            || cx.tcx.lints_that_dont_need_to_run(()).contains(&LintId::of(IF_LET_RESCOPE))
+            || cx.tcx.skippable_lints(()).contains(&LintId::of(IF_LET_RESCOPE))
         {
             return;
         }
@@ -304,14 +302,16 @@ impl<'tcx> LateLintPass<'tcx> for IfLetRescope {
     }
 }
 
-#[derive(LintDiagnostic)]
-#[diag(lint_if_let_rescope)]
+#[derive(Diagnostic)]
+#[diag("`if let` assigns a shorter lifetime since Edition 2024")]
 struct IfLetRescopeLint {
     #[subdiagnostic]
     destructors: Vec<DestructorLabel>,
-    #[label]
+    #[label(
+        "this value has a significant drop implementation which may observe a major change in drop order and requires your discretion"
+    )]
     significant_droppers: Vec<Span>,
-    #[help]
+    #[help("the value is now dropped here in Edition 2024")]
     lifetime_ends: Vec<Span>,
     #[subdiagnostic]
     rewrite: Option<IfLetRescopeRewrite>,
@@ -349,12 +349,12 @@ impl Subdiagnostic for IfLetRescopeRewrite {
             closing_brackets
                 .empty_alt
                 .then_some(" _ => {}".chars())
-                .into_iter()
-                .flatten()
-                .chain(repeat('}').take(closing_brackets.count))
+                .into_flat_iter()
+                .chain(repeat_n('}', closing_brackets.count))
                 .collect(),
         ));
-        let msg = diag.eagerly_translate(crate::fluent_generated::lint_suggestion);
+        let msg =
+            msg!("a `match` with a single arm can preserve the drop order up to Edition 2021");
         diag.multipart_suggestion_with_style(
             msg,
             suggestions,
@@ -365,7 +365,12 @@ impl Subdiagnostic for IfLetRescopeRewrite {
 }
 
 #[derive(Subdiagnostic)]
-#[note(lint_if_let_dtor)]
+#[note(
+    "{$dtor_kind ->
+        [dyn] value may invoke a custom destructor because it contains a trait object
+        *[concrete] value invokes this custom destructor
+    }"
+)]
 struct DestructorLabel {
     #[primary_span]
     span: Span,

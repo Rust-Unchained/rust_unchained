@@ -1,16 +1,10 @@
-//@compile-flags: -Zdeduplicate-diagnostics=yes
 //@aux-build: proc_macros.rs
 
 #![warn(clippy::indexing_slicing)]
 // We also check the out_of_bounds_indexing lint here, because it lints similar things and
-// we want to avoid false positives.
-#![warn(clippy::out_of_bounds_indexing)]
-#![allow(
-    unconditional_panic,
-    clippy::no_effect,
-    clippy::unnecessary_operation,
-    clippy::useless_vec
-)]
+// we want to avoid false positives. This needs to be cleaned up after <https://github.com/rust-lang/rust-clippy/issues/17117> is fixed.
+#![deny(clippy::out_of_bounds_indexing)]
+#![expect(clippy::no_effect, clippy::unnecessary_operation, clippy::useless_vec)]
 
 extern crate proc_macros;
 use proc_macros::with_span;
@@ -68,7 +62,6 @@ fn main() {
     // This should be linted, since `suppress-restriction-lint-in-const` default is false.
     const { &ARR[idx4()] };
     //~^ ERROR: indexing may panic
-    //~| ERROR: evaluation of `main
 
     let y = &x;
     // Ok, referencing shouldn't affect this lint. See the issue 6021

@@ -1,9 +1,12 @@
 #![allow(dead_code)] // not used on all platforms
 
-use crate::fs;
+use crate::fs::{remove_file, rename};
 use crate::io::{self, Error, ErrorKind};
-use crate::path::Path;
-use crate::sys_common::ignore_notfound;
+use crate::path::{Path, PathBuf};
+use crate::sys::IntoInner;
+use crate::sys::fs::{File, FileAttr, OpenOptions};
+use crate::sys::helpers::ignore_notfound;
+use crate::{fmt, fs};
 
 pub(crate) const NOT_FILE_ERROR: Error = io::const_error!(
     ErrorKind::InvalidInput,
@@ -56,5 +59,37 @@ pub fn exists(path: &Path) -> io::Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+pub struct Dir {
+    path: PathBuf,
+}
+
+impl Dir {
+    pub fn open(path: &Path, _opts: &OpenOptions) -> io::Result<Self> {
+        path.canonicalize().map(|path| Self { path })
+    }
+
+    pub fn open_file(&self, path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        File::open(&self.path.join(path), &opts)
+    }
+
+    pub fn metadata(&self) -> io::Result<FileAttr> {
+        self.path.metadata().map(|m| m.into_inner())
+    }
+
+    pub fn remove_file(&self, path: &Path) -> io::Result<()> {
+        remove_file(self.path.join(path))
+    }
+
+    pub fn rename(&self, from: &Path, to_dir: &Self, to: &Path) -> io::Result<()> {
+        rename(self.path.join(from), to_dir.path.join(to))
+    }
+}
+
+impl fmt::Debug for Dir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Dir").field("path", &self.path).finish()
     }
 }

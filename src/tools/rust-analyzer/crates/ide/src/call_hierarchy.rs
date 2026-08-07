@@ -4,14 +4,17 @@ use std::iter;
 
 use hir::Semantics;
 use ide_db::{
+    FileRange, FxIndexMap, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
     helpers::pick_best_token,
+    ra_fixture::RaFixtureConfig,
     search::FileReference,
-    FileRange, FxIndexMap, RootDatabase,
 };
-use syntax::{ast, AstNode, SyntaxKind::IDENT};
+use syntax::{AstNode, SyntaxKind::IDENT, ast};
 
-use crate::{goto_definition, FilePosition, NavigationTarget, RangeInfo, TryToNav};
+use crate::{
+    FilePosition, GotoDefinitionConfig, NavigationTarget, RangeInfo, TryToNav, goto_definition,
+};
 
 #[derive(Debug, Clone)]
 pub struct CallItem {
@@ -19,22 +22,28 @@ pub struct CallItem {
     pub ranges: Vec<FileRange>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallHierarchyConfig {
+#[derive(Debug, Clone, Copy)]
+pub struct CallHierarchyConfig<'a> {
     /// Whether to exclude tests from the call hierarchy
     pub exclude_tests: bool,
+    pub ra_fixture: RaFixtureConfig<'a>,
 }
 
 pub(crate) fn call_hierarchy(
     db: &RootDatabase,
     position: FilePosition,
+    config: &CallHierarchyConfig<'_>,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
-    goto_definition::goto_definition(db, position)
+    goto_definition::goto_definition(
+        db,
+        position,
+        &GotoDefinitionConfig { ra_fixture: config.ra_fixture },
+    )
 }
 
 pub(crate) fn incoming_calls(
     db: &RootDatabase,
-    CallHierarchyConfig { exclude_tests }: CallHierarchyConfig,
+    config: &CallHierarchyConfig<'_>,
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<Vec<CallItem>> {
     let sema = &Semantics::new(db);
@@ -67,18 +76,18 @@ pub(crate) fn incoming_calls(
                 let def = ast::Fn::cast(node).and_then(|fn_| sema.to_def(&fn_))?;
                 // We should return def before check if it is a test, so that we
                 // will not continue to search for outer fn in nested fns
-                def.try_to_nav(sema.db).map(|nav| (def, nav))
+                def.try_to_nav(sema).map(|nav| (def, nav))
             });
 
             if let Some((def, nav)) = def_nav {
-                if exclude_tests && def.is_test(db) {
+                if config.exclude_tests && def.is_test(db) {
                     continue;
                 }
 
                 let range = sema.original_range(name.syntax());
-                calls.add(nav.call_site, range.into());
+                calls.add(nav.call_site, range.into_file_id(db));
                 if let Some(other) = nav.def_site {
-                    calls.add(other, range.into());
+                    calls.add(other, range.into_file_id(db));
                 }
             }
         }
@@ -89,7 +98,7 @@ pub(crate) fn incoming_calls(
 
 pub(crate) fn outgoing_calls(
     db: &RootDatabase,
-    CallHierarchyConfig { exclude_tests }: CallHierarchyConfig,
+    config: &CallHierarchyConfig<'_>,
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<Vec<CallItem>> {
     let sema = Semantics::new(db);
@@ -119,31 +128,31 @@ pub(crate) fn outgoing_calls(
                     let callable = sema.type_of_expr(&expr)?.original.as_callable(db)?;
                     match callable.kind() {
                         hir::CallableKind::Function(it) => {
-                            if exclude_tests && it.is_test(db) {
+                            if config.exclude_tests && it.is_test(db) {
                                 return None;
                             }
-                            it.try_to_nav(db)
+                            it.try_to_nav(&sema)
                         }
-                        hir::CallableKind::TupleEnumVariant(it) => it.try_to_nav(db),
-                        hir::CallableKind::TupleStruct(it) => it.try_to_nav(db),
+                        hir::CallableKind::TupleEnumVariant(it) => it.try_to_nav(&sema),
+                        hir::CallableKind::TupleStruct(it) => it.try_to_nav(&sema),
                         _ => None,
                     }
                     .zip(Some(sema.original_range(expr.syntax())))
                 }
                 ast::CallableExpr::MethodCall(expr) => {
                     let function = sema.resolve_method_call(&expr)?;
-                    if exclude_tests && function.is_test(db) {
+                    if config.exclude_tests && function.is_test(db) {
                         return None;
                     }
                     function
-                        .try_to_nav(db)
+                        .try_to_nav(&sema)
                         .zip(Some(sema.original_range(expr.name_ref()?.syntax())))
                 }
             }?;
             Some(nav_target.into_iter().zip(iter::repeat(range)))
         })
         .flatten()
-        .for_each(|(nav, range)| calls.add(nav, range.into()));
+        .for_each(|(nav, range)| calls.add(nav, range.into_file_id(db)));
 
     Some(calls.into_items())
 }
@@ -165,8 +174,8 @@ impl CallLocations {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
-    use ide_db::FilePosition;
+    use expect_test::{Expect, expect};
+    use ide_db::{FilePosition, ra_fixture::RaFixtureConfig};
     use itertools::Itertools;
 
     use crate::fixture;
@@ -189,21 +198,21 @@ mod tests {
             )
         }
 
+        let config =
+            crate::CallHierarchyConfig { exclude_tests, ra_fixture: RaFixtureConfig::default() };
         let (analysis, pos) = fixture::position(ra_fixture);
 
-        let mut navs = analysis.call_hierarchy(pos).unwrap().unwrap().info;
+        let mut navs = analysis.call_hierarchy(pos, &config).unwrap().unwrap().info;
         assert_eq!(navs.len(), 1);
         let nav = navs.pop().unwrap();
         expected_nav.assert_eq(&nav.debug_render());
 
-        let config = crate::CallHierarchyConfig { exclude_tests };
-
         let item_pos =
             FilePosition { file_id: nav.file_id, offset: nav.focus_or_full_range().start() };
-        let incoming_calls = analysis.incoming_calls(config, item_pos).unwrap().unwrap();
+        let incoming_calls = analysis.incoming_calls(&config, item_pos).unwrap().unwrap();
         expected_incoming.assert_eq(&incoming_calls.into_iter().map(debug_render).join("\n"));
 
-        let outgoing_calls = analysis.outgoing_calls(config, item_pos).unwrap().unwrap();
+        let outgoing_calls = analysis.outgoing_calls(&config, item_pos).unwrap().unwrap();
         expected_outgoing.assert_eq(&outgoing_calls.into_iter().map(debug_render).join("\n"));
     }
 
@@ -592,7 +601,7 @@ macro_rules! call {
 "#,
             expect!["callee Function FileId(0) 22..37 30..36"],
             expect![[r#"
-                caller Function FileId(0) 38..52 : FileId(0):44..50
+                caller Function FileId(0) 38..43 : FileId(0):44..50
                 caller Function FileId(1) 130..136 130..136 : FileId(0):44..50
                 callee Function FileId(0) 38..52 44..50 : FileId(0):44..50"#]],
             expect![[]],

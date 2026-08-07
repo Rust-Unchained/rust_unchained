@@ -1,20 +1,20 @@
 use std::ops::{Bound, Range};
 
-use ast::token::IdentIsRaw;
-use pm::bridge::{
-    DelimSpan, Diagnostic, ExpnGlobals, Group, Ident, LitKind, Literal, Punct, TokenTree, server,
-};
-use pm::{Delimiter, Level};
 use rustc_ast as ast;
-use rustc_ast::token;
+use rustc_ast::token as tk;
 use rustc_ast::tokenstream::{self, DelimSpacing, Spacing, TokenStream};
 use rustc_ast::util::literal::escape_byte_str_symbol;
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Diag, ErrorGuaranteed, MultiSpan, PResult};
-use rustc_parse::lexer::nfc_normalize;
+use rustc_errors::{Diag, ErrorGuaranteed, MultiSpan};
+use rustc_parse::lexer::{StripTokens, nfc_normalize};
 use rustc_parse::parser::Parser;
-use rustc_parse::{exp, new_parser_from_source_str, source_str_to_stream, unwrap_or_emit_fatal};
+use rustc_parse::{exp, new_parser_from_source_str, source_str_to_stream};
+use rustc_proc_macro::bridge::{
+    DelimSpan, Diagnostic, ExpnGlobals, Group, Ident, LitKind, Literal, Punct, TokenTree, server,
+};
+use rustc_proc_macro::{Delimiter, Level};
+use rustc_session::Session;
 use rustc_session::parse::ParseSess;
 use rustc_span::def_id::CrateNum;
 use rustc_span::{BytePos, FileName, Pos, Span, Symbol, sym};
@@ -30,65 +30,65 @@ trait ToInternal<T> {
     fn to_internal(self) -> T;
 }
 
-impl FromInternal<token::Delimiter> for Delimiter {
-    fn from_internal(delim: token::Delimiter) -> Delimiter {
+impl FromInternal<tk::Delimiter> for Delimiter {
+    fn from_internal(delim: tk::Delimiter) -> Delimiter {
         match delim {
-            token::Delimiter::Parenthesis => Delimiter::Parenthesis,
-            token::Delimiter::Brace => Delimiter::Brace,
-            token::Delimiter::Bracket => Delimiter::Bracket,
-            token::Delimiter::Invisible(_) => Delimiter::None,
+            tk::Delimiter::Parenthesis => Delimiter::Parenthesis,
+            tk::Delimiter::Brace => Delimiter::Brace,
+            tk::Delimiter::Bracket => Delimiter::Bracket,
+            tk::Delimiter::Invisible(_) => Delimiter::None,
         }
     }
 }
 
-impl ToInternal<token::Delimiter> for Delimiter {
-    fn to_internal(self) -> token::Delimiter {
+impl ToInternal<tk::Delimiter> for Delimiter {
+    fn to_internal(self) -> tk::Delimiter {
         match self {
-            Delimiter::Parenthesis => token::Delimiter::Parenthesis,
-            Delimiter::Brace => token::Delimiter::Brace,
-            Delimiter::Bracket => token::Delimiter::Bracket,
-            Delimiter::None => token::Delimiter::Invisible(token::InvisibleOrigin::ProcMacro),
+            Delimiter::Parenthesis => tk::Delimiter::Parenthesis,
+            Delimiter::Brace => tk::Delimiter::Brace,
+            Delimiter::Bracket => tk::Delimiter::Bracket,
+            Delimiter::None => tk::Delimiter::Invisible(tk::InvisibleOrigin::ProcMacro),
         }
     }
 }
 
-impl FromInternal<token::LitKind> for LitKind {
-    fn from_internal(kind: token::LitKind) -> Self {
+impl FromInternal<tk::LitKind> for LitKind {
+    fn from_internal(kind: tk::LitKind) -> Self {
         match kind {
-            token::Byte => LitKind::Byte,
-            token::Char => LitKind::Char,
-            token::Integer => LitKind::Integer,
-            token::Float => LitKind::Float,
-            token::Str => LitKind::Str,
-            token::StrRaw(n) => LitKind::StrRaw(n),
-            token::ByteStr => LitKind::ByteStr,
-            token::ByteStrRaw(n) => LitKind::ByteStrRaw(n),
-            token::CStr => LitKind::CStr,
-            token::CStrRaw(n) => LitKind::CStrRaw(n),
-            token::Err(_guar) => {
-                // This is the only place a `pm::bridge::LitKind::ErrWithGuar`
+            tk::Byte => LitKind::Byte,
+            tk::Char => LitKind::Char,
+            tk::Integer => LitKind::Integer,
+            tk::Float => LitKind::Float,
+            tk::Str => LitKind::Str,
+            tk::StrRaw(n) => LitKind::StrRaw(n),
+            tk::ByteStr => LitKind::ByteStr,
+            tk::ByteStrRaw(n) => LitKind::ByteStrRaw(n),
+            tk::CStr => LitKind::CStr,
+            tk::CStrRaw(n) => LitKind::CStrRaw(n),
+            tk::Err(_guar) => {
+                // This is the only place a `rustc_proc_macro::bridge::LitKind::ErrWithGuar`
                 // is constructed. Note that an `ErrorGuaranteed` is available,
                 // as required. See the comment in `to_internal`.
                 LitKind::ErrWithGuar
             }
-            token::Bool => unreachable!(),
+            tk::Bool => unreachable!(),
         }
     }
 }
 
-impl ToInternal<token::LitKind> for LitKind {
-    fn to_internal(self) -> token::LitKind {
+impl ToInternal<tk::LitKind> for LitKind {
+    fn to_internal(self) -> tk::LitKind {
         match self {
-            LitKind::Byte => token::Byte,
-            LitKind::Char => token::Char,
-            LitKind::Integer => token::Integer,
-            LitKind::Float => token::Float,
-            LitKind::Str => token::Str,
-            LitKind::StrRaw(n) => token::StrRaw(n),
-            LitKind::ByteStr => token::ByteStr,
-            LitKind::ByteStrRaw(n) => token::ByteStrRaw(n),
-            LitKind::CStr => token::CStr,
-            LitKind::CStrRaw(n) => token::CStrRaw(n),
+            LitKind::Byte => tk::Byte,
+            LitKind::Char => tk::Char,
+            LitKind::Integer => tk::Integer,
+            LitKind::Float => tk::Float,
+            LitKind::Str => tk::Str,
+            LitKind::StrRaw(n) => tk::StrRaw(n),
+            LitKind::ByteStr => tk::ByteStr,
+            LitKind::ByteStrRaw(n) => tk::ByteStrRaw(n),
+            LitKind::CStr => tk::CStr,
+            LitKind::CStrRaw(n) => tk::CStrRaw(n),
             LitKind::ErrWithGuar => {
                 // This is annoying but valid. `LitKind::ErrWithGuar` would
                 // have an `ErrorGuaranteed` except that type isn't available
@@ -97,59 +97,37 @@ impl ToInternal<token::LitKind> for LitKind {
                 // which would be expensive.
                 #[allow(deprecated)]
                 let guar = ErrorGuaranteed::unchecked_error_guaranteed();
-                token::Err(guar)
+                tk::Err(guar)
             }
         }
     }
 }
 
-impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStream, Span, Symbol>> {
-    fn from_internal((stream, rustc): (TokenStream, &mut Rustc<'_, '_>)) -> Self {
-        use rustc_ast::token::*;
-
+impl FromInternal<TokenStream> for Vec<TokenTree<TokenStream, Span, Symbol>> {
+    fn from_internal(stream: TokenStream) -> Self {
         // Estimate the capacity as `stream.len()` rounded up to the next power
         // of two to limit the number of required reallocations.
         let mut trees = Vec::with_capacity(stream.len().next_power_of_two());
-        let mut iter = stream.iter();
 
-        while let Some(tree) = iter.next() {
-            let (Token { kind, span }, joint) = match tree.clone() {
+        for tree in stream.iter() {
+            let (tk::Token { kind, span }, joint) = match tree.clone() {
                 tokenstream::TokenTree::Delimited(span, _, mut delim, mut stream) => {
-                    // We used to have an alternative behaviour for crates that
-                    // needed it: a hack used to pass AST fragments to
-                    // attribute and derive macros as a single nonterminal
-                    // token instead of a token stream. Such token needs to be
-                    // "unwrapped" and not represented as a delimited group. We
-                    // had a lint for a long time, but now we just emit a hard
-                    // error. Eventually we might remove the special case hard
-                    // error check altogether. See #73345.
-                    if let Delimiter::Invisible(InvisibleOrigin::MetaVar(kind)) = delim {
-                        crate::base::stream_pretty_printing_compatibility_hack(
-                            kind,
-                            &stream,
-                            rustc.psess(),
-                        );
-                    }
-
                     // In `mk_delimited` we avoid nesting invisible delimited
                     // of the same `MetaVarKind`. Here we do the same but
                     // ignore the `MetaVarKind` because it is discarded when we
                     // convert it to a `Group`.
-                    while let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim {
-                        if stream.len() == 1
-                            && let tree = stream.iter().next().unwrap()
-                            && let tokenstream::TokenTree::Delimited(_, _, delim2, stream2) = tree
-                            && let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim2
-                        {
-                            delim = *delim2;
-                            stream = stream2.clone();
-                        } else {
-                            break;
-                        }
+                    while let tk::Delimiter::Invisible(tk::InvisibleOrigin::MetaVar(_)) = delim
+                        && stream.len() == 1
+                        && let tree = stream.get(0).unwrap()
+                        && let tokenstream::TokenTree::Delimited(_, _, delim2, stream2) = tree
+                        && let tk::Delimiter::Invisible(tk::InvisibleOrigin::MetaVar(_)) = delim2
+                    {
+                        delim = *delim2;
+                        stream = stream2.clone();
                     }
 
                     trees.push(TokenTree::Group(Group {
-                        delimiter: pm::Delimiter::from_internal(delim),
+                        delimiter: rustc_proc_macro::Delimiter::from_internal(delim),
                         stream: Some(stream),
                         span: DelimSpan {
                             open: span.open,
@@ -202,81 +180,87 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
             };
 
             match kind {
-                Eq => op("="),
-                Lt => op("<"),
-                Le => op("<="),
-                EqEq => op("=="),
-                Ne => op("!="),
-                Ge => op(">="),
-                Gt => op(">"),
-                AndAnd => op("&&"),
-                OrOr => op("||"),
-                Bang => op("!"),
-                Tilde => op("~"),
-                Plus => op("+"),
-                Minus => op("-"),
-                Star => op("*"),
-                Slash => op("/"),
-                Percent => op("%"),
-                Caret => op("^"),
-                And => op("&"),
-                Or => op("|"),
-                Shl => op("<<"),
-                Shr => op(">>"),
-                PlusEq => op("+="),
-                MinusEq => op("-="),
-                StarEq => op("*="),
-                SlashEq => op("/="),
-                PercentEq => op("%="),
-                CaretEq => op("^="),
-                AndEq => op("&="),
-                OrEq => op("|="),
-                ShlEq => op("<<="),
-                ShrEq => op(">>="),
-                At => op("@"),
-                Dot => op("."),
-                DotDot => op(".."),
-                DotDotDot => op("..."),
-                DotDotEq => op("..="),
-                Comma => op(","),
-                Semi => op(";"),
-                Colon => op(":"),
-                PathSep => op("::"),
-                RArrow => op("->"),
-                LArrow => op("<-"),
-                FatArrow => op("=>"),
-                Pound => op("#"),
-                Dollar => op("$"),
-                Question => op("?"),
-                SingleQuote => op("'"),
+                tk::Eq => op("="),
+                tk::Lt => op("<"),
+                tk::Le => op("<="),
+                tk::EqEq => op("=="),
+                tk::Ne => op("!="),
+                tk::Ge => op(">="),
+                tk::Gt => op(">"),
+                tk::AndAnd => op("&&"),
+                tk::OrOr => op("||"),
+                tk::Bang => op("!"),
+                tk::Tilde => op("~"),
+                tk::Plus => op("+"),
+                tk::Minus => op("-"),
+                tk::Star => op("*"),
+                tk::Slash => op("/"),
+                tk::Percent => op("%"),
+                tk::Caret => op("^"),
+                tk::And => op("&"),
+                tk::Or => op("|"),
+                tk::Shl => op("<<"),
+                tk::Shr => op(">>"),
+                tk::PlusEq => op("+="),
+                tk::MinusEq => op("-="),
+                tk::StarEq => op("*="),
+                tk::SlashEq => op("/="),
+                tk::PercentEq => op("%="),
+                tk::CaretEq => op("^="),
+                tk::AndEq => op("&="),
+                tk::OrEq => op("|="),
+                tk::ShlEq => op("<<="),
+                tk::ShrEq => op(">>="),
+                tk::At => op("@"),
+                tk::Dot => op("."),
+                tk::DotDot => op(".."),
+                tk::DotDotDot => op("..."),
+                tk::DotDotEq => op("..="),
+                tk::Comma => op(","),
+                tk::Semi => op(";"),
+                tk::Colon => op(":"),
+                tk::PathSep => op("::"),
+                tk::RArrow => op("->"),
+                tk::LArrow => op("<-"),
+                tk::FatArrow => op("=>"),
+                tk::Pound => op("#"),
+                tk::Dollar => op("$"),
+                tk::Question => op("?"),
+                tk::SingleQuote => op("'"),
 
-                Ident(sym, is_raw) => {
-                    trees.push(TokenTree::Ident(Ident { sym, is_raw: is_raw.into(), span }))
-                }
-                NtIdent(ident, is_raw) => trees.push(TokenTree::Ident(Ident {
+                tk::Ident(sym, is_raw) => trees.push(TokenTree::Ident(Ident {
+                    sym,
+                    is_raw: matches!(is_raw, tk::IdentIsRaw::Yes),
+                    span,
+                })),
+                tk::NtIdent(ident, is_raw) => trees.push(TokenTree::Ident(Ident {
                     sym: ident.name,
-                    is_raw: is_raw.into(),
+                    is_raw: matches!(is_raw, tk::IdentIsRaw::Yes),
                     span: ident.span,
                 })),
 
-                Lifetime(name, is_raw) => {
+                tk::Lifetime(name, is_raw) => {
                     let ident = rustc_span::Ident::new(name, span).without_first_quote();
                     trees.extend([
                         TokenTree::Punct(Punct { ch: b'\'', joint: true, span }),
-                        TokenTree::Ident(Ident { sym: ident.name, is_raw: is_raw.into(), span }),
+                        TokenTree::Ident(Ident {
+                            sym: ident.name,
+                            is_raw: matches!(is_raw, tk::IdentIsRaw::Yes),
+                            span,
+                        }),
                     ]);
                 }
-                NtLifetime(ident, is_raw) => {
+                tk::NtLifetime(ident, is_raw) => {
                     let stream =
-                        TokenStream::token_alone(token::Lifetime(ident.name, is_raw), ident.span);
+                        TokenStream::token_alone(tk::Lifetime(ident.name, is_raw), ident.span);
                     trees.push(TokenTree::Group(Group {
-                        delimiter: pm::Delimiter::None,
+                        delimiter: rustc_proc_macro::Delimiter::None,
                         stream: Some(stream),
                         span: DelimSpan::from_single(span),
                     }))
                 }
 
-                Literal(token::Lit { kind, symbol, suffix }) => {
+                tk::Literal(tk::Lit { kind, symbol, suffix }) => {
                     trees.push(TokenTree::Literal(self::Literal {
                         kind: FromInternal::from_internal(kind),
                         symbol,
@@ -284,15 +268,15 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
                         span,
                     }));
                 }
-                DocComment(_, attr_style, data) => {
+                tk::DocComment(_, attr_style, data) => {
                     let mut escaped = String::new();
                     for ch in data.as_str().chars() {
                         escaped.extend(ch.escape_debug());
                     }
                     let stream = [
-                        Ident(sym::doc, IdentIsRaw::No),
-                        Eq,
-                        TokenKind::lit(token::Str, Symbol::intern(&escaped), None),
+                        tk::Ident(sym::doc, tk::IdentIsRaw::No),
+                        tk::Eq,
+                        tk::TokenKind::lit(tk::Str, Symbol::intern(&escaped), None),
                     ]
                     .into_iter()
                     .map(|kind| tokenstream::TokenTree::token_alone(kind, span))
@@ -302,14 +286,21 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
                         trees.push(TokenTree::Punct(Punct { ch: b'!', joint: false, span }));
                     }
                     trees.push(TokenTree::Group(Group {
-                        delimiter: pm::Delimiter::Bracket,
+                        delimiter: rustc_proc_macro::Delimiter::Bracket,
                         stream: Some(stream),
                         span: DelimSpan::from_single(span),
                     }));
                 }
 
-                OpenParen | CloseParen | OpenBrace | CloseBrace | OpenBracket | CloseBracket
-                | OpenInvisible(_) | CloseInvisible(_) | Eof => unreachable!(),
+                tk::OpenParen
+                | tk::CloseParen
+                | tk::OpenBrace
+                | tk::CloseBrace
+                | tk::OpenBracket
+                | tk::CloseBracket
+                | tk::OpenInvisible(_)
+                | tk::CloseInvisible(_)
+                | tk::Eof => unreachable!(),
             }
         }
         trees
@@ -321,8 +312,6 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
     for (TokenTree<TokenStream, Span, Symbol>, &mut Rustc<'_, '_>)
 {
     fn to_internal(self) -> SmallVec<[tokenstream::TokenTree; 2]> {
-        use rustc_ast::token::*;
-
         // The code below is conservative, using `token_alone`/`Spacing::Alone`
         // in most places. It's hard in general to do better when working at
         // the token level. When the resulting code is pretty-printed by
@@ -332,31 +321,31 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
         match tree {
             TokenTree::Punct(Punct { ch, joint, span }) => {
                 let kind = match ch {
-                    b'=' => Eq,
-                    b'<' => Lt,
-                    b'>' => Gt,
-                    b'!' => Bang,
-                    b'~' => Tilde,
-                    b'+' => Plus,
-                    b'-' => Minus,
-                    b'*' => Star,
-                    b'/' => Slash,
-                    b'%' => Percent,
-                    b'^' => Caret,
-                    b'&' => And,
-                    b'|' => Or,
-                    b'@' => At,
-                    b'.' => Dot,
-                    b',' => Comma,
-                    b';' => Semi,
-                    b':' => Colon,
-                    b'#' => Pound,
-                    b'$' => Dollar,
-                    b'?' => Question,
-                    b'\'' => SingleQuote,
+                    b'=' => tk::Eq,
+                    b'<' => tk::Lt,
+                    b'>' => tk::Gt,
+                    b'!' => tk::Bang,
+                    b'~' => tk::Tilde,
+                    b'+' => tk::Plus,
+                    b'-' => tk::Minus,
+                    b'*' => tk::Star,
+                    b'/' => tk::Slash,
+                    b'%' => tk::Percent,
+                    b'^' => tk::Caret,
+                    b'&' => tk::And,
+                    b'|' => tk::Or,
+                    b'@' => tk::At,
+                    b'.' => tk::Dot,
+                    b',' => tk::Comma,
+                    b';' => tk::Semi,
+                    b':' => tk::Colon,
+                    b'#' => tk::Pound,
+                    b'$' => tk::Dollar,
+                    b'?' => tk::Question,
+                    b'\'' => tk::SingleQuote,
                     _ => unreachable!(),
                 };
-                // We never produce `token::Spacing::JointHidden` here, which
+                // We never produce `tk::Spacing::JointHidden` here, which
                 // means the pretty-printing of code produced by proc macros is
                 // ugly, with lots of whitespace between tokens. This is
                 // unavoidable because `proc_macro::Spacing` only applies to
@@ -377,7 +366,7 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
             }
             TokenTree::Ident(self::Ident { sym, is_raw, span }) => {
                 rustc.psess().symbol_gallery.insert(sym, span);
-                smallvec![tokenstream::TokenTree::token_alone(Ident(sym, is_raw.into()), span)]
+                smallvec![tokenstream::TokenTree::token_alone(tk::Ident(sym, is_raw.into()), span)]
             }
             TokenTree::Literal(self::Literal {
                 kind: self::LitKind::Integer,
@@ -386,8 +375,8 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
                 span,
             }) if let Some(symbol) = symbol.as_str().strip_prefix('-') => {
                 let symbol = Symbol::intern(symbol);
-                let integer = TokenKind::lit(token::Integer, symbol, suffix);
-                let a = tokenstream::TokenTree::token_joint_hidden(Minus, span);
+                let integer = tk::TokenKind::lit(tk::Integer, symbol, suffix);
+                let a = tokenstream::TokenTree::token_joint_hidden(tk::Minus, span);
                 let b = tokenstream::TokenTree::token_alone(integer, span);
                 smallvec![a, b]
             }
@@ -398,14 +387,14 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
                 span,
             }) if let Some(symbol) = symbol.as_str().strip_prefix('-') => {
                 let symbol = Symbol::intern(symbol);
-                let float = TokenKind::lit(token::Float, symbol, suffix);
-                let a = tokenstream::TokenTree::token_joint_hidden(Minus, span);
+                let float = tk::TokenKind::lit(tk::Float, symbol, suffix);
+                let a = tokenstream::TokenTree::token_joint_hidden(tk::Minus, span);
                 let b = tokenstream::TokenTree::token_alone(float, span);
                 smallvec![a, b]
             }
             TokenTree::Literal(self::Literal { kind, symbol, suffix, span }) => {
                 smallvec![tokenstream::TokenTree::token_alone(
-                    TokenKind::lit(kind.to_internal(), symbol, suffix),
+                    tk::TokenKind::lit(kind.to_internal(), symbol, suffix),
                     span,
                 )]
             }
@@ -425,7 +414,12 @@ impl ToInternal<rustc_errors::Level> for Level {
     }
 }
 
-pub(crate) struct FreeFunctions;
+fn cancel_diags_into_string(diags: Vec<Diag<'_>>) -> String {
+    let mut messages = diags.into_iter().flat_map(Diag::cancel_into_message);
+    let msg = messages.next().expect("no diagnostic has a message");
+    messages.for_each(|_| ()); // consume iterator to cancel the remaining diagnostics
+    msg
+}
 
 pub(crate) struct Rustc<'a, 'b> {
     ecx: &'a mut ExtCtxt<'b>,
@@ -449,80 +443,104 @@ impl<'a, 'b> Rustc<'a, 'b> {
         }
     }
 
+    fn sess(&self) -> &Session {
+        &self.ecx.sess
+    }
+
     fn psess(&self) -> &ParseSess {
         self.ecx.psess()
     }
 }
 
-impl server::Types for Rustc<'_, '_> {
-    type FreeFunctions = FreeFunctions;
+impl server::Server for Rustc<'_, '_> {
     type TokenStream = TokenStream;
     type Span = Span;
     type Symbol = Symbol;
-}
 
-impl server::FreeFunctions for Rustc<'_, '_> {
+    fn globals(&mut self) -> ExpnGlobals<Self::Span> {
+        ExpnGlobals {
+            def_site: self.def_site,
+            call_site: self.call_site,
+            mixed_site: self.mixed_site,
+        }
+    }
+
+    fn intern_symbol(string: &str) -> Self::Symbol {
+        Symbol::intern(string)
+    }
+
+    fn with_symbol_string(symbol: &Self::Symbol, f: impl FnOnce(&str)) {
+        f(symbol.as_str())
+    }
+
     fn injected_env_var(&mut self, var: &str) -> Option<String> {
         self.ecx.sess.opts.logical_env.get(var).cloned()
     }
 
     fn track_env_var(&mut self, var: &str, value: Option<&str>) {
-        self.psess()
+        self.ecx
+            .sess
             .env_depinfo
             .borrow_mut()
             .insert((Symbol::intern(var), value.map(Symbol::intern)));
     }
 
     fn track_path(&mut self, path: &str) {
-        self.psess().file_depinfo.borrow_mut().insert(Symbol::intern(path));
+        self.ecx.sess.file_depinfo.borrow_mut().insert(Symbol::intern(path));
     }
 
-    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span, Self::Symbol>, ()> {
+    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span, Self::Symbol>, String> {
         let name = FileName::proc_macro_source_code(s);
-        let mut parser =
-            unwrap_or_emit_fatal(new_parser_from_source_str(self.psess(), name, s.to_owned()));
+
+        let mut parser = rustc_errors::catch_fatal_errors(|| {
+            new_parser_from_source_str(self.psess(), name, s.to_owned(), StripTokens::Nothing)
+        })
+        .map_err(|_| String::from("failed to parse to literal"))?
+        .map_err(cancel_diags_into_string)?;
 
         let first_span = parser.token.span.data();
         let minus_present = parser.eat(exp!(Minus));
 
         let lit_span = parser.token.span.data();
-        let token::Literal(mut lit) = parser.token.kind else {
-            return Err(());
+        let tk::Literal(mut lit) = parser.token.kind else {
+            return Err("not a literal".to_string());
         };
 
         // Check no comment or whitespace surrounding the (possibly negative)
         // literal, or more tokens after it.
         if (lit_span.hi.0 - first_span.lo.0) as usize != s.len() {
-            return Err(());
+            return Err("comment or whitespace around literal".to_string());
         }
 
         if minus_present {
             // If minus is present, check no comment or whitespace in between it
             // and the literal token.
             if first_span.hi.0 != lit_span.lo.0 {
-                return Err(());
+                return Err("comment or whitespace after minus".to_string());
             }
 
             // Check literal is a kind we allow to be negated in a proc macro token.
             match lit.kind {
-                token::LitKind::Bool
-                | token::LitKind::Byte
-                | token::LitKind::Char
-                | token::LitKind::Str
-                | token::LitKind::StrRaw(_)
-                | token::LitKind::ByteStr
-                | token::LitKind::ByteStrRaw(_)
-                | token::LitKind::CStr
-                | token::LitKind::CStrRaw(_)
-                | token::LitKind::Err(_) => return Err(()),
-                token::LitKind::Integer | token::LitKind::Float => {}
+                tk::LitKind::Bool
+                | tk::LitKind::Byte
+                | tk::LitKind::Char
+                | tk::LitKind::Str
+                | tk::LitKind::StrRaw(_)
+                | tk::LitKind::ByteStr
+                | tk::LitKind::ByteStrRaw(_)
+                | tk::LitKind::CStr
+                | tk::LitKind::CStrRaw(_)
+                | tk::LitKind::Err(_) => {
+                    return Err("non-numeric literal may not be negated".to_string());
+                }
+                tk::LitKind::Integer | tk::LitKind::Float => {}
             }
 
             // Synthesize a new symbol that includes the minus sign.
             let symbol = Symbol::intern(&s[..1 + lit.symbol.as_str().len()]);
-            lit = token::Lit::new(lit.kind, symbol, lit.suffix);
+            lit = tk::Lit::new(lit.kind, symbol, lit.suffix);
         }
-        let token::Lit { kind, symbol, suffix } = lit;
+        let tk::Lit { kind, symbol, suffix } = lit;
         Ok(Literal {
             kind: FromInternal::from_internal(kind),
             symbol,
@@ -537,39 +555,46 @@ impl server::FreeFunctions for Rustc<'_, '_> {
             Diag::new(self.psess().dcx(), diagnostic.level.to_internal(), message);
         diag.span(MultiSpan::from_spans(diagnostic.spans));
         for child in diagnostic.children {
-            // This message comes from another diagnostic, and we are just reconstructing the
-            // diagnostic, so there's no need for translation.
-            #[allow(rustc::untranslatable_diagnostic)]
             diag.sub(child.level.to_internal(), child.message, MultiSpan::from_spans(child.spans));
         }
         diag.emit();
     }
-}
 
-impl server::TokenStream for Rustc<'_, '_> {
-    fn is_empty(&mut self, stream: &Self::TokenStream) -> bool {
+    fn ts_drop(&mut self, stream: Self::TokenStream) {
+        drop(stream);
+    }
+
+    fn ts_clone(&mut self, stream: &Self::TokenStream) -> Self::TokenStream {
+        stream.clone()
+    }
+
+    fn ts_is_empty(&mut self, stream: &Self::TokenStream) -> bool {
         stream.is_empty()
     }
 
-    fn from_str(&mut self, src: &str) -> Self::TokenStream {
-        unwrap_or_emit_fatal(source_str_to_stream(
-            self.psess(),
-            FileName::proc_macro_source_code(src),
-            src.to_string(),
-            Some(self.call_site),
-        ))
+    fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
+        rustc_errors::catch_fatal_errors(|| {
+            source_str_to_stream(
+                self.psess(),
+                FileName::proc_macro_source_code(src),
+                src.to_string(),
+                Some(self.call_site),
+            )
+        })
+        .map_err(|_| String::from("failed to parse to tokenstream"))?
+        .map_err(cancel_diags_into_string)
     }
 
-    fn to_string(&mut self, stream: &Self::TokenStream) -> String {
+    fn ts_to_string(&mut self, stream: &Self::TokenStream) -> String {
         pprust::tts_to_string(stream)
     }
 
-    fn expand_expr(&mut self, stream: &Self::TokenStream) -> Result<Self::TokenStream, ()> {
+    fn ts_expand_expr(&mut self, stream: &Self::TokenStream) -> Result<Self::TokenStream, ()> {
         // Parse the expression from our tokenstream.
-        let expr: PResult<'_, _> = try {
+        let expr = try {
             let mut p = Parser::new(self.psess(), stream.clone(), Some("proc_macro expand expr"));
             let expr = p.parse_expr()?;
-            if p.token != token::Eof {
+            if p.token != tk::Eof {
                 p.unexpected()?;
             }
             expr
@@ -590,27 +615,28 @@ impl server::TokenStream for Rustc<'_, '_> {
         // We don't use `TokenStream::from_ast` as the tokenstream currently cannot
         // be recovered in the general case.
         match &expr.kind {
-            ast::ExprKind::Lit(token_lit) if token_lit.kind == token::Bool => {
+            ast::ExprKind::Lit(token_lit) if token_lit.kind == tk::Bool => {
                 Ok(tokenstream::TokenStream::token_alone(
-                    token::Ident(token_lit.symbol, IdentIsRaw::No),
+                    tk::Ident(token_lit.symbol, tk::IdentIsRaw::No),
                     expr.span,
                 ))
             }
             ast::ExprKind::Lit(token_lit) => {
-                Ok(tokenstream::TokenStream::token_alone(token::Literal(*token_lit), expr.span))
+                Ok(tokenstream::TokenStream::token_alone(tk::Literal(*token_lit), expr.span))
             }
-            ast::ExprKind::IncludedBytes(bytes) => {
-                let lit = token::Lit::new(token::ByteStr, escape_byte_str_symbol(bytes), None);
-                Ok(tokenstream::TokenStream::token_alone(token::TokenKind::Literal(lit), expr.span))
+            ast::ExprKind::IncludedBytes(byte_sym) => {
+                let lit =
+                    tk::Lit::new(tk::ByteStr, escape_byte_str_symbol(byte_sym.as_byte_str()), None);
+                Ok(tokenstream::TokenStream::token_alone(tk::TokenKind::Literal(lit), expr.span))
             }
             ast::ExprKind::Unary(ast::UnOp::Neg, e) => match &e.kind {
                 ast::ExprKind::Lit(token_lit) => match token_lit {
-                    token::Lit { kind: token::Integer | token::Float, .. } => {
+                    tk::Lit { kind: tk::Integer | tk::Float, .. } => {
                         Ok(Self::TokenStream::from_iter([
                             // FIXME: The span of the `-` token is lost when
                             // parsing, so we cannot faithfully recover it here.
-                            tokenstream::TokenTree::token_joint_hidden(token::Minus, e.span),
-                            tokenstream::TokenTree::token_alone(token::Literal(*token_lit), e.span),
+                            tokenstream::TokenTree::token_joint_hidden(tk::Minus, e.span),
+                            tokenstream::TokenTree::token_alone(tk::Literal(*token_lit), e.span),
                         ]))
                     }
                     _ => Err(()),
@@ -621,14 +647,14 @@ impl server::TokenStream for Rustc<'_, '_> {
         }
     }
 
-    fn from_token_tree(
+    fn ts_from_token_tree(
         &mut self,
         tree: TokenTree<Self::TokenStream, Self::Span, Self::Symbol>,
     ) -> Self::TokenStream {
         Self::TokenStream::new((tree, &mut *self).to_internal().into_iter().collect::<Vec<_>>())
     }
 
-    fn concat_trees(
+    fn ts_concat_trees(
         &mut self,
         base: Option<Self::TokenStream>,
         trees: Vec<TokenTree<Self::TokenStream, Self::Span, Self::Symbol>>,
@@ -636,34 +662,32 @@ impl server::TokenStream for Rustc<'_, '_> {
         let mut stream = base.unwrap_or_default();
         for tree in trees {
             for tt in (tree, &mut *self).to_internal() {
-                stream.push_tree(tt);
+                stream.push_tree_with_gluing(tt);
             }
         }
         stream
     }
 
-    fn concat_streams(
+    fn ts_concat_streams(
         &mut self,
         base: Option<Self::TokenStream>,
         streams: Vec<Self::TokenStream>,
     ) -> Self::TokenStream {
         let mut stream = base.unwrap_or_default();
         for s in streams {
-            stream.push_stream(s);
+            stream.push_stream_with_gluing(s);
         }
         stream
     }
 
-    fn into_trees(
+    fn ts_into_trees(
         &mut self,
         stream: Self::TokenStream,
     ) -> Vec<TokenTree<Self::TokenStream, Self::Span, Self::Symbol>> {
-        FromInternal::from_internal((stream, self))
+        FromInternal::from_internal(stream)
     }
-}
 
-impl server::Span for Rustc<'_, '_> {
-    fn debug(&mut self, span: Self::Span) -> String {
+    fn span_debug(&mut self, span: Self::Span) -> String {
         if self.ecx.ecfg.span_debug {
             format!("{span:?}")
         } else {
@@ -671,17 +695,17 @@ impl server::Span for Rustc<'_, '_> {
         }
     }
 
-    fn file(&mut self, span: Self::Span) -> String {
+    fn span_file(&mut self, span: Self::Span) -> String {
         self.psess()
             .source_map()
             .lookup_char_pos(span.lo())
             .file
             .name
-            .prefer_remapped_unconditionaly()
+            .prefer_remapped_unconditionally()
             .to_string()
     }
 
-    fn local_file(&mut self, span: Self::Span) -> Option<String> {
+    fn span_local_file(&mut self, span: Self::Span) -> Option<String> {
         self.psess()
             .source_map()
             .lookup_char_pos(span.lo())
@@ -696,15 +720,15 @@ impl server::Span for Rustc<'_, '_> {
             })
     }
 
-    fn parent(&mut self, span: Self::Span) -> Option<Self::Span> {
+    fn span_parent(&mut self, span: Self::Span) -> Option<Self::Span> {
         span.parent_callsite()
     }
 
-    fn source(&mut self, span: Self::Span) -> Self::Span {
+    fn span_source(&mut self, span: Self::Span) -> Self::Span {
         span.source_callsite()
     }
 
-    fn byte_range(&mut self, span: Self::Span) -> Range<usize> {
+    fn span_byte_range(&mut self, span: Self::Span) -> Range<usize> {
         let source_map = self.psess().source_map();
 
         let relative_start_pos = source_map.lookup_byte_offset(span.lo()).pos;
@@ -712,36 +736,36 @@ impl server::Span for Rustc<'_, '_> {
 
         Range { start: relative_start_pos.0 as usize, end: relative_end_pos.0 as usize }
     }
-    fn start(&mut self, span: Self::Span) -> Self::Span {
+    fn span_start(&mut self, span: Self::Span) -> Self::Span {
         span.shrink_to_lo()
     }
 
-    fn end(&mut self, span: Self::Span) -> Self::Span {
+    fn span_end(&mut self, span: Self::Span) -> Self::Span {
         span.shrink_to_hi()
     }
 
-    fn line(&mut self, span: Self::Span) -> usize {
+    fn span_line(&mut self, span: Self::Span) -> usize {
         let loc = self.psess().source_map().lookup_char_pos(span.lo());
         loc.line
     }
 
-    fn column(&mut self, span: Self::Span) -> usize {
+    fn span_column(&mut self, span: Self::Span) -> usize {
         let loc = self.psess().source_map().lookup_char_pos(span.lo());
         loc.col.to_usize() + 1
     }
 
-    fn join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
+    fn span_join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
         let self_loc = self.psess().source_map().lookup_char_pos(first.lo());
         let other_loc = self.psess().source_map().lookup_char_pos(second.lo());
 
-        if self_loc.file.name != other_loc.file.name {
+        if self_loc.file.stable_id != other_loc.file.stable_id {
             return None;
         }
 
         Some(first.to(second))
     }
 
-    fn subspan(
+    fn span_subspan(
         &mut self,
         span: Self::Span,
         start: Bound<usize>,
@@ -777,11 +801,11 @@ impl server::Span for Rustc<'_, '_> {
         Some(span.with_lo(new_lo).with_hi(new_hi))
     }
 
-    fn resolved_at(&mut self, span: Self::Span, at: Self::Span) -> Self::Span {
+    fn span_resolved_at(&mut self, span: Self::Span, at: Self::Span) -> Self::Span {
         span.with_ctxt(at.ctxt())
     }
 
-    fn source_text(&mut self, span: Self::Span) -> Option<String> {
+    fn span_source_text(&mut self, span: Self::Span) -> Option<String> {
         self.psess().source_map().span_to_snippet(span).ok()
     }
 
@@ -809,11 +833,11 @@ impl server::Span for Rustc<'_, '_> {
     /// span from the metadata of `my_proc_macro` (which we have access to,
     /// since we've loaded `my_proc_macro` from disk in order to execute it).
     /// In this way, we have obtained a span pointing into `my_proc_macro`
-    fn save_span(&mut self, span: Self::Span) -> usize {
-        self.psess().save_proc_macro_span(span)
+    fn span_save_span(&mut self, span: Self::Span) -> usize {
+        self.sess().save_proc_macro_span(span)
     }
 
-    fn recover_proc_macro_span(&mut self, id: usize) -> Self::Span {
+    fn span_recover_proc_macro_span(&mut self, id: usize) -> Self::Span {
         let (resolver, krate, def_site) = (&*self.ecx.resolver, self.krate, self.def_site);
         *self.rebased_spans.entry(id).or_insert_with(|| {
             // FIXME: `SyntaxContext` for spans from proc macro crates is lost during encoding,
@@ -821,29 +845,9 @@ impl server::Span for Rustc<'_, '_> {
             resolver.get_proc_macro_quoted_span(krate, id).with_ctxt(def_site.ctxt())
         })
     }
-}
 
-impl server::Symbol for Rustc<'_, '_> {
-    fn normalize_and_validate_ident(&mut self, string: &str) -> Result<Self::Symbol, ()> {
+    fn symbol_normalize_and_validate_ident(&mut self, string: &str) -> Result<Self::Symbol, ()> {
         let sym = nfc_normalize(string);
         if rustc_lexer::is_ident(sym.as_str()) { Ok(sym) } else { Err(()) }
-    }
-}
-
-impl server::Server for Rustc<'_, '_> {
-    fn globals(&mut self) -> ExpnGlobals<Self::Span> {
-        ExpnGlobals {
-            def_site: self.def_site,
-            call_site: self.call_site,
-            mixed_site: self.mixed_site,
-        }
-    }
-
-    fn intern_symbol(string: &str) -> Self::Symbol {
-        Symbol::intern(string)
-    }
-
-    fn with_symbol_string(symbol: &Self::Symbol, f: impl FnOnce(&str)) {
-        f(symbol.as_str())
     }
 }

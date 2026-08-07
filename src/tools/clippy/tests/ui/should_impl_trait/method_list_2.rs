@@ -1,15 +1,8 @@
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::needless_pass_by_value,
-    clippy::must_use_candidate,
-    clippy::unused_self,
-    clippy::needless_lifetimes,
-    clippy::missing_safety_doc,
-    clippy::wrong_self_convention,
-    clippy::missing_panics_doc,
-    clippy::return_self_not_must_use
-)]
-//@no-rustfix
+//@revisions: edition2015 edition2021
+//@[edition2015] edition:2015
+//@[edition2021] edition:2021
+#![warn(clippy::should_implement_trait)]
+
 use std::ops::Mul;
 use std::rc::{self, Rc};
 use std::sync::{self, Arc};
@@ -29,7 +22,7 @@ impl T {
     }
 
     pub fn from_iter<T>(iter: T) -> Self {
-        //~^ should_implement_trait
+        //~[edition2021]^ should_implement_trait
 
         unimplemented!()
     }

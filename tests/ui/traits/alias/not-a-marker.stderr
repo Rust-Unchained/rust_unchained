@@ -1,11 +1,10 @@
-error: attribute should be applied to a trait
-  --> $DIR/not-a-marker.rs:3:1
+error: the `marker` attribute cannot be used on trait aliases
+  --> $DIR/not-a-marker.rs:3:3
    |
 LL | #[marker]
-   | ^^^^^^^^^
-LL |
-LL | trait Foo = Send;
-   | ----------------- not a trait
+   |   ^^^^^^
+   |
+   = help: the `marker` attribute can only be applied to traits
 
 error: aborting due to 1 previous error
 

@@ -1,7 +1,6 @@
-// FIXME: run-rustfix waiting on multi-span suggestions
-
 #![warn(clippy::needless_borrow)]
-#![allow(clippy::needless_borrowed_reference, clippy::explicit_auto_deref)]
+#![allow(clippy::needless_borrowed_reference)]
+#![expect(clippy::explicit_auto_deref)]
 
 fn f1(_: &str) {}
 macro_rules! m1 {
@@ -32,7 +31,6 @@ macro_rules! if_chain {
     };
 }
 
-#[allow(dead_code)]
 fn main() {
     let x = String::new();
 
@@ -162,7 +160,6 @@ impl T1 for S {
 }
 
 // Ok - used to error due to rustc bug
-#[allow(dead_code)]
 #[derive(Debug)]
 enum Foo<'a> {
     Str(&'a str),

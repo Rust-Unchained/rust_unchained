@@ -1,8 +1,9 @@
-#![feature(repr128, proc_macro_quote, proc_macro_span)]
-#![allow(incomplete_features)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::eq_op)]
-#![allow(clippy::literal_string_with_formatting_args)]
+#![feature(proc_macro_quote, proc_macro_span)]
+#![allow(
+    clippy::eq_op,
+    clippy::field_reassign_with_default,
+    clippy::literal_string_with_formatting_args
+)]
 
 extern crate proc_macro;
 
@@ -17,7 +18,7 @@ pub fn derive(_: TokenStream) -> TokenStream {
     let output = quote! {
         // Should not trigger `useless_attribute`
         #[allow(dead_code)]
-        extern crate rustc_middle;
+        extern crate core;
     };
     output
 }
@@ -230,4 +231,15 @@ pub fn allow_lint_same_span_derive(input: TokenStream) -> TokenStream {
         span_help(Group::new(Delimiter::Parenthesis, TokenStream::new()).into()),
         span_help(Group::new(Delimiter::Brace, TokenStream::new()).into()),
     ])
+}
+
+#[proc_macro_derive(DoubleParens)]
+pub fn derive_double_parens(_: TokenStream) -> TokenStream {
+    quote! {
+        fn foo() {
+            let a = (());
+            let b = ((5));
+            let c = std::convert::identity((5));
+        }
+    }
 }

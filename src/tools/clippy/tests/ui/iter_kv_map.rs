@@ -1,5 +1,6 @@
 #![warn(clippy::iter_kv_map)]
-#![allow(unused_mut, clippy::redundant_clone, clippy::suspicious_map, clippy::map_identity)]
+#![allow(clippy::redundant_closure)]
+#![expect(clippy::suspicious_map)]
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -30,15 +31,19 @@ fn main() {
 
     let _ = map.clone().iter().map(|(_, val)| val).collect::<Vec<_>>();
     //~^ iter_kv_map
-    let _ = map.iter().map(|(key, _)| key).filter(|x| *x % 2 == 0).count();
+    let _ = map.iter().map(|(key, _)| key).filter(|x| x.is_multiple_of(2)).count();
     //~^ iter_kv_map
 
     // Don't lint
-    let _ = map.iter().filter(|(_, val)| *val % 2 == 0).map(|(key, _)| key).count();
+    let _ = map
+        .iter()
+        .filter(|(_, val)| val.is_multiple_of(2))
+        .map(|(key, _)| key)
+        .count();
     let _ = map.iter().map(get_key).collect::<Vec<_>>();
 
     // Linting the following could be an improvement to the lint
-    // map.iter().filter_map(|(_, val)| (val % 2 == 0).then(val * 17)).count();
+    // map.iter().filter_map(|(_, val)| (val.is_multiple_of(2)).then(val * 17)).count();
 
     // Lint
     let _ = map.iter().map(|(key, _value)| key * 9).count();
@@ -86,15 +91,19 @@ fn main() {
 
     let _ = map.clone().iter().map(|(_, val)| val).collect::<Vec<_>>();
     //~^ iter_kv_map
-    let _ = map.iter().map(|(key, _)| key).filter(|x| *x % 2 == 0).count();
+    let _ = map.iter().map(|(key, _)| key).filter(|x| x.is_multiple_of(2)).count();
     //~^ iter_kv_map
 
     // Don't lint
-    let _ = map.iter().filter(|(_, val)| *val % 2 == 0).map(|(key, _)| key).count();
+    let _ = map
+        .iter()
+        .filter(|(_, val)| val.is_multiple_of(2))
+        .map(|(key, _)| key)
+        .count();
     let _ = map.iter().map(get_key).collect::<Vec<_>>();
 
     // Linting the following could be an improvement to the lint
-    // map.iter().filter_map(|(_, val)| (val % 2 == 0).then(val * 17)).count();
+    // map.iter().filter_map(|(_, val)| (val.is_multiple_of(2)).then(val * 17)).count();
 
     // Lint
     let _ = map.iter().map(|(key, _value)| key * 9).count();
@@ -183,5 +192,53 @@ fn issue14595() {
     let map = Foo(BTreeMap::default());
 
     let _ = map.as_ref().iter().map(|(_, v)| v).copied().collect::<Vec<_>>();
+    //~^ iter_kv_map
+}
+
+fn issue16340() {
+    let hm: HashMap<&str, &str> = HashMap::new();
+    let _ = hm.iter().map(|(key, _)| vec![key]);
+    //~^ iter_kv_map
+}
+
+fn issue16515() {
+    let hash_map: HashMap<u32, u32> = HashMap::new();
+    hash_map.iter().flat_map(|(k, _)| Some(*k));
+    //~^ iter_kv_map
+
+    hash_map.iter().flat_map(|(_, v)| Some(*v));
+    //~^ iter_kv_map
+
+    hash_map.iter().filter_map(|(k, _)| (k > &0).then_some(1));
+    //~^ iter_kv_map
+
+    hash_map.iter().filter_map(|(_, v)| (v > &0).then_some(1));
+    //~^ iter_kv_map
+
+    hash_map.into_iter().flat_map(|(k, _)| Some(k));
+    //~^ iter_kv_map
+
+    let hash_map: HashMap<u32, u32> = HashMap::new();
+    hash_map.into_iter().flat_map(|(_, v)| Some(v));
+    //~^ iter_kv_map
+
+    let hash_map: HashMap<u32, u32> = HashMap::new();
+    hash_map.into_iter().filter_map(|(k, _)| (k > 0).then_some(1));
+    //~^ iter_kv_map
+
+    let hash_map: HashMap<u32, u32> = HashMap::new();
+    hash_map.into_iter().filter_map(|(_, v)| (v > 0).then_some(1));
+    //~^ iter_kv_map
+}
+
+fn issue16742() {
+    let map: HashMap<u32, Vec<u32>> = HashMap::new();
+    map.iter().flat_map(|(_, v)| v.iter().map(|i| *i + 1));
+    //~^ iter_kv_map
+    map.iter().flat_map(|(_, v)| v);
+    //~^ iter_kv_map
+
+    let map: HashMap<u32, Vec<u32>> = HashMap::new();
+    map.into_iter().flat_map(|(_, v)| v);
     //~^ iter_kv_map
 }

@@ -32,6 +32,9 @@ pub(super) const ITEM_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![impl],
     T![trait],
     T![const],
+    T![async],
+    T![unsafe],
+    T![extern],
     T![static],
     T![let],
     T![mod],
@@ -116,6 +119,25 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
     let mut has_mods = false;
     let mut has_extern = false;
 
+    if p.at(T![impl])
+        && p.nth(1) == T!['(']
+        && ((matches!(p.nth(2), T![crate] | T![super] | T![self]) && p.nth(3) == T![')'])
+            || p.nth(2) == T![in])
+    {
+        // test impl_restrictions
+        // pub impl(crate) unsafe trait Foo {}
+        // impl(in super::bar) trait Bar {}
+        // impl () {}
+        // impl (i32) {}
+        let m = p.start();
+        p.bump(T![impl]);
+        if !opt_visibility_inner(p, false) {
+            p.error("expected an impl restriction");
+        }
+        m.complete(p, IMPL_RESTRICTION);
+        has_mods = true;
+    }
+
     // modifiers
     if p.at(T![const]) && p.nth(1) != T!['{'] {
         p.eat(T![const]);
@@ -132,7 +154,7 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
         has_mods = true;
     }
 
-    // test_err gen_fn
+    // test_err gen_fn 2021
     // gen fn gen_fn() {}
     // async gen fn async_gen_fn() {}
     if p.at(T![gen]) && p.nth(1) == T![fn] {
@@ -213,6 +235,7 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
         T![trait] => traits::trait_(p, m),
         T![impl] => traits::impl_(p, m),
 
+        T![type] if p.nth(1) == T![const] => consts::konst(p, m),
         T![type] => type_alias(p, m),
 
         // test extern_block
@@ -244,6 +267,9 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
         T![use] => use_item::use_(p, m),
         T![mod] => mod_item(p, m),
 
+        // test type_const
+        // type const FOO: i32 = 2;
+        T![type] if la == T![const] => consts::konst(p, m),
         T![type] => type_alias(p, m),
         T![struct] => adt::strukt(p, m),
         T![enum] => adt::enum_(p, m),
@@ -257,6 +283,19 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
 
         T![const] if (la == IDENT || la == T![_] || la == T![mut]) => consts::konst(p, m),
         T![static] if (la == IDENT || la == T![_] || la == T![mut]) => consts::static_(p, m),
+
+        IDENT
+            if p.at_contextual_kw(T![builtin])
+                && p.nth_at(1, T![#])
+                && p.nth_at_contextual_kw(2, T![global_asm]) =>
+        {
+            p.bump_remap(T![builtin]);
+            p.bump(T![#]);
+            p.bump_remap(T![global_asm]);
+            // test global_asm
+            // builtin#global_asm("")
+            expressions::parse_asm_expr(p, m);
+        }
 
         _ => return Err(m),
     };
@@ -406,7 +445,20 @@ fn fn_(p: &mut Parser<'_>, m: Marker) {
     // test function_ret_type
     // fn foo() {}
     // fn bar() -> () {}
-    opt_ret_type(p);
+    if !opt_ret_type(p) {
+        // test_err function_ret_type_missing_arrow
+        // fn foo() usize {}
+        // fn bar() super::Foo {}
+        opt_no_arrow_ret_type(p);
+    }
+
+    // test_err fn_ret_recovery
+    // fn foo() -> A>]) { let x = 1; }
+    // fn foo() -> A>]) where T: Copy { let x = 1; }
+    while p.at(T![')']) | p.at(T![']']) | p.at(T![>]) {
+        // recover from unbalanced return type brackets
+        p.err_and_bump("expected a curly brace");
+    }
 
     // test function_where_clause
     // fn foo<T>() where T: Copy {}

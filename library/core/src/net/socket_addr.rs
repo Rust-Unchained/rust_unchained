@@ -592,7 +592,8 @@ impl SocketAddrV6 {
 }
 
 #[stable(feature = "ip_from_ip", since = "1.16.0")]
-impl From<SocketAddrV4> for SocketAddr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl From<SocketAddrV4> for SocketAddr {
     /// Converts a [`SocketAddrV4`] into a [`SocketAddr::V4`].
     #[inline]
     fn from(sock4: SocketAddrV4) -> SocketAddr {
@@ -601,7 +602,8 @@ impl From<SocketAddrV4> for SocketAddr {
 }
 
 #[stable(feature = "ip_from_ip", since = "1.16.0")]
-impl From<SocketAddrV6> for SocketAddr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl From<SocketAddrV6> for SocketAddr {
     /// Converts a [`SocketAddrV6`] into a [`SocketAddr::V6`].
     #[inline]
     fn from(sock6: SocketAddrV6) -> SocketAddr {
@@ -610,7 +612,8 @@ impl From<SocketAddrV6> for SocketAddr {
 }
 
 #[stable(feature = "addr_from_into_ip", since = "1.17.0")]
-impl<I: Into<IpAddr>> From<(I, u16)> for SocketAddr {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<I: [const] Into<IpAddr>> From<(I, u16)> for SocketAddr {
     /// Converts a tuple struct (Into<[`IpAddr`]>, `u16`) into a [`SocketAddr`].
     ///
     /// This conversion creates a [`SocketAddr::V4`] for an [`IpAddr::V4`]
@@ -649,7 +652,8 @@ impl fmt::Display for SocketAddrV4 {
         } else {
             const LONGEST_IPV4_SOCKET_ADDR: &str = "255.255.255.255:65535";
 
-            let mut buf = DisplayBuffer::<{ LONGEST_IPV4_SOCKET_ADDR.len() }>::new();
+            let mut buf = DisplayBuffer::buffer::<{ LONGEST_IPV4_SOCKET_ADDR.len() }>();
+            let mut buf = DisplayBuffer::new(&mut buf);
             // Buffer is long enough for the longest possible IPv4 socket address, so this should never fail.
             write!(buf, "{}:{}", self.ip(), self.port()).unwrap();
 
@@ -679,7 +683,8 @@ impl fmt::Display for SocketAddrV6 {
             const LONGEST_IPV6_SOCKET_ADDR: &str =
                 "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535";
 
-            let mut buf = DisplayBuffer::<{ LONGEST_IPV6_SOCKET_ADDR.len() }>::new();
+            let mut buf = DisplayBuffer::buffer::<{ LONGEST_IPV6_SOCKET_ADDR.len() }>();
+            let mut buf = DisplayBuffer::new(&mut buf);
             match self.scope_id() {
                 0 => write!(buf, "[{}]:{}", self.ip(), self.port()),
                 scope_id => write!(buf, "[{}%{}]:{}", self.ip(), scope_id, self.port()),

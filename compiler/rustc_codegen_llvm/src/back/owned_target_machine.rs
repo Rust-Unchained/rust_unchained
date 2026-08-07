@@ -1,10 +1,10 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use rustc_data_structures::small_c_str::SmallCStr;
 
-use crate::errors::LlvmError;
+use crate::diagnostics::LlvmError;
 use crate::llvm;
 
 /// Responsible for safely creating and disposing llvm::TargetMachine via ffi functions.
@@ -36,16 +36,11 @@ impl OwnedTargetMachine {
         use_init_array: bool,
         split_dwarf_file: &CStr,
         output_obj_file: &CStr,
-        debug_info_compression: &CStr,
+        debug_info_compression: llvm::CompressionKind,
         use_emulated_tls: bool,
-        args_cstr_buff: &[u8],
+        use_wasm_eh: bool,
+        large_data_threshold: u64,
     ) -> Result<Self, LlvmError<'static>> {
-        assert!(args_cstr_buff.len() > 0);
-        assert!(
-            *args_cstr_buff.last().unwrap() == 0,
-            "The last character must be a null terminator."
-        );
-
         // SAFETY: llvm::LLVMRustCreateTargetMachine copies pointed to data
         let tm_ptr = unsafe {
             llvm::LLVMRustCreateTargetMachine(
@@ -68,10 +63,10 @@ impl OwnedTargetMachine {
                 use_init_array,
                 split_dwarf_file.as_ptr(),
                 output_obj_file.as_ptr(),
-                debug_info_compression.as_ptr(),
+                debug_info_compression,
                 use_emulated_tls,
-                args_cstr_buff.as_ptr() as *const c_char,
-                args_cstr_buff.len(),
+                use_wasm_eh,
+                large_data_threshold,
             )
         };
 
@@ -96,8 +91,6 @@ impl Drop for OwnedTargetMachine {
         // SAFETY: constructing ensures we have a valid pointer created by
         // llvm::LLVMRustCreateTargetMachine OwnedTargetMachine is not copyable so there is no
         // double free or use after free.
-        unsafe {
-            llvm::LLVMRustDisposeTargetMachine(self.tm_unique.as_mut());
-        }
+        unsafe { llvm::LLVMDisposeTargetMachine(self.tm_unique) };
     }
 }

@@ -1,4 +1,4 @@
-use crate::spec::{StackProbeType, Target, TargetMetadata, TargetOptions, base};
+use crate::spec::{Arch, LlvmAbi, StackProbeType, Target, TargetMetadata, TargetOptions, base};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -11,10 +11,10 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 64,
         data_layout: "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128".into(),
-        arch: "riscv64".into(),
+        arch: Arch::RiscV64,
         options: TargetOptions {
             cpu: "generic-rv64".into(),
-            llvm_abiname: "lp64d".into(),
+            llvm_abiname: LlvmAbi::Lp64d,
             max_atomic_width: Some(64),
             features: "+m,+a,+f,+d,+c,+zicsr,+zifencei".into(),
             stack_probes: StackProbeType::Inline,

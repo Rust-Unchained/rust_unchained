@@ -6,44 +6,46 @@ use std::sync::atomic::AtomicBool;
 
 use rustc_abi::Align;
 use rustc_data_structures::profiling::TimePassesFormat;
+use rustc_errors::ColorConfig;
 use rustc_errors::emitter::HumanReadableErrorType;
-use rustc_errors::{ColorConfig, registry};
+use rustc_hir::attrs::{CollapseMacroDebuginfo, NativeLibKind};
 use rustc_session::config::{
-    AutoDiff, BranchProtection, CFGuard, Cfg, CollapseMacroDebuginfo, CoverageLevel,
+    AnnotateMoves, AutoDiff, BranchProtection, CFGuard, Cfg, CodegenRetagOptions, CoverageLevel,
     CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation,
-    Externs, FmtDebug, FunctionReturn, InliningThreshold, Input, InstrumentCoverage,
-    InstrumentXRay, LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans,
-    NextSolverConfig, OomStrategy, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet,
-    Passes, PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
-    SymbolManglingVersion, WasiExecModel, build_configuration, build_session_options,
-    rustc_optgroups,
+    Externs, FmtDebug, FunctionReturn, IncrementalStateAssertion, InliningThreshold, Input,
+    InstrumentCoverage, InstrumentMcount, InstrumentMcountOpts, InstrumentXRay, LinkSelfContained,
+    LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload, Options,
+    OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, PatchableFunctionEntry,
+    Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
+    WasiExecModel, build_configuration, build_session_options, rustc_optgroups,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
-use rustc_session::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
+use rustc_session::utils::{CanonicalizedPath, NativeLib};
 use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, build_session, getopts};
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::{RealFileLoader, SourceMapInputs};
-use rustc_span::{FileName, SourceFileHashAlgorithm, sym};
+use rustc_span::{FileName, RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm, sym};
 use rustc_target::spec::{
     CodeModel, FramePointer, LinkerFlavorCli, MergeFunctions, OnBrokenPipe, PanicStrategy,
-    RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel, WasmCAbi,
+    RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TlsModel,
 };
 
-use crate::interface::{initialize_checked_jobserver, parse_cfg};
+use crate::interface::parse_cfg;
 
 fn sess_and_cfg<F>(args: &[&'static str], f: F)
 where
     F: FnOnce(Session, Cfg),
 {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
-    initialize_checked_jobserver(&early_dcx);
-
     let matches = optgroups().parse(args).unwrap();
     let sessopts = build_session_options(&mut early_dcx, &matches);
-    let sysroot = sessopts.sysroot.clone();
-    let target =
-        rustc_session::config::build_target_config(&early_dcx, &sessopts.target_triple, &sysroot);
+    let target = rustc_session::config::build_target_config(
+        &early_dcx,
+        &sessopts.target_triple,
+        sessopts.sysroot.path(),
+        sessopts.unstable_opts.unstable_options,
+    );
     let hash_kind = sessopts.unstable_opts.src_hash_algorithm(&target);
     let checksum_hash_kind = sessopts.unstable_opts.checksum_hash_algorithm();
     let sm_inputs = Some(SourceMapInputs {
@@ -67,16 +69,11 @@ where
         let sess = build_session(
             sessopts,
             io,
-            None,
-            registry::Registry::new(&[]),
-            vec![],
             Default::default(),
             target,
-            sysroot,
             "",
             None,
             &USING_INTERNAL_FEATURES,
-            Default::default(),
         );
         let cfg = parse_cfg(sess.dcx(), matches.opt_strs("cfg"));
         let cfg = build_configuration(&sess, cfg);
@@ -174,6 +171,33 @@ fn test_can_print_warnings() {
     sess_and_cfg(&["-Adead_code"], |sess, _cfg| {
         assert!(sess.dcx().can_emit_warnings());
     });
+}
+
+// `-Zremap-cwd-prefix` must not be merged into the tracked `remap_path_prefix` option:
+// storing the absolute cwd there invalidates the incremental cache across build
+// directories (see #132132). It must instead be applied via `file_path_mapping`.
+#[test]
+fn test_remap_cwd_prefix_not_in_remap_path_prefix() {
+    sess_and_cfg(
+        &["--remap-path-prefix=/explicit=mapped", "-Zremap-cwd-prefix=cwd-mapped"],
+        |sess, _cfg| {
+            // The tracked option holds only the explicit `--remap-path-prefix` entry.
+            assert_eq!(
+                sess.opts.remap_path_prefix,
+                vec![(PathBuf::from("/explicit"), PathBuf::from("mapped"))],
+            );
+
+            // ... but the cwd remapping is still applied via `file_path_mapping`.
+            let cwd = std::env::current_dir().unwrap();
+            let remapped = sess
+                .opts
+                .file_path_mapping()
+                .to_real_filename(&RealFileName::empty(), cwd.join("foo.rs"))
+                .path(RemapPathScopeComponents::DEBUGINFO)
+                .to_path_buf();
+            assert_eq!(remapped, PathBuf::from("cwd-mapped/foo.rs"));
+        },
+    );
 }
 
 #[test]
@@ -320,7 +344,7 @@ fn test_search_paths_tracking_hash_different_order() {
     let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
-        json_rendered: HumanReadableErrorType::Default,
+        json_rendered: HumanReadableErrorType { short: false, unicode: false },
         color_config: ColorConfig::Never,
     };
 
@@ -377,7 +401,7 @@ fn test_native_libs_tracking_hash_different_values() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -399,7 +423,7 @@ fn test_native_libs_tracking_hash_different_values() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -421,13 +445,13 @@ fn test_native_libs_tracking_hash_different_values() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
             name: String::from("b"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -443,7 +467,7 @@ fn test_native_libs_tracking_hash_different_values() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -465,7 +489,7 @@ fn test_native_libs_tracking_hash_different_values() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -499,7 +523,7 @@ fn test_native_libs_tracking_hash_different_order() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -526,7 +550,7 @@ fn test_native_libs_tracking_hash_different_order() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -547,7 +571,7 @@ fn test_native_libs_tracking_hash_different_order() {
         NativeLib {
             name: String::from("a"),
             new_name: None,
-            kind: NativeLibKind::Static { bundle: None, whole_archive: None },
+            kind: NativeLibKind::Static { bundle: None, whole_archive: None, export_symbols: None },
             verbatim: None,
         },
         NativeLib {
@@ -579,19 +603,16 @@ fn test_codegen_options_tracking_hash() {
 
     // Make sure that changing an [UNTRACKED] option leaves the hash unchanged.
     // tidy-alphabetical-start
-    untracked!(ar, String::from("abc"));
     untracked!(codegen_units, Some(42));
     untracked!(default_linker_libraries, true);
     untracked!(dlltool, Some(PathBuf::from("custom_dlltool.exe")));
     untracked!(extra_filename, String::from("extra-filename"));
     untracked!(incremental, Some(String::from("abc")));
-    untracked!(inline_threshold, Some(0xf007ba11));
     // `link_arg` is omitted because it just forwards to `link_args`.
     untracked!(link_args, vec![String::from("abc"), String::from("def")]);
     untracked!(link_self_contained, LinkSelfContained::on());
     untracked!(linker, Some(PathBuf::from("linker")));
     untracked!(linker_flavor, Some(LinkerFlavorCli::Gcc));
-    untracked!(no_stack_check, true);
     untracked!(remark, Passes::Some(vec![String::from("pass1"), String::from("pass2")]));
     untracked!(rpath, true);
     untracked!(save_temps, true);
@@ -619,6 +640,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
+    tracked!(jump_tables, false);
     tracked!(link_dead_code, Some(true));
     tracked!(linker_plugin_lto, LinkerPluginLto::LinkerPluginAuto);
     tracked!(llvm_args, vec![String::from("1"), String::from("2")]);
@@ -637,7 +659,6 @@ fn test_codegen_options_tracking_hash() {
     tracked!(profile_use, Some(PathBuf::from("abc")));
     tracked!(relocation_model, Some(RelocModel::Pic));
     tracked!(relro_level, Some(RelroLevel::Full));
-    tracked!(soft_float, true);
     tracked!(split_debuginfo, Some(SplitDebuginfo::Packed));
     tracked!(symbol_mangling_version, Some(SymbolManglingVersion::V0));
     tracked!(target_cpu, Some(String::from("abc")));
@@ -687,7 +708,8 @@ fn test_unstable_options_tracking_hash() {
 
     // Make sure that changing an [UNTRACKED] option leaves the hash unchanged.
     // tidy-alphabetical-start
-    untracked!(assert_incr_state, Some(String::from("loaded")));
+    untracked!(assert_incr_state, Some(IncrementalStateAssertion::Loaded));
+    untracked!(codegen_source_order, true);
     untracked!(deduplicate_diagnostics, false);
     untracked!(dump_dep_graph, true);
     untracked!(dump_mir, Some(String::from("abc")));
@@ -709,18 +731,20 @@ fn test_unstable_options_tracking_hash() {
     untracked!(llvm_time_trace, true);
     untracked!(ls, vec!["all".to_owned()]);
     untracked!(macro_backtrace, true);
+    untracked!(macro_stats, true);
     untracked!(meta_stats, true);
     untracked!(mir_include_spans, MirIncludeSpans::On);
     untracked!(nll_facts, true);
     untracked!(no_analysis, true);
     untracked!(no_leak_check, true);
     untracked!(no_parallel_backend, true);
+    untracked!(no_steal_thir, true);
     untracked!(parse_crate_root_only, true);
     // `pre_link_arg` is omitted because it just forwards to `pre_link_args`.
     untracked!(pre_link_args, vec![String::from("abc"), String::from("def")]);
     untracked!(print_codegen_stats, true);
     untracked!(print_llvm_passes, true);
-    untracked!(print_mono_items, Some(String::from("abc")));
+    untracked!(print_mono_items, true);
     untracked!(print_type_sizes, true);
     untracked!(proc_macro_backtrace, true);
     untracked!(proc_macro_execution_strategy, ProcMacroExecutionStrategy::CrossThread);
@@ -732,7 +756,7 @@ fn test_unstable_options_tracking_hash() {
     untracked!(span_debug, true);
     untracked!(span_free_formats, true);
     untracked!(temps_dir, Some(String::from("abc")));
-    untracked!(threads, 99);
+    untracked!(threads, Some(String::from("99")));
     untracked!(time_llvm_passes, true);
     untracked!(time_passes, true);
     untracked!(time_passes_format, TimePassesFormat::Json);
@@ -759,30 +783,34 @@ fn test_unstable_options_tracking_hash() {
     // tidy-alphabetical-start
     tracked!(allow_features, Some(vec![String::from("lang_items")]));
     tracked!(always_encode_mir, true);
+    tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
-    tracked!(autodiff, vec![AutoDiff::Enable]);
+    tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
+    tracked!(autodiff_post_passes, Some("function(mem2reg,instsimplify,simplifycfg)".to_string()));
     tracked!(binary_dep_depinfo, true);
     tracked!(box_noalias, false);
     tracked!(
         branch_protection,
         Some(BranchProtection {
             bti: true,
-            pac_ret: Some(PacRet { leaf: true, pc: true, key: PAuthKey::B })
+            pac_ret: Some(PacRet { leaf: true, pc: true, key: PAuthKey::B }),
+            gcs: true,
         })
     );
     tracked!(codegen_backend, Some("abc".to_string()));
+    tracked!(codegen_emit_retag, Some(CodegenRetagOptions::default()));
     tracked!(
         coverage_options,
         CoverageOptions {
-            level: CoverageLevel::Mcdc,
-            no_mir_spans: true,
-            discard_all_spans_in_codegen: true
+            level: CoverageLevel::Branch,
+            // (don't collapse test-only options onto the same line)
+            discard_all_spans_in_codegen: true,
         }
     );
     tracked!(crate_attr, vec!["abc".to_string()]);
     tracked!(cross_crate_inline_threshold, InliningThreshold::Always);
-    tracked!(debug_info_for_profiling, true);
     tracked!(debug_info_type_line_numbers, true);
+    tracked!(debuginfo_for_profiling, true);
     tracked!(default_visibility, Some(rustc_target::spec::SymbolVisibility::Hidden));
     tracked!(dep_info_omit_d_target, true);
     tracked!(direct_access_external_data, Some(true));
@@ -790,8 +818,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(dwarf_version, Some(5));
     tracked!(embed_metadata, false);
     tracked!(embed_source, true);
-    tracked!(emit_thin_lto, false);
-    tracked!(emscripten_wasm_eh, true);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
     tracked!(fixed_x18, true);
@@ -800,44 +826,46 @@ fn test_unstable_options_tracking_hash() {
     tracked!(force_unstable_if_unmarked, true);
     tracked!(function_return, FunctionReturn::ThunkExtern);
     tracked!(function_sections, Some(false));
+    tracked!(hint_mostly_unused, true);
     tracked!(human_readable_cgu_names, true);
+    tracked!(implicit_sysroot_deps, false);
     tracked!(incremental_ignore_spans, true);
+    tracked!(indirect_branch_cs_prefix, true);
     tracked!(inline_mir, Some(true));
     tracked!(inline_mir_hint_threshold, Some(123));
     tracked!(inline_mir_threshold, Some(123));
-    tracked!(instrument_mcount, true);
+    tracked!(instrument_mcount, InstrumentMcount::Mcount(InstrumentMcountOpts::default()));
     tracked!(instrument_xray, Some(InstrumentXRay::default()));
     tracked!(link_directives, false);
     tracked!(link_only, true);
     tracked!(lint_llvm_ir, true);
     tracked!(llvm_module_flag, vec![("bar".to_string(), 123, "max".to_string())]);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
+    tracked!(llvm_writable, true);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(maximal_hir_to_mir_coverage, true);
     tracked!(merge_functions, Some(MergeFunctions::Disabled));
     tracked!(min_function_alignment, Some(Align::EIGHT));
-    tracked!(mir_emit_retag, true);
+    tracked!(min_recursion_limit, Some(256));
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
     tracked!(mir_opt_level, Some(4));
     tracked!(mir_preserve_ub, true);
     tracked!(move_size_limit, Some(4096));
-    tracked!(mutable_noalias, false);
     tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });
     tracked!(no_generate_arange_section, true);
-    tracked!(no_jump_tables, true);
     tracked!(no_link, true);
     tracked!(no_profiler_runtime, true);
     tracked!(no_trait_vptr, true);
     tracked!(no_unique_section_names, true);
+    tracked!(offload, vec![Offload::Device]);
     tracked!(on_broken_pipe, OnBrokenPipe::Kill);
-    tracked!(oom, OomStrategy::Panic);
     tracked!(osx_rpath_install_name, true);
     tracked!(packed_bundled_libs, true);
     tracked!(panic_abort_tests, true);
     tracked!(panic_in_drop, PanicStrategy::Abort);
     tracked!(
         patchable_function_entry,
-        PatchableFunctionEntry::from_total_and_prefix_nops(10, 5)
+        PatchableFunctionEntry::from_parts(10, 5, None)
             .expect("total must be greater than or equal to prefix")
     );
     tracked!(plt, Some(true));
@@ -864,6 +892,8 @@ fn test_unstable_options_tracking_hash() {
     tracked!(split_lto_unit, Some(true));
     tracked!(src_hash_algorithm, Some(SourceFileHashAlgorithm::Sha1));
     tracked!(stack_protector, StackProtector::All);
+    tracked!(staticlib_hide_internal_symbols, true);
+    tracked!(staticlib_rename_internal_symbols, true);
     tracked!(teach, true);
     tracked!(thinlto, Some(true));
     tracked!(tiny_const_eval_limit, true);
@@ -880,7 +910,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(verify_llvm_ir, true);
     tracked!(virtual_function_elimination, true);
     tracked!(wasi_exec_model, Some(WasiExecModel::Reactor));
-    tracked!(wasm_c_abi, WasmCAbi::Spec);
     // tidy-alphabetical-end
 
     macro_rules! tracked_no_crate_hash {

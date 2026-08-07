@@ -35,7 +35,7 @@ extern "C" {
     fn integer(a: i32x4, b: i32x4) -> i32x4;
     // vmaxq_s32
     #[cfg(target_arch = "aarch64")]
-    #[link_name = "llvm.aarch64.neon.maxs.v4i32"]
+    #[link_name = "llvm.aarch64.neon.smax.v4i32"]
     fn integer(a: i32x4, b: i32x4) -> i32x4;
 
     // Use a generic LLVM intrinsic to do type checking on other platforms
@@ -52,8 +52,14 @@ pub fn bar(a: i32x4, b: i32x4) -> i32x4 {
     unsafe { integer(a, b) }
 }
 
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+
 #[lang = "sized"]
-pub trait Sized {}
+pub trait Sized: MetaSized {}
 
 #[lang = "copy"]
 pub trait Copy {}

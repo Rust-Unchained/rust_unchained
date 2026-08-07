@@ -1,10 +1,10 @@
 use rustc_data_structures::intern::Interned;
-use rustc_macros::HashStable;
+use rustc_macros::StableHash;
 use rustc_type_ir as ir;
 pub use rustc_type_ir::solve::*;
 
 use crate::ty::{
-    self, FallibleTypeFolder, TyCtxt, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor,
+    self, FallibleTypeFolder, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor,
     try_visit,
 };
 
@@ -14,19 +14,16 @@ pub type QueryResult<'tcx> = ir::solve::QueryResult<TyCtxt<'tcx>>;
 pub type CandidateSource<'tcx> = ir::solve::CandidateSource<TyCtxt<'tcx>>;
 pub type CanonicalInput<'tcx, P = ty::Predicate<'tcx>> = ir::solve::CanonicalInput<TyCtxt<'tcx>, P>;
 pub type CanonicalResponse<'tcx> = ir::solve::CanonicalResponse<TyCtxt<'tcx>>;
+pub type FetchEligibleAssocItemResponse<'tcx> =
+    ir::solve::FetchEligibleAssocItemResponse<TyCtxt<'tcx>>;
+pub type ComputeGoalFastPathOutcome<'tcx> = ir::solve::ComputeGoalFastPathOutcome<TyCtxt<'tcx>>;
+pub type GoalStalledOn<'tcx> = ir::solve::GoalStalledOn<TyCtxt<'tcx>>;
+pub type GoalStalledOnOpaques<'tcx> = ir::solve::GoalStalledOnOpaques<TyCtxt<'tcx>>;
+pub type SucceededInErased<'tcx> = ir::solve::SucceededInErased<TyCtxt<'tcx>>;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, HashStable)]
-pub struct PredefinedOpaques<'tcx>(pub(crate) Interned<'tcx, PredefinedOpaquesData<TyCtxt<'tcx>>>);
+pub type PredefinedOpaques<'tcx> = &'tcx ty::List<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>;
 
-impl<'tcx> std::ops::Deref for PredefinedOpaques<'tcx> {
-    type Target = PredefinedOpaquesData<TyCtxt<'tcx>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, HashStable)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, StableHash)]
 pub struct ExternalConstraints<'tcx>(
     pub(crate) Interned<'tcx, ExternalConstraintsData<TyCtxt<'tcx>>>,
 );
@@ -49,6 +46,13 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ExternalConstraints<'tcx> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
+        // Perf testing has found that this check is slightly faster than
+        // folding and re-interning an empty `ExternalConstraintsData`.
+        // See: <https://github.com/rust-lang/rust/pull/142430>.
+        if self.is_empty() {
+            return Ok(self);
+        }
+
         Ok(FallibleTypeFolder::cx(folder).mk_external_constraints(ExternalConstraintsData {
             region_constraints: self.region_constraints.clone().try_fold_with(folder)?,
             opaque_types: self
@@ -64,6 +68,13 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ExternalConstraints<'tcx> {
     }
 
     fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        // Perf testing has found that this check is slightly faster than
+        // folding and re-interning an empty `ExternalConstraintsData`.
+        // See: <https://github.com/rust-lang/rust/pull/142430>.
+        if self.is_empty() {
+            return self;
+        }
+
         TypeFolder::cx(folder).mk_external_constraints(ExternalConstraintsData {
             region_constraints: self.region_constraints.clone().fold_with(folder),
             opaque_types: self.opaque_types.iter().map(|opaque| opaque.fold_with(folder)).collect(),
@@ -74,40 +85,25 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ExternalConstraints<'tcx> {
 
 impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ExternalConstraints<'tcx> {
     fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
-        try_visit!(self.region_constraints.visit_with(visitor));
-        try_visit!(self.opaque_types.visit_with(visitor));
-        self.normalization_nested_goals.visit_with(visitor)
+        let ExternalConstraintsData {
+            region_constraints,
+            opaque_types,
+            normalization_nested_goals,
+        } = &**self;
+
+        try_visit!(region_constraints.visit_with(visitor));
+        try_visit!(opaque_types.visit_with(visitor));
+        normalization_nested_goals.visit_with(visitor)
     }
 }
 
-// FIXME: Having to clone `region_constraints` for folding feels bad and
-// probably isn't great wrt performance.
-//
-// Not sure how to fix this, maybe we should also intern `opaque_types` and
-// `region_constraints` here or something.
-impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for PredefinedOpaques<'tcx> {
-    fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
-        self,
-        folder: &mut F,
-    ) -> Result<Self, F::Error> {
-        Ok(FallibleTypeFolder::cx(folder).mk_predefined_opaques_in_body(PredefinedOpaquesData {
-            opaque_types: self
-                .opaque_types
-                .iter()
-                .map(|opaque| opaque.try_fold_with(folder))
-                .collect::<Result<_, F::Error>>()?,
-        }))
-    }
+// Some types are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(target_pointer_width = "64")]
+mod size_asserts {
+    use rustc_data_structures::static_assert_size;
 
-    fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
-        TypeFolder::cx(folder).mk_predefined_opaques_in_body(PredefinedOpaquesData {
-            opaque_types: self.opaque_types.iter().map(|opaque| opaque.fold_with(folder)).collect(),
-        })
-    }
-}
-
-impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for PredefinedOpaques<'tcx> {
-    fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
-        self.opaque_types.visit_with(visitor)
-    }
+    use super::*;
+    // tidy-alphabetical-start
+    static_assert_size!(GoalStalledOn<'_>, 56);
+    // tidy-alphabetical-end
 }

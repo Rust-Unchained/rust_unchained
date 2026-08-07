@@ -71,6 +71,16 @@ Whether `dbg!` should be allowed in test functions or `#[cfg(test)]`
 * [`dbg_macro`](https://rust-lang.github.io/rust-clippy/master/index.html#dbg_macro)
 
 
+## `allow-exact-repetitions`
+Whether an item should be allowed to have the same name as its containing module
+
+**Default Value:** `true`
+
+---
+**Affected lints:**
+* [`module_name_repetitions`](https://rust-lang.github.io/rust-clippy/master/index.html#module_name_repetitions)
+
+
 ## `allow-expect-in-consts`
 Whether `expect` should be allowed in code always evaluated at compile time
 
@@ -99,6 +109,16 @@ Whether `indexing_slicing` should be allowed in test functions or `#[cfg(test)]`
 ---
 **Affected lints:**
 * [`indexing_slicing`](https://rust-lang.github.io/rust-clippy/master/index.html#indexing_slicing)
+
+
+## `allow-large-stack-frames-in-tests`
+Whether functions inside `#[cfg(test)]` modules or test functions should be checked.
+
+**Default Value:** `true`
+
+---
+**Affected lints:**
+* [`large_stack_frames`](https://rust-lang.github.io/rust-clippy/master/index.html#large_stack_frames)
 
 
 ## `allow-mixed-uninlined-format-args`
@@ -194,6 +214,23 @@ Whether `unwrap` should be allowed in test functions or `#[cfg(test)]`
 * [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
 
 
+## `allow-unwrap-types`
+List of types to allow `unwrap()` and `expect()` on.
+
+#### Example
+
+```toml
+allow-unwrap-types = [ "std::sync::LockResult" ]
+```
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`expect_used`](https://rust-lang.github.io/rust-clippy/master/index.html#expect_used)
+* [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
+
+
 ## `allow-useless-vec-in-tests`
 Whether `useless_vec` should ignore test functions or `#[cfg(test)]`
 
@@ -226,7 +263,7 @@ A list of crate names to allow duplicates of
 
 ## `allowed-idents-below-min-chars`
 Allowed names below the minimum allowed characters. The value `".."` can be used as part of
-the list to indicate, that the configured values should be appended to the default
+the list to indicate that the configured values should be appended to the default
 configuration of Clippy. By default, any configuration will replace the default value.
 
 **Default Value:** `["i", "j", "x", "y", "z", "w", "n"]`
@@ -415,6 +452,37 @@ For internal testing only, ignores the current `publish` settings in the Cargo m
 * [`cargo_common_metadata`](https://rust-lang.github.io/rust-clippy/master/index.html#cargo_common_metadata)
 
 
+## `check-grouped-late-init`
+Whether to check for grouped late initializations from multiple `let` statements.
+
+#### Example
+```rust
+let a;
+let b;
+if true {
+    a = 1;
+    b = 2;
+} else {
+    a = 3;
+    b = 4;
+}
+```
+Use instead:
+```rust
+let (a, b) = if true {
+    (1, 2)
+} else {
+    (3, 4)
+};
+```
+
+**Default Value:** `true`
+
+---
+**Affected lints:**
+* [`needless_late_init`](https://rust-lang.github.io/rust-clippy/master/index.html#needless_late_init)
+
+
 ## `check-incompatible-msrv-in-tests`
 Whether to check MSRV compatibility in `#[test]` and `#[cfg(test)]` code.
 
@@ -475,8 +543,42 @@ The maximum cognitive complexity a function can have
 * [`cognitive_complexity`](https://rust-lang.github.io/rust-clippy/master/index.html#cognitive_complexity)
 
 
+## `const-literal-digits-threshold`
+The minimum digits a const float literal must have to supress the `excessive_precicion` lint
+
+**Default Value:** `30`
+
+---
+**Affected lints:**
+* [`excessive_precision`](https://rust-lang.github.io/rust-clippy/master/index.html#excessive_precision)
+
+
+## `disallowed-fields`
+The list of disallowed fields, written as fully qualified paths.
+
+**Fields:**
+- `path` (required): the fully qualified path to the field that should be disallowed
+- `reason` (optional): explanation why this field is disallowed
+- `replacement` (optional): suggested alternative method
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`disallowed_fields`](https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_fields)
+
+
 ## `disallowed-macros`
 The list of disallowed macros, written as fully qualified paths.
+
+**Fields:**
+- `path` (required): the fully qualified path to the macro that should be disallowed
+- `reason` (optional): explanation why this macro is disallowed
+- `replacement` (optional): suggested alternative macro
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
 
 **Default Value:** `[]`
 
@@ -487,6 +589,13 @@ The list of disallowed macros, written as fully qualified paths.
 
 ## `disallowed-methods`
 The list of disallowed methods, written as fully qualified paths.
+
+**Fields:**
+- `path` (required): the fully qualified path to the method that should be disallowed
+- `reason` (optional): explanation why this method is disallowed
+- `replacement` (optional): suggested alternative method
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
 
 **Default Value:** `[]`
 
@@ -510,6 +619,13 @@ default configuration of Clippy. By default, any configuration will replace the 
 ## `disallowed-types`
 The list of disallowed types, written as fully qualified paths.
 
+**Fields:**
+- `path` (required): the fully qualified path to the type that should be disallowed
+- `reason` (optional): explanation why this type is disallowed
+- `replacement` (optional): suggested alternative type
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
+
 **Default Value:** `[]`
 
 ---
@@ -519,12 +635,12 @@ The list of disallowed types, written as fully qualified paths.
 
 ## `doc-valid-idents`
 The list of words this lint should not consider as identifiers needing ticks. The value
-`".."` can be used as part of the list to indicate, that the configured values should be appended to the
+`".."` can be used as part of the list to indicate that the configured values should be appended to the
 default configuration of Clippy. By default, any configuration will replace the default value. For example:
 * `doc-valid-idents = ["ClipPy"]` would replace the default list with `["ClipPy"]`.
 * `doc-valid-idents = ["ClipPy", ".."]` would append `ClipPy` to the default list.
 
-**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "MHz", "GHz", "THz", "AccessKit", "CoAP", "CoreFoundation", "CoreGraphics", "CoreText", "DevOps", "Direct2D", "Direct3D", "DirectWrite", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "ClojureScript", "CoffeeScript", "JavaScript", "PostScript", "PureScript", "TypeScript", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "OCaml", "OpenAL", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "OpenType", "WebGL", "WebGL2", "WebGPU", "WebRTC", "WebSocket", "WebTransport", "WebP", "OpenExr", "YCbCr", "sRGB", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
+**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "MHz", "GHz", "THz", "AccessKit", "CoAP", "CoreFoundation", "CoreGraphics", "CoreText", "DevOps", "Direct2D", "Direct3D", "DirectWrite", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "InfiniBand", "RoCE", "ClojureScript", "CoffeeScript", "JavaScript", "PostScript", "PureScript", "TypeScript", "PowerPC", "PowerShell", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "SQLite", "MySQL", "PostgreSQL", "MariaDB", "MongoDB", "OCaml", "OpenAL", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "OpenType", "WebGL", "WebGL2", "WebGPU", "WebRTC", "WebSocket", "WebTransport", "WebP", "OpenExr", "YCbCr", "sRGB", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD", "NixOS", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
 
 ---
 **Affected lints:**
@@ -630,6 +746,27 @@ A list of paths to types that should be treated as if they do not contain interi
 * [`mutable_key_type`](https://rust-lang.github.io/rust-clippy/master/index.html#mutable_key_type)
 
 
+## `inherent-impl-lint-scope`
+Sets the scope ("crate", "file", or "module") in which duplicate inherent `impl` blocks for the same type are linted.
+
+**Default Value:** `"crate"`
+
+---
+**Affected lints:**
+* [`multiple_inherent_impl`](https://rust-lang.github.io/rust-clippy/master/index.html#multiple_inherent_impl)
+
+
+## `large-error-ignored`
+A list of paths to types that should be ignored as overly large `Err`-variants in a
+`Result` returned from a function
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`result_large_err`](https://rust-lang.github.io/rust-clippy/master/index.html#result_large_err)
+
+
 ## `large-error-threshold`
 The maximum size of the `Err`-variant in a `Result` returned from a function
 
@@ -641,13 +778,14 @@ The maximum size of the `Err`-variant in a `Result` returned from a function
 
 
 ## `lint-commented-code`
-Whether collapsible `if` chains are linted if they contain comments inside the parts
+Whether collapsible `if` and `else if` chains are linted if they contain comments inside the parts
 that would be collapsed.
 
 **Default Value:** `false`
 
 ---
 **Affected lints:**
+* [`collapsible_else_if`](https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_else_if)
 * [`collapsible_if`](https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if)
 
 
@@ -673,7 +811,8 @@ be filtering for common types.
 
 
 ## `max-fn-params-bools`
-The maximum number of bool parameters a function can have
+The maximum number of bool parameters a function can have.
+Use `0` to lint on any function with a bool parameter.
 
 **Default Value:** `3`
 
@@ -732,6 +871,16 @@ Minimum chars an ident can have, anything below or equal to this will be linted.
 ---
 **Affected lints:**
 * [`min_ident_chars`](https://rust-lang.github.io/rust-clippy/master/index.html#min_ident_chars)
+
+
+## `missing-docs-allow-unused`
+Whether to allow fields starting with an underscore to skip documentation requirements
+
+**Default Value:** `false`
+
+---
+**Affected lints:**
+* [`missing_docs_in_private_items`](https://rust-lang.github.io/rust-clippy/master/index.html#missing_docs_in_private_items)
 
 
 ## `missing-docs-in-crate-items`
@@ -793,9 +942,11 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`from_over_into`](https://rust-lang.github.io/rust-clippy/master/index.html#from_over_into)
 * [`if_then_some_else_none`](https://rust-lang.github.io/rust-clippy/master/index.html#if_then_some_else_none)
 * [`index_refutable_slice`](https://rust-lang.github.io/rust-clippy/master/index.html#index_refutable_slice)
+* [`inefficient_to_string`](https://rust-lang.github.io/rust-clippy/master/index.html#inefficient_to_string)
 * [`io_other_error`](https://rust-lang.github.io/rust-clippy/master/index.html#io_other_error)
 * [`iter_kv_map`](https://rust-lang.github.io/rust-clippy/master/index.html#iter_kv_map)
 * [`legacy_numeric_constants`](https://rust-lang.github.io/rust-clippy/master/index.html#legacy_numeric_constants)
+* [`len_zero`](https://rust-lang.github.io/rust-clippy/master/index.html#len_zero)
 * [`lines_filter_map_ok`](https://rust-lang.github.io/rust-clippy/master/index.html#lines_filter_map_ok)
 * [`manual_abs_diff`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_abs_diff)
 * [`manual_bits`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_bits)
@@ -806,9 +957,12 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_hash_one`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_hash_one)
 * [`manual_is_ascii_check`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_ascii_check)
 * [`manual_is_power_of_two`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_power_of_two)
+* [`manual_is_variant_and`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_variant_and)
+* [`manual_isolate_lowest_one`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_isolate_lowest_one)
 * [`manual_let_else`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_let_else)
 * [`manual_midpoint`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_midpoint)
 * [`manual_non_exhaustive`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_non_exhaustive)
+* [`manual_noop_waker`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_noop_waker)
 * [`manual_option_as_slice`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_option_as_slice)
 * [`manual_pattern_char_comparison`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_pattern_char_comparison)
 * [`manual_range_contains`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains)
@@ -816,9 +970,11 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_repeat_n`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_repeat_n)
 * [`manual_retain`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_retain)
 * [`manual_slice_fill`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_slice_fill)
+* [`manual_slice_size_calculation`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_slice_size_calculation)
 * [`manual_split_once`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_split_once)
 * [`manual_str_repeat`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_str_repeat)
 * [`manual_strip`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_strip)
+* [`manual_take`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_take)
 * [`manual_try_fold`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_try_fold)
 * [`map_clone`](https://rust-lang.github.io/rust-clippy/master/index.html#map_clone)
 * [`map_unwrap_or`](https://rust-lang.github.io/rust-clippy/master/index.html#map_unwrap_or)
@@ -830,7 +986,7 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`needless_borrow`](https://rust-lang.github.io/rust-clippy/master/index.html#needless_borrow)
 * [`non_std_lazy_statics`](https://rust-lang.github.io/rust-clippy/master/index.html#non_std_lazy_statics)
 * [`option_as_ref_deref`](https://rust-lang.github.io/rust-clippy/master/index.html#option_as_ref_deref)
-* [`option_map_unwrap_or`](https://rust-lang.github.io/rust-clippy/master/index.html#option_map_unwrap_or)
+* [`or_fun_call`](https://rust-lang.github.io/rust-clippy/master/index.html#or_fun_call)
 * [`ptr_as_ptr`](https://rust-lang.github.io/rust-clippy/master/index.html#ptr_as_ptr)
 * [`question_mark`](https://rust-lang.github.io/rust-clippy/master/index.html#question_mark)
 * [`redundant_field_names`](https://rust-lang.github.io/rust-clippy/master/index.html#redundant_field_names)
@@ -838,16 +994,18 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`repeat_vec_with_capacity`](https://rust-lang.github.io/rust-clippy/master/index.html#repeat_vec_with_capacity)
 * [`same_item_push`](https://rust-lang.github.io/rust-clippy/master/index.html#same_item_push)
 * [`seek_from_current`](https://rust-lang.github.io/rust-clippy/master/index.html#seek_from_current)
-* [`seek_rewind`](https://rust-lang.github.io/rust-clippy/master/index.html#seek_rewind)
+* [`to_digit_is_some`](https://rust-lang.github.io/rust-clippy/master/index.html#to_digit_is_some)
 * [`transmute_ptr_to_ref`](https://rust-lang.github.io/rust-clippy/master/index.html#transmute_ptr_to_ref)
 * [`tuple_array_conversions`](https://rust-lang.github.io/rust-clippy/master/index.html#tuple_array_conversions)
 * [`type_repetition_in_bounds`](https://rust-lang.github.io/rust-clippy/master/index.html#type_repetition_in_bounds)
-* [`unchecked_duration_subtraction`](https://rust-lang.github.io/rust-clippy/master/index.html#unchecked_duration_subtraction)
+* [`unchecked_time_subtraction`](https://rust-lang.github.io/rust-clippy/master/index.html#unchecked_time_subtraction)
 * [`uninlined_format_args`](https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args)
 * [`unnecessary_lazy_evaluations`](https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_lazy_evaluations)
+* [`unnecessary_unwrap`](https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_unwrap)
 * [`unnested_or_patterns`](https://rust-lang.github.io/rust-clippy/master/index.html#unnested_or_patterns)
 * [`unused_trait_names`](https://rust-lang.github.io/rust-clippy/master/index.html#unused_trait_names)
 * [`use_self`](https://rust-lang.github.io/rust-clippy/master/index.html#use_self)
+* [`zero_ptr`](https://rust-lang.github.io/rust-clippy/master/index.html#zero_ptr)
 
 
 ## `pass-by-value-size-limit`
@@ -869,6 +1027,16 @@ exported visibility, or whether they are marked as "pub".
 ---
 **Affected lints:**
 * [`pub_underscore_fields`](https://rust-lang.github.io/rust-clippy/master/index.html#pub_underscore_fields)
+
+
+## `recursive-self-in-type-definitions`
+Whether the type itself in a struct or enum should be replaced with `Self` when encountering recursive types.
+
+**Default Value:** `true`
+
+---
+**Affected lints:**
+* [`use_self`](https://rust-lang.github.io/rust-clippy/master/index.html#use_self)
 
 
 ## `semicolon-inside-block-ignore-singleline`
@@ -1004,7 +1172,7 @@ The order of associated items in traits.
 The maximum size (in bytes) to consider a `Copy` type for passing by value instead of by
 reference.
 
-**Default Value:** `target_pointer_width * 2`
+**Default Value:** `target_pointer_width`
 
 ---
 **Affected lints:**

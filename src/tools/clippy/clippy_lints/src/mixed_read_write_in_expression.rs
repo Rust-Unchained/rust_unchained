@@ -1,11 +1,40 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
 use clippy_utils::macros::root_macro_call_first_node;
-use clippy_utils::{get_parent_expr, path_to_local, path_to_local_id};
+use clippy_utils::res::MaybeResPath;
+use clippy_utils::{get_parent_expr, sym};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{BinOpKind, Block, Expr, ExprKind, HirId, LetStmt, Node, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::declare_lint_pass;
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for diverging calls that are not match arms or
+    /// statements.
+    ///
+    /// ### Why is this bad?
+    /// It is often confusing to read. In addition, the
+    /// sub-expression evaluation order for Rust is not well documented.
+    ///
+    /// ### Known problems
+    /// Someone might want to use `some_bool || panic!()` as a
+    /// shorthand.
+    ///
+    /// ### Example
+    /// ```rust,no_run
+    /// # fn b() -> bool { true }
+    /// # fn c() -> bool { true }
+    /// let a = b() || panic!() || c();
+    /// // `c()` is dead, `panic!()` is only called if `b()` returns `false`
+    /// let x = (a, b, c, panic!());
+    /// // can simply be replaced by `panic!()`
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub DIVERGING_SUB_EXPRESSION,
+    complexity,
+    "whether an expression contains a diverging sub expression"
+}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -50,41 +79,16 @@ declare_clippy_lint! {
     "whether a variable read occurs before a write depends on sub-expression evaluation order"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for diverging calls that are not match arms or
-    /// statements.
-    ///
-    /// ### Why is this bad?
-    /// It is often confusing to read. In addition, the
-    /// sub-expression evaluation order for Rust is not well documented.
-    ///
-    /// ### Known problems
-    /// Someone might want to use `some_bool || panic!()` as a
-    /// shorthand.
-    ///
-    /// ### Example
-    /// ```rust,no_run
-    /// # fn b() -> bool { true }
-    /// # fn c() -> bool { true }
-    /// let a = b() || panic!() || c();
-    /// // `c()` is dead, `panic!()` is only called if `b()` returns `false`
-    /// let x = (a, b, c, panic!());
-    /// // can simply be replaced by `panic!()`
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub DIVERGING_SUB_EXPRESSION,
-    complexity,
-    "whether an expression contains a diverging sub expression"
-}
-
-declare_lint_pass!(EvalOrderDependence => [MIXED_READ_WRITE_IN_EXPRESSION, DIVERGING_SUB_EXPRESSION]);
+declare_lint_pass!(EvalOrderDependence => [
+    DIVERGING_SUB_EXPRESSION,
+    MIXED_READ_WRITE_IN_EXPRESSION,
+]);
 
 impl<'tcx> LateLintPass<'tcx> for EvalOrderDependence {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         // Find a write to a local variable.
         let var = if let ExprKind::Assign(lhs, ..) | ExprKind::AssignOp(_, lhs, _) = expr.kind
-            && let Some(var) = path_to_local(lhs)
+            && let Some(var) = lhs.res_local_id()
             && expr.span.desugaring_kind().is_none()
         {
             var
@@ -134,9 +138,9 @@ impl<'tcx> DivergenceVisitor<'_, 'tcx> {
         }
     }
 
-    fn report_diverging_sub_expr(&mut self, e: &Expr<'_>) {
+    fn report_diverging_sub_expr(&self, e: &Expr<'_>) {
         if let Some(macro_call) = root_macro_call_first_node(self.cx, e)
-            && self.cx.tcx.item_name(macro_call.def_id).as_str() == "todo"
+            && self.cx.tcx.is_diagnostic_item(sym::todo_macro, macro_call.def_id)
         {
             return;
         }
@@ -153,32 +157,25 @@ impl<'tcx> Visitor<'tcx> for DivergenceVisitor<'_, 'tcx> {
         match e.kind {
             // fix #10776
             ExprKind::Block(block, ..) => match (block.stmts, block.expr) {
-                (stmts, Some(e)) => {
-                    if stmts.iter().all(|stmt| !stmt_might_diverge(stmt)) {
-                        self.visit_expr(e);
-                    }
+                (stmts, Some(e)) if stmts.iter().all(|stmt| !stmt_might_diverge(stmt)) => {
+                    self.visit_expr(e);
                 },
-                ([first @ .., stmt], None) => {
-                    if first.iter().all(|stmt| !stmt_might_diverge(stmt)) {
-                        match stmt.kind {
-                            StmtKind::Expr(e) | StmtKind::Semi(e) => self.visit_expr(e),
-                            _ => {},
-                        }
-                    }
+                ([first @ .., stmt], None)
+                    if first.iter().all(|stmt| !stmt_might_diverge(stmt))
+                        && let StmtKind::Expr(e) | StmtKind::Semi(e) = stmt.kind =>
+                {
+                    self.visit_expr(e);
                 },
                 _ => {},
             },
             ExprKind::Continue(_) | ExprKind::Break(_, _) | ExprKind::Ret(_) => self.report_diverging_sub_expr(e),
             ExprKind::Call(func, _) => {
                 let typ = self.cx.typeck_results().expr_ty(func);
-                match typ.kind() {
-                    ty::FnDef(..) | ty::FnPtr(..) => {
-                        let sig = typ.fn_sig(self.cx.tcx);
-                        if self.cx.tcx.instantiate_bound_regions_with_erased(sig).output().kind() == &ty::Never {
-                            self.report_diverging_sub_expr(e);
-                        }
-                    },
-                    _ => {},
+                if typ.is_fn() {
+                    let sig = typ.fn_sig(self.cx.tcx);
+                    if self.cx.tcx.instantiate_bound_regions_with_erased(sig).output().kind() == &ty::Never {
+                        self.report_diverging_sub_expr(e);
+                    }
                 }
             },
             ExprKind::MethodCall(..) => {
@@ -328,7 +325,7 @@ impl<'tcx> Visitor<'tcx> for ReadVisitor<'_, 'tcx> {
             return;
         }
 
-        if path_to_local_id(expr, self.var)
+        if expr.res_local_id() == Some(self.var)
             // Check that this is a read, not a write.
             && !is_in_assignment_position(self.cx, expr)
         {

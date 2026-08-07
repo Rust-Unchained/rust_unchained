@@ -1,15 +1,14 @@
-use super::{TestCx, WillExecute};
+use super::{Emit, TestCx, WillExecute};
 
 impl TestCx<'_> {
     pub(super) fn run_crash_test(&self) {
-        let pm = self.pass_mode();
-        let proc_res = self.compile_test(WillExecute::No, self.should_emit_metadata(pm));
+        let proc_res = self.compile_test(WillExecute::No, Emit::None);
 
         if std::env::var("COMPILETEST_VERBOSE_CRASHES").is_ok() {
-            eprintln!("{}", proc_res.status);
-            eprintln!("{}", proc_res.stdout);
-            eprintln!("{}", proc_res.stderr);
-            eprintln!("{}", proc_res.cmdline);
+            writeln!(self.stderr, "{}", proc_res.status);
+            writeln!(self.stderr, "{}", proc_res.stdout);
+            writeln!(self.stderr, "{}", proc_res.stderr);
+            writeln!(self.stderr, "{}", proc_res.cmdline);
         }
 
         // if a test does not crash, consider it an error

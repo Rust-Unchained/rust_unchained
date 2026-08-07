@@ -561,7 +561,7 @@ fn itemized_block_quote_start(line: &str, mut line_start: String, remove_indent:
     }
 
     for _ in 0..quote_level {
-        line_start.push_str("> ")
+        line_start.push_str("> ");
     }
     line_start
 }
@@ -764,6 +764,14 @@ impl<'a> CommentRewrite<'a> {
                             .doc_comment_code_block_width()
                             .min(config.max_width());
                         config.set().max_width(comment_max_width);
+                        if let Some(comment_use_small_heuristics) = config
+                            .doc_comment_code_block_small_heuristics()
+                            .to_heuristics()
+                        {
+                            config
+                                .set()
+                                .use_small_heuristics(comment_use_small_heuristics);
+                        }
                         if let Some(s) =
                             crate::format_code_block(&self.code_block_buffer, &config, false)
                         {
@@ -884,6 +892,9 @@ impl<'a> CommentRewrite<'a> {
             if line.is_empty() && self.result.ends_with(' ') && !is_last {
                 // Remove space if this is an empty comment or a doc comment.
                 self.result.pop();
+            }
+            if self.code_block_attr.is_some() && self.is_prev_line_multi_line {
+                self.result.push_str(&self.comment_line_separator);
             }
             self.result.push_str(line);
             self.fmt.shape = Shape::legacy(self.max_width, self.fmt_indent);

@@ -87,7 +87,6 @@ fn test_and() {
     assert_eq!(x.and(Some(2)), None);
     assert_eq!(x.and(None::<isize>), None);
 
-    /* FIXME(#110395)
     const FOO: Option<isize> = Some(1);
     const A: Option<isize> = FOO.and(Some(2));
     const B: Option<isize> = FOO.and(None);
@@ -99,7 +98,6 @@ fn test_and() {
     const D: Option<isize> = BAR.and(None);
     assert_eq!(C, None);
     assert_eq!(D, None);
-    */
 }
 
 #[test]
@@ -495,6 +493,30 @@ const fn option_const_mut() {
             }
         }
     */
+}
+
+/// Test that `Option::get_or_insert_default` is usable in const contexts, including with types that
+/// do not satisfy `T: const Destruct`.
+#[test]
+fn const_get_or_insert_default() {
+    const OPT_DEFAULT: Option<Vec<bool>> = {
+        let mut x = None;
+        x.get_or_insert_default();
+        x
+    };
+    assert!(OPT_DEFAULT.is_some());
+}
+
+/// Test that `Option::get_or_insert_with` is usable in const contexts, including with types that
+/// do not satisfy `T: const Destruct`.
+#[test]
+fn const_get_or_insert_with() {
+    const OPT_WITH: Option<Vec<bool>> = {
+        let mut x = None;
+        x.get_or_insert_with(Vec::new);
+        x
+    };
+    assert!(OPT_WITH.is_some());
 }
 
 #[test]

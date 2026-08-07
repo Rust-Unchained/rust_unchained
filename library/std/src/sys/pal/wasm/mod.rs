@@ -16,25 +16,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[path = "../unsupported/os.rs"]
-pub mod os;
-#[path = "../unsupported/pipe.rs"]
-pub mod pipe;
-#[path = "../unsupported/time.rs"]
-pub mod time;
-
-cfg_if::cfg_if! {
-    if #[cfg(target_feature = "atomics")] {
-        #[path = "atomics/futex.rs"]
-        pub mod futex;
-        #[path = "atomics/thread.rs"]
-        pub mod thread;
-    } else {
-        #[path = "../unsupported/thread.rs"]
-        pub mod thread;
-    }
-}
-
 #[path = "../unsupported/common.rs"]
 #[deny(unsafe_op_in_unsafe_fn)]
 mod common;

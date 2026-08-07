@@ -1,3 +1,4 @@
+//@ edition:2015
 // Check we do the correct privacy checks when we import a name and there is an
 // item with that name in both the value and type namespaces.
 
@@ -17,7 +18,7 @@ pub mod foo1 {
 fn test_glob1() {
     use foo1::*;
 
-    Bar();  //~ ERROR expected function, tuple struct or tuple variant, found trait `Bar`
+    Bar();  //~ ERROR cannot find function, tuple struct or tuple variant `Bar` in this scope
 }
 
 // private type, public value

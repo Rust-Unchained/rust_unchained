@@ -1,12 +1,12 @@
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Applicability, Diag};
+use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_hir as hir;
 use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::{declare_lint, impl_lint_pass};
-use rustc_span::Symbol;
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::sym;
+use rustc_span::{Span, Symbol};
 
 use crate::{LateContext, LateLintPass};
 
@@ -50,28 +50,24 @@ declare_lint! {
     @feature_gate = default_field_values;
 }
 
-#[derive(Default)]
-pub(crate) struct DefaultCouldBeDerived;
-
-impl_lint_pass!(DefaultCouldBeDerived => [DEFAULT_OVERRIDES_DEFAULT_FIELDS]);
+declare_lint_pass!(DefaultCouldBeDerived => [DEFAULT_OVERRIDES_DEFAULT_FIELDS]);
 
 impl<'tcx> LateLintPass<'tcx> for DefaultCouldBeDerived {
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
         // Look for manual implementations of `Default`.
-        let Some(default_def_id) = cx.tcx.get_diagnostic_item(sym::Default) else { return };
+        let hir::ImplItemImplKind::Trait { trait_item_def_id, .. } = impl_item.impl_kind else {
+            return;
+        };
+        if !trait_item_def_id.is_ok_and(|id| cx.tcx.is_diagnostic_item(sym::default_fn, id)) {
+            return;
+        }
         let hir::ImplItemKind::Fn(_sig, body_id) = impl_item.kind else { return };
-        let assoc = cx.tcx.associated_item(impl_item.owner_id);
-        let parent = assoc.container_id(cx.tcx);
-        if cx.tcx.has_attr(parent, sym::automatically_derived) {
+        let impl_id = cx.tcx.local_parent(impl_item.owner_id.def_id);
+        if cx.tcx.is_automatically_derived(impl_id.to_def_id()) {
             // We don't care about what `#[derive(Default)]` produces in this lint.
             return;
         }
-        let Some(trait_ref) = cx.tcx.impl_trait_ref(parent) else { return };
-        let trait_ref = trait_ref.instantiate_identity();
-        if trait_ref.def_id != default_def_id {
-            return;
-        }
-        let ty = trait_ref.self_ty();
+        let ty = cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip();
         let ty::Adt(def, _) = ty.kind() else { return };
 
         // We now know we have a manually written definition of a `<Type as Default>::default()`.
@@ -95,8 +91,8 @@ impl<'tcx> LateLintPass<'tcx> for DefaultCouldBeDerived {
                 kind:
                     hir::ItemKind::Struct(
                         _,
-                        hir::VariantData::Struct { fields, recovered: _ },
                         _generics,
+                        hir::VariantData::Struct { fields, recovered: _ },
                     ),
                 ..
             })) => fields.iter().map(|f| (f.ident.name, f)).collect::<FxHashMap<_, _>>(),
@@ -133,7 +129,7 @@ impl<'tcx> LateLintPass<'tcx> for DefaultCouldBeDerived {
             //     }
             // }
             // where `something()` would have to be a call or path.
-            // We have nothing meaninful to do with this.
+            // We have nothing meaningful to do with this.
             return;
         }
 
@@ -149,57 +145,61 @@ impl<'tcx> LateLintPass<'tcx> for DefaultCouldBeDerived {
             return;
         }
 
-        let Some(local) = parent.as_local() else { return };
-        let hir_id = cx.tcx.local_def_id_to_hir_id(local);
-        let hir::Node::Item(item) = cx.tcx.hir_node(hir_id) else { return };
-        cx.tcx.node_span_lint(DEFAULT_OVERRIDES_DEFAULT_FIELDS, hir_id, item.span, |diag| {
-            mk_lint(cx.tcx, diag, type_def_id, parent, orig_fields, fields);
-        });
+        let hir_id = cx.tcx.local_def_id_to_hir_id(impl_id);
+        let span = cx.tcx.hir_span_with_body(hir_id);
+        cx.tcx.emit_node_span_lint(
+            DEFAULT_OVERRIDES_DEFAULT_FIELDS,
+            hir_id,
+            span,
+            WrongDefaultImpl { tcx: cx.tcx, type_def_id, orig_fields, fields, impl_span: span },
+        );
     }
 }
 
-fn mk_lint(
-    tcx: TyCtxt<'_>,
-    diag: &mut Diag<'_, ()>,
+struct WrongDefaultImpl<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
     type_def_id: DefId,
-    impl_def_id: DefId,
-    orig_fields: FxHashMap<Symbol, &hir::FieldDef<'_>>,
-    fields: &[hir::ExprField<'_>],
-) {
-    diag.primary_message("`Default` impl doesn't use the declared default field values");
+    orig_fields: FxHashMap<Symbol, &'a hir::FieldDef<'tcx>>,
+    fields: &'a [hir::ExprField<'tcx>],
+    impl_span: Span,
+}
 
-    // For each field in the struct expression
-    //   - if the field in the type has a default value, it should be removed
-    //   - elif the field is an expression that could be a default value, it should be used as the
-    //     field's default value (FIXME: not done).
-    //   - else, we wouldn't touch this field, it would remain in the manual impl
-    let mut removed_all_fields = true;
-    for field in fields {
-        if orig_fields.get(&field.ident.name).and_then(|f| f.default).is_some() {
-            diag.span_label(field.expr.span, "this field has a default value");
-        } else {
-            removed_all_fields = false;
+impl<'a, 'b, 'tcx> Diagnostic<'a, ()> for WrongDefaultImpl<'b, 'tcx> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        let Self { tcx, type_def_id, orig_fields, fields, impl_span } = self;
+        let mut diag =
+            Diag::new(dcx, level, "`Default` impl doesn't use the declared default field values");
+
+        // For each field in the struct expression
+        //   - if the field in the type has a default value, it should be removed
+        //   - elif the field is an expression that could be a default value, it should be used as the
+        //     field's default value (FIXME: not done).
+        //   - else, we wouldn't touch this field, it would remain in the manual impl
+        let mut removed_all_fields = true;
+        for field in fields {
+            if orig_fields.get(&field.ident.name).and_then(|f| f.default).is_some() {
+                diag.span_label(field.expr.span, "this field has a default value");
+            } else {
+                removed_all_fields = false;
+            }
         }
-    }
 
-    if removed_all_fields {
-        let msg = "to avoid divergence in behavior between `Struct { .. }` and \
-                   `<Struct as Default>::default()`, derive the `Default`";
-        if let Some(hir::Node::Item(impl_)) = tcx.hir_get_if_local(impl_def_id) {
-            diag.multipart_suggestion_verbose(
-                msg,
+        if removed_all_fields {
+            diag.multipart_suggestion(
+                "to avoid divergence in behavior between `Struct { .. }` and \
+                 `<Struct as Default>::default()`, derive the `Default`",
                 vec![
                     (tcx.def_span(type_def_id).shrink_to_lo(), "#[derive(Default)] ".to_string()),
-                    (impl_.span, String::new()),
+                    (impl_span, String::new()),
                 ],
                 Applicability::MachineApplicable,
             );
         } else {
-            diag.help(msg);
+            diag.help(
+                "use the default values in the `impl` with `Struct { mandatory_field, .. }` to \
+                       avoid them diverging over time",
+            );
         }
-    } else {
-        let msg = "use the default values in the `impl` with `Struct { mandatory_field, .. }` to \
-                   avoid them diverging over time";
-        diag.help(msg);
+        diag
     }
 }

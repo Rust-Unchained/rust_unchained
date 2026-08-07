@@ -8,6 +8,52 @@ use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for possible missing comma in an array. It lints if
+    /// an array element is a binary operator expression and it lies on two lines.
+    ///
+    /// ### Why is this bad?
+    /// This could lead to unexpected results.
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// let a = &[
+    ///     -1, -2, -3 // <= no comma here
+    ///     -4, -5, -6
+    /// ];
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub POSSIBLE_MISSING_COMMA,
+    correctness,
+    "possible missing comma in array"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for an `if` expression followed by either a block or another `if` that
+    /// looks like it should have an `else` between them.
+    ///
+    /// ### Why is this bad?
+    /// This is probably some refactoring remnant, even if the code is correct, it
+    /// might look confusing.
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// if foo {
+    /// } { // looks like an `else` is missing here
+    /// }
+    ///
+    /// if foo {
+    /// } if bar { // looks like an `else` is missing here
+    /// }
+    /// ```
+    #[clippy::version = "1.91.0"]
+    pub POSSIBLE_MISSING_ELSE,
+    suspicious,
+    "possibly missing `else`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// Checks for usage of the non-existent `=*`, `=!` and `=-`
     /// operators.
     ///
@@ -23,35 +69,6 @@ declare_clippy_lint! {
     pub SUSPICIOUS_ASSIGNMENT_FORMATTING,
     suspicious,
     "suspicious formatting of `*=`, `-=` or `!=`"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks the formatting of a unary operator on the right hand side
-    /// of a binary operator. It lints if there is no space between the binary and unary operators,
-    /// but there is a space between the unary and its operand.
-    ///
-    /// ### Why is this bad?
-    /// This is either a typo in the binary operator or confusing.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// # let foo = true;
-    /// # let bar = false;
-    /// // &&! looks like a different operator
-    /// if foo &&! bar {}
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # let foo = true;
-    /// # let bar = false;
-    /// if foo && !bar {}
-    /// ```
-    #[clippy::version = "1.40.0"]
-    pub SUSPICIOUS_UNARY_OP_FORMATTING,
-    suspicious,
-    "suspicious formatting of unary `-` or `!` on the RHS of a BinOp"
 }
 
 declare_clippy_lint! {
@@ -93,30 +110,39 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for possible missing comma in an array. It lints if
-    /// an array element is a binary operator expression and it lies on two lines.
+    /// Checks the formatting of a unary operator on the right hand side
+    /// of a binary operator. It lints if there is no space between the binary and unary operators,
+    /// but there is a space between the unary and its operand.
     ///
     /// ### Why is this bad?
-    /// This could lead to unexpected results.
+    /// This is either a typo in the binary operator or confusing.
     ///
     /// ### Example
-    /// ```rust,ignore
-    /// let a = &[
-    ///     -1, -2, -3 // <= no comma here
-    ///     -4, -5, -6
-    /// ];
+    /// ```no_run
+    /// # let foo = true;
+    /// # let bar = false;
+    /// // &&! looks like a different operator
+    /// if foo &&! bar {}
     /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub POSSIBLE_MISSING_COMMA,
-    correctness,
-    "possible missing comma in array"
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # let foo = true;
+    /// # let bar = false;
+    /// if foo && !bar {}
+    /// ```
+    #[clippy::version = "1.40.0"]
+    pub SUSPICIOUS_UNARY_OP_FORMATTING,
+    suspicious,
+    "suspicious formatting of unary `-` or `!` on the RHS of a BinOp"
 }
 
 declare_lint_pass!(Formatting => [
+    POSSIBLE_MISSING_COMMA,
+    POSSIBLE_MISSING_ELSE,
     SUSPICIOUS_ASSIGNMENT_FORMATTING,
-    SUSPICIOUS_UNARY_OP_FORMATTING,
     SUSPICIOUS_ELSE_FORMATTING,
-    POSSIBLE_MISSING_COMMA
+    SUSPICIOUS_UNARY_OP_FORMATTING,
 ]);
 
 impl EarlyLintPass for Formatting {
@@ -307,11 +333,11 @@ fn check_missing_else(cx: &EarlyContext<'_>, first: &Expr, second: &Expr) {
 
         span_lint_and_note(
             cx,
-            SUSPICIOUS_ELSE_FORMATTING,
+            POSSIBLE_MISSING_ELSE,
             else_span,
             format!("this looks like {looks_like} but the `else` is missing"),
             None,
-            format!("to remove this lint, add the missing `else` or add a new line before {next_thing}",),
+            format!("to remove this lint, add the missing `else` or add a new line before {next_thing}"),
         );
     }
 }

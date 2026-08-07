@@ -6,7 +6,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
+use rustc_span::{SyntaxContext, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -16,10 +16,6 @@ declare_clippy_lint! {
     /// ### Why is this bad?
     /// `if` is not guaranteed to be exhaustive and conditionals can get
     /// repetitive
-    ///
-    /// ### Known problems
-    /// The match statement may be slower due to the compiler
-    /// not inlining the call to cmp. See issue [#5354](https://github.com/rust-lang/rust-clippy/issues/5354)
     ///
     /// ### Example
     /// ```rust,ignore
@@ -75,8 +71,12 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
         }
 
         // Check that there exists at least one explicit else condition
-        let (conds, _) = if_sequence(expr);
+        let (conds, blocks) = if_sequence(expr);
         if conds.len() < 2 {
+            return;
+        }
+
+        if blocks.len() < 3 {
             return;
         }
 
@@ -90,8 +90,10 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
 
                 // Check that both sets of operands are equal
                 let mut spanless_eq = SpanlessEq::new(cx);
-                let same_fixed_operands = spanless_eq.eq_expr(lhs1, lhs2) && spanless_eq.eq_expr(rhs1, rhs2);
-                let same_transposed_operands = spanless_eq.eq_expr(lhs1, rhs2) && spanless_eq.eq_expr(rhs1, lhs2);
+                let same_fixed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, lhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, rhs2);
+                let same_transposed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, rhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, lhs2);
 
                 if !same_fixed_operands && !same_transposed_operands {
                     return;
@@ -125,6 +127,7 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
         let ExprKind::Binary(_, lhs, rhs) = conds[0].kind else {
             unreachable!();
         };
+
         let lhs = Sugg::hir(cx, lhs, "..").maybe_paren();
         let rhs = Sugg::hir(cx, rhs, "..").addr();
         span_lint_and_sugg(

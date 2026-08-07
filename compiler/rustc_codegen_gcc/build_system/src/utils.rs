@@ -1,18 +1,11 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-#[cfg(unix)]
-use std::ffi::c_int;
 use std::fmt::Debug;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
-
-#[cfg(unix)]
-extern "C" {
-    fn raise(signal: c_int) -> c_int;
-}
 
 fn exec_command(
     input: &[&dyn AsRef<OsStr>],
@@ -27,17 +20,14 @@ fn exec_command(
     #[cfg(unix)]
     {
         if let Some(signal) = status.signal() {
-            unsafe {
-                raise(signal as _);
-            }
             // In case the signal didn't kill the current process.
-            return Err(command_error(input, &cwd, format!("Process received signal {}", signal)));
+            return Err(command_error(input, &cwd, format!("Process received signal {signal}")));
         }
     }
     Ok(status)
 }
 
-fn get_command_inner(
+pub(crate) fn get_command_inner(
     input: &[&dyn AsRef<OsStr>],
     cwd: Option<&Path>,
     env: Option<&HashMap<String, String>>,
@@ -75,18 +65,18 @@ fn check_exit_status(
     );
     let input = input.iter().map(|i| i.as_ref()).collect::<Vec<&OsStr>>();
     if show_err {
-        eprintln!("Command `{:?}` failed", input);
+        eprintln!("Command `{input:?}` failed");
     }
     if let Some(output) = output {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !stdout.is_empty() {
             error.push_str("\n==== STDOUT ====\n");
-            error.push_str(&*stdout);
+            error.push_str(&stdout);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.is_empty() {
             error.push_str("\n==== STDERR ====\n");
-            error.push_str(&*stderr);
+            error.push_str(&stderr);
         }
     }
     Err(error)
@@ -122,8 +112,7 @@ pub fn run_command_with_output(
     cwd: Option<&Path>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, None)?;
-    check_exit_status(input, cwd, exit_status, None, true)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, true)
 }
 
 pub fn run_command_with_output_and_env(
@@ -132,18 +121,17 @@ pub fn run_command_with_output_and_env(
     env: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, env)?;
-    check_exit_status(input, cwd, exit_status, None, true)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, true)
 }
 
+#[cfg(not(unix))]
 pub fn run_command_with_output_and_env_no_err(
     input: &[&dyn AsRef<OsStr>],
     cwd: Option<&Path>,
     env: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, env)?;
-    check_exit_status(input, cwd, exit_status, None, false)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, false)
 }
 
 pub fn cargo_install(to_install: &str) -> Result<(), String> {
@@ -242,7 +230,7 @@ pub fn get_toolchain() -> Result<String, String> {
             if !line.starts_with("channel") {
                 return None;
             }
-            line.split('"').skip(1).next()
+            line.split('"').nth(1)
         })
         .next()
     {
@@ -281,7 +269,7 @@ fn git_clone_inner(
 }
 
 fn get_repo_name(url: &str) -> String {
-    let repo_name = url.split('/').last().unwrap();
+    let repo_name = url.split('/').next_back().unwrap();
     match repo_name.strip_suffix(".git") {
         Some(n) => n.to_string(),
         None => repo_name.to_string(),
@@ -310,19 +298,6 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> Result<(), String> {
     fs::create_dir_all(&path).map_err(|error| {
         format!("Failed to create directory `{}`: {:?}", path.as_ref().display(), error)
     })
-}
-
-pub fn copy_file<F: AsRef<Path>, T: AsRef<Path>>(from: F, to: T) -> Result<(), String> {
-    fs::copy(&from, &to)
-        .map_err(|error| {
-            format!(
-                "Failed to copy file `{}` into `{}`: {:?}",
-                from.as_ref().display(),
-                to.as_ref().display(),
-                error
-            )
-        })
-        .map(|_| ())
 }
 
 /// This function differs from `git_clone` in how it handles *where* the repository will be cloned.

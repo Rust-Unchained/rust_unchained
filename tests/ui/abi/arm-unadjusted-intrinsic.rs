@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ build-pass
 //@ revisions: arm
 //@[arm] compile-flags: --target arm-unknown-linux-gnueabi
@@ -6,23 +6,20 @@
 //@ revisions: aarch64
 //@[aarch64] compile-flags: --target aarch64-unknown-linux-gnu
 //@[aarch64] needs-llvm-components: aarch64
-#![feature(
-    no_core, lang_items, link_llvm_intrinsics,
-    abi_unadjusted, repr_simd, arm_target_feature,
-)]
+//@ ignore-backends: gcc
+#![feature(no_core, lang_items, link_llvm_intrinsics, abi_unadjusted, arm_target_feature)]
 #![no_std]
 #![no_core]
 #![crate_type = "lib"]
 #![allow(non_camel_case_types)]
 
 extern crate minicore;
+use minicore::simd::Simd;
 use minicore::*;
 
 // Regression test for https://github.com/rust-lang/rust/issues/118124.
 
-#[repr(simd)]
-pub struct int8x16_t(pub(crate) [i8; 16]);
-impl Copy for int8x16_t {}
+pub type int8x16_t = Simd<i8, 16>;
 
 #[repr(C)]
 pub struct int8x16x4_t(pub int8x16_t, pub int8x16_t, pub int8x16_t, pub int8x16_t);

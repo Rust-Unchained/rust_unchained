@@ -5,14 +5,17 @@
 //@normalize-stderr-test: "\n +\[\.\.\. omitted [0-9]+ frames? \.\.\.\].*" -> ""
 //@normalize-stderr-test: "\n[ =]*note:.*" -> ""
 //@normalize-stderr-test: "DefId\([^()]*\)" -> "DefId"
+// Paths differ between bootstrap and stand-alone Miri runs, normalize them to be the same
+//@normalize-stderr-test: "/rustc-dev/[^/]*/" -> ""
 // Somehow on rustc Windows CI, the "Miri caused an ICE" message is not shown
 // and we don't even get a regular panic; rustc aborts with a different exit code instead.
 //@ignore-host: windows
+
 #![feature(custom_mir, core_intrinsics)]
 use core::intrinsics::mir::*;
 
 #[custom_mir(dialect = "runtime", phase = "optimized")]
-pub fn main() {
+fn main() {
     mir! {
         let x: i32;
         let tuple: (*mut i32,);

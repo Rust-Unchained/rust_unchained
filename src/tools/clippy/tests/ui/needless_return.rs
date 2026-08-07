@@ -1,15 +1,8 @@
 //@aux-build:proc_macros.rs
 #![feature(yeet_expr)]
-#![allow(unused)]
-#![allow(
-    clippy::if_same_then_else,
-    clippy::single_match,
-    clippy::needless_bool,
-    clippy::equatable_if_let,
-    clippy::needless_else,
-    clippy::missing_safety_doc
-)]
 #![warn(clippy::needless_return)]
+#![allow(clippy::single_match)]
+#![expect(clippy::if_same_then_else, clippy::missing_safety_doc, clippy::needless_bool)]
 
 extern crate proc_macros;
 use proc_macros::with_span;
@@ -85,16 +78,16 @@ fn test_macro_call() -> i32 {
 
 fn test_void_fun() {
     return;
-    //~^^ needless_return
+    //~^ needless_return
 }
 
 fn test_void_if_fun(b: bool) {
     if b {
         return;
-        //~^^ needless_return
+        //~^ needless_return
     } else {
         return;
-        //~^^ needless_return
+        //~^ needless_return
     }
 }
 
@@ -112,7 +105,7 @@ fn test_nested_match(x: u32) {
         1 => {
             let _ = 42;
             return;
-            //~^^ needless_return
+            //~^ needless_return
         },
         _ => return,
         //~^ needless_return
@@ -161,7 +154,7 @@ mod issue6501 {
     fn test_closure() {
         let _ = || {
             return;
-            //~^^ needless_return
+            //~^ needless_return
         };
         let _ = || return;
         //~^ needless_return
@@ -226,16 +219,16 @@ async fn async_test_macro_call() -> i32 {
 
 async fn async_test_void_fun() {
     return;
-    //~^^ needless_return
+    //~^ needless_return
 }
 
 async fn async_test_void_if_fun(b: bool) {
     if b {
         return;
-        //~^^ needless_return
+        //~^ needless_return
     } else {
         return;
-        //~^^ needless_return
+        //~^ needless_return
     }
 }
 
@@ -363,7 +356,7 @@ mod issue9416 {
     pub fn with_newline() {
         let _ = 42;
         return;
-        //~^^ needless_return
+        //~^ needless_return
     }
 
     #[rustfmt::skip]
@@ -460,4 +453,76 @@ unsafe fn todo() -> *const u8 {
 pub unsafe fn issue_12157() -> *const i32 {
     return unsafe { todo() } as *const i32;
     //~^ needless_return
+}
+
+mod else_ifs {
+    fn test1(a: i32) -> u32 {
+        if a == 0 {
+            return 1;
+        //~^ needless_return
+        } else if a < 10 {
+            return 2;
+        //~^ needless_return
+        } else {
+            return 3;
+            //~^ needless_return
+        }
+    }
+
+    fn test2(a: i32) -> u32 {
+        if a == 0 {
+            return 1;
+        //~^ needless_return
+        } else if a < 10 {
+            2
+        } else {
+            return 3;
+            //~^ needless_return
+        }
+    }
+
+    fn test3(a: i32) -> u32 {
+        if a == 0 {
+            return 1;
+        //~^ needless_return
+        } else if a < 10 {
+            2
+        } else {
+            return 3;
+            //~^ needless_return
+        }
+    }
+
+    #[allow(clippy::match_single_binding, clippy::redundant_pattern)]
+    fn test4(a: i32) -> u32 {
+        if a == 0 {
+            return 1;
+            //~^ needless_return
+        } else if if if a > 0x1_1 {
+            return 2;
+        } else {
+            return 5;
+        } {
+            true
+        } else {
+            true
+        } {
+            0xDEADC0DE
+        } else if match a {
+            b @ _ => {
+                return 1;
+            },
+        } {
+            0xDEADBEEF
+        } else {
+            1
+        }
+    }
+}
+
+fn issue14474() -> u64 {
+    return 456;
+
+    #[cfg(false)]
+    123
 }

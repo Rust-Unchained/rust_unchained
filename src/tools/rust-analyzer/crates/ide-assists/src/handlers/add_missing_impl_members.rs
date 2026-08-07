@@ -1,16 +1,17 @@
 use hir::HasSource;
 use syntax::{
-    ast::{self, make, AstNode},
     Edition,
+    ast::{self, AstNode, syntax_factory::SyntaxFactory},
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
     utils::{
-        add_trait_assoc_items_to_impl, filter_assoc_items, gen_trait_fn_body, DefaultMethods,
-        IgnoreAssocItems,
+        DefaultMethods, IgnoreAssocItems, add_trait_assoc_items_to_impl, filter_assoc_items,
+        gen_trait_fn_body,
     },
-    AssistId, AssistKind,
 };
 
 // Assist: add_impl_missing_members
@@ -44,7 +45,10 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn add_missing_impl_members(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn add_missing_impl_members(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     add_missing_impl_members_inner(
         acc,
         ctx,
@@ -88,7 +92,7 @@ pub(crate) fn add_missing_impl_members(acc: &mut Assists, ctx: &AssistContext<'_
 // ```
 pub(crate) fn add_missing_default_members(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     add_missing_impl_members_inner(
         acc,
@@ -102,7 +106,7 @@ pub(crate) fn add_missing_default_members(
 
 fn add_missing_impl_members_inner(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     mode: DefaultMethods,
     ignore_items: IgnoreAssocItems,
     assist_id: &'static str,
@@ -129,7 +133,7 @@ fn add_missing_impl_members_inner(
     if let IgnoreAssocItems::DocHiddenAttrPresent = ignore_items {
         // Relax condition for local crates.
         let db = ctx.db();
-        if trait_.module(db).krate().origin(db).is_local() {
+        if trait_.module(db).krate(db).origin(db).is_local() {
             ign_item = IgnoreAssocItems::No;
         }
     }
@@ -146,61 +150,94 @@ fn add_missing_impl_members_inner(
     }
 
     let target = impl_def.syntax().text_range();
-    acc.add(AssistId(assist_id, AssistKind::QuickFix), label, target, |edit| {
-        let new_impl_def = edit.make_mut(impl_def.clone());
-        let first_new_item = add_trait_assoc_items_to_impl(
+    acc.add(AssistId::quick_fix(assist_id), label, target, |edit| {
+        let editor = edit.make_editor(impl_def.syntax());
+        let make = editor.make();
+        let new_item = add_trait_assoc_items_to_impl(
+            make,
             &ctx.sema,
+            ctx.config,
             &missing_items,
             trait_,
-            &new_impl_def,
+            &impl_def,
             &target_scope,
         );
 
+        let Some((first_new_item, other_items)) = new_item.split_first() else {
+            return;
+        };
+
+        let mut first_new_item = if let DefaultMethods::No = mode
+            && let ast::AssocItem::Fn(func) = &first_new_item
+            && let Some(body) = try_gen_trait_body(
+                make,
+                ctx,
+                func,
+                trait_ref,
+                &impl_def,
+                target_scope.krate().edition(ctx.sema.db),
+            )
+            && let Some(func_body) = func.body()
+        {
+            let (func_editor, _) = SyntaxEditor::new(first_new_item.syntax().clone());
+            func_editor.replace(func_body.syntax(), body.syntax());
+            ast::AssocItem::cast(func_editor.finish().new_root().clone())
+        } else {
+            Some(first_new_item.clone())
+        };
+
+        let new_assoc_items = first_new_item
+            .clone()
+            .into_iter()
+            .chain(other_items.iter().cloned())
+            .collect::<Vec<_>>();
+
+        if let Some(assoc_item_list) = impl_def.assoc_item_list() {
+            assoc_item_list.add_items(&editor, new_assoc_items);
+        } else {
+            let assoc_item_list = make.assoc_item_list(new_assoc_items);
+            editor.insert_all(
+                Position::after(impl_def.syntax()),
+                vec![make.whitespace(" ").into(), assoc_item_list.syntax().clone().into()],
+            );
+            first_new_item = assoc_item_list.assoc_items().next();
+        }
+
         if let Some(cap) = ctx.config.snippet_cap {
             let mut placeholder = None;
-            if let DefaultMethods::No = mode {
-                if let ast::AssocItem::Fn(func) = &first_new_item {
-                    if try_gen_trait_body(
-                        ctx,
-                        func,
-                        trait_ref,
-                        &impl_def,
-                        target_scope.krate().edition(ctx.sema.db),
-                    )
-                    .is_none()
-                    {
-                        if let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
-                        {
-                            if m.syntax().text() == "todo!()" {
-                                placeholder = Some(m);
-                            }
-                        }
-                    }
-                }
+            if let DefaultMethods::No = mode
+                && let Some(ast::AssocItem::Fn(func)) = &first_new_item
+                && let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
+                && m.syntax().text() == "todo!()"
+            {
+                placeholder = Some(m);
             }
 
             if let Some(macro_call) = placeholder {
-                edit.add_placeholder_snippet(cap, macro_call);
-            } else {
-                edit.add_tabstop_before(cap, first_new_item);
+                let placeholder = edit.make_placeholder_snippet(cap);
+                editor.add_annotation(macro_call.syntax(), placeholder);
+            } else if let Some(first_new_item) = first_new_item {
+                let tabstop = edit.make_tabstop_before(cap);
+                editor.add_annotation(first_new_item.syntax(), tabstop);
             };
         };
+        edit.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
 
 fn try_gen_trait_body(
-    ctx: &AssistContext<'_>,
+    make: &SyntaxFactory,
+    ctx: &AssistContext<'_, '_>,
     func: &ast::Fn,
-    trait_ref: hir::TraitRef,
+    trait_ref: hir::TraitRef<'_>,
     impl_def: &ast::Impl,
     edition: Edition,
-) -> Option<()> {
-    let trait_path = make::ext::ident_path(
-        &trait_ref.trait_().name(ctx.db()).display(ctx.db(), edition).to_string(),
-    );
+) -> Option<ast::BlockExpr> {
+    let trait_path =
+        make.ident_path(&trait_ref.trait_().name(ctx.db()).display(ctx.db(), edition).to_string());
     let hir_ty = ctx.sema.resolve_type(&impl_def.self_ty()?)?;
     let adt = hir_ty.as_adt()?.source(ctx.db())?;
-    gen_trait_fn_body(func, &trait_path, &adt.value, Some(trait_ref))
+    gen_trait_fn_body(make, func, &trait_path, &adt.value, Some(trait_ref))
 }
 
 #[cfg(test)]
@@ -321,7 +358,7 @@ impl Foo for S {
     }
 
     #[test]
-    fn test_impl_def_without_braces() {
+    fn test_impl_def_without_braces_macro() {
         check_assist(
             add_missing_impl_members,
             r#"
@@ -334,6 +371,33 @@ struct S;
 impl Foo for S {
     fn foo(&self) {
         ${0:todo!()}
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_impl_def_without_braces_tabstop_first_item() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+trait Foo {
+    type Output;
+    fn foo(&self);
+}
+struct S;
+impl Foo for S { $0 }"#,
+            r#"
+trait Foo {
+    type Output;
+    fn foo(&self);
+}
+struct S;
+impl Foo for S {
+    $0type Output;
+
+    fn foo(&self) {
+        todo!()
     }
 }"#,
         );
@@ -590,9 +654,9 @@ mod m {
 }
 
 impl m::Foo for () {
-    $0fn get_n(&self) -> usize { {40 + 2} }
+    $0fn get_n(&self) -> usize { N }
 
-    fn get_m(&self) -> usize { {m::VAL + 1} }
+    fn get_m(&self) -> usize { M }
 }"#,
         )
     }
@@ -2360,6 +2424,302 @@ pub struct MyStruct;
 
 impl other_file_2::Trait for MyStruct {
     $0type Iter;
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_qualify_ident_pat_in_default_members() {
+        check_assist(
+            add_missing_default_members,
+            r#"
+//- /lib.rs crate:b new_source_root:library
+pub enum State {
+    Active,
+    Inactive,
+}
+
+use State::*;
+
+pub trait Checker {
+    fn check(&self) -> State;
+
+    fn is_active(&self) -> bool {
+        match self.check() {
+            Active => true,
+            Inactive => false,
+        }
+    }
+}
+//- /main.rs crate:a deps:b
+struct MyChecker;
+
+impl b::Checker for MyChecker {
+    fn check(&self) -> b::State {
+        todo!();
+    }$0
+}"#,
+            r#"
+struct MyChecker;
+
+impl b::Checker for MyChecker {
+    fn check(&self) -> b::State {
+        todo!();
+    }
+
+    $0fn is_active(&self) -> bool {
+        match self.check() {
+            b::State::Active => true,
+            b::State::Inactive => false,
+        }
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_parameter_names_matching_macros_not_qualified() {
+        // Parameter names that match macro names should not be qualified
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- /lib.rs crate:dep
+#[macro_export]
+macro_rules! my_macro {
+    () => {}
+}
+
+pub trait Foo {
+    fn foo(&self, my_macro: usize);
+}
+
+//- /main.rs crate:main deps:dep
+struct Bar;
+
+impl dep::Foo for Bar {$0}
+"#,
+            r#"
+struct Bar;
+
+impl dep::Foo for Bar {
+    fn foo(&self, my_macro: usize) {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_test_for_when_impl_for_unit() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+trait Test {
+    fn f<B>()
+    where
+        B: IntoIterator,
+        <B as IntoIterator>::Item: Copy;
+}
+impl Test for () {
+    $0
+}
+"#,
+            r#"
+trait Test {
+    fn f<B>()
+    where
+        B: IntoIterator,
+        <B as IntoIterator>::Item: Copy;
+}
+impl Test for () {
+    fn f<B>()
+    where
+        B: IntoIterator,
+        <B as IntoIterator>::Item: Copy {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_param_name_not_qualified() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+mod ptr {
+    pub struct NonNull<T>(T);
+}
+mod alloc {
+    use super::ptr::NonNull;
+    pub trait Allocator {
+        unsafe fn deallocate(&self, ptr: NonNull<u8>);
+    }
+}
+
+struct System;
+
+unsafe impl alloc::Allocator for System {
+    $0
+}
+"#,
+            r#"
+mod ptr {
+    pub struct NonNull<T>(T);
+}
+mod alloc {
+    use super::ptr::NonNull;
+    pub trait Allocator {
+        unsafe fn deallocate(&self, ptr: NonNull<u8>);
+    }
+}
+
+struct System;
+
+unsafe impl alloc::Allocator for System {
+    unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>) {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_param_name_shadows_module() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+mod m { }
+use m as p;
+
+pub trait Allocator {
+    fn deallocate(&self, p: u8);
+}
+
+struct System;
+
+impl Allocator for System {
+    $0
+}
+"#,
+            r#"
+mod m { }
+use m as p;
+
+pub trait Allocator {
+    fn deallocate(&self, p: u8);
+}
+
+struct System;
+
+impl Allocator for System {
+    fn deallocate(&self, p: u8) {
+        ${0:todo!()}
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn does_not_include_defaulted_assoc_types() {
+        check_assist_not_applicable(
+            add_missing_impl_members,
+            r#"
+trait Trait {
+    type NotRequired = ();
+}
+
+struct Struct;
+
+impl Trait for Struct {
+    $0
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn drop_pin_drop() {
+        check_assist_not_applicable(
+            add_missing_impl_members,
+            r#"
+//- minicore: drop, pin
+struct Foo;
+impl Drop for Foo {$0
+    fn drop(&mut self) {}
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            add_missing_impl_members,
+            r#"
+//- minicore: drop, pin
+struct Foo;
+impl Drop for Foo {$0
+    fn pin_drop(self: core::pin::Pin<&mut Self>) {}
+}
+        "#,
+        );
+
+        check_assist_not_applicable(
+            add_missing_default_members,
+            r#"
+//- minicore: drop, pin
+struct Foo;
+impl Drop for Foo {$0
+    fn drop(&mut self) {}
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            add_missing_default_members,
+            r#"
+//- minicore: drop, pin
+struct Foo;
+impl Drop for Foo {$0
+    fn pin_drop(self: core::pin::Pin<&mut Self>) {}
+}
+        "#,
+        );
+
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- minicore: drop, pin
+struct Foo;
+impl Drop for Foo {$0
+}
+        "#,
+            r#"
+struct Foo;
+impl Drop for Foo {
+    fn drop(&mut self) {
+        ${0:todo!()}
+    }
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn issue_10326() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+trait A<T: ?Sized> { fn a(&self) -> &T; }
+trait B {}
+impl<'a, T: B> A<dyn 'a + B> for T {$0}"#,
+            r#"
+trait A<T: ?Sized> { fn a(&self) -> &T; }
+trait B {}
+impl<'a, T: B> A<dyn 'a + B> for T {
+    fn a(&self) -> &(dyn 'a + B) {
+        ${0:todo!()}
+    }
 }"#,
         );
     }

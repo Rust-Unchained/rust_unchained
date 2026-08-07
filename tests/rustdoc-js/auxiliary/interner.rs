@@ -18,7 +18,7 @@ pub trait Interner: Sized {
     type Binder<T: TypeVisitable<Self>>: BoundVars<Self> + TypeSuperVisitable<Self>;
     type BoundVars: IntoIterator<Item = Self::BoundVar>;
     type BoundVar;
-    type CanonicalVars: Copy + Debug + Hash + Eq + IntoIterator<Item = CanonicalVarInfo<Self>>;
+    type CanonicalVarKinds: Copy + Debug + Hash + Eq + IntoIterator<Item = CanonicalVarKind<Self>>;
     type Ty: Copy
         + DebugWithInfcx<Self>
         + Hash
@@ -68,8 +68,8 @@ pub trait Interner: Sized {
     type PlaceholderRegion: Copy + Debug + Hash + Ord + PlaceholderLike;
     type Predicate: Copy + Debug + Hash + Eq + TypeSuperVisitable<Self> + Flags;
     type TraitPredicate: Copy + Debug + Hash + Eq;
-    type RegionOutlivesPredicate: Copy + Debug + Hash + Eq;
-    type TypeOutlivesPredicate: Copy + Debug + Hash + Eq;
+    type RegionOutlivesClause: Copy + Debug + Hash + Eq;
+    type TypeOutlivesClause: Copy + Debug + Hash + Eq;
     type ProjectionPredicate: Copy + Debug + Hash + Eq;
     type NormalizesTo: Copy + Debug + Hash + Eq;
     type SubtypePredicate: Copy + Debug + Hash + Eq;
@@ -77,7 +77,7 @@ pub trait Interner: Sized {
     type ClosureKind: Copy + Debug + Hash + Eq;
 
     // Required method
-    fn mk_canonical_var_infos(self, infos: &[CanonicalVarInfo<Self>]) -> Self::CanonicalVars;
+    fn mk_canonical_var_kinds(self, kinds: &[CanonicalVarKind<Self>]) -> Self::CanonicalVarKinds;
 }
 
 pub trait DebugWithInfcx<I: Interner>: Debug {
@@ -102,10 +102,6 @@ pub trait BoundVars<I: Interner> {
 pub trait TypeSuperVisitable<I: Interner>: TypeVisitable<I> {
     // Required method
     fn super_visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result;
-}
-
-pub struct CanonicalVarInfo<I: Interner> {
-    pub kind: CanonicalVarKind<I>,
 }
 
 pub struct CanonicalVarKind<I>(std::marker::PhantomData<I>);

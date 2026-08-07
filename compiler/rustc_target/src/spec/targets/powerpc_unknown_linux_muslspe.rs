@@ -1,7 +1,8 @@
 use rustc_abi::Endian;
 
 use crate::spec::{
-    Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetMetadata, TargetOptions, base,
+    Arch, Cc, CfgAbi, LinkerFlavor, Lld, RustcAbi, StackProbeType, Target, TargetMetadata,
+    TargetOptions, base,
 };
 
 pub(crate) fn target() -> Target {
@@ -9,8 +10,6 @@ pub(crate) fn target() -> Target {
     base.add_pre_link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &["-mspe"]);
     base.max_atomic_width = Some(32);
     base.stack_probes = StackProbeType::Inline;
-    // FIXME(compiler-team#422): musl targets should be dynamically linked by default.
-    base.crt_static_default = true;
 
     Target {
         llvm_target: "powerpc-unknown-linux-muslspe".into(),
@@ -22,11 +21,12 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 32,
         data_layout: "E-m:e-p:32:32-Fn32-i64:64-n32".into(),
-        arch: "powerpc".into(),
+        arch: Arch::PowerPC,
         options: TargetOptions {
-            abi: "spe".into(),
+            cfg_abi: CfgAbi::Spe,
+            rustc_abi: Some(RustcAbi::PowerPcSpe),
             endian: Endian::Big,
-            features: "+msync".into(),
+            features: "+msync,+spe".into(),
             mcount: "_mcount".into(),
             ..base
         },

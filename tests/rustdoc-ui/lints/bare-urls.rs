@@ -38,6 +38,16 @@
 //~^ ERROR this URL is not a hyperlink
 pub fn c() {}
 
+#[doc = "here's a thing: https://example.com/"]
+//~^ ERROR this URL is not a hyperlink
+pub fn f() {}
+
+/// https://example.com/sugar
+//~^ ERROR this URL is not a hyperlink
+#[doc = "https://example.com/raw"]
+//~^ ERROR this URL is not a hyperlink
+pub fn mixed() {}
+
 /// <https://somewhere.com>
 /// [a](http://a.com)
 /// [b]
@@ -58,3 +68,27 @@ pub mod foo {
     /// https://somewhere.com/a?hello=12&bye=11#xyz
     pub fn bar() {}
 }
+
+/// Visit https://example.com/docs.
+//~^ ERROR this URL is not a hyperlink
+/// Two sentences. https://example.com. And more text.
+//~^ ERROR this URL is not a hyperlink
+/// Trailing ellipsis https://example.com/docs...
+//~^ ERROR this URL is not a hyperlink
+/// A period in the middle of https://example.com/a.b is part of the URL.
+//~^ ERROR this URL is not a hyperlink
+pub fn trailing_period() {}
+
+/// [https://bloob.blob]
+//~^ ERROR this URL is not a hyperlink
+/// [ https://bloob.blob ]
+//~^ ERROR this URL is not a hyperlink
+/// [ https://bloob.blob]
+//~^ ERROR this URL is not a hyperlink
+/// [https://bloob.blob ]
+//~^ ERROR this URL is not a hyperlink
+/// [https://bloob.blob
+//~^ ERROR this URL is not a hyperlink
+/// https://bloob.blob]
+//~^ ERROR this URL is not a hyperlink
+pub fn lint_with_brackets() {}

@@ -26,6 +26,7 @@
 
 use itertools::Itertools;
 use rustc_data_structures::graph::{DirectedGraph, Successors};
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::*;
 use rustc_middle::{bug, ty};
@@ -68,14 +69,14 @@ impl<'tcx> MockBlocks<'tcx> {
             BytePos(1)
         };
         let next_hi = next_lo + BytePos(1);
-        self.blocks.push(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        self.blocks.push(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(Span::with_root_ctxt(next_lo, next_hi)),
                 kind,
+                attributes: ThinVec::new(),
             }),
-            is_cleanup: false,
-        })
+            false,
+        ))
     }
 
     fn link(&mut self, from_block: BasicBlock, to_block: BasicBlock) {

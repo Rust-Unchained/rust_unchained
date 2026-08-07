@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use rustc_ast::ast::{Pat, PatKind};
+use rustc_ast::ast::{Pat, PatFieldsRest, PatKind};
 use rustc_errors::Applicability;
 use rustc_lint::EarlyContext;
 use rustc_span::Span;
@@ -8,7 +8,7 @@ use super::UNNEEDED_WILDCARD_PATTERN;
 
 pub(super) fn check(cx: &EarlyContext<'_>, pat: &Pat) {
     if let PatKind::TupleStruct(_, _, ref patterns) | PatKind::Tuple(ref patterns) = pat.kind
-        && let Some(rest_index) = patterns.iter().position(|pat| pat.is_rest())
+        && let Some(rest_index) = patterns.iter().position(Pat::is_rest)
     {
         if let Some((left_index, left_pat)) = patterns[..rest_index]
             .iter()
@@ -32,6 +32,19 @@ pub(super) fn check(cx: &EarlyContext<'_>, pat: &Pat) {
                 right_index == 0,
             );
         }
+    } else if let PatKind::Struct(_, _, patfields, rest) = &pat.kind
+        && let PatFieldsRest::Rest(rspan) = rest
+        && let Some((right_index, _right_pat)) = patfields
+            .iter()
+            .rev()
+            .take_while(|patfield| matches!(patfield.pat.kind, PatKind::Wild))
+            .enumerate()
+            .last()
+    {
+        // Unlike the tuples above, structs have patfields rather than patterns, and separate out the
+        // `..` into a separate parameter. Also, the `..` can only be at the end of the pattern.
+        let singlewild = patfields.len() - right_index - 1;
+        span_lint(cx, patfields[singlewild].span.until(*rspan), right_index == 0);
     }
 }
 

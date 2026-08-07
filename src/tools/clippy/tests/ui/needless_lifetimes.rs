@@ -1,16 +1,13 @@
 //@aux-build:proc_macros.rs
 
-#![warn(clippy::needless_lifetimes, clippy::elidable_lifetime_names)]
-#![allow(
-    unused,
+#![warn(clippy::needless_lifetimes)]
+#![deny(clippy::elidable_lifetime_names)]
+#![allow(mismatched_lifetime_syntaxes)]
+#![expect(
+    dyn_drop,
     clippy::boxed_local,
     clippy::extra_unused_type_parameters,
-    clippy::needless_pass_by_value,
-    clippy::redundant_allocation,
-    clippy::unnecessary_wraps,
-    dyn_drop,
-    clippy::get_first,
-    elided_named_lifetimes
+    clippy::get_first
 )]
 
 extern crate proc_macros;
@@ -428,7 +425,6 @@ mod issue7296 {
 }
 
 mod pr_9743_false_negative_fix {
-    #![allow(unused)]
 
     fn foo<'a>(x: &'a u8, y: &'_ u8) {}
     //~^ needless_lifetimes
@@ -438,7 +434,6 @@ mod pr_9743_false_negative_fix {
 }
 
 mod pr_9743_output_lifetime_checks {
-    #![allow(unused)]
 
     // lint: only one input
     fn one_input<'a>(x: &'a u8) -> &'a u8 {
@@ -470,11 +465,34 @@ mod in_macro {
         }
     }
 
-    // no lint on external macro
+    // no lint on external macro (standalone function)
     external! {
         fn needless_lifetime<'a>(x: &'a u8) -> &'a u8 {
             unimplemented!()
         }
+    }
+
+    // no lint on external macro (method in impl block)
+    external! {
+        struct ExternalStruct;
+
+        impl ExternalStruct {
+            fn needless_lifetime_method<'a>(x: &'a u8) -> &'a u8 {
+                unimplemented!()
+            }
+        }
+    }
+
+    // no lint on external macro (trait method)
+    external! {
+        trait ExternalTrait {
+            fn needless_lifetime_trait_method<'a>(x: &'a u8) -> &'a u8;
+        }
+    }
+
+    // no lint on external macro (extra unused lifetimes in function)
+    external! {
+        fn extra_unused_lifetime<'a>(x: u8) {}
     }
 
     inline! {

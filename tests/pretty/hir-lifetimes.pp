@@ -5,10 +5,9 @@
 // This tests the pretty-printing of lifetimes in lots of ways.
 
 #![allow(unused)]
-#[prelude_import]
-use ::std::prelude::rust_2015::*;
-#[macro_use]
 extern crate std;
+#[attr = PreludeImport]
+use ::std::prelude::rust_2015::*;
 
 struct Foo<'a> {
     x: &'a u32,
@@ -29,11 +28,9 @@ impl  Foo<'_> {
     fn d<'a>(&self, x: &'a u32) { }
 
     // FIXME: impl Traits printed as just `/*impl Trait*/`, ugh
-    fn iter1<'a>(&self)
-        -> /*impl Trait*/ { #[lang = "Range"] { start: 0, end: 1 } }
+    fn iter1<'a>(&self) -> /*impl Trait*/ { Range { start: 0, end: 1 } }
 
-    fn iter2(&self)
-        -> /*impl Trait*/ { #[lang = "Range"] { start: 0, end: 1 } }
+    fn iter2(&self) -> /*impl Trait*/ { Range { start: 0, end: 1 } }
 }
 
 fn a(x: Foo<'_>) { }
@@ -69,7 +66,7 @@ type Q<'a> = dyn MyTrait<'a, 'a> + 'a;
 fn h<'b, F>(f: F, y: Foo<'b>) where F: for<'d> MyTrait<'d, 'b> { }
 
 // FIXME(?): attr printing is weird
-#[attr = Repr([ReprC])]
+#[attr = Repr {reprs: [ReprC]}]
 struct S<'a>(&'a u32);
 
 extern "C" {

@@ -1,21 +1,23 @@
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::inherent::*;
-use crate::{self as ty, Interner};
+use crate::{self as ty, Interner, Region};
 
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct OpaqueTypeKey<I: Interner> {
-    pub def_id: I::LocalDefId,
+    pub def_id: I::LocalOpaqueTyId,
     pub args: I::GenericArgs,
 }
+
+impl<I: Interner> Eq for OpaqueTypeKey<I> {}
 
 impl<I: Interner> OpaqueTypeKey<I> {
     pub fn iter_captured_args(self, cx: I) -> impl Iterator<Item = (usize, I::GenericArg)> {
@@ -32,7 +34,7 @@ impl<I: Interner> OpaqueTypeKey<I> {
     pub fn fold_captured_lifetime_args(
         self,
         cx: I,
-        mut f: impl FnMut(I::Region) -> I::Region,
+        mut f: impl FnMut(Region<I>) -> Region<I>,
     ) -> Self {
         let Self { def_id, args } = self;
         let variances = cx.variances_of(def_id.into());

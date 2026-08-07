@@ -4,7 +4,7 @@ use std::num::NonZero;
 use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
-use rustc_errors::{DiagArgValue, IntoDiagArg};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 
 use crate::ty::TyCtxt;
@@ -24,6 +24,28 @@ impl ConstInt {
     pub fn new(int: ScalarInt, signed: bool, is_ptr_sized_integral: bool) -> Self {
         Self { int, signed, is_ptr_sized_integral }
     }
+}
+
+/// An enum to represent the compiler-side view of `intrinsics::AtomicOrdering`.
+/// This lives here because there's a method in this file that needs it and it is entirely unclear
+/// where else to put this...
+#[derive(Debug, Copy, Clone)]
+pub enum AtomicOrdering {
+    // These values must match `intrinsics::AtomicOrdering`!
+    Relaxed = 0,
+    Release = 1,
+    Acquire = 2,
+    AcqRel = 3,
+    SeqCst = 4,
+}
+
+/// An enum to represent the compiler-side view of `intrinsics::simd::SimdAlign`.
+#[derive(Debug, Copy, Clone)]
+pub enum SimdAlign {
+    // These values must match `intrinsics::simd::SimdAlign`!
+    Unaligned = 0,
+    Element = 1,
+    Vector = 2,
 }
 
 impl std::fmt::Debug for ConstInt {
@@ -115,14 +137,6 @@ impl std::fmt::Debug for ConstInt {
     }
 }
 
-impl IntoDiagArg for ConstInt {
-    // FIXME this simply uses the Debug impl, but we could probably do better by converting both
-    // to an inherent method that returns `Cow`.
-    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
-        DiagArgValue::Str(format!("{self:?}").into())
-    }
-}
-
 /// The raw bytes of a simple value.
 ///
 /// This is a packed struct in order to allow this type to be optimally embedded in enums
@@ -138,14 +152,18 @@ pub struct ScalarInt {
 
 // Cannot derive these, as the derives take references to the fields, and we
 // can't take references to fields of packed structs.
-impl<CTX> crate::ty::HashStable<CTX> for ScalarInt {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut crate::ty::StableHasher) {
+impl StableHash for ScalarInt {
+    fn stable_hash<Hcx: StableHashCtxt>(
+        &self,
+        hcx: &mut Hcx,
+        hasher: &mut crate::ty::StableHasher,
+    ) {
         // Using a block `{self.data}` here to force a copy instead of using `self.data`
-        // directly, because `hash_stable` takes `&self` and would thus borrow `self.data`.
+        // directly, because `stable_hash` takes `&self` and would thus borrow `self.data`.
         // Since `Self` is a packed struct, that would create a possibly unaligned reference,
         // which is UB.
-        { self.data }.hash_stable(hcx, hasher);
-        self.size.get().hash_stable(hcx, hasher);
+        { self.data }.stable_hash(hcx, hasher);
+        self.size.get().stable_hash(hcx, hasher);
     }
 }
 
@@ -239,7 +257,7 @@ impl ScalarInt {
 
     #[inline]
     pub fn try_from_target_usize(i: impl Into<u128>, tcx: TyCtxt<'_>) -> Option<Self> {
-        Self::try_from_uint(i, tcx.data_layout.pointer_size)
+        Self::try_from_uint(i, tcx.data_layout.pointer_size())
     }
 
     /// Try to convert this ScalarInt to the raw underlying bits.
@@ -315,7 +333,41 @@ impl ScalarInt {
 
     #[inline]
     pub fn to_target_usize(&self, tcx: TyCtxt<'_>) -> u64 {
-        self.to_uint(tcx.data_layout.pointer_size).try_into().unwrap()
+        self.to_uint(tcx.data_layout.pointer_size()).try_into().unwrap()
+    }
+
+    #[inline]
+    pub fn to_atomic_ordering(self) -> AtomicOrdering {
+        use AtomicOrdering::*;
+        let val = self.to_u32();
+        if val == Relaxed as u32 {
+            Relaxed
+        } else if val == Release as u32 {
+            Release
+        } else if val == Acquire as u32 {
+            Acquire
+        } else if val == AcqRel as u32 {
+            AcqRel
+        } else if val == SeqCst as u32 {
+            SeqCst
+        } else {
+            panic!("not a valid atomic ordering")
+        }
+    }
+
+    #[inline]
+    pub fn to_simd_alignment(self) -> SimdAlign {
+        use SimdAlign::*;
+        let val = self.to_u32();
+        if val == Unaligned as u32 {
+            Unaligned
+        } else if val == Element as u32 {
+            Element
+        } else if val == Vector as u32 {
+            Vector
+        } else {
+            panic!("not a valid simd alignment")
+        }
     }
 
     /// Converts the `ScalarInt` to `bool`.
@@ -370,7 +422,7 @@ impl ScalarInt {
 
     #[inline]
     pub fn to_target_isize(&self, tcx: TyCtxt<'_>) -> i64 {
-        self.to_int(tcx.data_layout.pointer_size).try_into().unwrap()
+        self.to_int(tcx.data_layout.pointer_size()).try_into().unwrap()
     }
 
     #[inline]
@@ -422,9 +474,9 @@ macro_rules! from_scalar_int_for_x {
             impl From<ScalarInt> for $ty {
                 #[inline]
                 fn from(int: ScalarInt) -> Self {
-                    // The `unwrap` cannot fail because to_bits (if it succeeds)
+                    // The `unwrap` cannot fail because to_uint (if it succeeds)
                     // is guaranteed to return a value that fits into the size.
-                    int.to_bits(Size::from_bytes(size_of::<$ty>()))
+                    int.to_uint(Size::from_bytes(size_of::<$ty>()))
                        .try_into().unwrap()
                 }
             }
@@ -447,6 +499,49 @@ impl From<char> for ScalarInt {
     #[inline]
     fn from(c: char) -> Self {
         (c as u32).into()
+    }
+}
+
+macro_rules! from_x_for_scalar_int_signed {
+    ($($ty:ty),*) => {
+        $(
+            impl From<$ty> for ScalarInt {
+                #[inline]
+                fn from(u: $ty) -> Self {
+                    Self {
+                        data: u128::from(u.cast_unsigned()), // go via the unsigned type of the same size
+                        size: NonZero::new(size_of::<$ty>() as u8).unwrap(),
+                    }
+                }
+            }
+        )*
+    }
+}
+
+macro_rules! from_scalar_int_for_x_signed {
+    ($($ty:ty),*) => {
+        $(
+            impl From<ScalarInt> for $ty {
+                #[inline]
+                fn from(int: ScalarInt) -> Self {
+                    // The `unwrap` cannot fail because to_int (if it succeeds)
+                    // is guaranteed to return a value that fits into the size.
+                    int.to_int(Size::from_bytes(size_of::<$ty>()))
+                       .try_into().unwrap()
+                }
+            }
+        )*
+    }
+}
+
+from_x_for_scalar_int_signed!(i8, i16, i32, i64, i128);
+from_scalar_int_for_x_signed!(i8, i16, i32, i64, i128);
+
+impl From<std::cmp::Ordering> for ScalarInt {
+    #[inline]
+    fn from(c: std::cmp::Ordering) -> Self {
+        // Here we rely on `cmp::Ordering` having the same values in host and target!
+        ScalarInt::from(c as i8)
     }
 }
 

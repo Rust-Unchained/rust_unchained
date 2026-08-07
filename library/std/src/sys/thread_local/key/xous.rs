@@ -38,6 +38,7 @@
 
 use core::arch::asm;
 
+use crate::alloc::System;
 use crate::mem::ManuallyDrop;
 use crate::os::xous::ffi::{MemoryFlags, map_memory, unmap_memory};
 use crate::ptr;
@@ -67,30 +68,36 @@ unsafe extern "Rust" {
     static DTORS: Atomic<*mut Node>;
 }
 
+#[inline]
 fn tls_ptr_addr() -> *mut *mut u8 {
-    let mut tp: usize;
+    let tp: *mut *mut u8;
     unsafe {
         asm!(
             "mv {}, tp",
             out(reg) tp,
         );
     }
-    core::ptr::with_exposed_provenance_mut::<*mut u8>(tp)
+    tp
 }
 
 /// Creates an area of memory that's unique per thread. This area will
 /// contain all thread local pointers.
+#[inline]
 fn tls_table() -> &'static mut [*mut u8] {
     let tp = tls_ptr_addr();
 
     if !tp.is_null() {
-        return unsafe {
-            core::slice::from_raw_parts_mut(tp, TLS_MEMORY_SIZE / size_of::<*mut u8>())
-        };
+        unsafe { core::slice::from_raw_parts_mut(tp, TLS_MEMORY_SIZE / size_of::<*mut u8>()) }
+    } else {
+        tls_table_slow()
     }
+}
+
+#[cold]
+fn tls_table_slow() -> &'static mut [*mut u8] {
     // If the TP register is `0`, then this thread hasn't initialized
     // its TLS yet. Allocate a new page to store this memory.
-    let tp = unsafe {
+    let tp: &mut [*mut u8] = unsafe {
         map_memory(
             None,
             None,
@@ -101,14 +108,14 @@ fn tls_table() -> &'static mut [*mut u8] {
     };
 
     for val in tp.iter() {
-        assert!(*val as usize == 0);
+        assert!((*val).is_null());
     }
 
     unsafe {
         // Set the thread's `$tp` register
         asm!(
             "mv tp, {}",
-            in(reg) tp.as_mut_ptr() as usize,
+            in(reg) tp.as_mut_ptr(),
         );
     }
     tp
@@ -151,7 +158,10 @@ struct Node {
 }
 
 unsafe fn register_dtor(key: Key, dtor: Dtor) {
-    let mut node = ManuallyDrop::new(Box::new(Node { key, dtor, next: ptr::null_mut() }));
+    // We use the System allocator here to avoid interfering with a potential
+    // Global allocator using thread-local storage.
+    let mut node =
+        ManuallyDrop::new(Box::new_in(Node { key, dtor, next: ptr::null_mut() }, System));
 
     #[allow(unused_unsafe)]
     let mut head = unsafe { DTORS.load(Acquire) };
@@ -182,6 +192,11 @@ pub unsafe fn destroy_tls() {
     };
 }
 
+// This is marked inline(never) to prevent dealloc calls from being reordered
+// to after the TLS has been destroyed.
+// See https://github.com/rust-lang/rust/pull/144465#pullrequestreview-3289729950
+// for more context.
+#[inline(never)]
 unsafe fn run_dtors() {
     let mut any_run = true;
 

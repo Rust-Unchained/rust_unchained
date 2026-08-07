@@ -1,12 +1,12 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_hir_and_then};
-use clippy_utils::path_res;
+use clippy_utils::res::MaybeResPath;
+use clippy_utils::sym;
 use clippy_utils::ty::implements_trait;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::Visibility;
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -32,6 +32,7 @@ declare_clippy_lint! {
     restriction,
     "exported types named `Error` that implement `Error`"
 }
+
 declare_lint_pass!(ErrorImplError => [ERROR_IMPL_ERROR]);
 
 impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
@@ -40,7 +41,7 @@ impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
             ItemKind::TyAlias(ident, ..)
                 if ident.name == sym::Error
                     && is_visible_outside_module(cx, item.owner_id.def_id)
-                    && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+                    && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip()
                     && let Some(error_def_id) = cx.tcx.get_diagnostic_item(sym::Error)
                     && implements_trait(cx, ty, error_def_id, &[]) =>
             {
@@ -52,10 +53,10 @@ impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
                 );
             },
             ItemKind::Impl(imp)
-                if let Some(trait_def_id) = imp.of_trait.and_then(|t| t.trait_def_id())
+                if let Some(trait_def_id) = imp.of_trait.and_then(|t| t.trait_ref.trait_def_id())
                     && let Some(error_def_id) = cx.tcx.get_diagnostic_item(sym::Error)
                     && error_def_id == trait_def_id
-                    && let Some(def_id) = path_res(cx, imp.self_ty).opt_def_id().and_then(DefId::as_local)
+                    && let Some(def_id) = imp.self_ty.basic_res().opt_def_id().and_then(DefId::as_local)
                     && let Some(ident) = cx.tcx.opt_item_ident(def_id.to_def_id())
                     && ident.name == sym::Error
                     && is_visible_outside_module(cx, def_id) =>
@@ -80,7 +81,7 @@ impl<'tcx> LateLintPass<'tcx> for ErrorImplError {
 /// which aren't reexported
 fn is_visible_outside_module(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
     !matches!(
-        cx.tcx.visibility(def_id),
-        Visibility::Restricted(mod_def_id) if cx.tcx.parent_module_from_def_id(def_id).to_def_id() == mod_def_id
+        cx.tcx.local_visibility(def_id),
+        Visibility::Restricted(mod_def_id) if cx.tcx.parent_module_from_def_id(def_id) == mod_def_id
     )
 }

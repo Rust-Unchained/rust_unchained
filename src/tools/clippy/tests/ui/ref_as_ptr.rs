@@ -1,5 +1,5 @@
 #![warn(clippy::ref_as_ptr)]
-#![allow(clippy::unnecessary_mut_passed, clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_mut_passed)]
 
 fn f<T>(_: T) {}
 
@@ -84,6 +84,16 @@ fn main() {
     f(&mut std::array::from_fn(|i| i * i) as *const [usize; 8]);
     //~^ ref_as_ptr
     f(&mut std::array::from_fn(|i| i * i) as *mut [usize; 9]);
+    //~^ ref_as_ptr
+
+    let x = (10, 20);
+    let _ = &x as *const _;
+    //~^ ref_as_ptr
+    let _ = &x.0 as *const _;
+    //~^ ref_as_ptr
+
+    let x = Box::new(10);
+    let _ = &*x as *const _;
     //~^ ref_as_ptr
 
     let _ = &String::new() as *const _;

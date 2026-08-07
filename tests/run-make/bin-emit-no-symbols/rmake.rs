@@ -1,3 +1,5 @@
+//@ needs-target-std
+//
 // When setting the crate type as a "bin" (in app.rs),
 // this could cause a bug where some symbols would not be
 // emitted in the object files. This has been fixed, and
@@ -12,5 +14,5 @@ fn main() {
     let out = llvm_readobj().input("app.o").arg("--symbols").run();
     out.assert_stdout_contains("rust_begin_unwind");
     out.assert_stdout_contains("rust_eh_personality");
-    out.assert_stdout_contains("__rg_oom");
+    out.assert_stdout_contains("__rust_alloc_error_handler");
 }

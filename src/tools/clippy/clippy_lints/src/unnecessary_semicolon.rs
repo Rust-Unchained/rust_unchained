@@ -35,12 +35,12 @@ declare_clippy_lint! {
     "unnecessary semicolon after expression returning `()`"
 }
 
+impl_lint_pass!(UnnecessarySemicolon => [UNNECESSARY_SEMICOLON]);
+
 #[derive(Default)]
 pub struct UnnecessarySemicolon {
     last_statements: Vec<(HirId, bool)>,
 }
-
-impl_lint_pass!(UnnecessarySemicolon => [UNNECESSARY_SEMICOLON]);
 
 impl UnnecessarySemicolon {
     /// Enter or leave a block, remembering the last statement of the block.
@@ -86,7 +86,10 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessarySemicolon {
                 expr.kind,
                 ExprKind::If(..) | ExprKind::Match(_, _, MatchSource::Normal | MatchSource::Postfix)
             )
-            && cx.typeck_results().expr_ty(expr) == cx.tcx.types.unit
+            && cx.typeck_results().expr_ty(expr).is_unit()
+            // if a stmt has attrs, then turning it into an expr will break the code, since attrs aren't allowed on exprs
+            // -- unless the corresponding feature is enabled
+            && (cx.tcx.hir_attrs(stmt.hir_id).is_empty() || cx.tcx.features().stmt_expr_attributes())
         {
             if let Some(block_is_unit) = self.is_last_in_block(stmt) {
                 if cx.tcx.sess.edition() <= Edition2021 && leaks_droppable_temporary_with_limited_lifetime(cx, expr) {

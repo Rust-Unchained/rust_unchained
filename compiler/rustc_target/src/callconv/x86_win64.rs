@@ -1,15 +1,18 @@
-use rustc_abi::{BackendRepr, Float, Integer, Primitive, RegKind, Size};
+use rustc_abi::{BackendRepr, Integer, Primitive, Size, TyAbiInterface};
 
 use crate::callconv::{ArgAbi, FnAbi, Reg};
 use crate::spec::{HasTargetSpec, RustcAbi};
 
 // Win64 ABI: https://docs.microsoft.com/en-us/cpp/build/parameter-passing
 
-pub(crate) fn compute_abi_info<Ty>(cx: &impl HasTargetSpec, fn_abi: &mut FnAbi<'_, Ty>) {
+pub(crate) fn compute_abi_info<'a, Ty, C: HasTargetSpec>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+where
+    Ty: TyAbiInterface<'a, C> + Copy,
+{
     let fixup = |a: &mut ArgAbi<'_, Ty>, is_ret: bool| {
         match a.layout.backend_repr {
             BackendRepr::Memory { sized: false } => {}
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { sized: true } => {
+            BackendRepr::ScalarPair { .. } | BackendRepr::Memory { sized: true } => {
                 match a.layout.size.bits() {
                     8 => a.cast_to(Reg::i8()),
                     16 => a.cast_to(Reg::i16()),
@@ -22,21 +25,17 @@ pub(crate) fn compute_abi_info<Ty>(cx: &impl HasTargetSpec, fn_abi: &mut FnAbi<'
                 // FIXME(eddyb) there should be a size cap here
                 // (probably what clang calls "illegal vectors").
             }
+            BackendRepr::SimdScalableVector { .. } => panic!("scalable vectors are unsupported"),
             BackendRepr::Scalar(scalar) => {
                 if is_ret && matches!(scalar.primitive(), Primitive::Int(Integer::I128, _)) {
-                    if cx.target_spec().rustc_abi == Some(RustcAbi::X86Softfloat) {
+                    if cx.target_spec().rustc_abi == Some(RustcAbi::Softfloat) {
                         // Use the native `i128` LLVM type for the softfloat ABI -- in other words, adjust nothing.
                     } else {
                         // `i128` is returned in xmm0 by Clang and GCC
                         // FIXME(#134288): This may change for the `-msvc` targets in the future.
-                        let reg = Reg { kind: RegKind::Vector, size: Size::from_bits(128) };
-                        a.cast_to(reg);
+                        a.cast_to(Reg::opaque_vector(Size::from_bits(128)));
                     }
-                } else if a.layout.size.bytes() > 8
-                    && !matches!(scalar.primitive(), Primitive::Float(Float::F128))
-                {
-                    // Match what LLVM does for `f128` so that `compiler-builtins` builtins match up
-                    // with what LLVM expects.
+                } else if a.layout.size.bytes() > 8 {
                     a.make_indirect();
                 } else {
                     a.extend_integer_width_to(32);
@@ -57,6 +56,10 @@ pub(crate) fn compute_abi_info<Ty>(cx: &impl HasTargetSpec, fn_abi: &mut FnAbi<'
             // We try to match clang and gcc (which allow ZST is their windows-gnu targets), so we
             // pass ZST via pointer indirection.
             arg.make_indirect_from_ignore();
+            continue;
+        }
+        if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+            arg.make_indirect();
             continue;
         }
         fixup(arg, false);

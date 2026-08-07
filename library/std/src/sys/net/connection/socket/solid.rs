@@ -6,8 +6,8 @@ use crate::ffi::CStr;
 use crate::io::{self, BorrowedBuf, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut};
 use crate::net::{Shutdown, SocketAddr};
 use crate::os::solid::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-use crate::sys::abi;
-use crate::sys_common::{FromInner, IntoInner};
+use crate::sys::pal::unsupported;
+use crate::sys::{FromInner, IntoInner, abi};
 use crate::time::Duration;
 use crate::{cmp, mem, ptr, str};
 
@@ -115,19 +115,9 @@ pub fn init() {}
 pub struct Socket(OwnedFd);
 
 impl Socket {
-    pub fn new(addr: &SocketAddr, ty: c_int) -> io::Result<Socket> {
-        let fam = match *addr {
-            SocketAddr::V4(..) => netc::AF_INET,
-            SocketAddr::V6(..) => netc::AF_INET6,
-        };
-        Socket::new_raw(fam, ty)
-    }
-
-    pub fn new_raw(fam: c_int, ty: c_int) -> io::Result<Socket> {
-        unsafe {
-            let fd = cvt(netc::socket(fam, ty, 0))?;
-            Ok(Self::from_raw_fd(fd))
-        }
+    pub fn new(fam: c_int, ty: c_int) -> io::Result<Socket> {
+        let fd = cvt(unsafe { netc::socket(fam, ty, 0) })?;
+        Ok(unsafe { Self::from_raw_fd(fd) })
     }
 
     pub fn connect(&self, addr: &SocketAddr) -> io::Result<()> {
@@ -152,8 +142,13 @@ impl Socket {
             return Err(io::Error::ZERO_TIMEOUT);
         }
 
-        let mut timeout =
-            netc::timeval { tv_sec: timeout.as_secs() as _, tv_usec: timeout.subsec_micros() as _ };
+        let secs = if timeout.as_secs() > netc::c_long::MAX as u64 {
+            netc::c_long::MAX
+        } else {
+            timeout.as_secs() as netc::c_long
+        };
+
+        let mut timeout = netc::timeval { tv_sec: secs, tv_usec: timeout.subsec_micros() as _ };
         if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
             timeout.tv_usec = 1;
         }
@@ -196,12 +191,12 @@ impl Socket {
         Ok(Self(self.0.try_clone()?))
     }
 
-    fn recv_with_flags(&self, mut buf: BorrowedCursor<'_>, flags: c_int) -> io::Result<()> {
+    fn recv_with_flags(&self, mut buf: BorrowedCursor<'_, u8>, flags: c_int) -> io::Result<()> {
         let ret = cvt(unsafe {
             netc::recv(self.as_raw_fd(), buf.as_mut().as_mut_ptr().cast(), buf.capacity(), flags)
         })?;
         unsafe {
-            buf.advance_unchecked(ret as usize);
+            buf.advance(ret as usize);
         }
         Ok(())
     }
@@ -218,7 +213,7 @@ impl Socket {
         Ok(buf.len())
     }
 
-    pub fn read_buf(&self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.recv_with_flags(buf, 0)
     }
 
@@ -303,11 +298,11 @@ impl Socket {
             }
             None => netc::timeval { tv_sec: 0, tv_usec: 0 },
         };
-        setsockopt(self, netc::SOL_SOCKET, kind, timeout)
+        unsafe { setsockopt(self, netc::SOL_SOCKET, kind, timeout) }
     }
 
     pub fn timeout(&self, kind: c_int) -> io::Result<Option<Duration>> {
-        let raw: netc::timeval = getsockopt(self, netc::SOL_SOCKET, kind)?;
+        let raw: netc::timeval = unsafe { getsockopt(self, netc::SOL_SOCKET, kind)? };
         if raw.tv_sec == 0 && raw.tv_usec == 0 {
             Ok(None)
         } else {
@@ -330,24 +325,33 @@ impl Socket {
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
         let linger = netc::linger {
             l_onoff: linger.is_some() as netc::c_int,
-            l_linger: linger.unwrap_or_default().as_secs() as netc::c_int,
+            l_linger: cmp::min(linger.unwrap_or_default().as_secs(), netc::c_int::MAX as u64)
+                as netc::c_int,
         };
 
-        setsockopt(self, netc::SOL_SOCKET, netc::SO_LINGER, linger)
+        unsafe { setsockopt(self, netc::SOL_SOCKET, netc::SO_LINGER, linger) }
     }
 
     pub fn linger(&self) -> io::Result<Option<Duration>> {
-        let val: netc::linger = getsockopt(self, netc::SOL_SOCKET, netc::SO_LINGER)?;
+        let val: netc::linger = unsafe { getsockopt(self, netc::SOL_SOCKET, netc::SO_LINGER)? };
 
         Ok((val.l_onoff != 0).then(|| Duration::from_secs(val.l_linger as u64)))
     }
 
+    pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn keepalive(&self) -> io::Result<bool> {
+        unsupported()
+    }
+
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        setsockopt(self, netc::IPPROTO_TCP, netc::TCP_NODELAY, nodelay as c_int)
+        unsafe { setsockopt(self, netc::IPPROTO_TCP, netc::TCP_NODELAY, nodelay as c_int) }
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        let raw: c_int = getsockopt(self, netc::IPPROTO_TCP, netc::TCP_NODELAY)?;
+        let raw: c_int = unsafe { getsockopt(self, netc::IPPROTO_TCP, netc::TCP_NODELAY)? };
         Ok(raw != 0)
     }
 
@@ -360,11 +364,10 @@ impl Socket {
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        let raw: c_int = getsockopt(self, netc::SOL_SOCKET, netc::SO_ERROR)?;
+        let raw: c_int = unsafe { getsockopt(self, netc::SOL_SOCKET, netc::SO_ERROR)? };
         if raw == 0 { Ok(None) } else { Ok(Some(io::Error::from_raw_os_error(raw as i32))) }
     }
 
-    // This method is used by sys_common code to abstract over targets.
     pub fn as_raw(&self) -> c_int {
         self.as_raw_fd()
     }

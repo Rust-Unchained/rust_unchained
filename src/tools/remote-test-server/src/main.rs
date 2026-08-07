@@ -10,13 +10,13 @@
 //! themselves having support libraries. All data over the TCP sockets is in a
 //! basically custom format suiting our needs.
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "motor", target_os = "uefi")))]
 use std::fs::Permissions;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "motor", target_os = "uefi")))]
 use std::os::unix::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -53,6 +53,10 @@ impl Config {
             batch: false,
             bind: if cfg!(target_os = "android") || cfg!(windows) {
                 ([0, 0, 0, 0], 12345).into()
+            } else if cfg!(target_env = "sim") {
+                // iOS/tvOS/watchOS/visionOS simulators share network device
+                // with the host machine.
+                ([127, 0, 0, 1], 12345).into()
             } else {
                 ([10, 0, 2, 15], 12345).into()
             },
@@ -119,6 +123,8 @@ fn main() {
     let listener = bind_socket(config.bind);
     let (work, tmp): (PathBuf, PathBuf) = if cfg!(target_os = "android") {
         ("/data/local/tmp/work".into(), "/data/local/tmp/work/tmp".into())
+    } else if cfg!(target_os = "uefi") {
+        ("tmp\\work".into(), "tmp\\work\\tmp".into())
     } else {
         let mut work_dir = env::temp_dir();
         work_dir.push("work");
@@ -205,12 +211,12 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
     let mut args = Vec::new();
     while t!(reader.read_until(0, &mut arg)) > 1 {
         args.push(t!(str::from_utf8(&arg[..arg.len() - 1])).to_string());
-        arg.truncate(0);
+        arg.clear();
     }
 
     // Next we'll get a bunch of env vars in pairs delimited by 0s as well
     let mut env = Vec::new();
-    arg.truncate(0);
+    arg.clear();
     while t!(reader.read_until(0, &mut arg)) > 1 {
         let key_len = arg.len() - 1;
         let val_len = t!(reader.read_until(0, &mut arg)) - 1;
@@ -221,7 +227,7 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
             let val = t!(str::from_utf8(val)).to_string();
             env.push((key, val));
         }
-        arg.truncate(0);
+        arg.clear();
     }
 
     // The section of code from here down to where we drop the lock is going to
@@ -262,10 +268,19 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
     cmd.args(args);
     cmd.envs(env);
 
-    // On windows, libraries are just searched in the executable directory,
-    // system directories, PWD, and PATH, in that order. PATH is the only one
-    // we can change for this.
-    let library_path = if cfg!(windows) { "PATH" } else { "LD_LIBRARY_PATH" };
+    let library_path = if cfg!(windows) {
+        // On windows, libraries are just searched in the executable directory,
+        // system directories, PWD, and PATH, in that order. PATH is the only
+        // one we can change for this.
+        "PATH"
+    } else if cfg!(target_vendor = "apple") {
+        // On Apple platforms, the environment variable is named differently.
+        "DYLD_LIBRARY_PATH"
+    } else if cfg!(target_os = "uefi") {
+        "path"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
 
     // Support libraries were uploaded to `work` earlier, so make sure that's
     // in `LD_LIBRARY_PATH`. Also include our own current dir which may have
@@ -314,7 +329,7 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
     ]));
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "motor", target_os = "uefi")))]
 fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     match status.code() {
         Some(n) => (0, n),
@@ -322,7 +337,7 @@ fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "motor", target_os = "uefi"))]
 fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     (0, status.code().unwrap())
 }
@@ -348,11 +363,11 @@ fn recv<B: BufRead>(dir: &Path, io: &mut B) -> PathBuf {
     dst
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "motor", target_os = "uefi")))]
 fn set_permissions(path: &Path) {
     t!(fs::set_permissions(&path, Permissions::from_mode(0o755)));
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "motor", target_os = "uefi"))]
 fn set_permissions(_path: &Path) {}
 
 fn my_copy(src: &mut dyn Read, which: u8, dst: &Mutex<dyn Write>) {
@@ -376,7 +391,7 @@ fn batch_copy(buf: &[u8], which: u8, dst: &Mutex<dyn Write>) {
     if n > 0 {
         t!(dst.write_all(buf));
         // Marking buf finished
-        t!(dst.write_all(&[which, 0, 0, 0, 0,]));
+        t!(dst.write_all(&create_header(which, 0)));
     }
 }
 

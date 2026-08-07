@@ -1,3 +1,4 @@
+//@ edition:2015
 mod m {
     pub enum E {
         Fn(u8),
@@ -8,7 +9,7 @@ mod m {
     }
 
     pub mod n {
-        pub(in m) enum Z {
+        pub(in crate::m) enum Z {
             Fn(u8),
             Struct {
                 s: u8,
@@ -17,13 +18,13 @@ mod m {
         }
     }
 
-    use m::n::Z; // OK, only the type is imported
+    use crate::m::n::Z; // OK, only the type is imported
 
     fn f() {
         n::Z;
-        //~^ ERROR expected value, found enum `n::Z`
+        //~^ ERROR cannot find value `Z` in module `n`
         Z;
-        //~^ ERROR expected value, found enum `Z`
+        //~^ ERROR cannot find value `Z` in this scope
         let _: Z = Z::Fn;
         //~^ ERROR mismatched types
         let _: Z = Z::Struct;
@@ -39,7 +40,7 @@ use m::E; // OK, only the type is imported
 
 fn main() {
     let _: E = m::E;
-    //~^ ERROR expected value, found enum `m::E`
+    //~^ ERROR cannot find value `E` in module `m`
     let _: E = m::E::Fn;
     //~^ ERROR mismatched types
     let _: E = m::E::Struct;
@@ -47,7 +48,7 @@ fn main() {
     let _: E = m::E::Unit();
     //~^ ERROR expected function, found enum variant `m::E::Unit`
     let _: E = E;
-    //~^ ERROR expected value, found enum `E`
+    //~^ ERROR cannot find value `E` in this scope
     let _: E = E::Fn;
     //~^ ERROR mismatched types
     let _: E = E::Struct;
@@ -56,7 +57,7 @@ fn main() {
     //~^ ERROR expected function, found enum variant `E::Unit`
     let _: Z = m::n::Z;
     //~^ ERROR cannot find type `Z` in this scope
-    //~| ERROR expected value, found enum `m::n::Z`
+    //~| ERROR cannot find value `Z` in module `m::n`
     //~| ERROR enum `Z` is private
     let _: Z = m::n::Z::Fn;
     //~^ ERROR cannot find type `Z` in this scope

@@ -1,14 +1,12 @@
-//@ known-bug: #110395
-//@ compile-flags: -Znext-solver
+//@ check-pass
 #![allow(incomplete_features)]
 #![feature(const_trait_impl, generic_const_exprs)]
 
-#[const_trait]
-trait ConstName {
+const trait ConstName {
     const NAME_BYTES: &'static [u8];
 }
 
-impl const ConstName for u8 {
+const impl ConstName for u8 {
     const NAME_BYTES: &'static [u8] = b"u8";
 }
 
@@ -16,14 +14,14 @@ const fn name_len<T: ?Sized + ConstName>() -> usize {
     T::NAME_BYTES.len()
 }
 
-impl<T: ?Sized + ConstName> const ConstName for &T
+const impl<T: ?Sized + ConstName> ConstName for &T
 where
     [(); name_len::<T>()]:,
 {
     const NAME_BYTES: &'static [u8] = b"&T";
 }
 
-impl<T: ?Sized + ConstName> const ConstName for &mut T
+const impl<T: ?Sized + ConstName> ConstName for &mut T
 where
     [(); name_len::<T>()]:,
 {

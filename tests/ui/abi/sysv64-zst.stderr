@@ -5,16 +5,15 @@ error: fn_abi_of(pass_zst) = FnAbi {
                        ty: (),
                        layout: Layout {
                            size: Size(0 bytes),
-                           align: AbiAndPrefAlign {
+                           align: AbiAlign {
                                abi: $SOME_ALIGN,
-                               pref: $SOME_ALIGN,
                            },
                            backend_repr: Memory {
                                sized: true,
                            },
                            fields: Arbitrary {
                                offsets: [],
-                               memory_index: [],
+                               in_memory_order: [],
                            },
                            largest_niche: None,
                            uninhabited: false,
@@ -34,16 +33,15 @@ error: fn_abi_of(pass_zst) = FnAbi {
                    ty: (),
                    layout: Layout {
                        size: Size(0 bytes),
-                       align: AbiAndPrefAlign {
+                       align: AbiAlign {
                            abi: $SOME_ALIGN,
-                           pref: $SOME_ALIGN,
                        },
                        backend_repr: Memory {
                            sized: true,
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -59,7 +57,9 @@ error: fn_abi_of(pass_zst) = FnAbi {
            },
            c_variadic: false,
            fixed_count: 1,
-           conv: X86_64SysV,
+           conv: X86(
+               SysV64,
+           ),
            can_unwind: false,
        }
   --> $DIR/sysv64-zst.rs:8:1

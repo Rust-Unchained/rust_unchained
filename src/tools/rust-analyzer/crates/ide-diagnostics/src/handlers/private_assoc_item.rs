@@ -5,7 +5,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 // This diagnostic is triggered if the referenced associated item is not visible from the current
 // module.
 pub(crate) fn private_assoc_item(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::PrivateAssocItem,
 ) -> Diagnostic {
     // FIXME: add quickfix
@@ -28,6 +28,7 @@ pub(crate) fn private_assoc_item(
         ),
         d.expr_or_pat.map(Into::into),
     )
+    .stable()
 }
 
 #[cfg(test)]

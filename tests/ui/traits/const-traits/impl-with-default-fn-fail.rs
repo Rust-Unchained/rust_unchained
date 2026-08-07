@@ -1,7 +1,6 @@
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Tr {
+const trait Tr {
     fn req(&self);
 
     fn default() {}
@@ -9,9 +8,8 @@ trait Tr {
 
 struct S;
 
-impl const Tr for u16 {
+const impl Tr for u16 {
     fn default() {}
 } //~^^ ERROR not all trait items implemented
-
 
 fn main() {}

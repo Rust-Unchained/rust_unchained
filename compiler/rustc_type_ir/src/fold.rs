@@ -55,7 +55,7 @@ use tracing::{debug, instrument};
 
 use crate::inherent::*;
 use crate::visit::{TypeVisitable, TypeVisitableExt as _};
-use crate::{self as ty, Interner, TypeFlags};
+use crate::{self as ty, BoundVarIndexKind, Interner, Region};
 
 /// This trait is implemented for every type that can be folded,
 /// providing the skeleton of the traversal.
@@ -121,10 +121,6 @@ pub trait TypeSuperFoldable<I: Interner>: TypeFoldable<I> {
 /// default that does an "identity" fold. Implementations of these methods
 /// often fall back to a `super_fold_with` method if the primary argument
 /// doesn't satisfy a particular condition.
-///
-/// A blanket implementation of [`FallibleTypeFolder`] will defer to
-/// the infallible methods of this trait to ensure that the two APIs
-/// are coherent.
 pub trait TypeFolder<I: Interner>: Sized {
     fn cx(&self) -> I;
 
@@ -141,7 +137,7 @@ pub trait TypeFolder<I: Interner>: Sized {
 
     // The default region folder is a no-op because `Region` is non-recursive
     // and has no `super_fold_with` method to call.
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         r
     }
 
@@ -151,6 +147,10 @@ pub trait TypeFolder<I: Interner>: Sized {
 
     fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
         p.super_fold_with(self)
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        c.super_fold_with(self)
     }
 }
 
@@ -179,7 +179,7 @@ pub trait FallibleTypeFolder<I: Interner>: Sized {
 
     // The default region folder is a no-op because `Region` is non-recursive
     // and has no `super_fold_with` method to call.
-    fn try_fold_region(&mut self, r: I::Region) -> Result<I::Region, Self::Error> {
+    fn try_fold_region(&mut self, r: Region<I>) -> Result<Region<I>, Self::Error> {
         Ok(r)
     }
 
@@ -189,6 +189,10 @@ pub trait FallibleTypeFolder<I: Interner>: Sized {
 
     fn try_fold_predicate(&mut self, p: I::Predicate) -> Result<I::Predicate, Self::Error> {
         p.try_super_fold_with(self)
+    }
+
+    fn try_fold_clauses(&mut self, c: I::Clauses) -> Result<I::Clauses, Self::Error> {
+        c.try_super_fold_with(self)
     }
 }
 
@@ -388,9 +392,11 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         t
     }
 
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         match r.kind() {
-            ty::ReBound(debruijn, br) if debruijn >= self.current_index => {
+            ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br)
+                if debruijn >= self.current_index =>
+            {
                 let debruijn = debruijn.shifted_in(self.amount);
                 Region::new_bound(self.cx, debruijn, br)
             }
@@ -400,7 +406,9 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
 
     fn fold_ty(&mut self, ty: I::Ty) -> I::Ty {
         match ty.kind() {
-            ty::Bound(debruijn, bound_ty) if debruijn >= self.current_index => {
+            ty::Bound(BoundVarIndexKind::Bound(debruijn), bound_ty)
+                if debruijn >= self.current_index =>
+            {
                 let debruijn = debruijn.shifted_in(self.amount);
                 Ty::new_bound(self.cx, debruijn, bound_ty)
             }
@@ -412,7 +420,9 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
 
     fn fold_const(&mut self, ct: I::Const) -> I::Const {
         match ct.kind() {
-            ty::ConstKind::Bound(debruijn, bound_ct) if debruijn >= self.current_index => {
+            ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_ct)
+                if debruijn >= self.current_index =>
+            {
                 let debruijn = debruijn.shifted_in(self.amount);
                 Const::new_bound(self.cx, debruijn, bound_ct)
             }
@@ -423,11 +433,15 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
     fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
         if p.has_vars_bound_at_or_above(self.current_index) { p.super_fold_with(self) } else { p }
     }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if c.has_vars_bound_at_or_above(self.current_index) { c.super_fold_with(self) } else { c }
+    }
 }
 
-pub fn shift_region<I: Interner>(cx: I, region: I::Region, amount: u32) -> I::Region {
+pub fn shift_region<I: Interner>(cx: I, region: Region<I>, amount: u32) -> Region<I> {
     match region.kind() {
-        ty::ReBound(debruijn, br) if amount > 0 => {
+        ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), br) if amount > 0 => {
             Region::new_bound(cx, debruijn.shifted_in(amount), br)
         }
         _ => region,
@@ -452,7 +466,7 @@ where
 pub fn fold_regions<I: Interner, T>(
     cx: I,
     value: T,
-    f: impl FnMut(I::Region, ty::DebruijnIndex) -> I::Region,
+    f: impl FnMut(Region<I>, ty::DebruijnIndex) -> Region<I>,
 ) -> T
 where
     T: TypeFoldable<I>,
@@ -463,10 +477,10 @@ where
 /// Folds over the substructure of a type, visiting its component
 /// types and all regions that occur *free* within it.
 ///
-/// That is, function pointer types and trait object can introduce
-/// new bound regions which are not visited by this visitors as
+/// That is, function pointer types and trait objects can introduce
+/// new bound regions which are not visited by this visitor as
 /// they are not free; only regions that occur free will be
-/// visited by `fld_r`.
+/// visited by `fold_region_fn`.
 pub struct RegionFolder<I, F> {
     cx: I,
 
@@ -475,7 +489,7 @@ pub struct RegionFolder<I, F> {
     /// binder, it is incremented (via `shift_in`).
     current_index: ty::DebruijnIndex,
 
-    /// Callback invokes for each free region. The `DebruijnIndex`
+    /// Callback invoked for each free region. The `DebruijnIndex`
     /// points to the binder *just outside* the ones we have passed
     /// through.
     fold_region_fn: F,
@@ -491,7 +505,7 @@ impl<I, F> RegionFolder<I, F> {
 impl<I, F> TypeFolder<I> for RegionFolder<I, F>
 where
     I: Interner,
-    F: FnMut(I::Region, ty::DebruijnIndex) -> I::Region,
+    F: FnMut(Region<I>, ty::DebruijnIndex) -> Region<I>,
 {
     fn cx(&self) -> I {
         self.cx
@@ -505,9 +519,15 @@ where
     }
 
     #[instrument(skip(self), level = "debug", ret)]
-    fn fold_region(&mut self, r: I::Region) -> I::Region {
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
         match r.kind() {
-            ty::ReBound(debruijn, _) if debruijn < self.current_index => {
+            ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _)
+                if debruijn < self.current_index =>
+            {
+                debug!(?self.current_index, "skipped bound region");
+                r
+            }
+            ty::ReBound(ty::BoundVarIndexKind::Canonical, _) => {
                 debug!(?self.current_index, "skipped bound region");
                 r
             }
@@ -519,32 +539,164 @@ where
     }
 
     fn fold_ty(&mut self, t: I::Ty) -> I::Ty {
-        if t.has_type_flags(
-            TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_RE_BOUND | TypeFlags::HAS_RE_ERASED,
-        ) {
-            t.super_fold_with(self)
-        } else {
-            t
-        }
+        if t.has_regions() { t.super_fold_with(self) } else { t }
     }
 
     fn fold_const(&mut self, ct: I::Const) -> I::Const {
-        if ct.has_type_flags(
-            TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_RE_BOUND | TypeFlags::HAS_RE_ERASED,
-        ) {
-            ct.super_fold_with(self)
-        } else {
-            ct
+        if ct.has_regions() { ct.super_fold_with(self) } else { ct }
+    }
+
+    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+        if p.has_regions() { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if c.has_regions() { c.super_fold_with(self) } else { c }
+    }
+}
+
+/// This function should ideally only be used if either the `TypingMode`
+/// or the `ParamEnv` differs from the environment the aliases were normalized
+/// in.
+///
+/// Cases outside these two should consider whether the problem can be
+/// fixed at the root instead.
+pub fn set_aliases_to_non_rigid<I: Interner, T>(cx: I, value: T) -> ty::Unnormalized<I, T>
+where
+    T: TypeFoldable<I>,
+{
+    let folded = set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::AllToNonRigid);
+    ty::Unnormalized::new(folded)
+}
+
+pub fn set_opaques_to_non_rigid<I: Interner, T>(cx: I, value: T) -> ty::Unnormalized<I, T>
+where
+    T: TypeFoldable<I>,
+{
+    let folded = set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::OpaqueToNonRigid);
+    ty::Unnormalized::new(folded)
+}
+
+pub fn set_aliases_to_rigid<I: Interner, T>(cx: I, value: T) -> T
+where
+    T: TypeFoldable<I>,
+{
+    set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::AllToRigid)
+}
+
+pub fn set_type_aliases_to_rigid<I: Interner, T>(cx: I, value: T) -> T
+where
+    T: TypeFoldable<I>,
+{
+    set_aliases_rigidness_with_mode(cx, value, RigidnessFoldMode::TypeToRigid)
+}
+
+fn set_aliases_rigidness_with_mode<I: Interner, T>(cx: I, value: T, mode: RigidnessFoldMode) -> T
+where
+    T: TypeFoldable<I>,
+{
+    if !mode.needs_change(&value) {
+        return value;
+    }
+
+    let mut folder = RigidnessFolder { cx, mode };
+    value.fold_with(&mut folder)
+}
+
+enum RigidnessFoldMode {
+    AllToRigid,
+    AllToNonRigid,
+    TypeToRigid,
+    OpaqueToNonRigid,
+}
+
+impl RigidnessFoldMode {
+    fn needs_change<I: Interner, T: TypeVisitable<I>>(&self, v: &T) -> bool {
+        match self {
+            RigidnessFoldMode::AllToRigid => v.has_non_rigid_aliases(),
+            RigidnessFoldMode::AllToNonRigid => v.has_rigid_aliases(),
+            RigidnessFoldMode::TypeToRigid => {
+                v.has_non_rigid_aliases()
+                    && v.has_type_flags(ty::TypeFlags::HAS_ALIAS - ty::TypeFlags::HAS_CONST_ALIAS)
+            }
+            RigidnessFoldMode::OpaqueToNonRigid => v.has_rigid_aliases() && v.has_opaque_types(),
+        }
+    }
+}
+
+// Set aliases to be rigid or non-rigid according to the mode.
+struct RigidnessFolder<I: Interner> {
+    cx: I,
+    mode: RigidnessFoldMode,
+}
+
+impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
+    #[inline]
+    fn cx(&self) -> I {
+        self.cx
+    }
+
+    fn fold_binder<T: TypeFoldable<I>>(&mut self, t: ty::Binder<I, T>) -> ty::Binder<I, T> {
+        if self.mode.needs_change(&t) { t.super_fold_with(self) } else { t }
+    }
+
+    fn fold_ty(&mut self, t: I::Ty) -> I::Ty {
+        if !self.mode.needs_change(&t) {
+            return t;
+        }
+
+        match t.kind() {
+            ty::Alias(is_rigid, alias_ty) => {
+                let alias_ty = alias_ty.fold_with(self);
+                match self.mode {
+                    RigidnessFoldMode::AllToRigid | RigidnessFoldMode::TypeToRigid => {
+                        I::Ty::new_alias(self.cx(), ty::IsRigid::Yes, alias_ty)
+                    }
+                    RigidnessFoldMode::AllToNonRigid => {
+                        I::Ty::new_alias(self.cx(), ty::IsRigid::No, alias_ty)
+                    }
+                    RigidnessFoldMode::OpaqueToNonRigid => {
+                        if let ty::AliasTyKind::Opaque { .. } = alias_ty.kind {
+                            I::Ty::new_alias(self.cx(), ty::IsRigid::No, alias_ty)
+                        } else {
+                            I::Ty::new_alias(self.cx(), is_rigid, alias_ty)
+                        }
+                    }
+                }
+            }
+            _ => t.super_fold_with(self),
+        }
+    }
+
+    fn fold_const(&mut self, c: I::Const) -> I::Const {
+        if !self.mode.needs_change(&c) {
+            return c;
+        }
+
+        match c.kind() {
+            ty::ConstKind::Alias(is_rigid, alias_const) => {
+                let alias_const = alias_const.fold_with(self);
+                match self.mode {
+                    RigidnessFoldMode::AllToRigid => {
+                        I::Const::new_alias(self.cx, ty::IsRigid::Yes, alias_const)
+                    }
+                    RigidnessFoldMode::AllToNonRigid => {
+                        I::Const::new_alias(self.cx(), ty::IsRigid::No, alias_const)
+                    }
+                    RigidnessFoldMode::OpaqueToNonRigid | RigidnessFoldMode::TypeToRigid => {
+                        I::Const::new_alias(self.cx(), is_rigid, alias_const)
+                    }
+                }
+            }
+            _ => c.super_fold_with(self),
         }
     }
 
     fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
-        if p.has_type_flags(
-            TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_RE_BOUND | TypeFlags::HAS_RE_ERASED,
-        ) {
-            p.super_fold_with(self)
-        } else {
-            p
-        }
+        if self.mode.needs_change(&p) { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if self.mode.needs_change(&c) { c.super_fold_with(self) } else { c }
     }
 }

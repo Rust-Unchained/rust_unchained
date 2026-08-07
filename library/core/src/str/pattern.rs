@@ -38,7 +38,6 @@
     issue = "27721"
 )]
 
-use crate::char::MAX_LEN_UTF8;
 use crate::cmp::Ordering;
 use crate::convert::TryInto as _;
 use crate::slice::memchr;
@@ -162,7 +161,7 @@ pub trait Pattern: Sized {
         }
     }
 
-    /// Returns the pattern as utf-8 bytes if possible.
+    /// Returns the pattern as UTF-8 if possible.
     fn as_utf8_pattern(&self) -> Option<Utf8Pattern<'_>> {
         None
     }
@@ -173,7 +172,9 @@ pub trait Pattern: Sized {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Utf8Pattern<'a> {
     /// Type returned by String and str types.
-    StringPattern(&'a [u8]),
+    /// This stores `str` rather than bytes so callers cannot describe
+    /// non-UTF-8 string patterns through this API.
+    StringPattern(&'a str),
     /// Type returned by char types.
     CharPattern(char),
 }
@@ -563,7 +564,7 @@ impl Pattern for char {
 
     #[inline]
     fn into_searcher<'a>(self, haystack: &'a str) -> Self::Searcher<'a> {
-        let mut utf8_encoded = [0; MAX_LEN_UTF8];
+        let mut utf8_encoded = [0; char::MAX_LEN_UTF8];
         let utf8_size = self
             .encode_utf8(&mut utf8_encoded)
             .len()
@@ -996,7 +997,11 @@ impl<'b> Pattern for &'b str {
                     return haystack.as_bytes().contains(&self.as_bytes()[0]);
                 }
 
-                #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+                #[cfg(any(
+                    all(target_arch = "x86_64", target_feature = "sse2"),
+                    all(target_arch = "loongarch64", target_feature = "lsx"),
+                    all(target_arch = "aarch64", target_feature = "neon")
+                ))]
                 if self.len() <= 32 {
                     if let Some(result) = simd_contains(self, haystack) {
                         return result;
@@ -1046,7 +1051,7 @@ impl<'b> Pattern for &'b str {
 
     #[inline]
     fn as_utf8_pattern(&self) -> Option<Utf8Pattern<'_>> {
-        Some(Utf8Pattern::StringPattern(self.as_bytes()))
+        Some(Utf8Pattern::StringPattern(*self))
     }
 }
 
@@ -1491,7 +1496,13 @@ impl TwoWaySearcher {
             let start =
                 if long_period { self.crit_pos } else { cmp::max(self.crit_pos, self.memory) };
             for i in start..needle.len() {
-                if needle[i] != haystack[self.position + i] {
+                // SAFETY: on every iteration of `'search`, the `haystack.get(self.position + needle_last)`
+                // check returned `Some`, so `self.position + needle_last < haystack.len()`.
+                // Since `i < needle.len()` implies `i <= needle_last`, we have
+                // `self.position + i < haystack.len()`.
+                // Every path that mutates `self.position` below either returns or re-enters `'search`,
+                // which re-runs the check before reaching the loop again.
+                if needle[i] != unsafe { *haystack.get_unchecked(self.position + i) } {
                     self.position += i - self.crit_pos + 1;
                     if !long_period {
                         self.memory = 0;
@@ -1503,7 +1514,13 @@ impl TwoWaySearcher {
             // See if the left part of the needle matches
             let start = if long_period { 0 } else { self.memory };
             for i in (start..self.crit_pos).rev() {
-                if needle[i] != haystack[self.position + i] {
+                // SAFETY: on every iteration of `'search`, the `haystack.get(self.position + needle_last)`
+                // check returned `Some`, so `self.position + needle_last < haystack.len()`.
+                // Since `i < self.crit_pos <= needle.len()`, we have `i <= needle_last`, and thus
+                // `self.position + i <= self.position + needle_last < haystack.len()`.
+                // Every path that mutates `self.position` below either returns or re-enters `'search`,
+                // which re-runs the check before reaching the loop again.
+                if needle[i] != unsafe { *haystack.get_unchecked(self.position + i) } {
                     self.position += self.period;
                     if !long_period {
                         self.memory = needle.len() - self.period;
@@ -1578,7 +1595,14 @@ impl TwoWaySearcher {
                 cmp::min(self.crit_pos_back, self.memory_back)
             };
             for i in (0..crit).rev() {
-                if needle[i] != haystack[self.end - needle.len() + i] {
+                // SAFETY: On every iteration of `'search`, `haystack.get(self.end.wrapping_sub(needle.len()))`
+                //   returned `Some`, so `self.end >= needle.len()` and `self.end - needle.len() < haystack.len()`.
+                //   Since `self.end <= haystack.len()` and `i < needle.len()`, we have
+                //   `self.end - needle.len() + i < self.end <= haystack.len()`, so
+                //   `haystack.get_unchecked(self.end - needle.len() + i)` is safe.
+                // - The path that mutates `self.end` either re-enters `'search`, which re-runs the checks
+                //   before reaching this loop again, or returns on match, so the invariant holds.
+                if needle[i] != unsafe { *haystack.get_unchecked(self.end - needle.len() + i) } {
                     self.end -= self.crit_pos_back - i;
                     if !long_period {
                         self.memory_back = needle.len();
@@ -1590,7 +1614,12 @@ impl TwoWaySearcher {
             // See if the right part of the needle matches
             let needle_end = if long_period { needle.len() } else { self.memory_back };
             for i in self.crit_pos_back..needle_end {
-                if needle[i] != haystack[self.end - needle.len() + i] {
+                // SAFETY: The same `self.end - needle.len() + i < haystack.len()` argument as the
+                // left-part loop applies: the `haystack.get(self.end.wrapping_sub(needle.len()))`
+                // check at the top of `'search` established the bound for this iteration, and
+                // every mutation of `self.end` is followed by `continue 'search` (which re-runs
+                // the check) or a `return` (which exits before any further unsafe access).
+                if needle[i] != unsafe { *haystack.get_unchecked(self.end - needle.len() + i) } {
                     self.end -= self.period;
                     if !long_period {
                         self.memory_back = self.period;
@@ -1770,11 +1799,19 @@ impl TwoWayStrategy for RejectAndMatch {
 /// If we ever ship std with for x86-64-v3 or adapt this for other platforms then wider vectors
 /// should be evaluated.
 ///
+/// Similarly, on LoongArch the 128-bit LSX vector extension is the baseline,
+/// so we also use `u8x16` there. Wider vector widths may be considered
+/// for future LoongArch extensions (e.g., LASX).
+///
 /// For haystacks smaller than vector-size + needle length it falls back to
 /// a naive O(n*m) search so this implementation should not be called on larger needles.
 ///
 /// [0]: http://0x80.pl/articles/simd-strfind.html#sse-avx2
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    all(target_arch = "loongarch64", target_feature = "lsx"),
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
 #[inline]
 fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
     let needle = needle.as_bytes();
@@ -1906,7 +1943,11 @@ fn simd_contains(needle: &str, haystack: &str) -> Option<bool> {
 /// # Safety
 ///
 /// Both slices must have the same length.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))] // only called on x86
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    all(target_arch = "loongarch64", target_feature = "lsx"),
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
 #[inline]
 unsafe fn small_slice_eq(x: &[u8], y: &[u8]) -> bool {
     debug_assert_eq!(x.len(), y.len());

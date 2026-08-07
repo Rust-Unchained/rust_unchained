@@ -23,40 +23,76 @@
 //! There are also a couple of ad-hoc diagnostics implemented directly here, we
 //! don't yet have a great pattern for how to do them properly.
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 mod handlers {
+    pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
+    pub(crate) mod bad_rtn;
     pub(crate) mod break_outside_of_loop;
+    pub(crate) mod cannot_be_dereferenced;
+    pub(crate) mod cannot_implicitly_deref_trait_object;
+    pub(crate) mod cannot_index_into;
+    pub(crate) mod duplicate_field;
+    pub(crate) mod elided_lifetimes_in_path;
+    pub(crate) mod expected_array_or_slice_pat;
     pub(crate) mod expected_function;
+    pub(crate) mod explicit_drop_method_use;
+    pub(crate) mod fru_in_destructuring_assignment;
+    pub(crate) mod functional_record_update_on_non_struct;
     pub(crate) mod generic_args_prohibited;
+    pub(crate) mod generic_default_refers_to_self;
     pub(crate) mod inactive_code;
     pub(crate) mod incoherent_impl;
     pub(crate) mod incorrect_case;
+    pub(crate) mod incorrect_generics_len;
+    pub(crate) mod incorrect_generics_order;
+    pub(crate) mod infer_vars_not_allowed;
     pub(crate) mod invalid_cast;
     pub(crate) mod invalid_derive_target;
+    pub(crate) mod invalid_lhs_of_assignment;
+    pub(crate) mod invalid_range_pat_type;
     pub(crate) mod macro_error;
     pub(crate) mod malformed_derive;
+    pub(crate) mod method_call_illegal_sized_bound;
     pub(crate) mod mismatched_arg_count;
+    pub(crate) mod mismatched_array_pat_len;
     pub(crate) mod missing_fields;
+    pub(crate) mod missing_lifetime;
     pub(crate) mod missing_match_arms;
     pub(crate) mod missing_unsafe;
     pub(crate) mod moved_out_of_ref;
+    pub(crate) mod mut_ref_in_imm_ref_pat;
     pub(crate) mod mutability_errors;
+    pub(crate) mod mutable_ref;
     pub(crate) mod no_such_field;
     pub(crate) mod non_exhaustive_let;
+    pub(crate) mod non_exhaustive_record_expr;
+    pub(crate) mod non_exhaustive_record_pat;
     pub(crate) mod parenthesized_generic_args_without_fn_trait;
+    pub(crate) mod pattern_arg_in_extern_fn;
     pub(crate) mod private_assoc_item;
     pub(crate) mod private_field;
     pub(crate) mod remove_trailing_return;
     pub(crate) mod remove_unnecessary_else;
     pub(crate) mod replace_filter_map_next_with_find_map;
+    pub(crate) mod return_outside_function;
     pub(crate) mod trait_impl_incorrect_safety;
     pub(crate) mod trait_impl_missing_assoc_item;
     pub(crate) mod trait_impl_orphan;
     pub(crate) mod trait_impl_redundant_assoc_item;
     pub(crate) mod type_mismatch;
+    pub(crate) mod type_must_be_known;
     pub(crate) mod typed_hole;
     pub(crate) mod undeclared_label;
     pub(crate) mod unimplemented_builtin_macro;
+    pub(crate) mod unimplemented_trait;
+    pub(crate) mod union_expr_must_have_exactly_one_field;
+    pub(crate) mod union_pat_has_rest;
+    pub(crate) mod union_pat_must_have_exactly_one_field;
     pub(crate) mod unreachable_label;
     pub(crate) mod unresolved_assoc_item;
     pub(crate) mod unresolved_extern_crate;
@@ -66,7 +102,9 @@ mod handlers {
     pub(crate) mod unresolved_macro_call;
     pub(crate) mod unresolved_method;
     pub(crate) mod unresolved_module;
+    pub(crate) mod unused_must_use;
     pub(crate) mod unused_variables;
+    pub(crate) mod yield_outside_coroutine;
 
     // The handlers below are unusual, the implement the diagnostics as well.
     pub(crate) mod field_shorthand;
@@ -78,30 +116,26 @@ mod handlers {
 #[cfg(test)]
 mod tests;
 
-use std::{collections::hash_map, iter, sync::LazyLock};
+use std::sync::LazyLock;
 
-use either::Either;
-use hir::{
-    db::ExpandDatabase, diagnostics::AnyDiagnostic, Crate, DisplayTarget, HirFileId, InFile,
-    Semantics,
-};
+use hir::{Crate, DisplayTarget, InFile, MacroCallIdExt, Semantics, diagnostics::AnyDiagnostic};
 use ide_db::{
-    assists::{Assist, AssistId, AssistKind, AssistResolveStrategy},
-    base_db::{ReleaseChannel, SourceDatabase},
-    generated::lints::{Lint, LintGroup, CLIPPY_LINT_GROUPS, DEFAULT_LINTS, DEFAULT_LINT_GROUPS},
+    FileId, FileRange, FxHashMap, FxHashSet, RootDatabase, Severity, SnippetCap,
+    assists::{Assist, AssistId, AssistResolveStrategy, ExprFillDefaultMode},
+    base_db::{ReleaseChannel, all_crates, toolchain_channel},
+    generated::lints::{CLIPPY_LINT_GROUPS, DEFAULT_LINT_GROUPS, DEFAULT_LINTS, Lint, LintGroup},
     imports::insert_use::InsertUseConfig,
     label::Label,
+    rename::RenameConfig,
     source_change::SourceChange,
-    syntax_helpers::node_ext::parse_tt_as_comma_sep_paths,
-    EditionedFileId, FileId, FileRange, FxHashMap, FxHashSet, RootDatabase, Severity, SnippetCap,
 };
-use itertools::Itertools;
+use smallvec::{SmallVec, smallvec};
 use syntax::{
-    ast::{self, AstNode, HasAttrs},
-    AstPtr, Edition, NodeOrToken, SmolStr, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, T,
+    AstPtr, Edition, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange,
+    ast::{self, AstNode},
+    format_smolstr,
 };
 
-// FIXME: Make this an enum
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DiagnosticCode {
     RustcHardError(&'static str),
@@ -109,6 +143,7 @@ pub enum DiagnosticCode {
     RustcLint(&'static str),
     Clippy(&'static str),
     Ra(&'static str, Severity),
+    RaLint(&'static str, Severity),
 }
 
 impl DiagnosticCode {
@@ -126,8 +161,8 @@ impl DiagnosticCode {
             DiagnosticCode::Clippy(e) => {
                 format!("https://rust-lang.github.io/rust-clippy/master/#/{e}")
             }
-            DiagnosticCode::Ra(e, _) => {
-                format!("https://rust-analyzer.github.io/manual.html#{e}")
+            DiagnosticCode::Ra(e, _) | DiagnosticCode::RaLint(e, _) => {
+                format!("https://rust-analyzer.github.io/book/diagnostics.html#{e}")
             }
         }
     }
@@ -137,7 +172,8 @@ impl DiagnosticCode {
             DiagnosticCode::RustcHardError(r)
             | DiagnosticCode::RustcLint(r)
             | DiagnosticCode::Clippy(r)
-            | DiagnosticCode::Ra(r, _) => r,
+            | DiagnosticCode::Ra(r, _)
+            | DiagnosticCode::RaLint(r, _) => r,
             DiagnosticCode::SyntaxError => "syntax-error",
         }
     }
@@ -174,17 +210,17 @@ impl Diagnostic {
                 // FIXME: We can make this configurable, and if the user uses `cargo clippy` on flycheck, we can
                 // make it normal warning.
                 DiagnosticCode::Clippy(_) => Severity::WeakWarning,
-                DiagnosticCode::Ra(_, s) => s,
+                DiagnosticCode::Ra(_, s) | DiagnosticCode::RaLint(_, s) => s,
             },
             unused: false,
-            experimental: false,
+            experimental: true,
             fixes: None,
             main_node: None,
         }
     }
 
     fn new_with_syntax_node_ptr(
-        ctx: &DiagnosticsContext<'_>,
+        ctx: &DiagnosticsContext<'_, '_>,
         code: DiagnosticCode,
         message: impl Into<String>,
         node: InFile<SyntaxNodePtr>,
@@ -193,8 +229,8 @@ impl Diagnostic {
             .with_main_node(node)
     }
 
-    fn experimental(mut self) -> Diagnostic {
-        self.experimental = true;
+    fn stable(mut self) -> Diagnostic {
+        self.experimental = false;
         self
     }
 
@@ -212,16 +248,24 @@ impl Diagnostic {
         self.unused = unused;
         self
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExprFillDefaultMode {
-    Todo,
-    Default,
-}
-impl Default for ExprFillDefaultMode {
-    fn default() -> Self {
-        Self::Todo
+    fn main_node(&self, sema: &Semantics<'_, RootDatabase>) -> Option<InFile<SyntaxNode>> {
+        self.main_node.map(|ptr| ptr.with_value(sema.to_node_syntax(ptr))).or_else(|| {
+            let token = sema
+                .parse_guess_edition(self.range.file_id)
+                .syntax()
+                .token_at_offset(self.range.range.start())
+                .right_biased()?;
+            sema.descend_into_macros(token).into_iter().find_map(|token| {
+                let node = sema.ancestors_with_macros(token.parent().unwrap()).find(|node| {
+                    let original_range = sema.original_range(node);
+                    original_range.file_id.file_id(sema.db) == self.range.file_id
+                        && original_range.range.contains_range(self.range.range)
+                })?;
+                let file = sema.hir_file_for(&node);
+                Some(InFile::new(file, node))
+            })
+        })
     }
 }
 
@@ -243,6 +287,7 @@ pub struct DiagnosticsConfig {
     pub prefer_absolute: bool,
     pub term_search_fuel: u64,
     pub term_search_borrowck: bool,
+    pub show_rename_conflicts: bool,
 }
 
 impl DiagnosticsConfig {
@@ -260,7 +305,7 @@ impl DiagnosticsConfig {
             style_lints: true,
             snippet_cap: SnippetCap::new(true),
             insert_use: InsertUseConfig {
-                granularity: ImportGranularity::Preserve,
+                granularity: ImportGranularity::Item,
                 enforce_granularity: false,
                 prefix_kind: PrefixKind::Plain,
                 group: false,
@@ -271,38 +316,27 @@ impl DiagnosticsConfig {
             prefer_absolute: false,
             term_search_fuel: 400,
             term_search_borrowck: true,
+            show_rename_conflicts: true,
         }
+    }
+
+    pub fn rename_config(&self) -> RenameConfig {
+        RenameConfig { show_conflicts: self.show_rename_conflicts }
     }
 }
 
-struct DiagnosticsContext<'a> {
+struct DiagnosticsContext<'a, 'db> {
     config: &'a DiagnosticsConfig,
-    sema: Semantics<'a, RootDatabase>,
+    sema: Semantics<'db, RootDatabase>,
     resolve: &'a AssistResolveStrategy,
     edition: Edition,
     display_target: DisplayTarget,
     is_nightly: bool,
 }
 
-impl DiagnosticsContext<'_> {
-    fn resolve_precise_location(
-        &self,
-        node: &InFile<SyntaxNodePtr>,
-        precise_location: Option<TextRange>,
-    ) -> FileRange {
-        let sema = &self.sema;
-        (|| {
-            let precise_location = precise_location?;
-            let root = sema.parse_or_expand(node.file_id);
-            match root.covering_element(precise_location) {
-                syntax::NodeOrToken::Node(it) => Some(sema.original_range(&it)),
-                syntax::NodeOrToken::Token(it) => {
-                    node.with_value(it).original_file_range_opt(sema.db)
-                }
-            }
-        })()
-        .unwrap_or_else(|| sema.diagnostics_display_range(*node))
-        .into()
+impl<'db> DiagnosticsContext<'_, 'db> {
+    fn db(&self) -> &'db RootDatabase {
+        self.sema.db
     }
 }
 
@@ -319,13 +353,13 @@ pub fn syntax_diagnostics(
     }
 
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
+    let editioned_file_id = sema.attach_first_edition(file_id);
+
+    let (file_id, _) = editioned_file_id.unpack(db);
 
     // [#3434] Only take first 128 errors to prevent slowing down editor/ide, the number 128 is chosen arbitrarily.
-    db.parse_errors(file_id)
-        .as_deref()
+    editioned_file_id
+        .parse_errors(db)
         .into_iter()
         .flatten()
         .take(128)
@@ -333,7 +367,7 @@ pub fn syntax_diagnostics(
             Diagnostic::new(
                 DiagnosticCode::SyntaxError,
                 format!("Syntax Error: {err}"),
-                FileRange { file_id: file_id.into(), range: err.range() },
+                FileRange { file_id, range: err.range() },
             )
         })
         .collect()
@@ -349,65 +383,77 @@ pub fn semantic_diagnostics(
 ) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
+    let editioned_file_id = sema.attach_first_edition(file_id);
+
+    let (file_id, edition) = editioned_file_id.unpack(db);
     let mut res = Vec::new();
 
-    let parse = sema.parse(file_id);
+    let parse = sema.parse(editioned_file_id);
 
     // FIXME: This iterates the entire file which is a rather expensive operation.
     // We should implement these differently in some form?
     // Salsa caching + incremental re-parse would be better here
     for node in parse.syntax().descendants() {
-        handlers::useless_braces::useless_braces(&mut res, file_id, &node);
-        handlers::field_shorthand::field_shorthand(&mut res, file_id, &node);
+        handlers::useless_braces::useless_braces(db, &mut res, editioned_file_id, &node);
+        handlers::field_shorthand::field_shorthand(db, &mut res, editioned_file_id, &node);
         handlers::json_is_not_rust::json_in_items(
             &sema,
             &mut res,
-            file_id,
+            editioned_file_id,
             &node,
             config,
-            file_id.edition(),
+            edition,
         );
     }
 
     let module = sema.file_to_module_def(file_id);
 
     let is_nightly = matches!(
-        module.and_then(|m| db.toolchain_channel(m.krate().into())),
+        module.and_then(|m| toolchain_channel(db, m.krate(db).into())),
         Some(ReleaseChannel::Nightly) | None
     );
-    let krate = module.map(|module| module.krate()).unwrap_or_else(|| {
-        (*db.crate_graph().crates_in_topological_order().last().unwrap()).into()
-    });
-    let display_target = krate.to_display_target(db);
-    let ctx = DiagnosticsContext {
-        config,
-        sema,
-        resolve,
-        edition: file_id.edition(),
-        is_nightly,
-        display_target,
+
+    let krate = match module {
+        Some(module) => module.krate(db),
+        None => {
+            match all_crates(db).last() {
+                Some(last) => (*last).into(),
+                // short-circuit, return an empty vec of diagnostics
+                None => return vec![],
+            }
+        }
     };
+    let display_target = krate.to_display_target(db);
+    let ctx = DiagnosticsContext { config, sema, resolve, edition, is_nightly, display_target };
 
     let mut diags = Vec::new();
     match module {
         // A bunch of parse errors in a file indicate some bigger structural parse changes in the
         // file, so we skip semantic diagnostics so we can show these faster.
         Some(m) => {
-            if db.parse_errors(file_id).as_deref().is_none_or(|es| es.len() < 16) {
+            if editioned_file_id.parse_errors(db).is_none_or(|es| es.len() < 16) {
                 m.diagnostics(db, &mut diags, config.style_lints);
             }
         }
-        None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, file_id.file_id()),
+        None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id),
     }
 
     for diag in diags {
         let d = match diag {
             AnyDiagnostic::AwaitOutsideOfAsync(d) => handlers::await_outside_of_async::await_outside_of_async(&ctx, &d),
+            AnyDiagnostic::CannotBeDereferenced(d) => handlers::cannot_be_dereferenced::cannot_be_dereferenced(&ctx, &d),
+            AnyDiagnostic::CannotImplicitlyDerefTraitObject(d) => handlers::cannot_implicitly_deref_trait_object::cannot_implicitly_deref_trait_object(&ctx, &d),
+            AnyDiagnostic::CannotIndexInto(d) => handlers::cannot_index_into::cannot_index_into(&ctx, &d),
             AnyDiagnostic::CastToUnsized(d) => handlers::invalid_cast::cast_to_unsized(&ctx, &d),
+            AnyDiagnostic::InferVarsNotAllowed(d) => handlers::infer_vars_not_allowed::infer_vars_not_allowed(&ctx, &d),
+            AnyDiagnostic::ArrayPatternWithoutFixedLength(d) => {
+                handlers::array_pattern_without_fixed_length::array_pattern_without_fixed_length(
+                    &ctx, &d,
+                )
+            }
+            AnyDiagnostic::ExpectedArrayOrSlicePat(d) => handlers::expected_array_or_slice_pat::expected_array_or_slice_pat(&ctx, &d),
             AnyDiagnostic::ExpectedFunction(d) => handlers::expected_function::expected_function(&ctx, &d),
+            AnyDiagnostic::FunctionalRecordUpdateOnNonStruct(d) => handlers::functional_record_update_on_non_struct::functional_record_update_on_non_struct(&ctx, &d),
             AnyDiagnostic::InactiveCode(d) => match handlers::inactive_code::inactive_code(&ctx, &d) {
                 Some(it) => it,
                 None => continue,
@@ -421,29 +467,37 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::MacroExpansionParseError(d) => {
                 // FIXME: Point to the correct error span here, not just the macro-call name
                 res.extend(d.errors.iter().take(16).map(|err| {
-                    {
                         Diagnostic::new(
                             DiagnosticCode::SyntaxError,
                             format!("Syntax Error in Expansion: {err}"),
-                            ctx.resolve_precise_location(&d.node.clone(), d.precise_location),
+                            ctx.sema.diagnostics_display_range_for_range(d.range),
                         )
-                    }
-                    .experimental()
                 }));
                 continue;
             },
             AnyDiagnostic::MalformedDerive(d) => handlers::malformed_derive::malformed_derive(&ctx, &d),
+            AnyDiagnostic::MethodCallIllegalSizedBound(d) => handlers::method_call_illegal_sized_bound::method_call_illegal_sized_bound(&ctx, &d),
             AnyDiagnostic::MismatchedArgCount(d) => handlers::mismatched_arg_count::mismatched_arg_count(&ctx, &d),
+            AnyDiagnostic::MismatchedArrayPatLen(d) => handlers::mismatched_array_pat_len::mismatched_array_pat_len(&ctx, &d),
             AnyDiagnostic::MissingFields(d) => handlers::missing_fields::missing_fields(&ctx, &d),
             AnyDiagnostic::MissingMatchArms(d) => handlers::missing_match_arms::missing_match_arms(&ctx, &d),
             AnyDiagnostic::MissingUnsafe(d) => handlers::missing_unsafe::missing_unsafe(&ctx, &d),
             AnyDiagnostic::MovedOutOfRef(d) => handlers::moved_out_of_ref::moved_out_of_ref(&ctx, &d),
+            AnyDiagnostic::MutRefInImmRefPat(d) => handlers::mut_ref_in_imm_ref_pat::mut_ref_in_imm_ref_pat(&ctx, &d),
+            AnyDiagnostic::MutableRefBinding(d) => handlers::mutable_ref::mutable_ref_binding(&ctx, &d),
             AnyDiagnostic::NeedMut(d) => match handlers::mutability_errors::need_mut(&ctx, &d) {
                 Some(it) => it,
                 None => continue,
             },
             AnyDiagnostic::NonExhaustiveLet(d) => handlers::non_exhaustive_let::non_exhaustive_let(&ctx, &d),
+            AnyDiagnostic::NonExhaustiveRecordExpr(d) => {
+                handlers::non_exhaustive_record_expr::non_exhaustive_record_expr(&ctx, &d)
+            }
+            AnyDiagnostic::NonExhaustiveRecordPat(d) => {
+                handlers::non_exhaustive_record_pat::non_exhaustive_record_pat(&ctx, &d)
+            }
             AnyDiagnostic::NoSuchField(d) => handlers::no_such_field::no_such_field(&ctx, &d),
+            AnyDiagnostic::DuplicateField(d) => handlers::duplicate_field::duplicate_field(&ctx, &d),
             AnyDiagnostic::PrivateAssocItem(d) => handlers::private_assoc_item::private_assoc_item(&ctx, &d),
             AnyDiagnostic::PrivateField(d) => handlers::private_field::private_field(&ctx, &d),
             AnyDiagnostic::ReplaceFilterMapNextWithFindMap(d) => handlers::replace_filter_map_next_with_find_map::replace_filter_map_next_with_find_map(&ctx, &d),
@@ -452,7 +506,10 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::TraitImplRedundantAssocItems(d) => handlers::trait_impl_redundant_assoc_item::trait_impl_redundant_assoc_item(&ctx, &d),
             AnyDiagnostic::TraitImplOrphan(d) => handlers::trait_impl_orphan::trait_impl_orphan(&ctx, &d),
             AnyDiagnostic::TypedHole(d) => handlers::typed_hole::typed_hole(&ctx, &d),
-            AnyDiagnostic::TypeMismatch(d) => handlers::type_mismatch::type_mismatch(&ctx, &d),
+            AnyDiagnostic::TypeMismatch(d) => match handlers::type_mismatch::type_mismatch(&ctx, &d) {
+                Some(diag) => diag,
+                None => continue,
+            },
             AnyDiagnostic::UndeclaredLabel(d) => handlers::undeclared_label::undeclared_label(&ctx, &d),
             AnyDiagnostic::UnimplementedBuiltinMacro(d) => handlers::unimplemented_builtin_macro::unimplemented_builtin_macro(&ctx, &d),
             AnyDiagnostic::UnreachableLabel(d) => handlers::unreachable_label::unreachable_label(&ctx, &d),
@@ -464,6 +521,7 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::UnresolvedMacroCall(d) => handlers::unresolved_macro_call::unresolved_macro_call(&ctx, &d),
             AnyDiagnostic::UnresolvedMethodCall(d) => handlers::unresolved_method::unresolved_method(&ctx, &d),
             AnyDiagnostic::UnresolvedModule(d) => handlers::unresolved_module::unresolved_module(&ctx, &d),
+            AnyDiagnostic::UnusedMustUse(d) => handlers::unused_must_use::unused_must_use(&ctx, &d),
             AnyDiagnostic::UnusedMut(d) => match handlers::mutability_errors::unused_mut(&ctx, &d) {
                 Some(it) => it,
                 None => continue,
@@ -482,12 +540,30 @@ pub fn semantic_diagnostics(
                 Some(it) => it,
                 None => continue,
             },
-            AnyDiagnostic::GenericArgsProhibited(d) => {
-                handlers::generic_args_prohibited::generic_args_prohibited(&ctx, &d)
+            AnyDiagnostic::GenericArgsProhibited(d) => handlers::generic_args_prohibited::generic_args_prohibited(&ctx, &d),
+            AnyDiagnostic::ParenthesizedGenericArgsWithoutFnTrait(d) => handlers::parenthesized_generic_args_without_fn_trait::parenthesized_generic_args_without_fn_trait(&ctx, &d),
+            AnyDiagnostic::BadRtn(d) => handlers::bad_rtn::bad_rtn(&ctx, &d),
+            AnyDiagnostic::IncorrectGenericsLen(d) => handlers::incorrect_generics_len::incorrect_generics_len(&ctx, &d),
+            AnyDiagnostic::IncorrectGenericsOrder(d) => handlers::incorrect_generics_order::incorrect_generics_order(&ctx, &d),
+            AnyDiagnostic::MissingLifetime(d) => handlers::missing_lifetime::missing_lifetime(&ctx, &d),
+            AnyDiagnostic::ElidedLifetimesInPath(d) => handlers::elided_lifetimes_in_path::elided_lifetimes_in_path(&ctx, &d),
+            AnyDiagnostic::GenericDefaultRefersToSelf(d) => handlers::generic_default_refers_to_self::generic_default_refers_to_self(&ctx, &d),
+            AnyDiagnostic::InvalidLhsOfAssignment(d) => handlers::invalid_lhs_of_assignment::invalid_lhs_of_assignment(&ctx, &d),
+            AnyDiagnostic::InvalidRangePatType(d) => handlers::invalid_range_pat_type::invalid_range_pat_type(&ctx, &d),
+            AnyDiagnostic::TypeMustBeKnown(d) => handlers::type_must_be_known::type_must_be_known(&ctx, &d),
+            AnyDiagnostic::PatternArgInExternFn(d) => handlers::pattern_arg_in_extern_fn::pattern_arg_in_extern_fn(&ctx, &d),
+            AnyDiagnostic::UnionExprMustHaveExactlyOneField(d) => handlers::union_expr_must_have_exactly_one_field::union_expr_must_have_exactly_one_field(&ctx, &d),
+            AnyDiagnostic::UnionPatMustHaveExactlyOneField(d) => {
+                handlers::union_pat_must_have_exactly_one_field::union_pat_must_have_exactly_one_field(&ctx, &d)
             }
-            AnyDiagnostic::ParenthesizedGenericArgsWithoutFnTrait(d) => {
-                handlers::parenthesized_generic_args_without_fn_trait::parenthesized_generic_args_without_fn_trait(&ctx, &d)
+            AnyDiagnostic::UnionPatHasRest(d) => {
+                handlers::union_pat_has_rest::union_pat_has_rest(&ctx, &d)
             }
+            AnyDiagnostic::UnimplementedTrait(d) => handlers::unimplemented_trait::unimplemented_trait(&ctx, &d),
+            AnyDiagnostic::FruInDestructuringAssignment(d) => handlers::fru_in_destructuring_assignment::fru_in_destructuring_assignment(&ctx, &d),
+            AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
+            AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
+            AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),
         };
         res.push(d)
     }
@@ -499,26 +575,20 @@ pub fn semantic_diagnostics(
 
     let mut lints = res
         .iter_mut()
-        .filter(|it| matches!(it.code, DiagnosticCode::Clippy(_) | DiagnosticCode::RustcLint(_)))
-        .filter_map(|it| {
-            Some((
-                it.main_node.map(|ptr| {
-                    ptr.map(|node| node.to_node(&ctx.sema.parse_or_expand(ptr.file_id)))
-                })?,
-                it,
-            ))
+        .filter(|it| {
+            matches!(
+                it.code,
+                DiagnosticCode::Clippy(_)
+                    | DiagnosticCode::RustcLint(_)
+                    | DiagnosticCode::RaLint(..)
+            )
         })
+        .filter_map(|it| Some((it.main_node(&ctx.sema)?, it)))
         .collect::<Vec<_>>();
 
     // The edition isn't accurate (each diagnostics may have its own edition due to macros),
     // but it's okay as it's only being used for error recovery.
-    handle_lints(
-        &ctx.sema,
-        &mut FxHashMap::default(),
-        &mut lints,
-        &mut Vec::new(),
-        file_id.edition(),
-    );
+    handle_lints(&ctx.sema, file_id, krate, &mut lints, editioned_file_id.edition(db));
 
     res.retain(|d| d.severity != Severity::Allow);
 
@@ -556,12 +626,11 @@ fn handle_diag_from_macros(
     node: &InFile<SyntaxNode>,
 ) -> bool {
     let Some(macro_file) = node.file_id.macro_file() else { return true };
-    let span_map = sema.db.expansion_span_map(macro_file);
+    let span_map = macro_file.expansion_span_map(sema.db);
     let mut spans = span_map.spans_for_range(node.text_range());
     if spans.any(|span| {
-        sema.db.lookup_intern_syntax_context(span.ctx).outer_expn.is_some_and(|expansion| {
-            let macro_call =
-                sema.db.lookup_intern_macro_call(expansion.as_macro_file().macro_call_id);
+        span.ctx.outer_expn(sema.db).is_some_and(|expansion| {
+            let macro_call = expansion.loc(sema.db);
             // We don't want to show diagnostics for non-local macros at all, but proc macros authors
             // seem to rely on being able to emit non-warning-free code, so we don't want to show warnings
             // for them even when the proc macro comes from the same workspace (in rustc that's not a
@@ -575,20 +644,18 @@ fn handle_diag_from_macros(
         diag.fixes = None;
 
         // All Clippy lints report in macros, see https://github.com/rust-lang/rust-clippy/blob/903293b199364/declare_clippy_lint/src/lib.rs#L172.
-        if let DiagnosticCode::RustcLint(lint) = diag.code {
-            if !LINTS_TO_REPORT_IN_EXTERNAL_MACROS.contains(lint) {
-                return false;
-            }
+        if let DiagnosticCode::RustcLint(lint) = diag.code
+            && !LINTS_TO_REPORT_IN_EXTERNAL_MACROS.contains(lint)
+        {
+            return false;
         };
     }
     true
 }
 
-// `__RA_EVERY_LINT` is a fake lint group to allow every lint in proc macros
-
 struct BuiltLint {
     lint: &'static Lint,
-    groups: Vec<&'static str>,
+    groups: SmallVec<[SmolStr; 5]>,
 }
 
 static RUSTC_LINTS: LazyLock<FxHashMap<&str, BuiltLint>> =
@@ -609,12 +676,17 @@ fn build_lints_map(
 ) -> FxHashMap<&'static str, BuiltLint> {
     let mut map_with_prefixes: FxHashMap<_, _> = lints
         .iter()
-        .map(|lint| (lint.label, BuiltLint { lint, groups: vec![lint.label, "__RA_EVERY_LINT"] }))
+        .map(|lint| {
+            (
+                lint.label,
+                BuiltLint { lint, groups: smallvec![lint.label.into(), "__RA_EVERY_LINT".into()] },
+            )
+        })
         .collect();
     for g in lint_group {
         let mut add_children = |label: &'static str| {
             for child in g.children {
-                map_with_prefixes.get_mut(child).unwrap().groups.push(label);
+                map_with_prefixes.get_mut(child).unwrap().groups.push(label.into());
             }
         };
         add_children(g.lint.label);
@@ -629,26 +701,30 @@ fn build_lints_map(
 
 fn handle_lints(
     sema: &Semantics<'_, RootDatabase>,
-    cache: &mut FxHashMap<HirFileId, FxHashMap<SmolStr, SeverityAttr>>,
+    file_id: FileId,
+    krate: hir::Crate,
     diagnostics: &mut [(InFile<SyntaxNode>, &mut Diagnostic)],
-    cache_stack: &mut Vec<HirFileId>,
     edition: Edition,
 ) {
     for (node, diag) in diagnostics {
-        let lint = match diag.code {
-            DiagnosticCode::RustcLint(lint) => RUSTC_LINTS[lint].lint,
-            DiagnosticCode::Clippy(lint) => CLIPPY_LINTS[lint].lint,
-            _ => panic!("non-lint passed to `handle_lints()`"),
+        let default_severity = 'find_severity: {
+            let lint = match diag.code {
+                DiagnosticCode::RustcLint(lint) => RUSTC_LINTS[lint].lint,
+                DiagnosticCode::Clippy(lint) => CLIPPY_LINTS[lint].lint,
+                DiagnosticCode::RaLint(_, severity) => break 'find_severity severity,
+                _ => panic!("non-lint passed to `handle_lints()`"),
+            };
+            default_lint_severity(lint, edition)
         };
-        let default_severity = default_lint_severity(lint, edition);
         if !(default_severity == Severity::Allow && diag.severity == Severity::WeakWarning) {
             diag.severity = default_severity;
         }
 
-        let mut diag_severity = fill_lint_attrs(sema, node, cache, cache_stack, diag, edition);
+        let mut diag_severity =
+            lint_severity_at(sema, file_id, krate, node, &lint_groups(&diag.code, edition));
 
         if let outline_diag_severity @ Some(_) =
-            find_outline_mod_lint_severity(sema, node, diag, edition)
+            find_outline_mod_lint_severity(sema, file_id, krate, node, diag, edition)
         {
             diag_severity = outline_diag_severity;
         }
@@ -671,6 +747,8 @@ fn default_lint_severity(lint: &Lint, edition: Edition) -> Severity {
 
 fn find_outline_mod_lint_severity(
     sema: &Semantics<'_, RootDatabase>,
+    file_id: FileId,
+    krate: hir::Crate,
     node: &InFile<SyntaxNode>,
     diag: &Diagnostic,
     edition: Edition,
@@ -683,271 +761,67 @@ fn find_outline_mod_lint_severity(
 
     let mod_def = sema.to_module_def(&mod_node)?;
     let module_source_file = sema.module_definition_node(mod_def);
-    let mut result = None;
     let lint_groups = lint_groups(&diag.code, edition);
     lint_attrs(
         sema,
+        file_id,
+        krate,
         ast::AnyHasAttrs::cast(module_source_file.value).expect("SourceFile always has attrs"),
-        edition,
     )
-    .for_each(|(lint, severity)| {
-        if lint_groups.contains(&lint) {
-            result = Some(severity);
-        }
-    });
-    result
+    .find_map(|(lint, severity)| lint_groups.contains(&lint).then_some(severity))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SeverityAttr {
-    severity: Severity,
-    /// This field counts how far we are from the main node. Bigger values mean more far.
-    ///
-    /// Note this isn't accurate: there can be gaps between values (created when merging severity maps).
-    /// The important thing is that if an attr is closer to the main node, it will have smaller value.
-    ///
-    /// This is necessary even though we take care to never overwrite a value from deeper nesting
-    /// because of lint groups. For example, in the following code:
-    /// ```
-    /// #[warn(non_snake_case)]
-    /// mod foo {
-    ///     #[allow(nonstandard_style)]
-    ///     mod bar {}
-    /// }
-    /// ```
-    /// We want to not warn on non snake case inside `bar`. If we are traversing this for the first
-    /// time, everything will be fine, because we will set `diag_severity` on the first matching group
-    /// and never overwrite it since then. But if `bar` is cached, the cache will contain both
-    /// `#[warn(non_snake_case)]` and `#[allow(nonstandard_style)]`, and without this field, we have
-    /// no way of differentiating between the two.
-    depth: u32,
-}
-
-fn fill_lint_attrs(
+fn lint_severity_at(
     sema: &Semantics<'_, RootDatabase>,
+    file_id: FileId,
+    krate: hir::Crate,
     node: &InFile<SyntaxNode>,
-    cache: &mut FxHashMap<HirFileId, FxHashMap<SmolStr, SeverityAttr>>,
-    cache_stack: &mut Vec<HirFileId>,
-    diag: &Diagnostic,
-    edition: Edition,
+    lint_groups: &LintGroups,
 ) -> Option<Severity> {
-    let mut collected_lint_attrs = FxHashMap::<SmolStr, SeverityAttr>::default();
-    let mut diag_severity = None;
-
-    let mut ancestors = node.value.ancestors().peekable();
-    let mut depth = 0;
-    loop {
-        let ancestor = ancestors.next().expect("we always return from top-level nodes");
-        depth += 1;
-
-        if ancestors.peek().is_none() {
-            // We don't want to insert too many nodes into cache, but top level nodes (aka. outline modules
-            // or macro expansions) need to touch the database so they seem like a good fit to cache.
-
-            if let Some(cached) = cache.get_mut(&node.file_id) {
-                // This node (and everything above it) is already cached; the attribute is either here or nowhere.
-
-                // Workaround for the borrow checker.
-                let cached = std::mem::take(cached);
-
-                cached.iter().for_each(|(lint, severity)| {
-                    for item in &*cache_stack {
-                        let node_cache_entry = cache
-                            .get_mut(item)
-                            .expect("we always insert cached nodes into the cache map");
-                        let lint_cache_entry = node_cache_entry.entry(lint.clone());
-                        if let hash_map::Entry::Vacant(lint_cache_entry) = lint_cache_entry {
-                            // Do not overwrite existing lint attributes, as we go bottom to top and bottom attrs
-                            // overwrite top attrs.
-                            lint_cache_entry.insert(SeverityAttr {
-                                severity: severity.severity,
-                                depth: severity.depth + depth,
-                            });
-                        }
-                    }
-                });
-
-                let all_matching_groups = lint_groups(&diag.code, edition)
-                    .iter()
-                    .filter_map(|lint_group| cached.get(lint_group));
-                let cached_severity =
-                    all_matching_groups.min_by_key(|it| it.depth).map(|it| it.severity);
-
-                cache.insert(node.file_id, cached);
-
-                return diag_severity.or(cached_severity);
-            }
-
-            // Insert this node's descendants' attributes into any outline descendant, but not including this node.
-            // This must come before inserting this node's own attributes to preserve order.
-            collected_lint_attrs.drain().for_each(|(lint, severity)| {
-                if diag_severity.is_none() && lint_groups(&diag.code, edition).contains(&lint) {
-                    diag_severity = Some(severity.severity);
-                }
-
-                for item in &*cache_stack {
-                    let node_cache_entry = cache
-                        .get_mut(item)
-                        .expect("we always insert cached nodes into the cache map");
-                    let lint_cache_entry = node_cache_entry.entry(lint.clone());
-                    if let hash_map::Entry::Vacant(lint_cache_entry) = lint_cache_entry {
-                        // Do not overwrite existing lint attributes, as we go bottom to top and bottom attrs
-                        // overwrite top attrs.
-                        lint_cache_entry.insert(severity);
-                    }
-                }
-            });
-
-            cache_stack.push(node.file_id);
-            cache.insert(node.file_id, FxHashMap::default());
-
-            if let Some(ancestor) = ast::AnyHasAttrs::cast(ancestor) {
-                // Insert this node's attributes into any outline descendant, including this node.
-                lint_attrs(sema, ancestor, edition).for_each(|(lint, severity)| {
-                    if diag_severity.is_none() && lint_groups(&diag.code, edition).contains(&lint) {
-                        diag_severity = Some(severity);
-                    }
-
-                    for item in &*cache_stack {
-                        let node_cache_entry = cache
-                            .get_mut(item)
-                            .expect("we always insert cached nodes into the cache map");
-                        let lint_cache_entry = node_cache_entry.entry(lint.clone());
-                        if let hash_map::Entry::Vacant(lint_cache_entry) = lint_cache_entry {
-                            // Do not overwrite existing lint attributes, as we go bottom to top and bottom attrs
-                            // overwrite top attrs.
-                            lint_cache_entry.insert(SeverityAttr { severity, depth });
-                        }
-                    }
-                });
-            }
-
-            let parent_node = sema.find_parent_file(node.file_id);
-            if let Some(parent_node) = parent_node {
-                let parent_severity =
-                    fill_lint_attrs(sema, &parent_node, cache, cache_stack, diag, edition);
-                if diag_severity.is_none() {
-                    diag_severity = parent_severity;
-                }
-            }
-            cache_stack.pop();
-            return diag_severity;
-        } else if let Some(ancestor) = ast::AnyHasAttrs::cast(ancestor) {
-            lint_attrs(sema, ancestor, edition).for_each(|(lint, severity)| {
-                if diag_severity.is_none() && lint_groups(&diag.code, edition).contains(&lint) {
-                    diag_severity = Some(severity);
-                }
-
-                let lint_cache_entry = collected_lint_attrs.entry(lint);
-                if let hash_map::Entry::Vacant(lint_cache_entry) = lint_cache_entry {
-                    // Do not overwrite existing lint attributes, as we go bottom to top and bottom attrs
-                    // overwrite top attrs.
-                    lint_cache_entry.insert(SeverityAttr { severity, depth });
-                }
-            });
-        }
-    }
-}
-
-fn lint_attrs<'a>(
-    sema: &'a Semantics<'a, RootDatabase>,
-    ancestor: ast::AnyHasAttrs,
-    edition: Edition,
-) -> impl Iterator<Item = (SmolStr, Severity)> + 'a {
-    ancestor
-        .attrs_including_inner()
-        .filter_map(|attr| {
-            attr.as_simple_call().and_then(|(name, value)| match &*name {
-                "allow" | "expect" => Some(Either::Left(iter::once((Severity::Allow, value)))),
-                "warn" => Some(Either::Left(iter::once((Severity::Warning, value)))),
-                "forbid" | "deny" => Some(Either::Left(iter::once((Severity::Error, value)))),
-                "cfg_attr" => {
-                    let mut lint_attrs = Vec::new();
-                    cfg_attr_lint_attrs(sema, &value, &mut lint_attrs);
-                    Some(Either::Right(lint_attrs.into_iter()))
-                }
-                _ => None,
-            })
+    node.value
+        .ancestors()
+        .filter_map(ast::AnyHasAttrs::cast)
+        .find_map(|ancestor| {
+            lint_attrs(sema, file_id, krate, ancestor)
+                .find_map(|(lint, severity)| lint_groups.contains(&lint).then_some(severity))
         })
-        .flatten()
-        .flat_map(move |(severity, lints)| {
-            parse_tt_as_comma_sep_paths(lints, edition).into_iter().flat_map(move |lints| {
-                // Rejoin the idents with `::`, so we have no spaces in between.
-                lints.into_iter().map(move |lint| {
-                    (
-                        lint.segments().filter_map(|segment| segment.name_ref()).join("::").into(),
-                        severity,
-                    )
-                })
-            })
+        .or_else(|| {
+            lint_severity_at(
+                sema,
+                file_id,
+                krate,
+                &sema.find_parent_file(node.file_id)?,
+                lint_groups,
+            )
         })
 }
 
-fn cfg_attr_lint_attrs(
+// FIXME: Switch this to analysis' `expand_cfg_attr`.
+fn lint_attrs(
     sema: &Semantics<'_, RootDatabase>,
-    value: &ast::TokenTree,
-    lint_attrs: &mut Vec<(Severity, ast::TokenTree)>,
-) {
-    let prev_len = lint_attrs.len();
-
-    let mut iter = value.token_trees_and_tokens().filter(|it| match it {
-        NodeOrToken::Node(_) => true,
-        NodeOrToken::Token(it) => !it.kind().is_trivia(),
-    });
-
-    // Skip the condition.
-    for value in &mut iter {
-        if value.as_token().is_some_and(|it| it.kind() == T![,]) {
-            break;
-        }
-    }
-
-    while let Some(value) = iter.next() {
-        if let Some(token) = value.as_token() {
-            if token.kind() == SyntaxKind::IDENT {
-                let severity = match token.text() {
-                    "allow" | "expect" => Some(Severity::Allow),
-                    "warn" => Some(Severity::Warning),
-                    "forbid" | "deny" => Some(Severity::Error),
-                    "cfg_attr" => {
-                        if let Some(NodeOrToken::Node(value)) = iter.next() {
-                            cfg_attr_lint_attrs(sema, &value, lint_attrs);
-                        }
-                        None
-                    }
-                    _ => None,
-                };
-                if let Some(severity) = severity {
-                    let lints = iter.next();
-                    if let Some(NodeOrToken::Node(lints)) = lints {
-                        lint_attrs.push((severity, lints));
-                    }
-                }
-            }
-        }
-    }
-
-    if prev_len != lint_attrs.len() {
-        if let Some(false) | None = sema.check_cfg_attr(value) {
-            // Discard the attributes when the condition is false.
-            lint_attrs.truncate(prev_len);
-        }
-    }
+    file_id: FileId,
+    krate: hir::Crate,
+    ancestor: ast::AnyHasAttrs,
+) -> impl Iterator<Item = (SmolStr, Severity)> {
+    sema.lint_attrs(file_id, krate, ancestor).rev().map(|(lint_attr, lint)| {
+        let severity = match lint_attr {
+            hir::LintAttr::Allow | hir::LintAttr::Expect => Severity::Allow,
+            hir::LintAttr::Warn => Severity::Warning,
+            hir::LintAttr::Deny | hir::LintAttr::Forbid => Severity::Error,
+        };
+        (lint, severity)
+    })
 }
 
 #[derive(Debug)]
 struct LintGroups {
-    groups: &'static [&'static str],
+    groups: SmallVec<[SmolStr; 5]>,
     inside_warnings: bool,
 }
 
 impl LintGroups {
     fn contains(&self, group: &str) -> bool {
-        self.groups.contains(&group) || (self.inside_warnings && group == "warnings")
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &'static str> {
-        self.groups.iter().copied().chain(self.inside_warnings.then_some("warnings"))
+        self.groups.iter().any(|g| g == group) || (self.inside_warnings && group == "warnings")
     }
 }
 
@@ -956,12 +830,15 @@ fn lint_groups(lint: &DiagnosticCode, edition: Edition) -> LintGroups {
         DiagnosticCode::RustcLint(name) => {
             let lint = &RUSTC_LINTS[name];
             let inside_warnings = default_lint_severity(lint.lint, edition) == Severity::Warning;
-            (&lint.groups, inside_warnings)
+            (lint.groups.clone(), inside_warnings)
         }
         DiagnosticCode::Clippy(name) => {
             let lint = &CLIPPY_LINTS[name];
             let inside_warnings = default_lint_severity(lint.lint, edition) == Severity::Warning;
-            (&lint.groups, inside_warnings)
+            (lint.groups.clone(), inside_warnings)
+        }
+        DiagnosticCode::RaLint(name, severity) => {
+            (smallvec![format_smolstr!("rust_analyzer::{name}")], *severity == Severity::Warning)
         }
         _ => panic!("non-lint passed to `handle_lints()`"),
     };
@@ -977,7 +854,7 @@ fn fix(id: &'static str, label: &str, source_change: SourceChange, target: TextR
 fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
     assert!(!id.contains(' '));
     Assist {
-        id: AssistId(id, AssistKind::QuickFix),
+        id: AssistId::quick_fix(id),
         label: Label::new(label.to_owned()),
         group: None,
         target,
@@ -987,14 +864,14 @@ fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
 }
 
 fn adjusted_display_range<N: AstNode>(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     diag_ptr: InFile<AstPtr<N>>,
     adj: &dyn Fn(N) -> Option<TextRange>,
 ) -> FileRange {
     let source_file = ctx.sema.parse_or_expand(diag_ptr.file_id);
     let node = diag_ptr.value.to_node(&source_file);
-    diag_ptr
+    let hir::FileRange { file_id, range } = diag_ptr
         .with_value(adj(node).unwrap_or_else(|| diag_ptr.value.text_range()))
-        .original_node_file_range_rooted(ctx.sema.db)
-        .into()
+        .original_node_file_range_rooted(ctx.sema.db);
+    ide_db::FileRange { file_id: file_id.file_id(ctx.sema.db), range }
 }

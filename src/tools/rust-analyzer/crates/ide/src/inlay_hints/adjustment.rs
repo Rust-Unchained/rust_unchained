@@ -13,7 +13,7 @@ use hir::{
 use ide_db::famous_defs::FamousDefs;
 
 use ide_db::text_edit::TextEditBuilder;
-use syntax::ast::{self, prec::ExprPrecedence, AstNode};
+use syntax::ast::{self, AstNode, prec::ExprPrecedence};
 
 use crate::{
     AdjustmentHints, AdjustmentHintsMode, InlayHint, InlayHintLabel, InlayHintLabelPart,
@@ -23,7 +23,7 @@ use crate::{
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     display_target: DisplayTarget,
     expr: &ast::Expr,
 ) -> Option<()> {
@@ -39,15 +39,30 @@ pub(super) fn hints(
     if let ast::Expr::ParenExpr(_) = expr {
         return None;
     }
-    if let ast::Expr::BlockExpr(b) = expr {
-        if !b.is_standalone() {
-            return None;
-        }
+    if let ast::Expr::BlockExpr(b) = expr
+        && !b.is_standalone()
+    {
+        return None;
     }
 
     let descended = sema.descend_node_into_attributes(expr.clone()).pop();
     let desc_expr = descended.as_ref().unwrap_or(expr);
-    let adjustments = sema.expr_adjustments(desc_expr).filter(|it| !it.is_empty())?;
+    let mut adjustments = sema.expr_adjustments(desc_expr).filter(|it| !it.is_empty())?;
+
+    if config.adjustment_hints_disable_reborrows {
+        // Remove consecutive deref-ref, i.e. reborrows.
+        let mut i = 0;
+        while i < adjustments.len().saturating_sub(1) {
+            let [current, next, ..] = &adjustments[i..] else { unreachable!() };
+            if matches!(current.kind, Adjust::Deref(None))
+                && matches!(next.kind, Adjust::Borrow(AutoBorrow::Ref(_)))
+            {
+                adjustments.splice(i..i + 2, []);
+            } else {
+                i += 1;
+            }
+        }
+    }
 
     if let ast::Expr::BlockExpr(_) | ast::Expr::IfExpr(_) | ast::Expr::MatchExpr(_) = desc_expr {
         // Don't show unnecessary reborrows for these, they will just repeat the inner ones again
@@ -109,50 +124,90 @@ pub(super) fn hints(
         }
         has_adjustments = true;
 
-        // FIXME: Add some nicer tooltips to each of these
-        let (text, coercion) = match kind {
+        let (text, coercion, detailed_tooltip) = match kind {
             Adjust::NeverToAny if config.adjustment_hints == AdjustmentHints::Always => {
                 allow_edit = false;
-                ("<never-to-any>", "never to any")
+                (
+                    "<never-to-any>",
+                    "never to any",
+                    "Coerces the never type `!` into any other type. This happens in code paths that never return, like after `panic!()` or `return`.",
+                )
             }
-            Adjust::Deref(None) => ("*", "dereference"),
-            Adjust::Deref(Some(OverloadedDeref(Mutability::Shared))) => {
-                ("*", "`Deref` dereference")
-            }
-            Adjust::Deref(Some(OverloadedDeref(Mutability::Mut))) => {
-                ("*", "`DerefMut` dereference")
-            }
-            Adjust::Borrow(AutoBorrow::Ref(Mutability::Shared)) => ("&", "borrow"),
-            Adjust::Borrow(AutoBorrow::Ref(Mutability::Mut)) => ("&mut ", "unique borrow"),
-            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Shared)) => {
-                ("&raw const ", "const pointer borrow")
-            }
-            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Mut)) => {
-                ("&raw mut ", "mut pointer borrow")
-            }
+            Adjust::Deref(None) => (
+                "*",
+                "dereference",
+                "Built-in dereference of a reference to access the underlying value. The compiler inserts `*` to get the value from `&T`.",
+            ),
+            Adjust::Deref(Some(OverloadedDeref(Mutability::Shared))) => (
+                "*",
+                "`Deref` dereference",
+                "Dereference via the `Deref` trait. Used for types like `Box<T>` or `Rc<T>` so they act like plain `T`.",
+            ),
+            Adjust::Deref(Some(OverloadedDeref(Mutability::Mut))) => (
+                "*",
+                "`DerefMut` dereference",
+                "Mutable dereference using the `DerefMut` trait. Enables smart pointers to give mutable access to their inner values.",
+            ),
+            Adjust::Borrow(AutoBorrow::Ref(Mutability::Shared)) => (
+                "&",
+                "shared borrow",
+                "Inserts `&` to create a shared reference. Lets you use a value without moving or cloning it.",
+            ),
+            Adjust::Borrow(AutoBorrow::Ref(Mutability::Mut)) => (
+                "&mut ",
+                "mutable borrow",
+                "Inserts `&mut` to create a unique, mutable reference. Lets you modify a value without taking ownership.",
+            ),
+            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Shared)) => (
+                "&raw const ",
+                "const raw pointer",
+                "Converts a reference to a raw const pointer `*const T`. Often used when working with FFI or unsafe code.",
+            ),
+            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Mut)) => (
+                "&raw mut ",
+                "mut raw pointer",
+                "Converts a mutable reference to a raw mutable pointer `*mut T`. Allows mutation in unsafe contexts.",
+            ),
             // some of these could be represented via `as` casts, but that's not too nice and
             // handling everything as a prefix expr makes the `(` and `)` insertion easier
             Adjust::Pointer(cast) if config.adjustment_hints == AdjustmentHints::Always => {
                 allow_edit = false;
                 match cast {
-                    PointerCast::ReifyFnPointer => {
-                        ("<fn-item-to-fn-pointer>", "fn item to fn pointer")
-                    }
+                    PointerCast::ReifyFnPointer => (
+                        "<fn-item-to-fn-pointer>",
+                        "fn item to fn pointer",
+                        "Converts a named function to a function pointer `fn()`. Useful when passing functions as values.",
+                    ),
                     PointerCast::UnsafeFnPointer => (
                         "<safe-fn-pointer-to-unsafe-fn-pointer>",
                         "safe fn pointer to unsafe fn pointer",
+                        "Coerces a safe function pointer to an unsafe one. Allows calling it in an unsafe context.",
                     ),
-                    PointerCast::ClosureFnPointer(Safety::Unsafe) => {
-                        ("<closure-to-unsafe-fn-pointer>", "closure to unsafe fn pointer")
-                    }
-                    PointerCast::ClosureFnPointer(Safety::Safe) => {
-                        ("<closure-to-fn-pointer>", "closure to fn pointer")
-                    }
-                    PointerCast::MutToConstPointer => {
-                        ("<mut-ptr-to-const-ptr>", "mut ptr to const ptr")
-                    }
-                    PointerCast::ArrayToPointer => ("<array-ptr-to-element-ptr>", ""),
-                    PointerCast::Unsize => ("<unsize>", "unsize"),
+                    PointerCast::ClosureFnPointer(Safety::Unsafe) => (
+                        "<closure-to-unsafe-fn-pointer>",
+                        "closure to unsafe fn pointer",
+                        "Converts a non-capturing closure to an unsafe function pointer. Required for use in `extern` or unsafe APIs.",
+                    ),
+                    PointerCast::ClosureFnPointer(Safety::Safe) => (
+                        "<closure-to-fn-pointer>",
+                        "closure to fn pointer",
+                        "Converts a non-capturing closure to a function pointer. Lets closures behave like plain functions.",
+                    ),
+                    PointerCast::MutToConstPointer => (
+                        "<mut-ptr-to-const-ptr>",
+                        "mut ptr to const ptr",
+                        "Coerces `*mut T` to `*const T`. Safe because const pointers restrict what you can do.",
+                    ),
+                    PointerCast::ArrayToPointer => (
+                        "<array-ptr-to-element-ptr>",
+                        "array to pointer",
+                        "Converts an array to a pointer to its first element. Similar to how arrays decay to pointers in C.",
+                    ),
+                    PointerCast::Unsize => (
+                        "<unsize>",
+                        "unsize coercion",
+                        "Converts a sized type to an unsized one. Used for things like turning arrays into slices or concrete types into trait objects.",
+                    ),
                 }
             }
             _ => continue,
@@ -162,9 +217,11 @@ pub(super) fn hints(
             linked_location: None,
             tooltip: Some(config.lazy_tooltip(|| {
                 InlayTooltip::Markdown(format!(
-                    "`{}` → `{}` ({coercion} coercion)",
+                    "`{}` → `{}`\n\n**{}**\n\n{}",
                     source.display(sema.db, display_target),
                     target.display(sema.db, display_target),
+                    coercion,
+                    detailed_tooltip
                 ))
             })),
         };
@@ -224,7 +281,7 @@ fn mode_and_needs_parens_for_adjustment_hints(
     expr: &ast::Expr,
     mode: AdjustmentHintsMode,
 ) -> (bool, bool, bool) {
-    use {std::cmp::Ordering::*, AdjustmentHintsMode::*};
+    use {AdjustmentHintsMode::*, std::cmp::Ordering::*};
 
     match mode {
         Prefix | Postfix => {
@@ -284,8 +341,8 @@ fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, 
 #[cfg(test)]
 mod tests {
     use crate::{
-        inlay_hints::tests::{check_with_config, DISABLED_CONFIG},
         AdjustmentHints, AdjustmentHintsMode, InlayHintsConfig,
+        inlay_hints::tests::{DISABLED_CONFIG, check_with_config},
     };
 
     #[test]
@@ -293,7 +350,7 @@ mod tests {
         check_with_config(
             InlayHintsConfig { adjustment_hints: AdjustmentHints::Always, ..DISABLED_CONFIG },
             r#"
-//- minicore: coerce_unsized, fn, eq, index, dispatch_from_dyn
+//- minicore: coerce_unsized, fn, eq, index, dispatch_from_dyn, builtin_impls
 fn main() {
     let _: u32         = loop {};
                        //^^^^^^^<never-to-any>
@@ -369,10 +426,9 @@ fn main() {
     (()) == {()};
   // ^^&
          // ^^^^&
-    let closure: dyn Fn = || ();
+    let closure: &dyn Fn = &|| ();
+                         //^^^^^^<unsize>&*
     closure();
-  //^^^^^^^(&
-  //^^^^^^^)
     Struct[0];
   //^^^^^^(&
   //^^^^^^)
@@ -408,9 +464,8 @@ impl core::ops::IndexMut for Struct {}
                 ..DISABLED_CONFIG
             },
             r#"
-//- minicore: coerce_unsized, fn, eq, index, dispatch_from_dyn
+//- minicore: coerce_unsized, fn, eq, index, dispatch_from_dyn, builtin_impls
 fn main() {
-
     Struct.consume();
     Struct.by_ref();
   //^^^^^^.&
@@ -465,9 +520,10 @@ fn main() {
     (()) == {()};
   // ^^.&
          // ^^^^.&
-    let closure: dyn Fn = || ();
+    let closure: &dyn Fn = &|| ();
+                         //^^^^^^(
+                         //^^^^^^).*.&.<unsize>
     closure();
-  //^^^^^^^.&
     Struct[0];
   //^^^^^^.&
     &mut Struct[0];
@@ -671,6 +727,38 @@ fn hello(it: &&[impl T]) {
     it.len();
   //^^(&**
   //^^)
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn disable_reborrows() {
+        check_with_config(
+            InlayHintsConfig {
+                adjustment_hints: AdjustmentHints::Always,
+                adjustment_hints_disable_reborrows: true,
+                ..DISABLED_CONFIG
+            },
+            r#"
+#![rustc_coherence_is_core]
+
+trait ToOwned {
+    type Owned;
+    fn to_owned(&self) -> Self::Owned;
+}
+
+struct String;
+impl ToOwned for str {
+    type Owned = String;
+    fn to_owned(&self) -> Self::Owned { String }
+}
+
+fn a(s: &String) {}
+
+fn main() {
+    let s = "".to_owned();
+    a(&s)
 }
 "#,
         );

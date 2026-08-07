@@ -4,27 +4,29 @@ mod analysis;
 #[cfg(test)]
 mod tests;
 
-use std::{iter, ops::ControlFlow};
+use std::{iter, sync::LazyLock};
 
+use base_db::toolchain_channel;
 use hir::{
-    DisplayTarget, HasAttrs, Local, ModPath, ModuleDef, ModuleSource, Name, PathResolution,
-    ScopeDef, Semantics, SemanticsScope, Symbol, Type, TypeInfo,
+    DisplayTarget, HasAttrs, InFile, Local, ModuleDef, ModuleSource, Name, PathResolution,
+    ScopeDef, Semantics, SemanticsScope, Symbol, Type, TypeInfo, sym,
 };
 use ide_db::{
-    base_db::SourceDatabase, famous_defs::FamousDefs, helpers::is_editable_crate, FilePosition,
-    FxHashMap, FxHashSet, RootDatabase,
+    FilePosition, FxHashMap, FxHashSet, RootDatabase, famous_defs::FamousDefs,
+    helpers::is_editable_crate, syntax_helpers::node_ext::is_in_macro_matcher,
 };
+use itertools::Either;
 use syntax::{
-    ast::{self, AttrKind, NameOrNameRef},
-    match_ast, AstNode, Edition, SmolStr,
+    AstNode, Edition, SmolStr,
     SyntaxKind::{self, *},
-    SyntaxToken, TextRange, TextSize, T,
+    SyntaxToken, T, TextRange, TextSize,
+    ast::{self, AttrKind, NameOrNameRef},
 };
 
 use crate::{
-    config::AutoImportExclusionType,
-    context::analysis::{expand_and_analyze, AnalysisResult},
     CompletionConfig,
+    config::AutoImportExclusionType,
+    context::analysis::{AnalysisResult, expand_and_analyze},
 };
 
 const COMPLETION_MARKER: &str = "raCompletionMarker";
@@ -50,6 +52,7 @@ pub(crate) struct QualifierCtx {
     pub(crate) unsafe_tok: Option<SyntaxToken>,
     pub(crate) safe_tok: Option<SyntaxToken>,
     pub(crate) vis_node: Option<ast::Visibility>,
+    pub(crate) abi_node: Option<ast::Abi>,
 }
 
 impl QualifierCtx {
@@ -58,18 +61,19 @@ impl QualifierCtx {
             && self.unsafe_tok.is_none()
             && self.safe_tok.is_none()
             && self.vis_node.is_none()
+            && self.abi_node.is_none()
     }
 }
 
 /// The state of the path we are currently completing.
 #[derive(Debug)]
-pub(crate) struct PathCompletionCtx {
+pub(crate) struct PathCompletionCtx<'db> {
     /// If this is a call with () already there (or {} in case of record patterns)
     pub(crate) has_call_parens: bool,
     /// If this has a macro call bang !
     pub(crate) has_macro_bang: bool,
     /// The qualifier of the current path.
-    pub(crate) qualified: Qualified,
+    pub(crate) qualified: Qualified<'db>,
     /// The parent of the path we are completing.
     pub(crate) parent: Option<ast::Path>,
     #[allow(dead_code)]
@@ -77,14 +81,14 @@ pub(crate) struct PathCompletionCtx {
     pub(crate) path: ast::Path,
     /// The path of which we are completing the segment in the original file
     pub(crate) original_path: Option<ast::Path>,
-    pub(crate) kind: PathKind,
+    pub(crate) kind: PathKind<'db>,
     /// Whether the path segment has type args or not.
     pub(crate) has_type_args: bool,
     /// Whether the qualifier comes from a use tree parent or not
     pub(crate) use_tree_parent: bool,
 }
 
-impl PathCompletionCtx {
+impl PathCompletionCtx<'_> {
     pub(crate) fn is_trivial_path(&self) -> bool {
         matches!(
             self,
@@ -98,13 +102,35 @@ impl PathCompletionCtx {
             }
         )
     }
+
+    pub(crate) fn required_thin_arrow(&self) -> Option<(&'static str, TextSize)> {
+        let PathKind::Type {
+            location:
+                TypeLocation::TypeAscription(TypeAscriptionTarget::RetType {
+                    item: Some(ref fn_item),
+                    ..
+                }),
+        } = self.kind
+        else {
+            return None;
+        };
+        if fn_item.ret_type().is_some_and(|it| it.thin_arrow_token().is_some()) {
+            return None;
+        }
+        let ret_type = fn_item.ret_type().and_then(|it| it.ty());
+        match (ret_type, fn_item.param_list()) {
+            (Some(ty), _) => Some(("-> ", ty.syntax().text_range().start())),
+            (None, Some(param)) => Some((" ->", param.syntax().text_range().end())),
+            (None, None) => None,
+        }
+    }
 }
 
 /// The kind of path we are completing right now.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PathKind {
+pub(crate) enum PathKind<'db> {
     Expr {
-        expr_ctx: PathExprCtx,
+        expr_ctx: PathExprCtx<'db>,
     },
     Type {
         location: TypeLocation,
@@ -138,19 +164,23 @@ pub(crate) struct AttrCtx {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PathExprCtx {
+pub(crate) struct PathExprCtx<'db> {
     pub(crate) in_block_expr: bool,
-    pub(crate) in_breakable: BreakableKind,
+    pub(crate) in_breakable: Option<BreakableKind>,
     pub(crate) after_if_expr: bool,
+    pub(crate) before_else_kw: bool,
     /// Whether this expression is the direct condition of an if or while expression
     pub(crate) in_condition: bool,
     pub(crate) incomplete_let: bool,
+    pub(crate) after_incomplete_let: bool,
+    pub(crate) in_value: bool,
     pub(crate) ref_expr_parent: Option<ast::RefExpr>,
     pub(crate) after_amp: bool,
     /// The surrounding RecordExpression we are completing a functional update
     pub(crate) is_func_update: Option<ast::RecordExpr>,
-    pub(crate) self_param: Option<hir::SelfParam>,
-    pub(crate) innermost_ret_ty: Option<hir::Type>,
+    pub(crate) self_param: Option<Either<hir::SelfParam, hir::Param<'db>>>,
+    pub(crate) innermost_ret_ty: Option<hir::Type<'db>>,
+    pub(crate) innermost_breakable_ty: Option<hir::Type<'db>>,
     pub(crate) impl_: Option<ast::Impl>,
     /// Whether this expression occurs in match arm guard position: before the
     /// fat arrow token
@@ -223,7 +253,7 @@ impl TypeLocation {
 pub(crate) enum TypeAscriptionTarget {
     Let(Option<ast::Pat>),
     FnParam(Option<ast::Pat>),
-    RetType(Option<ast::Expr>),
+    RetType { body: Option<ast::Expr>, item: Option<ast::Fn> },
     Const(Option<ast::Expr>),
 }
 
@@ -239,11 +269,11 @@ pub(crate) enum ItemListKind {
 }
 
 #[derive(Debug)]
-pub(crate) enum Qualified {
+pub(crate) enum Qualified<'db> {
     No,
     With {
         path: ast::Path,
-        resolution: Option<PathResolution>,
+        resolution: Option<PathResolution<'db>>,
         /// How many `super` segments are present in the path
         ///
         /// This would be None, if path is not solely made of
@@ -258,7 +288,7 @@ pub(crate) enum Qualified {
     },
     /// <_>::
     TypeAnchor {
-        ty: Option<hir::Type>,
+        ty: Option<hir::Type<'db>>,
         trait_: Option<hir::Trait>,
     },
     /// Whether the path is an absolute path
@@ -272,14 +302,15 @@ pub(crate) struct PatternContext {
     pub(crate) param_ctx: Option<ParamContext>,
     pub(crate) has_type_ascription: bool,
     pub(crate) should_suggest_name: bool,
+    pub(crate) after_if_expr: bool,
     pub(crate) parent_pat: Option<ast::Pat>,
     pub(crate) ref_token: Option<SyntaxToken>,
     pub(crate) mut_token: Option<SyntaxToken>,
     /// The record pattern this name or ref is a field of
     pub(crate) record_pat: Option<ast::RecordPat>,
-    pub(crate) impl_: Option<ast::Impl>,
+    pub(crate) impl_or_trait: Option<Either<ast::Impl, ast::Trait>>,
     /// List of missing variants in a match expr
-    pub(crate) missing_variants: Vec<hir::Variant>,
+    pub(crate) missing_variants: Vec<hir::EnumVariant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,17 +370,17 @@ pub(crate) enum NameKind {
 
 /// The state of the NameRef we are completing.
 #[derive(Debug)]
-pub(crate) struct NameRefContext {
+pub(crate) struct NameRefContext<'db> {
     /// NameRef syntax in the original file
     pub(crate) nameref: Option<ast::NameRef>,
-    pub(crate) kind: NameRefKind,
+    pub(crate) kind: NameRefKind<'db>,
 }
 
 /// The kind of the NameRef we are completing.
 #[derive(Debug)]
-pub(crate) enum NameRefKind {
-    Path(PathCompletionCtx),
-    DotAccess(DotAccess),
+pub(crate) enum NameRefKind<'db> {
+    Path(PathCompletionCtx<'db>),
+    DotAccess(DotAccess<'db>),
     /// Position where we are only interested in keyword completions
     Keyword(ast::Item),
     /// The record expression this nameref is a field of and whether a dot precedes the completion identifier.
@@ -363,9 +394,9 @@ pub(crate) enum NameRefKind {
 
 /// The identifier we are currently completing.
 #[derive(Debug)]
-pub(crate) enum CompletionAnalysis {
+pub(crate) enum CompletionAnalysis<'db> {
     Name(NameContext),
-    NameRef(NameRefContext),
+    NameRef(NameRefContext<'db>),
     Lifetime(LifetimeContext),
     /// The string the cursor is currently inside
     String {
@@ -377,16 +408,19 @@ pub(crate) enum CompletionAnalysis {
     /// Set if we are currently completing in an unexpanded attribute, this usually implies a builtin attribute like `allow($0)`
     UnexpandedAttrTT {
         colon_prefix: bool,
-        fake_attribute_under_caret: Option<ast::Attr>,
+        fake_attribute_under_caret: Option<ast::TokenTreeMeta>,
         extern_crate: Option<ast::ExternCrate>,
     },
+    /// Set if we are inside the predicate of a `#[cfg]` or `#[cfg_attr]`.
+    CfgPredicate,
+    MacroSegment,
 }
 
 /// Information about the field or method access we are completing.
 #[derive(Debug)]
-pub(crate) struct DotAccess {
+pub(crate) struct DotAccess<'db> {
     pub(crate) receiver: Option<ast::Expr>,
-    pub(crate) receiver_ty: Option<TypeInfo>,
+    pub(crate) receiver_ty: Option<TypeInfo<'db>>,
     pub(crate) kind: DotAccessKind,
     pub(crate) ctx: DotAccessExprCtx,
 }
@@ -398,20 +432,17 @@ pub(crate) enum DotAccessKind {
         /// like `0.$0`
         receiver_is_ambiguous_float_literal: bool,
     },
-    Method {
-        has_parens: bool,
-    },
+    Method,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DotAccessExprCtx {
     pub(crate) in_block_expr: bool,
-    pub(crate) in_breakable: BreakableKind,
+    pub(crate) in_breakable: Option<BreakableKind>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BreakableKind {
-    None,
     Loop,
     For,
     While,
@@ -427,13 +458,14 @@ pub(crate) enum ParamKind {
 /// `CompletionContext` is created early during completion to figure out, where
 /// exactly is the cursor, syntax-wise.
 #[derive(Debug)]
-pub(crate) struct CompletionContext<'a> {
-    pub(crate) sema: Semantics<'a, RootDatabase>,
-    pub(crate) scope: SemanticsScope<'a>,
-    pub(crate) db: &'a RootDatabase,
+pub(crate) struct CompletionContext<'a, 'db> {
+    pub(crate) sema: Semantics<'db, RootDatabase>,
+    pub(crate) scope: SemanticsScope<'db>,
+    pub(crate) db: &'db RootDatabase,
     pub(crate) config: &'a CompletionConfig<'a>,
     pub(crate) position: FilePosition,
 
+    pub(crate) trigger_character: Option<char>,
     /// The token before the cursor, in the original file.
     pub(crate) original_token: SyntaxToken,
     /// The token before the cursor, in the macro-expanded file.
@@ -455,11 +487,11 @@ pub(crate) struct CompletionContext<'a> {
     /// This is usually the parameter name of the function argument we are completing.
     pub(crate) expected_name: Option<NameOrNameRef>,
     /// The expected type of what we are completing.
-    pub(crate) expected_type: Option<Type>,
+    pub(crate) expected_type: Option<Type<'db>>,
 
     pub(crate) qualifier_ctx: QualifierCtx,
 
-    pub(crate) locals: FxHashMap<Name, Local>,
+    pub(crate) locals: FxHashMap<Name, Local<'db>>,
 
     /// The module depth of the current module of the cursor position.
     /// - crate-root
@@ -491,7 +523,7 @@ pub(crate) enum CompleteSemicolon {
     CompleteComma,
 }
 
-impl CompletionContext<'_> {
+impl<'db> CompletionContext<'_, 'db> {
     /// The range of the identifier that is being completed.
     pub(crate) fn source_range(&self) -> TextRange {
         let kind = self.original_token.kind();
@@ -508,22 +540,21 @@ impl CompletionContext<'_> {
         }
     }
 
-    pub(crate) fn famous_defs(&self) -> FamousDefs<'_, '_> {
+    pub(crate) fn famous_defs(&self) -> FamousDefs<'_, 'db> {
         FamousDefs(&self.sema, self.krate)
     }
 
     /// Checks if an item is visible and not `doc(hidden)` at the completion site.
-    pub(crate) fn def_is_visible(&self, item: &ScopeDef) -> Visible {
+    pub(crate) fn def_is_visible(&self, item: &ScopeDef<'db>) -> Visible {
         match item {
             ScopeDef::ModuleDef(def) => match def {
                 hir::ModuleDef::Module(it) => self.is_visible(it),
                 hir::ModuleDef::Function(it) => self.is_visible(it),
                 hir::ModuleDef::Adt(it) => self.is_visible(it),
-                hir::ModuleDef::Variant(it) => self.is_visible(it),
+                hir::ModuleDef::EnumVariant(it) => self.is_visible(it),
                 hir::ModuleDef::Const(it) => self.is_visible(it),
                 hir::ModuleDef::Static(it) => self.is_visible(it),
                 hir::ModuleDef::Trait(it) => self.is_visible(it),
-                hir::ModuleDef::TraitAlias(it) => self.is_visible(it),
                 hir::ModuleDef::TypeAlias(it) => self.is_visible(it),
                 hir::ModuleDef::Macro(it) => self.is_visible(it),
                 hir::ModuleDef::BuiltinType(_) => Visible::Yes,
@@ -552,7 +583,7 @@ impl CompletionContext<'_> {
         I: hir::HasAttrs + Copy,
     {
         let attrs = item.attrs(self.db);
-        attrs.doc_aliases().map(|it| it.as_str().into()).collect()
+        attrs.doc_aliases(self.db).iter().map(|it| it.as_str().into()).collect()
     }
 
     /// Check if an item is `#[doc(hidden)]`.
@@ -566,11 +597,22 @@ impl CompletionContext<'_> {
     }
 
     /// Checks whether this item should be listed in regards to stability. Returns `true` if we should.
-    pub(crate) fn check_stability(&self, attrs: Option<&hir::Attrs>) -> bool {
+    pub(crate) fn check_stability(&self, attrs: Option<&hir::AttrsWithOwner>) -> bool {
         let Some(attrs) = attrs else {
             return true;
         };
-        !attrs.is_unstable() || self.is_nightly
+        if !attrs.is_unstable() {
+            return true;
+        }
+        if !self.is_nightly {
+            return false;
+        }
+        // Unstable on nightly, but we still don't want to suggest internal features, unless the feature flag is enabled.
+        let Some(unstable_feature) = attrs.unstable_feature(self.db) else {
+            return true;
+        };
+        !is_internal_feature(&unstable_feature)
+            || self.krate.is_unstable_feature_enabled(self.db, &unstable_feature)
     }
 
     pub(crate) fn check_stability_and_hidden<I>(&self, item: I) -> bool
@@ -584,15 +626,15 @@ impl CompletionContext<'_> {
 
     /// Whether the given trait is an operator trait or not.
     pub(crate) fn is_ops_trait(&self, trait_: hir::Trait) -> bool {
-        match trait_.attrs(self.db).lang() {
-            Some(lang) => OP_TRAIT_LANG_NAMES.contains(&lang.as_str()),
+        match trait_.attrs(self.db).lang(self.db) {
+            Some(lang) => OP_TRAIT_LANG.contains(&lang),
             None => false,
         }
     }
 
     /// Whether the given trait has `#[doc(notable_trait)]`
     pub(crate) fn is_doc_notable_trait(&self, trait_: hir::Trait) -> bool {
-        trait_.attrs(self.db).has_doc_notable_trait()
+        trait_.attrs(self.db).is_doc_notable_trait()
     }
 
     /// Returns the traits in scope, with the [`Drop`] trait removed.
@@ -606,30 +648,23 @@ impl CompletionContext<'_> {
 
     pub(crate) fn iterate_path_candidates(
         &self,
-        ty: &hir::Type,
+        ty: &hir::Type<'_>,
         mut cb: impl FnMut(hir::AssocItem),
     ) {
         let mut seen = FxHashSet::default();
-        ty.iterate_path_candidates(
-            self.db,
-            &self.scope,
-            &self.traits_in_scope(),
-            Some(self.module),
-            None,
-            |item| {
-                // We might iterate candidates of a trait multiple times here, so deduplicate
-                // them.
-                if seen.insert(item) {
-                    cb(item)
-                }
-                None::<()>
-            },
-        );
+        ty.iterate_path_candidates(self.db, &self.scope, &self.traits_in_scope(), None, |item| {
+            // We might iterate candidates of a trait multiple times here, so deduplicate
+            // them.
+            if seen.insert(item) {
+                cb(item)
+            }
+            None::<()>
+        });
     }
 
     /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items and
-    /// passes all doc-aliases along, to funnel it into [`Completions::add_path_resolution`].
-    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef, Vec<SmolStr>)) {
+    /// passes all doc-aliases along, to funnel it into `Completions::add_path_resolution`.
+    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef<'db>, Vec<SmolStr>)) {
         let _p = tracing::info_span!("CompletionContext::process_all_names").entered();
         self.scope.process_all_names(&mut |name, def| {
             if self.is_scope_def_hidden(def) {
@@ -640,12 +675,12 @@ impl CompletionContext<'_> {
         });
     }
 
-    pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+    pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef<'db>)) {
         let _p = tracing::info_span!("CompletionContext::process_all_names_raw").entered();
         self.scope.process_all_names(f);
     }
 
-    fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
+    fn is_scope_def_hidden(&self, scope_def: ScopeDef<'db>) -> bool {
         if let (Some(attrs), Some(krate)) = (scope_def.attrs(self.db), scope_def.krate(self.db)) {
             return self.is_doc_hidden(&attrs, krate);
         }
@@ -656,7 +691,7 @@ impl CompletionContext<'_> {
     fn is_visible_impl(
         &self,
         vis: &hir::Visibility,
-        attrs: &hir::Attrs,
+        attrs: &hir::AttrsWithOwner,
         defining_crate: hir::Crate,
     ) -> Visible {
         if !self.check_stability(Some(attrs)) {
@@ -675,46 +710,55 @@ impl CompletionContext<'_> {
             };
         }
 
-        if self.is_doc_hidden(attrs, defining_crate) {
-            Visible::No
-        } else {
-            Visible::Yes
-        }
+        if self.is_doc_hidden(attrs, defining_crate) { Visible::No } else { Visible::Yes }
     }
 
-    pub(crate) fn is_doc_hidden(&self, attrs: &hir::Attrs, defining_crate: hir::Crate) -> bool {
+    pub(crate) fn is_doc_hidden(
+        &self,
+        attrs: &hir::AttrsWithOwner,
+        defining_crate: hir::Crate,
+    ) -> bool {
         // `doc(hidden)` items are only completed within the defining crate.
-        self.krate != defining_crate && attrs.has_doc_hidden()
+        self.krate != defining_crate && attrs.is_doc_hidden()
     }
 
-    pub(crate) fn doc_aliases_in_scope(&self, scope_def: ScopeDef) -> Vec<SmolStr> {
+    pub(crate) fn doc_aliases_in_scope(&self, scope_def: ScopeDef<'db>) -> Vec<SmolStr> {
         if let Some(attrs) = scope_def.attrs(self.db) {
-            attrs.doc_aliases().map(|it| it.as_str().into()).collect()
+            attrs.doc_aliases(self.db).iter().map(|it| it.as_str().into()).collect()
         } else {
             vec![]
         }
     }
+
+    pub(crate) fn rebase_ty(&self, ty: &hir::Type<'db>) -> hir::Type<'db> {
+        self.scope
+            .generic_def()
+            .and_then(|def| ty.try_rebase_into_owner(self.db, def))
+            .unwrap_or_else(|| ty.instantiate_with_errors())
+    }
 }
 
 // CompletionContext construction
-impl<'a> CompletionContext<'a> {
+impl<'a, 'db> CompletionContext<'a, 'db> {
     pub(crate) fn new(
-        db: &'a RootDatabase,
+        db: &'db RootDatabase,
         position @ FilePosition { file_id, offset }: FilePosition,
         config: &'a CompletionConfig<'a>,
-    ) -> Option<(CompletionContext<'a>, CompletionAnalysis)> {
+        trigger_character: Option<char>,
+    ) -> Option<(CompletionContext<'a, 'db>, CompletionAnalysis<'db>)> {
         let _p = tracing::info_span!("CompletionContext::new").entered();
         let sema = Semantics::new(db);
 
-        let file_id = sema.attach_first_edition(file_id)?;
-        let original_file = sema.parse(file_id);
+        let editioned_file_id = sema.attach_first_edition(file_id);
+        let original_file = sema.parse(editioned_file_id);
 
         // Insert a fake ident to get a valid parse tree. We will use this file
         // to determine context, though the original_file will be used for
         // actual completion.
         let file_with_fake_ident = {
-            let parse = db.parse(file_id);
-            parse.reparse(TextRange::empty(offset), COMPLETION_MARKER, file_id.edition()).tree()
+            let (_, edition) = editioned_file_id.unpack(db);
+            let parse = editioned_file_id.parse(db);
+            parse.reparse(TextRange::empty(offset), COMPLETION_MARKER, edition).tree()
         };
 
         // always pick the token to the immediate left of the cursor, as that is what we are actually
@@ -728,7 +772,7 @@ impl<'a> CompletionContext<'a> {
             let prev_token = original_token.prev_token()?;
 
             // only has a single colon
-            if prev_token.kind() != T![:] {
+            if prev_token.kind() != T![:] && !is_in_macro_matcher(&original_token) {
                 return None;
             }
 
@@ -752,7 +796,7 @@ impl<'a> CompletionContext<'a> {
             original_offset,
         } = expand_and_analyze(
             &sema,
-            original_file.syntax().clone(),
+            InFile::new(editioned_file_id.into(), original_file.syntax().clone()),
             file_with_fake_ident.syntax().clone(),
             offset,
             &original_token,
@@ -766,7 +810,7 @@ impl<'a> CompletionContext<'a> {
         let containing_function = scope.containing_function();
         let edition = krate.edition(db);
 
-        let toolchain = db.toolchain_channel(krate.into());
+        let toolchain = toolchain_channel(db, krate.into());
         // `toolchain == None` means we're in some detached files. Since we have no information on
         // the toolchain being used, let's just allow unstable items to be listed.
         let is_nightly = matches!(toolchain, Some(base_db::ReleaseChannel::Nightly) | None);
@@ -794,15 +838,12 @@ impl<'a> CompletionContext<'a> {
             .exclude_traits
             .iter()
             .filter_map(|path| {
-                scope
-                    .resolve_mod_path(&ModPath::from_segments(
-                        hir::PathKind::Plain,
-                        path.split("::").map(Symbol::intern).map(Name::new_symbol_root),
-                    ))
-                    .find_map(|it| match it {
+                hir::resolve_absolute_path(db, path.split("::").map(Symbol::intern)).find_map(
+                    |it| match it {
                         hir::ItemInNs::Types(ModuleDef::Trait(t)) => Some(t),
                         _ => None,
-                    })
+                    },
+                )
             })
             .collect();
 
@@ -810,59 +851,64 @@ impl<'a> CompletionContext<'a> {
             .exclude_flyimport
             .iter()
             .flat_map(|(path, kind)| {
-                scope
-                    .resolve_mod_path(&ModPath::from_segments(
-                        hir::PathKind::Plain,
-                        path.split("::").map(Symbol::intern).map(Name::new_symbol_root),
-                    ))
+                hir::resolve_absolute_path(db, path.split("::").map(Symbol::intern))
                     .map(|it| (it.into_module_def(), *kind))
             })
             .collect();
+        let exclude_subitems = exclude_flyimport
+            .iter()
+            .flat_map(|it| match it {
+                (ModuleDef::Module(module), AutoImportExclusionType::SubItems) => {
+                    module.scope(db, None)
+                }
+                _ => vec![],
+            })
+            .filter_map(|(_, def)| match def {
+                ScopeDef::ModuleDef(module_def) => Some(module_def),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let exclude_variants = exclude_flyimport
+            .iter()
+            .flat_map(|it| match it {
+                (ModuleDef::Adt(hir::Adt::Enum(enum_)), AutoImportExclusionType::Variants) => {
+                    enum_.variants(db)
+                }
+                _ => vec![],
+            })
+            .collect::<Vec<_>>();
         exclude_flyimport
             .extend(exclude_traits.iter().map(|&t| (t.into(), AutoImportExclusionType::Always)));
+        exclude_flyimport
+            .extend(exclude_subitems.into_iter().map(|it| (it, AutoImportExclusionType::Always)));
+        exclude_flyimport.extend(
+            exclude_variants.into_iter().map(|it| (it.into(), AutoImportExclusionType::Always)),
+        );
 
-        let complete_semicolon = if config.add_semicolon_to_unit {
-            let inside_closure_ret = token.parent_ancestors().try_for_each(|ancestor| {
-                match_ast! {
-                    match ancestor {
-                        ast::BlockExpr(_) => ControlFlow::Break(false),
-                        ast::ClosureExpr(_) => ControlFlow::Break(true),
-                        _ => ControlFlow::Continue(())
-                    }
-                }
-            });
-
-            if inside_closure_ret == ControlFlow::Break(true) {
-                CompleteSemicolon::DoNotComplete
-            } else {
-                let next_non_trivia_token =
-                    std::iter::successors(token.next_token(), |it| it.next_token())
-                        .find(|it| !it.kind().is_trivia());
-                let in_match_arm = token.parent_ancestors().try_for_each(|ancestor| {
-                    if ast::MatchArm::can_cast(ancestor.kind()) {
-                        ControlFlow::Break(true)
-                    } else if matches!(
-                        ancestor.kind(),
-                        SyntaxKind::EXPR_STMT | SyntaxKind::BLOCK_EXPR
-                    ) {
-                        ControlFlow::Break(false)
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                });
-                // FIXME: This will assume expr macros are not inside match, we need to somehow go to the "parent" of the root node.
-                let in_match_arm = match in_match_arm {
-                    ControlFlow::Continue(()) => false,
-                    ControlFlow::Break(it) => it,
-                };
-                let complete_token = if in_match_arm { T![,] } else { T![;] };
-                if next_non_trivia_token.map(|it| it.kind()) == Some(complete_token) {
-                    CompleteSemicolon::DoNotComplete
-                } else if in_match_arm {
-                    CompleteSemicolon::CompleteComma
-                } else {
-                    CompleteSemicolon::CompleteSemi
-                }
+        // FIXME: This should be part of `CompletionAnalysis` / `expand_and_analyze`
+        let complete_semicolon = if !config.add_semicolon_to_unit {
+            CompleteSemicolon::DoNotComplete
+        } else if let Some(term_node) =
+            sema.token_ancestors_with_macros(token.clone()).find(|node| {
+                matches!(
+                    node.kind(),
+                    BLOCK_EXPR
+                        | MATCH_ARM
+                        | CLOSURE_EXPR
+                        | ARG_LIST
+                        | PAREN_EXPR
+                        | ARRAY_EXPR
+                        | MATCH_EXPR
+                )
+            })
+        {
+            let next_token = iter::successors(token.next_token(), |it| it.next_token())
+                .map(|it| it.kind())
+                .find(|kind| !kind.is_trivia());
+            match term_node.kind() {
+                MATCH_ARM if next_token != Some(T![,]) => CompleteSemicolon::CompleteComma,
+                BLOCK_EXPR if next_token != Some(T![;]) => CompleteSemicolon::CompleteSemi,
+                _ => CompleteSemicolon::DoNotComplete,
             }
         } else {
             CompleteSemicolon::DoNotComplete
@@ -875,6 +921,7 @@ impl<'a> CompletionContext<'a> {
             db,
             config,
             position,
+            trigger_character,
             original_token,
             token,
             krate,
@@ -896,35 +943,82 @@ impl<'a> CompletionContext<'a> {
     }
 }
 
-const OP_TRAIT_LANG_NAMES: &[&str] = &[
-    "add_assign",
-    "add",
-    "bitand_assign",
-    "bitand",
-    "bitor_assign",
-    "bitor",
-    "bitxor_assign",
-    "bitxor",
-    "deref_mut",
-    "deref",
-    "div_assign",
-    "div",
-    "eq",
-    "fn_mut",
-    "fn_once",
-    "fn",
-    "index_mut",
-    "index",
-    "mul_assign",
-    "mul",
-    "neg",
-    "not",
-    "partial_ord",
-    "rem_assign",
-    "rem",
-    "shl_assign",
-    "shl",
-    "shr_assign",
-    "shr",
-    "sub",
+const OP_TRAIT_LANG: &[hir::LangItem] = &[
+    hir::LangItem::AddAssign,
+    hir::LangItem::Add,
+    hir::LangItem::BitAndAssign,
+    hir::LangItem::BitAnd,
+    hir::LangItem::BitOrAssign,
+    hir::LangItem::BitOr,
+    hir::LangItem::BitXorAssign,
+    hir::LangItem::BitXor,
+    hir::LangItem::DerefMut,
+    hir::LangItem::Deref,
+    hir::LangItem::DivAssign,
+    hir::LangItem::Div,
+    hir::LangItem::PartialEq,
+    hir::LangItem::FnMut,
+    hir::LangItem::FnOnce,
+    hir::LangItem::Fn,
+    hir::LangItem::IndexMut,
+    hir::LangItem::Index,
+    hir::LangItem::MulAssign,
+    hir::LangItem::Mul,
+    hir::LangItem::Neg,
+    hir::LangItem::Not,
+    hir::LangItem::PartialOrd,
+    hir::LangItem::RemAssign,
+    hir::LangItem::Rem,
+    hir::LangItem::ShlAssign,
+    hir::LangItem::Shl,
+    hir::LangItem::ShrAssign,
+    hir::LangItem::Shr,
+    hir::LangItem::Sub,
 ];
+
+// FIXME: Find a way to keep this up to date somehow?
+const INTERNAL_FEATURES_LIST: &[Symbol] = &[
+    sym::abi_unadjusted,
+    sym::allocator_internals,
+    sym::allow_internal_unsafe,
+    sym::allow_internal_unstable,
+    sym::cfg_emscripten_wasm_eh,
+    sym::cfg_target_has_reliable_f16_f128,
+    sym::compiler_builtins,
+    sym::custom_mir,
+    sym::eii_internals,
+    sym::field_representing_type_raw,
+    sym::intrinsics,
+    sym::core_intrinsics,
+    sym::lang_items,
+    sym::link_cfg,
+    sym::more_maybe_bounds,
+    sym::negative_bounds,
+    sym::pattern_complexity_limit,
+    sym::prelude_import,
+    sym::profiler_runtime,
+    sym::rustc_attrs,
+    sym::staged_api,
+    sym::test_unstable_lint,
+    sym::builtin_syntax,
+    sym::link_llvm_intrinsics,
+    sym::needs_panic_runtime,
+    sym::panic_runtime,
+    sym::pattern_types,
+    sym::rustdoc_internals,
+    sym::contracts_internals,
+    sym::freeze_impls,
+    sym::unsized_fn_params,
+];
+
+static INTERNAL_FEATURES: LazyLock<FxHashSet<Symbol>> =
+    LazyLock::new(|| INTERNAL_FEATURES_LIST.iter().cloned().collect());
+
+fn is_internal_feature(feature: &Symbol) -> bool {
+    if INTERNAL_FEATURES.contains(feature) {
+        return true;
+    }
+    // Libs features are internal if they end in `_internal` or `_internals`.
+    let feature = feature.as_str();
+    feature.ends_with("_internal") || feature.ends_with("_internals")
+}

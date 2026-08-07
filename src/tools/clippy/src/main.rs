@@ -4,21 +4,24 @@
 // warn on lints, that are included in `rust-lang/rust`s bootstrap
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
+extern crate rustc_driver;
+
 use std::env;
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{self, Command};
+use std::process::{self, Command, exit};
 
-use anstream::println;
-
-#[allow(clippy::ignored_unit_patterns)]
 fn show_help() {
-    println!("{}", help_message());
+    if writeln!(&mut anstream::stdout().lock(), "{}", help_message()).is_err() {
+        exit(rustc_driver::EXIT_FAILURE);
+    }
 }
 
-#[allow(clippy::ignored_unit_patterns)]
 fn show_version() {
     let version_info = rustc_tools_util::get_version_info!();
-    println!("{version_info}");
+    if writeln!(&mut anstream::stdout().lock(), "{version_info}").is_err() {
+        exit(rustc_driver::EXIT_FAILURE);
+    }
 }
 
 pub fn main() {
@@ -39,9 +42,8 @@ pub fn main() {
             process::exit(clippy_lints::explain(
                 &lint.strip_prefix("clippy::").unwrap_or(&lint).replace('-', "_"),
             ));
-        } else {
-            show_help();
         }
+        show_help();
         return;
     }
 
@@ -107,7 +109,7 @@ impl ClippyCmd {
     }
 
     fn into_std_cmd(self) -> Command {
-        let mut cmd = Command::new(env::var("CARGO").unwrap_or("cargo".into()));
+        let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let clippy_args: String = self
             .clippy_args
             .iter()

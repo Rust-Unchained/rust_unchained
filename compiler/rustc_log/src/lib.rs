@@ -33,15 +33,23 @@
 //! debugging, you can make changes inside those crates and quickly run main.rs
 //! to read the debug logs.
 
+use std::cell::Cell;
 use std::env::{self, VarError};
 use std::fmt::{self, Display};
+use std::fs::File;
 use std::io::{self, IsTerminal};
+use std::sync::Mutex;
 
-use tracing_core::{Event, Subscriber};
+use tracing::dispatcher::SetGlobalDefaultError;
+use tracing::{Event, Subscriber, span};
 use tracing_subscriber::filter::{Directive, EnvFilter, LevelFilter};
 use tracing_subscriber::fmt::FmtContext;
-use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::fmt::format::{self, FmtSpan, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{Layer, Registry};
+// Re-export tracing
+pub use {tracing, tracing_core, tracing_subscriber};
 
 /// The values of all the environment variables that matter for configuring a logger.
 /// Errors are explicitly preserved so that we can share error handling.
@@ -51,12 +59,15 @@ pub struct LoggerConfig {
     pub verbose_entry_exit: Result<String, VarError>,
     pub verbose_thread_ids: Result<String, VarError>,
     pub backtrace: Result<String, VarError>,
+    pub json: Result<String, VarError>,
+    pub output_target: Result<String, VarError>,
     pub wraptree: Result<String, VarError>,
     pub lines: Result<String, VarError>,
 }
 
 impl LoggerConfig {
     pub fn from_env(env: &str) -> Self {
+        // NOTE: documented in the dev guide. If you change this, also update it!
         LoggerConfig {
             filter: env::var(env),
             color_logs: env::var(format!("{env}_COLOR")),
@@ -65,12 +76,44 @@ impl LoggerConfig {
             backtrace: env::var(format!("{env}_BACKTRACE")),
             wraptree: env::var(format!("{env}_WRAPTREE")),
             lines: env::var(format!("{env}_LINES")),
+            json: env::var(format!("{env}_FORMAT_JSON")),
+            output_target: env::var(format!("{env}_OUTPUT_TARGET")),
         }
     }
 }
 
 /// Initialize the logger with the given values for the filter, coloring, and other options env variables.
 pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
+    init_logger_with_additional_layer(cfg, Registry::default)
+}
+
+/// Trait alias for the complex return type of `build_subscriber` in
+/// [init_logger_with_additional_layer]. A [Registry] with any composition of [tracing::Subscriber]s
+/// (e.g. `Registry::default().with(custom_layer)`) should be compatible with this type.
+/// Having an alias is also useful so rustc_driver_impl does not need to explicitly depend on
+/// `tracing_subscriber`.
+pub trait BuildSubscriberRet:
+    tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync
+{
+}
+
+impl<
+    T: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
+> BuildSubscriberRet for T
+{
+}
+
+/// Initialize the logger with the given values for the filter, coloring, and other options env variables.
+/// Additionally add a custom layer to collect logging and tracing events via `build_subscriber`,
+/// for example: `|| Registry::default().with(custom_layer)`.
+pub fn init_logger_with_additional_layer<F, T>(
+    cfg: LoggerConfig,
+    build_subscriber: F,
+) -> Result<(), Error>
+where
+    F: FnOnce() -> T,
+    T: BuildSubscriberRet,
+{
     let filter = match cfg.filter {
         Ok(env) => EnvFilter::new(env),
         _ => EnvFilter::default().add_directive(Directive::from(LevelFilter::WARN)),
@@ -102,39 +145,74 @@ pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
         Err(_) => false,
     };
 
-    let mut layer = tracing_tree::HierarchicalLayer::default()
-        .with_writer(io::stderr)
-        .with_ansi(color_logs)
-        .with_targets(true)
-        .with_verbose_exit(verbose_entry_exit)
-        .with_verbose_entry(verbose_entry_exit)
-        .with_indent_amount(2)
-        .with_indent_lines(lines)
-        .with_thread_ids(verbose_thread_ids)
-        .with_thread_names(verbose_thread_ids);
+    let json = match cfg.json {
+        Ok(v) => &v == "1",
+        Err(_) => false,
+    };
 
-    match cfg.wraptree {
-        Ok(v) => match v.parse::<usize>() {
-            Ok(v) => {
-                layer = layer.with_wraparound(v);
+    let output_target: BoxMakeWriter = match cfg.output_target {
+        Ok(v) => match File::options().create(true).write(true).truncate(true).open(&v) {
+            Ok(i) => BoxMakeWriter::new(Mutex::new(i)),
+            Err(e) => {
+                eprintln!("couldn't open {v} as a log target: {e:?}");
+                BoxMakeWriter::new(io::stderr)
             }
-            Err(_) => return Err(Error::InvalidWraptree(v)),
         },
-        Err(_) => {} // no wraptree
-    }
+        Err(_) => BoxMakeWriter::new(io::stderr),
+    };
 
-    let subscriber = tracing_subscriber::Registry::default().with(filter).with(layer);
+    let layer = if json {
+        let format = tracing_subscriber::fmt::format()
+            .json()
+            .with_span_list(true)
+            .with_source_location(true);
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .event_format(format)
+            .with_writer(output_target)
+            .with_target(true)
+            .with_ansi(false)
+            .with_thread_ids(verbose_thread_ids)
+            .with_thread_names(verbose_thread_ids)
+            .with_span_events(FmtSpan::ACTIVE);
+        let fmt_layer = NonrecursiveLayer { inner: fmt_layer };
+        Layer::boxed(fmt_layer)
+    } else {
+        let mut layer = tracing_tree::HierarchicalLayer::default()
+            .with_writer(output_target)
+            .with_ansi(color_logs)
+            .with_targets(true)
+            .with_verbose_exit(verbose_entry_exit)
+            .with_verbose_entry(verbose_entry_exit)
+            .with_indent_amount(2)
+            .with_indent_lines(lines)
+            .with_thread_ids(verbose_thread_ids)
+            .with_thread_names(verbose_thread_ids);
+
+        if let Ok(v) = cfg.wraptree {
+            match v.parse::<usize>() {
+                Ok(v) => layer = layer.with_wraparound(v),
+                Err(_) => return Err(Error::InvalidWraptree(v)),
+            }
+        }
+
+        Layer::boxed(layer)
+    };
+
+    let subscriber = build_subscriber();
+    // NOTE: It is important to make sure that the filter is applied on the last layer
     match cfg.backtrace {
         Ok(backtrace_target) => {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_writer(io::stderr)
                 .without_time()
                 .event_format(BacktraceFormatter { backtrace_target });
-            let subscriber = subscriber.with(fmt_layer);
-            tracing::subscriber::set_global_default(subscriber).unwrap();
+            let subscriber = subscriber.with(layer).with(fmt_layer).with(filter);
+            tracing::subscriber::set_global_default(subscriber)?;
         }
         Err(_) => {
-            tracing::subscriber::set_global_default(subscriber).unwrap();
+            tracing::subscriber::set_global_default(subscriber.with(layer).with(filter))?;
         }
     };
 
@@ -180,6 +258,7 @@ pub enum Error {
     InvalidColorValue(String),
     NonUnicodeColorValue,
     InvalidWraptree(String),
+    AlreadyInit(SetGlobalDefaultError),
 }
 
 impl std::error::Error for Error {}
@@ -199,6 +278,115 @@ impl Display for Error {
                 formatter,
                 "invalid log WRAPTREE value '{value}': expected a non-negative integer",
             ),
+            Error::AlreadyInit(tracing_error) => Display::fmt(tracing_error, formatter),
         }
+    }
+}
+
+impl From<SetGlobalDefaultError> for Error {
+    fn from(tracing_error: SetGlobalDefaultError) -> Self {
+        Error::AlreadyInit(tracing_error)
+    }
+}
+
+thread_local! {
+    static NONRECURSIVE_GUARD_LOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+struct NonrecursiveGuard;
+
+impl NonrecursiveGuard {
+    fn lock() -> Option<NonrecursiveGuard> {
+        if !NONRECURSIVE_GUARD_LOCK.replace(true) { Some(NonrecursiveGuard) } else { None }
+    }
+}
+
+impl Drop for NonrecursiveGuard {
+    fn drop(&mut self) {
+        NONRECURSIVE_GUARD_LOCK.set(false);
+    }
+}
+
+/// Many debug messages that rustc emits produce additional debug messages when formatting the
+/// arguments to the original debug message. [`tracing_tree::HierarchicalLayer`] (used by the
+/// default output format) filters these out, but [`tracing_subscriber::fmt::format::Json`] (used by
+/// `RUSTC_LOG_FORMAT_JSON`) does not. So, implement a simple recursion check to filter these
+/// messages out.
+struct NonrecursiveLayer<S> {
+    inner: S,
+}
+
+impl<S: Subscriber, L: Layer<S>> Layer<S> for NonrecursiveLayer<L> {
+    fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
+        self.inner.on_register_dispatch(subscriber)
+    }
+
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.inner.on_layer(subscriber)
+    }
+
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing_core::Interest {
+        self.inner.register_callsite(metadata)
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, ctx: Context<'_, S>) -> bool {
+        self.inner.enabled(metadata, ctx)
+    }
+
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_new_span(attrs, id, ctx)
+        }
+    }
+
+    fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_record(span, values, ctx)
+        }
+    }
+
+    fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_follows_from(span, follows, ctx)
+        }
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, ctx: Context<'_, S>) -> bool {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.event_enabled(event, ctx)
+        } else {
+            false
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_event(event, ctx)
+        }
+    }
+
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_enter(id, ctx)
+        }
+    }
+
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_exit(id, ctx)
+        }
+    }
+
+    fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+        if let Some(_) = NonrecursiveGuard::lock() {
+            self.inner.on_close(id, ctx)
+        }
+    }
+
+    fn on_id_change(&self, old: &span::Id, new: &span::Id, ctx: Context<'_, S>) {
+        self.inner.on_id_change(old, new, ctx)
     }
 }

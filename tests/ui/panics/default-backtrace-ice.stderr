@@ -1,5 +1,5 @@
 error: internal compiler error[E0425]: cannot find value `missing_ident` in this scope
-  --> $DIR/default-backtrace-ice.rs:23:13
+  --> $DIR/default-backtrace-ice.rs:20:13
    |
 LL | fn main() { missing_ident; }
    |             ^^^^^^^^^^^^^ not found in this scope
@@ -13,7 +13,7 @@ stack backtrace:
 (end_short_backtrace)
 (begin_short_backtrace)
 
-error: the compiler unexpectedly panicked. this is a bug.
+error: the compiler unexpectedly panicked. This is a bug
 
 
 

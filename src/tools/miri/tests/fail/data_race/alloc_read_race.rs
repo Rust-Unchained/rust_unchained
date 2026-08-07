@@ -1,6 +1,5 @@
-//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
-// Avoid accidental synchronization via address reuse inside `thread::spawn`.
-//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-deterministic-concurrency -Zmiri-disable-stacked-borrows
 
 use std::mem::MaybeUninit;
 use std::ptr::null_mut;
@@ -13,7 +12,7 @@ struct EvilSend<T>(pub T);
 unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
 
-pub fn main() {
+fn main() {
     // Shared atomic pointer
     let pointer = AtomicPtr::new(null_mut::<MaybeUninit<usize>>());
     let ptr = EvilSend(&pointer as *const AtomicPtr<MaybeUninit<usize>>);

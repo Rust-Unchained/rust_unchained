@@ -6,7 +6,8 @@ use rustc_span::Span;
 use tracing::debug;
 
 use crate::builder::ForGuard::OutsideGuard;
-use crate::builder::matches::{DeclareLetBindings, EmitStorageLive, ScheduleDrops};
+use crate::builder::matches::{DeclareLetBindings, ScheduleDrops};
+use crate::builder::scope::LintLevel;
 use crate::builder::{BlockAnd, BlockAndExtension, BlockFrame, Builder};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
@@ -39,7 +40,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         expr: Option<ExprId>,
         region_scope: Scope,
     ) -> BlockAnd<()> {
-        let this = self;
+        let this = self; // See "LET_THIS_SELF".
 
         // This convoluted structure is to avoid using recursion as we walk down a list
         // of statements. Basically, the structure we get back is something like:
@@ -83,7 +84,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     init_scope,
                     pattern,
                     initializer: Some(initializer),
-                    lint_level,
+                    hir_id,
                     else_block: Some(else_block),
                     span: _,
                 } => {
@@ -183,7 +184,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                     // Declare the bindings, which may create a source scope.
                     let remainder_span = remainder_scope.span(this.tcx, this.region_scope_tree);
-                    this.push_scope((*remainder_scope, source_info));
+                    this.push_scope(*remainder_scope);
                     let_scope_stack.push(remainder_scope);
 
                     let visibility_scope =
@@ -191,7 +192,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                     let initializer_span = this.thir[*initializer].span;
                     let scope = (*init_scope, source_info);
-                    let failure_and_block = this.in_scope(scope, *lint_level, |this| {
+                    let lint_level = LintLevel::Explicit(*hir_id);
+                    let failure_and_block = this.in_scope(scope, lint_level, |this| {
                         this.declare_bindings(
                             visibility_scope,
                             remainder_span,
@@ -199,15 +201,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             None,
                             Some((Some(&destination), initializer_span)),
                         );
-                        this.visit_primary_bindings(pattern, &mut |this, node, span| {
-                            this.storage_live_binding(
-                                block,
-                                node,
-                                span,
-                                OutsideGuard,
-                                ScheduleDrops::Yes,
-                            );
-                        });
                         let else_block_span = this.thir[*else_block].span;
                         let (matching, failure) =
                             this.in_if_then_scope(last_remainder_scope, else_block_span, |this| {
@@ -218,7 +211,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                     None,
                                     initializer_span,
                                     DeclareLetBindings::No,
-                                    EmitStorageLive::No,
                                 )
                             });
                         matching.and(failure)
@@ -242,7 +234,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     init_scope,
                     pattern,
                     initializer,
-                    lint_level,
+                    hir_id,
                     else_block: None,
                     span: _,
                 } => {
@@ -250,7 +242,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     this.block_context.push(BlockFrame::Statement { ignores_expr_result });
 
                     // Enter the remainder scope, i.e., the bindings' destruction scope.
-                    this.push_scope((*remainder_scope, source_info));
+                    this.push_scope(*remainder_scope);
                     let_scope_stack.push(remainder_scope);
 
                     // Declare the bindings, which may create a source scope.
@@ -260,12 +252,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         Some(this.new_source_scope(remainder_span, LintLevel::Inherited));
 
                     // Evaluate the initializer, if present.
+                    let lint_level = LintLevel::Explicit(*hir_id);
                     if let Some(init) = *initializer {
                         let initializer_span = this.thir[init].span;
                         let scope = (*init_scope, source_info);
 
                         block = this
-                            .in_scope(scope, *lint_level, |this| {
+                            .in_scope(scope, lint_level, |this| {
                                 this.declare_bindings(
                                     visibility_scope,
                                     remainder_span,
@@ -279,7 +272,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             .into_block();
                     } else {
                         let scope = (*init_scope, source_info);
-                        let _: BlockAnd<()> = this.in_scope(scope, *lint_level, |this| {
+                        let _: BlockAnd<()> = this.in_scope(scope, lint_level, |this| {
                             this.declare_bindings(
                                 visibility_scope,
                                 remainder_span,
@@ -296,6 +289,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                 block,
                                 node,
                                 span,
+                                false,
                                 OutsideGuard,
                                 ScheduleDrops::Yes,
                             );
@@ -339,7 +333,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // Opaque types of empty bodies also need this unit assignment, in order to infer that their
             // type is actually unit. Otherwise there will be no defining use found in the MIR.
             if destination_ty.is_unit()
-                || matches!(destination_ty.kind(), ty::Alias(ty::Opaque, ..))
+                || matches!(
+                    destination_ty.kind(),
+                    ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. })
+                )
             {
                 // We only want to assign an implicit `()` as the return value of the block if the
                 // block does not diverge. (Otherwise, we may try to assign a unit to a `!`-type.)
@@ -349,7 +346,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // Finally, we pop all the let scopes before exiting out from the scope of block
         // itself.
         for scope in let_scope_stack.into_iter().rev() {
-            block = this.pop_scope((*scope, source_info), block).into_block();
+            block = this.pop_scope(*scope, block).into_block();
         }
         // Restore the original source scope.
         this.source_scope = outer_source_scope;

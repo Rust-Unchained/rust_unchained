@@ -1,39 +1,41 @@
 //! Builtin derives.
 
+use base_db::SourceDatabase;
+use either::Either;
 use intern::sym;
-use itertools::{izip, Itertools};
+use itertools::{Itertools, izip};
 use parser::SyntaxKind;
 use rustc_hash::FxHashSet;
-use span::{Edition, MacroCallId, Span, SyntaxContextId};
+use span::{Edition, Span};
 use stdx::never;
 use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
 
 use crate::{
-    builtin::quote::{dollar_crate, quote},
-    db::ExpandDatabase,
+    ExpandError, ExpandResult, MacroCallId,
+    builtin::quote::dollar_crate,
     hygiene::span_with_def_site_ctxt,
     name::{self, AsName, Name},
     span_map::ExpansionSpanMap,
-    tt, ExpandError, ExpandResult,
+    tt,
 };
 use syntax::{
     ast::{
-        self, edit_in_place::GenericParamsOwnerEdit, make, AstNode, FieldList, HasAttrs,
-        HasGenericArgs, HasGenericParams, HasModuleItem, HasName, HasTypeBounds,
+        self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
+        HasName, HasTypeBounds,
     },
-    ted,
+    syntax_editor::{GetOrCreateWhereClause, SyntaxEditor},
 };
 
 macro_rules! register_builtin {
-    ( $($trait:ident => $expand:ident),* ) => {
+    ( $($trait:ident => $expand:ident),* $(,)? ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum BuiltinDeriveExpander {
             $($trait),*
         }
 
         impl BuiltinDeriveExpander {
-            pub fn expander(&self) -> fn(&dyn ExpandDatabase, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> fn(&dyn SourceDatabase, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( BuiltinDeriveExpander::$trait => $expand, )*
                 }
@@ -46,19 +48,18 @@ macro_rules! register_builtin {
                 }
             }
         }
-
     };
 }
 
 impl BuiltinDeriveExpander {
     pub fn expand(
         &self,
-        db: &dyn ExpandDatabase,
+        db: &dyn SourceDatabase,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
-        let span = span_with_def_site_ctxt(db, span, id, Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
         self.expander()(db, span, tt)
     }
 }
@@ -73,7 +74,7 @@ register_builtin! {
     PartialOrd => partial_ord_expand,
     Eq => eq_expand,
     PartialEq => partial_eq_expand,
-    CoercePointee => coerce_pointee_expand
+    CoercePointee => coerce_pointee_expand,
 }
 
 pub fn find_builtin_derive(ident: &name::Name) -> Option<BuiltinDeriveExpander> {
@@ -117,7 +118,7 @@ impl VariantShape {
                     quote! {span => #it : #mapped , }
                 });
                 quote! {span =>
-                    #path { ##fields }
+                    #path { # #fields }
                 }
             }
             &VariantShape::Tuple(n) => {
@@ -128,7 +129,7 @@ impl VariantShape {
                     }
                 });
                 quote! {span =>
-                    #path ( ##fields )
+                    #path ( # #fields )
                 }
             }
             VariantShape::Unit => path,
@@ -227,7 +228,7 @@ struct AdtParam {
 
 // FIXME: This whole thing needs a refactor. Each derive requires its special values, and the result is a mess.
 fn parse_adt(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
@@ -237,7 +238,7 @@ fn parse_adt(
 
 fn parse_adt_from_syntax(
     adt: &ast::Adt,
-    tm: &span::SpanMap<SyntaxContextId>,
+    tm: &span::SpanMap,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
     let (name, generic_param_list, where_clause, shape) = match &adt {
@@ -386,16 +387,11 @@ fn parse_adt_from_syntax(
 }
 
 fn to_adt_syntax(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     tt: &tt::TopSubtree,
     call_site: Span,
-) -> Result<(ast::Adt, span::SpanMap<SyntaxContextId>), ExpandError> {
-    let (parsed, tm) = crate::db::token_tree_to_syntax_node(
-        db,
-        tt,
-        crate::ExpandTo::Items,
-        parser::Edition::CURRENT_FIXME,
-    );
+) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
+    let (parsed, tm) = crate::token_tree_to_syntax_node(db, tt, crate::ExpandTo::Items);
     let macro_items = ast::MacroItems::cast(parsed.syntax_node())
         .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
     let item =
@@ -416,7 +412,7 @@ fn name_to_token(
     })?;
     let span = token_map.span_at(name.syntax().text_range().start());
 
-    let name_token = tt::Ident::new(name.text().as_ref(), span);
+    let name_token = tt::Ident::new(name.text(), span);
     Ok(name_token)
 }
 
@@ -452,10 +448,11 @@ fn name_to_token(
 /// where B1, ..., BN are the bounds given by `bounds_paths`. Z is a phantom type, and
 /// therefore does not get bound by the derived trait.
 fn expand_simple_derive(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     invoc_span: Span,
     tt: &tt::TopSubtree,
     trait_path: tt::TopSubtree,
+    allow_unions: bool,
     make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let info = match parse_adt(db, tt, invoc_span) {
@@ -464,9 +461,15 @@ fn expand_simple_derive(
             return ExpandResult::new(
                 tt::TopSubtree::empty(tt::DelimSpan { open: invoc_span, close: invoc_span }),
                 e,
-            )
+            );
         }
     };
+    if !allow_unions && matches!(info.shape, AdtShape::Union) {
+        return ExpandResult::new(
+            tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
+            ExpandError::other(invoc_span, "this trait cannot be derived for unions"),
+        );
+    }
     ExpandResult::ok(expand_simple_derive_with_parsed(
         invoc_span,
         info,
@@ -523,26 +526,33 @@ fn expand_simple_derive_with_parsed(
 
     let name = info.name;
     quote! {invoc_span =>
-        impl < ##params #extra_impl_params > #trait_path for #name < ##args > where ##where_block { #trait_body }
+        impl < # #params #extra_impl_params > #trait_path for #name < # #args > where # #where_block { #trait_body }
     }
 }
 
 fn copy_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::marker::Copy }, |_| quote! {span =>})
+    expand_simple_derive(
+        db,
+        span,
+        tt,
+        quote! {span => #krate::marker::Copy },
+        true,
+        |_| quote! {span =>},
+    )
 }
 
 fn clone_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, |adt| {
+    expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, true, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
@@ -572,7 +582,7 @@ fn clone_expand(
         quote! {span =>
             fn clone(&self) -> Self {
                 match self {
-                    ##arms
+                    # #arms
                 }
             }
         }
@@ -592,55 +602,77 @@ fn and_and(span: Span) -> tt::TopSubtree {
 }
 
 fn default_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::default::Default }, |adt| {
-        let body = match &adt.shape {
-            AdtShape::Struct(fields) => {
-                let name = &adt.name;
-                fields.as_pattern_map(
-                    quote!(span =>#name),
+    let adt = match parse_adt(db, tt, span) {
+        Ok(info) => info,
+        Err(e) => {
+            return ExpandResult::new(
+                tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }),
+                e,
+            );
+        }
+    };
+    let (body, constrain_to_trait) = match &adt.shape {
+        AdtShape::Struct(fields) => {
+            let name = &adt.name;
+            let body = fields.as_pattern_map(
+                quote!(span =>#name),
+                span,
+                |_| quote!(span =>#krate::default::Default::default()),
+            );
+            (body, true)
+        }
+        AdtShape::Enum { default_variant, variants } => {
+            if let Some(d) = default_variant {
+                let (name, fields) = &variants[*d];
+                let adt_name = &adt.name;
+                let body = fields.as_pattern_map(
+                    quote!(span =>#adt_name :: #name),
                     span,
                     |_| quote!(span =>#krate::default::Default::default()),
-                )
-            }
-            AdtShape::Enum { default_variant, variants } => {
-                if let Some(d) = default_variant {
-                    let (name, fields) = &variants[*d];
-                    let adt_name = &adt.name;
-                    fields.as_pattern_map(
-                        quote!(span =>#adt_name :: #name),
-                        span,
-                        |_| quote!(span =>#krate::default::Default::default()),
-                    )
-                } else {
-                    // FIXME: Return expand error here
-                    quote!(span =>)
-                }
-            }
-            AdtShape::Union => {
-                // FIXME: Return expand error here
-                quote!(span =>)
-            }
-        };
-        quote! {span =>
-            fn default() -> Self {
-                #body
+                );
+                (body, false)
+            } else {
+                return ExpandResult::new(
+                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                    ExpandError::other(span, "`#[derive(Default)]` on enum with no `#[default]`"),
+                );
             }
         }
-    })
+        AdtShape::Union => {
+            return ExpandResult::new(
+                tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                ExpandError::other(span, "this trait cannot be derived for unions"),
+            );
+        }
+    };
+    ExpandResult::ok(expand_simple_derive_with_parsed(
+        span,
+        adt,
+        quote! {span => #krate::default::Default },
+        |_adt| {
+            quote! {span =>
+                fn default() -> Self {
+                    #body
+                }
+            }
+        },
+        constrain_to_trait,
+        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+    ))
 }
 
 fn debug_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, |adt| {
+    expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, false, |adt| {
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
                 let for_fields = fields.iter().map(|it| {
@@ -650,7 +682,7 @@ fn debug_expand(
                     }
                 });
                 quote! {span =>
-                    f.debug_struct(#name) ##for_fields .finish()
+                    f.debug_struct(#name) # #for_fields .finish()
                 }
             }
             VariantShape::Tuple(n) => {
@@ -660,7 +692,7 @@ fn debug_expand(
                     }
                 });
                 quote! {span =>
-                    f.debug_tuple(#name) ##for_fields .finish()
+                    f.debug_tuple(#name) # #for_fields .finish()
                 }
             }
             VariantShape::Unit => quote! {span =>
@@ -695,15 +727,12 @@ fn debug_expand(
                     }
                 })
                 .collect(),
-            AdtShape::Union => {
-                // FIXME: Return expand error here
-                vec![]
-            }
+            AdtShape::Union => unreachable!(),
         };
         quote! {span =>
             fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result {
                 match self {
-                    ##arms
+                    # #arms
                 }
             }
         }
@@ -711,16 +740,12 @@ fn debug_expand(
 }
 
 fn hash_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::hash::Hash }, |adt| {
-        if matches!(adt.shape, AdtShape::Union) {
-            // FIXME: Return expand error here
-            return quote! {span =>};
-        }
+    expand_simple_derive(db, span, tt, quote! {span => #krate::hash::Hash }, false, |adt| {
         if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
@@ -736,7 +761,7 @@ fn hash_expand(
                         let it =
                             names.iter().map(|it| quote! {span => #it . hash(ra_expand_state); });
                         quote! {span => {
-                            ##it
+                            # #it
                         } }
                     };
                     let fat_arrow = fat_arrow(span);
@@ -754,7 +779,7 @@ fn hash_expand(
             fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
                 #check_discriminant
                 match self {
-                    ##arms
+                    # #arms
                 }
             }
         }
@@ -762,25 +787,28 @@ fn hash_expand(
 }
 
 fn eq_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Eq }, |_| quote! {span =>})
+    expand_simple_derive(
+        db,
+        span,
+        tt,
+        quote! {span => #krate::cmp::Eq },
+        true,
+        |_| quote! {span =>},
+    )
 }
 
 fn partial_eq_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialEq }, |adt| {
-        if matches!(adt.shape, AdtShape::Union) {
-            // FIXME: Return expand error here
-            return quote! {span =>};
-        }
+    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialEq }, false, |adt| {
         let name = &adt.name;
 
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
@@ -803,7 +831,7 @@ fn partial_eq_expand(
                             let t2 = tt::Ident::new(&format!("{}_other", first.sym), first.span);
                             quote!(span =>#t1 .eq( #t2 ))
                         };
-                        quote!(span =>#first ##rest)
+                        quote!(span =>#first # #rest)
                     }
                 };
                 quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
@@ -814,7 +842,7 @@ fn partial_eq_expand(
         quote! {span =>
             fn eq(&self, other: &Self) -> bool {
                 match (self, other) {
-                    ##arms
+                    # #arms
                     _unused #fat_arrow false
                 }
             }
@@ -847,12 +875,12 @@ fn self_and_other_patterns(
 }
 
 fn ord_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Ord }, |adt| {
+    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Ord }, false, |adt| {
         fn compare(
             krate: &tt::Ident,
             left: tt::TopSubtree,
@@ -871,10 +899,6 @@ fn ord_expand(
                 }
             }
         }
-        if matches!(adt.shape, AdtShape::Union) {
-            // FIXME: Return expand error here
-            return quote!(span =>);
-        }
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
         let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span)).map(
             |(pat1, pat2, fields)| {
@@ -891,7 +915,7 @@ fn ord_expand(
         let fat_arrow = fat_arrow(span);
         let mut body = quote! {span =>
             match (self, other) {
-                ##arms
+                # #arms
                 _unused #fat_arrow #krate::cmp::Ordering::Equal
             }
         };
@@ -909,12 +933,12 @@ fn ord_expand(
 }
 
 fn partial_ord_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialOrd }, |adt| {
+    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::PartialOrd }, false, |adt| {
         fn compare(
             krate: &tt::Ident,
             left: tt::TopSubtree,
@@ -932,10 +956,6 @@ fn partial_ord_expand(
                     c #fat_arrow2 return c,
                 }
             }
-        }
-        if matches!(adt.shape, AdtShape::Union) {
-            // FIXME: Return expand error here
-            return quote!(span =>);
         }
         let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
         let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
@@ -961,14 +981,14 @@ fn partial_ord_expand(
             right,
             quote! {span =>
                 match (self, other) {
-                    ##arms
+                    # #arms
                     _unused #fat_arrow #krate::option::Option::Some(#krate::cmp::Ordering::Equal)
                 }
             },
             span,
         );
         quote! {span =>
-            fn partial_cmp(&self, other: &Self) -> #krate::option::Option::Option<#krate::cmp::Ordering> {
+            fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering> {
                 #body
             }
         }
@@ -976,7 +996,7 @@ fn partial_ord_expand(
 }
 
 fn coerce_pointee_expand(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -986,7 +1006,8 @@ fn coerce_pointee_expand(
             return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
         }
     };
-    let adt = adt.clone_for_update();
+    let (editor, adt) = SyntaxEditor::with_ast_node(&adt);
+    let make = editor.make();
     let ast::Adt::Struct(strukt) = &adt else {
         return ExpandResult::new(
             tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
@@ -1057,7 +1078,7 @@ fn coerce_pointee_expand(
                 if is_pointee {
                     // Remove the `#[pointee]` attribute so it won't be present in the generated
                     // impls (where we cannot resolve it).
-                    ted::remove(attr.syntax());
+                    editor.delete(attr.syntax());
                 }
                 is_pointee
             })
@@ -1072,7 +1093,7 @@ fn coerce_pointee_expand(
                         "exactly one generic type parameter must be marked \
                                 as `#[pointee]` to derive `CoercePointee` traits",
                     ),
-                )
+                );
             }
             (Some(_), Some(_)) => {
                 return ExpandResult::new(
@@ -1082,7 +1103,7 @@ fn coerce_pointee_expand(
                         "only one type parameter can be marked as `#[pointee]` \
                                 when deriving `CoercePointee` traits",
                     ),
-                )
+                );
             }
         }
     };
@@ -1120,7 +1141,9 @@ fn coerce_pointee_expand(
                 tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
                 ExpandError::other(
                     span,
-                    format!("`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"),
+                    format!(
+                        "`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"
+                    ),
                 ),
             );
         }
@@ -1128,11 +1151,9 @@ fn coerce_pointee_expand(
 
     const ADDED_PARAM: &str = "__S";
 
-    let where_clause = strukt.get_or_create_where_clause();
+    let mut new_predicates: Vec<ast::WherePred> = Vec::new();
 
     {
-        let mut new_predicates = Vec::new();
-
         // # Rewrite generic parameter bounds
         // For each bound `U: ..` in `struct<U: ..>`, make a new bound with `__S` in place of `#[pointee]`
         // Example:
@@ -1160,30 +1181,30 @@ fn coerce_pointee_expand(
                 // If the target type is the pointee, duplicate the bound as whole.
                 // Otherwise, duplicate only bounds that mention the pointee.
                 let is_pointee = param_name.text() == pointee_param_name.text();
-                let new_bounds = bounds
-                    .bounds()
-                    .map(|bound| bound.clone_subtree().clone_for_update())
-                    .filter(|bound| {
-                        bound.ty().is_some_and(|ty| {
-                            substitute_type_in_bound(ty, &pointee_param_name.text(), ADDED_PARAM)
-                                || is_pointee
-                        })
-                    });
+                let new_bounds = bounds.bounds().filter_map(|bound| {
+                    let new_bound = substitute_type_bound(
+                        bound.clone(),
+                        pointee_param_name.text(),
+                        ADDED_PARAM,
+                    );
+
+                    if is_pointee {
+                        return new_bound.or(Some(bound));
+                    }
+                    new_bound
+                });
+
                 let new_bounds_target = if is_pointee {
-                    make::name_ref(ADDED_PARAM)
+                    make.name_ref(ADDED_PARAM)
                 } else {
-                    make::name_ref(&param_name.text())
+                    make.name_ref(param_name.text())
                 };
-                new_predicates.push(
-                    make::where_pred(
-                        make::ty_path(make::path_from_segments(
-                            [make::path_segment(new_bounds_target)],
-                            false,
-                        )),
-                        new_bounds,
-                    )
-                    .clone_for_update(),
-                );
+                new_predicates.push(make.where_pred(
+                    Either::Right(
+                        make.ty_path_from_segments([make.path_segment(new_bounds_target)], false),
+                    ),
+                    new_bounds,
+                ));
             }
         }
 
@@ -1213,41 +1234,21 @@ fn coerce_pointee_expand(
         //
         // We should also write a few new `where` bounds from `#[pointee] T` to `__S`
         // as well as any bound that indirectly involves the `#[pointee] T` type.
-        for predicate in where_clause.predicates() {
-            let predicate = predicate.clone_subtree().clone_for_update();
+        for predicate in strukt.where_clause().into_iter().flat_map(|wc| wc.predicates()) {
             let Some(pred_target) = predicate.ty() else { continue };
 
             // If the target type references the pointee, duplicate the bound as whole.
             // Otherwise, duplicate only bounds that mention the pointee.
-            if substitute_type_in_bound(
-                pred_target.clone(),
-                &pointee_param_name.text(),
-                ADDED_PARAM,
-            ) {
-                if let Some(bounds) = predicate.type_bound_list() {
-                    for bound in bounds.bounds() {
-                        if let Some(ty) = bound.ty() {
-                            substitute_type_in_bound(ty, &pointee_param_name.text(), ADDED_PARAM);
-                        }
-                    }
-                }
-
-                new_predicates.push(predicate);
+            if let Some(predicate_with_substituted_target) =
+                substitute_where_pred(&predicate, pointee_param_name.text(), ADDED_PARAM)
+            {
+                new_predicates.push(predicate_with_substituted_target);
             } else if let Some(bounds) = predicate.type_bound_list() {
-                let new_bounds = bounds
-                    .bounds()
-                    .map(|bound| bound.clone_subtree().clone_for_update())
-                    .filter(|bound| {
-                        bound.ty().is_some_and(|ty| {
-                            substitute_type_in_bound(ty, &pointee_param_name.text(), ADDED_PARAM)
-                        })
-                    });
-                new_predicates.push(make::where_pred(pred_target, new_bounds).clone_for_update());
+                let new_bounds = bounds.bounds().filter_map(|bound| {
+                    substitute_type_bound(bound, pointee_param_name.text(), ADDED_PARAM)
+                });
+                new_predicates.push(make.where_pred(Either::Right(pred_target), new_bounds));
             }
-        }
-
-        for new_predicate in new_predicates {
-            where_clause.add_predicate(new_predicate);
         }
     }
 
@@ -1255,29 +1256,31 @@ fn coerce_pointee_expand(
         // # Add `Unsize<__S>` bound to `#[pointee]` at the generic parameter location
         //
         // Find the `#[pointee]` parameter and add an `Unsize<__S>` bound to it.
-        where_clause.add_predicate(
-            make::where_pred(
-                make::ty_path(make::path_from_segments(
-                    [make::path_segment(make::name_ref(&pointee_param_name.text()))],
+        new_predicates.push(
+            make.where_pred(
+                Either::Right(make.ty_path_from_segments(
+                    [make.path_segment(make.name_ref(pointee_param_name.text()))],
                     false,
                 )),
-                [make::type_bound(make::ty_path(make::path_from_segments(
-                    [
-                        make::path_segment(make::name_ref("core")),
-                        make::path_segment(make::name_ref("marker")),
-                        make::generic_ty_path_segment(
-                            make::name_ref("Unsize"),
-                            [make::type_arg(make::ty_path(make::path_from_segments(
-                                [make::path_segment(make::name_ref(ADDED_PARAM))],
-                                false,
-                            )))
-                            .into()],
-                        ),
-                    ],
-                    true,
-                )))],
-            )
-            .clone_for_update(),
+                [make.type_bound(
+                    make.ty_path_from_segments(
+                        [
+                            make.path_segment(make.name_ref("core")),
+                            make.path_segment(make.name_ref("marker")),
+                            make.generic_ty_path_segment(
+                                make.name_ref("Unsize"),
+                                [make
+                                    .type_arg(make.ty_path_from_segments(
+                                        [make.path_segment(make.name_ref(ADDED_PARAM))],
+                                        false,
+                                    ))
+                                    .into()],
+                            ),
+                        ],
+                        true,
+                    ),
+                )],
+            ),
         );
     }
 
@@ -1291,36 +1294,37 @@ fn coerce_pointee_expand(
             .filter_map(|param| {
                 Some(match param {
                     ast::GenericParam::ConstParam(param) => {
-                        ast::GenericArg::ConstArg(make::expr_const_value(&param.name()?.text()))
+                        ast::GenericArg::ConstArg(make.expr_const_value(param.name()?.text()))
                     }
                     ast::GenericParam::LifetimeParam(param) => {
-                        make::lifetime_arg(param.lifetime()?).into()
+                        make.lifetime_arg(param.lifetime()?).into()
                     }
                     ast::GenericParam::TypeParam(param) => {
                         let name = if pointee_param_idx == type_param_idx {
-                            make::name_ref(ADDED_PARAM)
+                            make.name_ref(ADDED_PARAM)
                         } else {
-                            make::name_ref(&param.name()?.text())
+                            make.name_ref(param.name()?.text())
                         };
                         type_param_idx += 1;
-                        make::type_arg(make::ty_path(make::path_from_segments(
-                            [make::path_segment(name)],
-                            false,
-                        )))
-                        .into()
+                        make.type_arg(make.ty_path_from_segments([make.path_segment(name)], false))
+                            .into()
                     }
                 })
             });
-        let self_for_traits = make::path_from_segments(
-            [make::generic_ty_path_segment(
-                make::name_ref(&struct_name.text()),
+
+        make.path_from_segments(
+            [make.generic_ty_path_segment(
+                make.name_ref(struct_name.text()),
                 self_params_for_traits,
             )],
             false,
         )
-        .clone_for_update();
-        self_for_traits
     };
+
+    strukt.get_or_create_where_clause(&editor, new_predicates.into_iter());
+    let edit = editor.finish();
+    let strukt = ast::Struct::cast(edit.new_root().clone()).unwrap();
+    let adt = ast::Adt::Struct(strukt.clone());
 
     let mut span_map = span::SpanMap::empty();
     // One span for them all.
@@ -1335,7 +1339,7 @@ fn coerce_pointee_expand(
     let info = match parse_adt_from_syntax(&adt, &span_map, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err)
+            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
         }
     };
 
@@ -1384,37 +1388,85 @@ fn coerce_pointee_expand(
     }
 
     /// Returns true if any substitution was performed.
-    fn substitute_type_in_bound(ty: ast::Type, param_name: &str, replacement: &str) -> bool {
-        return match ty {
-            ast::Type::ArrayType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
+    fn substitute_type_bound(
+        bound: ast::TypeBound,
+        param_name: &str,
+        replacement: &str,
+    ) -> Option<ast::TypeBound> {
+        let (editor, bound) = SyntaxEditor::with_ast_node(&bound);
+        let substituted = bound
+            .ty()
+            .is_some_and(|ty| substitute_type_in_bound(&editor, ty, param_name, replacement));
+        if !substituted {
+            return None;
+        }
+
+        let edit = editor.finish();
+        Some(ast::TypeBound::cast(edit.new_root().clone()).unwrap())
+    }
+
+    fn substitute_where_pred(
+        predicate: &ast::WherePred,
+        param_name: &str,
+        replacement: &str,
+    ) -> Option<ast::WherePred> {
+        let (editor, predicate) = SyntaxEditor::with_ast_node(predicate);
+        let substituted = predicate
+            .ty()
+            .is_some_and(|ty| substitute_type_in_bound(&editor, ty, param_name, replacement));
+        if substituted && let Some(bounds) = predicate.type_bound_list() {
+            for bound in bounds.bounds() {
+                if let Some(ty) = bound.ty() {
+                    substitute_type_in_bound(&editor, ty, param_name, replacement);
+                }
             }
-            ast::Type::DynTraitType(ty) => go_bounds(ty.type_bound_list(), param_name, replacement),
+        }
+        if !substituted {
+            return None;
+        }
+
+        let edit = editor.finish();
+        Some(ast::WherePred::cast(edit.new_root().clone()).unwrap())
+    }
+
+    fn substitute_type_in_bound(
+        editor: &SyntaxEditor,
+        ty: ast::Type,
+        param_name: &str,
+        replacement: &str,
+    ) -> bool {
+        let make = editor.make();
+        return match ty {
+            ast::Type::ArrayType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::DynTraitType(ty) => {
+                go_bounds(editor, ty.type_bound_list(), param_name, replacement)
+            }
             ast::Type::FnPtrType(ty) => any_long(
                 ty.param_list()
                     .into_iter()
                     .flat_map(|params| params.params().filter_map(|param| param.ty()))
                     .chain(ty.ret_type().and_then(|it| it.ty())),
-                |ty| substitute_type_in_bound(ty, param_name, replacement),
+                |ty| substitute_type_in_bound(editor, ty, param_name, replacement),
             ),
-            ast::Type::ForType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
+            ast::Type::ForType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
             ast::Type::ImplTraitType(ty) => {
-                go_bounds(ty.type_bound_list(), param_name, replacement)
+                go_bounds(editor, ty.type_bound_list(), param_name, replacement)
             }
-            ast::Type::ParenType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
+            ast::Type::ParenType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
             ast::Type::PathType(ty) => ty.path().is_some_and(|path| {
                 if path.as_single_name_ref().is_some_and(|name| name.text() == param_name) {
-                    ted::replace(
+                    editor.replace(
                         path.syntax(),
-                        make::path_from_segments(
-                            [make::path_segment(make::name_ref(replacement))],
+                        make.path_from_segments(
+                            [make.path_segment(make.name_ref(replacement))],
                             false,
                         )
-                        .clone_for_update()
                         .syntax(),
                     );
                     return true;
@@ -1428,34 +1480,38 @@ fn coerce_pointee_expand(
                             ast::GenericArg::TypeArg(ty) => ty.ty(),
                             _ => None,
                         }),
-                    |ty| substitute_type_in_bound(ty, param_name, replacement),
+                    |ty| substitute_type_in_bound(editor, ty, param_name, replacement),
                 )
             }),
-            ast::Type::PtrType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
-            ast::Type::RefType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
-            ast::Type::SliceType(ty) => {
-                ty.ty().is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
-            ast::Type::TupleType(ty) => {
-                any_long(ty.fields(), |ty| substitute_type_in_bound(ty, param_name, replacement))
-            }
+            ast::Type::PtrType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::RefType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::SliceType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            ast::Type::TupleType(ty) => any_long(ty.fields(), |ty| {
+                substitute_type_in_bound(editor, ty, param_name, replacement)
+            }),
+            ast::Type::PatternType(ty) => ty
+                .ty()
+                .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
             ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
         };
 
         fn go_bounds(
+            editor: &SyntaxEditor,
             bounds: Option<ast::TypeBoundList>,
             param_name: &str,
             replacement: &str,
         ) -> bool {
             bounds.is_some_and(|bounds| {
                 any_long(bounds.bounds(), |bound| {
-                    bound
-                        .ty()
-                        .is_some_and(|ty| substitute_type_in_bound(ty, param_name, replacement))
+                    bound.ty().is_some_and(|ty| {
+                        substitute_type_in_bound(editor, ty, param_name, replacement)
+                    })
                 })
             })
         }

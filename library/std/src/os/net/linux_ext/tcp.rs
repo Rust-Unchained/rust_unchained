@@ -2,15 +2,16 @@
 //!
 //! [`std::net`]: crate::net
 
-use crate::sealed::Sealed;
-use crate::sys_common::AsInner;
+use crate::sys::AsInner;
+#[cfg(target_os = "linux")]
+use crate::time::Duration;
 use crate::{io, net};
 
 /// Os-specific extensions for [`TcpStream`]
 ///
 /// [`TcpStream`]: net::TcpStream
-#[unstable(feature = "tcp_quickack", issue = "96256")]
-pub trait TcpStreamExt: Sealed {
+#[stable(feature = "tcp_quickack", since = "1.89.0")]
+pub impl(self) trait TcpStreamExt {
     /// Enable or disable `TCP_QUICKACK`.
     ///
     /// This flag causes Linux to eagerly send ACKs rather than delaying them.
@@ -22,16 +23,25 @@ pub trait TcpStreamExt: Sealed {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// #![feature(tcp_quickack)]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "cygwin")),
+        doc = "```ignore (needs linux)"
+    )]
     /// use std::net::TcpStream;
+    /// #[cfg(target_os = "linux")]
     /// use std::os::linux::net::TcpStreamExt;
+    /// #[cfg(target_os = "android")]
+    /// use std::os::android::net::TcpStreamExt;
     ///
     /// let stream = TcpStream::connect("127.0.0.1:8080")
     ///         .expect("Couldn't connect to the server...");
     /// stream.set_quickack(true).expect("set_quickack call failed");
     /// ```
-    #[unstable(feature = "tcp_quickack", issue = "96256")]
+    #[stable(feature = "tcp_quickack", since = "1.89.0")]
     fn set_quickack(&self, quickack: bool) -> io::Result<()>;
 
     /// Gets the value of the `TCP_QUICKACK` option on this socket.
@@ -40,26 +50,37 @@ pub trait TcpStreamExt: Sealed {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// #![feature(tcp_quickack)]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "cygwin")),
+        doc = "```ignore (needs linux)"
+    )]
     /// use std::net::TcpStream;
+    /// #[cfg(target_os = "linux")]
     /// use std::os::linux::net::TcpStreamExt;
+    /// #[cfg(target_os = "android")]
+    /// use std::os::android::net::TcpStreamExt;
     ///
     /// let stream = TcpStream::connect("127.0.0.1:8080")
     ///         .expect("Couldn't connect to the server...");
     /// stream.set_quickack(true).expect("set_quickack call failed");
     /// assert_eq!(stream.quickack().unwrap_or(false), true);
     /// ```
-    #[unstable(feature = "tcp_quickack", issue = "96256")]
+    #[stable(feature = "tcp_quickack", since = "1.89.0")]
     fn quickack(&self) -> io::Result<bool>;
 
     /// A socket listener will be awakened solely when data arrives.
     ///
-    /// The `accept` argument set the delay in seconds until the
+    /// The `accept` argument set the maximum delay until the
     /// data is available to read, reducing the number of short lived
     /// connections without data to process.
     /// Contrary to other platforms `SO_ACCEPTFILTER` feature equivalent, there is
     /// no necessity to set it after the `listen` call.
+    /// Note that the delay is expressed as Duration from user's perspective
+    /// the call rounds it down to the nearest second expressible as a `c_int`.
     ///
     /// See [`man 7 tcp`](https://man7.org/linux/man-pages/man7/tcp.7.html)
     ///
@@ -69,40 +90,46 @@ pub trait TcpStreamExt: Sealed {
     /// #![feature(tcp_deferaccept)]
     /// use std::net::TcpStream;
     /// use std::os::linux::net::TcpStreamExt;
+    /// use std::time::Duration;
     ///
     /// let stream = TcpStream::connect("127.0.0.1:8080")
     ///         .expect("Couldn't connect to the server...");
-    /// stream.set_deferaccept(1).expect("set_deferaccept call failed");
+    /// stream.set_deferaccept(Duration::from_secs(1u64)).expect("set_deferaccept call failed");
     /// ```
     #[unstable(feature = "tcp_deferaccept", issue = "119639")]
     #[cfg(target_os = "linux")]
-    fn set_deferaccept(&self, accept: u32) -> io::Result<()>;
+    fn set_deferaccept(&self, accept: Duration) -> io::Result<()>;
 
-    /// Gets the accept delay value (in seconds) of the `TCP_DEFER_ACCEPT` option.
+    /// Gets the accept delay value of the `TCP_DEFER_ACCEPT` option.
     ///
     /// For more information about this option, see [`TcpStreamExt::set_deferaccept`].
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "cygwin")),
+        doc = "```ignore (needs linux)"
+    )]
     /// #![feature(tcp_deferaccept)]
     /// use std::net::TcpStream;
     /// use std::os::linux::net::TcpStreamExt;
+    /// use std::time::Duration;
     ///
     /// let stream = TcpStream::connect("127.0.0.1:8080")
     ///         .expect("Couldn't connect to the server...");
-    /// stream.set_deferaccept(1).expect("set_deferaccept call failed");
-    /// assert_eq!(stream.deferaccept().unwrap_or(0), 1);
+    /// stream.set_deferaccept(Duration::from_secs(1u64)).expect("set_deferaccept call failed");
+    /// assert_eq!(stream.deferaccept().unwrap(), Duration::from_secs(1u64));
     /// ```
     #[unstable(feature = "tcp_deferaccept", issue = "119639")]
     #[cfg(target_os = "linux")]
-    fn deferaccept(&self) -> io::Result<u32>;
+    fn deferaccept(&self) -> io::Result<Duration>;
 }
 
-#[unstable(feature = "tcp_quickack", issue = "96256")]
-impl Sealed for net::TcpStream {}
-
-#[unstable(feature = "tcp_quickack", issue = "96256")]
+#[stable(feature = "tcp_quickack", since = "1.89.0")]
 impl TcpStreamExt for net::TcpStream {
     fn set_quickack(&self, quickack: bool) -> io::Result<()> {
         self.as_inner().as_inner().set_quickack(quickack)
@@ -113,12 +140,12 @@ impl TcpStreamExt for net::TcpStream {
     }
 
     #[cfg(target_os = "linux")]
-    fn set_deferaccept(&self, accept: u32) -> io::Result<()> {
+    fn set_deferaccept(&self, accept: Duration) -> io::Result<()> {
         self.as_inner().as_inner().set_deferaccept(accept)
     }
 
     #[cfg(target_os = "linux")]
-    fn deferaccept(&self) -> io::Result<u32> {
+    fn deferaccept(&self) -> io::Result<Duration> {
         self.as_inner().as_inner().deferaccept()
     }
 }

@@ -1,16 +1,16 @@
 //! Check whether a type has (potentially) non-trivial drop glue.
 
+use rustc_data_structures::Limit;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
+use rustc_hir::find_attr;
 use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::util::{AlwaysRequiresDrop, needs_drop_components};
-use rustc_middle::ty::{self, EarlyBinder, GenericArgsRef, Ty, TyCtxt};
-use rustc_session::Limit;
-use rustc_span::sym;
+use rustc_middle::ty::{self, EarlyBinder, GenericArgsRef, Ty, TyCtxt, Unnormalized};
 use tracing::{debug, instrument};
 
-use crate::errors::NeedsDropOverflow;
+use crate::diagnostics::NeedsDropOverflow;
 
 type NeedsDropResult<T> = Result<T, AlwaysRequiresDrop>;
 
@@ -23,10 +23,16 @@ fn needs_drop_raw<'tcx>(
     // needs drop.
     let adt_has_dtor =
         |adt_def: ty::AdtDef<'tcx>| adt_def.destructor(tcx).map(|_| DtorType::Significant);
-    let res = drop_tys_helper(tcx, query.value, query.typing_env, adt_has_dtor, false, false)
-        .filter(filter_array_elements(tcx, query.typing_env))
-        .next()
-        .is_some();
+    let res = drop_tys_helper(
+        tcx,
+        query.value,
+        query.typing_env,
+        adt_has_dtor,
+        DropTysOptions::default(),
+    )
+    .filter(filter_array_elements(tcx, query.typing_env))
+    .next()
+    .is_some();
 
     debug!("needs_drop_raw({:?}) = {:?}", query, res);
     res
@@ -41,12 +47,18 @@ fn needs_async_drop_raw<'tcx>(
     // it needs async drop.
     let adt_has_async_dtor =
         |adt_def: ty::AdtDef<'tcx>| adt_def.async_destructor(tcx).map(|_| DtorType::Significant);
-    let res = drop_tys_helper(tcx, query.value, query.typing_env, adt_has_async_dtor, false, false)
-        .filter(filter_array_elements(tcx, query.typing_env))
-        .next()
-        .is_some();
+    let res = drop_tys_helper(
+        tcx,
+        query.value,
+        query.typing_env,
+        adt_has_async_dtor,
+        DropTysOptions::default().recurse_into_box_for_async_drop(),
+    )
+    .filter(filter_array_elements_async(tcx, query.typing_env))
+    .next()
+    .is_some();
 
-    debug!("needs_drop_raw({:?}) = {:?}", query, res);
+    debug!("needs_async_drop_raw({:?}) = {:?}", query, res);
     res
 }
 
@@ -66,6 +78,18 @@ fn filter_array_elements<'tcx>(
         Err(AlwaysRequiresDrop) => true,
     }
 }
+fn filter_array_elements_async<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+) -> impl Fn(&Result<Ty<'tcx>, AlwaysRequiresDrop>) -> bool {
+    move |ty| match ty {
+        Ok(ty) => match *ty.kind() {
+            ty::Array(elem, _) => tcx.needs_async_drop_raw(typing_env.as_query_input(elem)),
+            _ => true,
+        },
+        Err(AlwaysRequiresDrop) => true,
+    }
+}
 
 fn has_significant_drop_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -76,8 +100,7 @@ fn has_significant_drop_raw<'tcx>(
         query.value,
         query.typing_env,
         adt_consider_insignificant_dtor(tcx),
-        true,
-        false,
+        DropTysOptions::default().only_significant(),
     )
     .filter(filter_array_elements(tcx, query.typing_env))
     .next()
@@ -89,9 +112,6 @@ fn has_significant_drop_raw<'tcx>(
 struct NeedsDropTypes<'tcx, F> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
-    /// Whether to reveal coroutine witnesses, this is set
-    /// to `false` unless we compute `needs_drop` for a coroutine witness.
-    reveal_coroutine_witnesses: bool,
     query_ty: Ty<'tcx>,
     seen_tys: FxHashSet<Ty<'tcx>>,
     /// A stack of types left to process, and the recursion depth when we
@@ -103,6 +123,15 @@ struct NeedsDropTypes<'tcx, F> {
     adt_components: F,
     /// Set this to true if an exhaustive list of types involved in
     /// drop obligation is requested.
+    // FIXME: Calling this bool `exhaustive` is confusing and possibly a footgun,
+    // since it does two things: It makes the iterator yield *all* of the types
+    // that need drop, and it also affects the computation of the drop components
+    // on `Coroutine`s. The latter is somewhat confusing, and probably should be
+    // a function of `typing_env`. See the HACK comment below for why this is
+    // necessary. If this isn't possible, then we probably should turn this into
+    // a `NeedsDropMode` so that we can have a variant like `CollectAllSignificantDrops`,
+    // which will more accurately indicate that we want *all* of the *significant*
+    // drops, which are the two important behavioral changes toggled by this bool.
     exhaustive: bool,
 }
 
@@ -119,7 +148,6 @@ impl<'tcx, F> NeedsDropTypes<'tcx, F> {
         Self {
             tcx,
             typing_env,
-            reveal_coroutine_witnesses: exhaustive,
             seen_tys,
             query_ty: ty,
             unchecked_tys: vec![(ty, 0)],
@@ -183,23 +211,29 @@ where
                     // for the coroutine witness and check whether any of the contained types
                     // need to be dropped, and only require the captured types to be live
                     // if they do.
-                    ty::Coroutine(_, args) => {
-                        if self.reveal_coroutine_witnesses {
-                            queue_type(self, args.as_coroutine().witness());
+                    ty::Coroutine(def_id, args) => {
+                        // FIXME: See FIXME on `exhaustive` field above.
+                        if self.exhaustive {
+                            for upvar in args.as_coroutine().upvar_tys() {
+                                queue_type(self, upvar);
+                            }
+                            queue_type(self, args.as_coroutine().resume_ty());
+                            if let Some(witness) = tcx.mir_coroutine_witnesses(def_id) {
+                                for field_ty in &witness.field_tys {
+                                    queue_type(
+                                        self,
+                                        EarlyBinder::bind(tcx, field_ty.ty)
+                                            .instantiate(tcx, args)
+                                            .skip_norm_wip(),
+                                    );
+                                }
+                            }
                         } else {
                             return Some(self.always_drop_component(ty));
                         }
                     }
-                    ty::CoroutineWitness(def_id, args) => {
-                        if let Some(witness) = tcx.mir_coroutine_witnesses(def_id) {
-                            self.reveal_coroutine_witnesses = true;
-                            for field_ty in &witness.field_tys {
-                                queue_type(
-                                    self,
-                                    EarlyBinder::bind(field_ty.ty).instantiate(tcx, args),
-                                );
-                            }
-                        }
+                    ty::CoroutineWitness(..) => {
+                        unreachable!("witness should be handled in parent");
                     }
 
                     ty::UnsafeBinder(bound_ty) => {
@@ -233,7 +267,10 @@ where
                         };
                         for required_ty in tys {
                             let required = tcx
-                                .try_normalize_erasing_regions(self.typing_env, required_ty)
+                                .try_normalize_erasing_regions(
+                                    self.typing_env,
+                                    Unnormalized::new_wip(required_ty),
+                                )
                                 .unwrap_or(required_ty);
 
                             queue_type(self, required);
@@ -294,6 +331,30 @@ enum DtorType {
     Significant,
 }
 
+#[derive(Copy, Clone, Default)]
+struct DropTysOptions {
+    only_significant: bool,
+    exhaustive: bool,
+    async_drop_recurses_into_box: bool,
+}
+
+impl DropTysOptions {
+    fn only_significant(mut self) -> Self {
+        self.only_significant = true;
+        self
+    }
+
+    fn exhaustive(mut self) -> Self {
+        self.exhaustive = true;
+        self
+    }
+
+    fn recurse_into_box_for_async_drop(mut self) -> Self {
+        self.async_drop_recurses_into_box = true;
+        self
+    }
+}
+
 // This is a helper function for `adt_drop_tys` and `adt_significant_drop_tys`.
 // Depending on the implantation of `adt_has_dtor`, it is used to check if the
 // ADT has a destructor or if the ADT only has a significant destructor. For
@@ -303,8 +364,7 @@ fn drop_tys_helper<'tcx>(
     ty: Ty<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     adt_has_dtor: impl Fn(ty::AdtDef<'tcx>) -> Option<DtorType>,
-    only_significant: bool,
-    exhaustive: bool,
+    options: DropTysOptions,
 ) -> impl Iterator<Item = NeedsDropResult<Ty<'tcx>>> {
     fn with_query_cache<'tcx>(
         tcx: TyCtxt<'tcx>,
@@ -314,7 +374,9 @@ fn drop_tys_helper<'tcx>(
             match subty.kind() {
                 ty::Adt(adt_id, args) => {
                     for subty in tcx.adt_drop_tys(adt_id.did())? {
-                        vec.push(EarlyBinder::bind(subty).instantiate(tcx, args));
+                        vec.push(
+                            EarlyBinder::bind(tcx, subty).instantiate(tcx, args).skip_norm_wip(),
+                        );
                     }
                 }
                 _ => vec.push(subty),
@@ -327,6 +389,24 @@ fn drop_tys_helper<'tcx>(
         if adt_def.is_manually_drop() {
             debug!("drop_tys_helper: `{:?}` is manually drop", adt_def);
             Ok(Vec::new())
+        } else if options.async_drop_recurses_into_box && adt_def.is_box() {
+            let box_components = match args.as_slice() {
+                [boxed_ty, allocator_ty] => {
+                    let boxed_ty = boxed_ty.expect_ty();
+                    let allocator_ty = allocator_ty.expect_ty();
+                    match boxed_ty.kind() {
+                        // FIXME(async_drop): boxed dyn pointees are deliberately skipped here
+                        // because async drop glue does not yet dispatch through dyn metadata.
+                        // Once that is supported, this should include the boxed pointee too.
+                        ty::Dynamic(..) | ty::Error(_) => vec![allocator_ty],
+                        _ => vec![boxed_ty, allocator_ty],
+                    }
+                }
+                _ => {
+                    bug!("drop_tys_helper: `Box` has unexpected generic args: {args:?}");
+                }
+            };
+            Ok(box_components)
         } else if let Some(dtor_info) = adt_has_dtor(adt_def) {
             match dtor_info {
                 DtorType::Significant => {
@@ -347,14 +427,14 @@ fn drop_tys_helper<'tcx>(
             Ok(Vec::new())
         } else {
             let field_tys = adt_def.all_fields().map(|field| {
-                let r = tcx.type_of(field.did).instantiate(tcx, args);
+                let r = tcx.type_of(field.did).instantiate(tcx, args).skip_norm_wip();
                 debug!(
                     "drop_tys_helper: Instantiate into {:?} with {:?} getting {:?}",
                     field, args, r
                 );
                 r
             });
-            if only_significant {
+            if options.only_significant {
                 // We can't recurse through the query system here because we might induce a cycle
                 Ok(field_tys.collect())
             } else {
@@ -368,15 +448,14 @@ fn drop_tys_helper<'tcx>(
         .map(|v| v.into_iter())
     };
 
-    NeedsDropTypes::new(tcx, typing_env, ty, exhaustive, adt_components)
+    NeedsDropTypes::new(tcx, typing_env, ty, options.exhaustive, adt_components)
 }
 
 fn adt_consider_insignificant_dtor<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> impl Fn(ty::AdtDef<'tcx>) -> Option<DtorType> {
     move |adt_def: ty::AdtDef<'tcx>| {
-        let is_marked_insig = tcx.has_attr(adt_def.did(), sym::rustc_insignificant_dtor);
-        if is_marked_insig {
+        if find_attr!(tcx, adt_def.did(), RustcInsignificantDtor) {
             // In some cases like `std::collections::HashMap` where the struct is a wrapper around
             // a type that is a Drop type, and the wrapped type (eg: `hashbrown::HashMap`) lies
             // outside stdlib, we might choose to still annotate the wrapper (std HashMap) with
@@ -405,15 +484,34 @@ fn adt_drop_tys<'tcx>(
     // `tcx.type_of(def_id)` identical to `tcx.make_adt(def, identity_args)`
     drop_tys_helper(
         tcx,
-        tcx.type_of(def_id).instantiate_identity(),
+        tcx.type_of(def_id).instantiate_identity().skip_norm_wip(),
         ty::TypingEnv::non_body_analysis(tcx, def_id),
         adt_has_dtor,
-        false,
-        false,
+        DropTysOptions::default(),
     )
     .collect::<Result<Vec<_>, _>>()
     .map(|components| tcx.mk_type_list(&components))
 }
+
+fn adt_async_drop_tys<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+) -> Result<&'tcx ty::List<Ty<'tcx>>, AlwaysRequiresDrop> {
+    // This is for the "adt_async_drop_tys" query, that considers all `AsyncDrop` impls.
+    let adt_has_dtor =
+        |adt_def: ty::AdtDef<'tcx>| adt_def.async_destructor(tcx).map(|_| DtorType::Significant);
+    // `tcx.type_of(def_id)` identical to `tcx.make_adt(def, identity_args)`
+    drop_tys_helper(
+        tcx,
+        tcx.type_of(def_id).instantiate_identity().skip_norm_wip(),
+        ty::TypingEnv::non_body_analysis(tcx, def_id),
+        adt_has_dtor,
+        DropTysOptions::default().recurse_into_box_for_async_drop(),
+    )
+    .collect::<Result<Vec<_>, _>>()
+    .map(|components| tcx.mk_type_list(&components))
+}
+
 // If `def_id` refers to a generic ADT, the queries above and below act as if they had been handed
 // a `tcx.make_ty(def, identity_args)` and as such it is legal to instantiate the generic parameters
 // of the ADT into the outputted `ty`s.
@@ -423,11 +521,10 @@ fn adt_significant_drop_tys(
 ) -> Result<&ty::List<Ty<'_>>, AlwaysRequiresDrop> {
     drop_tys_helper(
         tcx,
-        tcx.type_of(def_id).instantiate_identity(), // identical to `tcx.make_adt(def, identity_args)`
+        tcx.type_of(def_id).instantiate_identity().skip_norm_wip(), // identical to `tcx.make_adt(def, identity_args)`
         ty::TypingEnv::non_body_analysis(tcx, def_id),
         adt_consider_insignificant_dtor(tcx),
-        true,
-        false,
+        DropTysOptions::default().only_significant(),
     )
     .collect::<Result<Vec<_>, _>>()
     .map(|components| tcx.mk_type_list(&components))
@@ -444,8 +541,7 @@ fn list_significant_drop_tys<'tcx>(
             key.value,
             key.typing_env,
             adt_consider_insignificant_dtor(tcx),
-            true,
-            true,
+            DropTysOptions::default().only_significant().exhaustive(),
         )
         .filter_map(|res| res.ok())
         .collect::<Vec<_>>(),
@@ -458,6 +554,7 @@ pub(crate) fn provide(providers: &mut Providers) {
         needs_async_drop_raw,
         has_significant_drop_raw,
         adt_drop_tys,
+        adt_async_drop_tys,
         adt_significant_drop_tys,
         list_significant_drop_tys,
         ..*providers

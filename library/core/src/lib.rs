@@ -39,38 +39,27 @@
 //!   return. You should mark your implementation using `#[panic_handler]`.
 //!
 //! * `rust_eh_personality` - is used by the failure mechanisms of the
-//!    compiler. This is often mapped to GCC's personality function, but crates
-//!    which do not trigger a panic can be assured that this function is never
-//!    called. The `lang` attribute is called `eh_personality`.
+//!   compiler. This is often mapped to GCC's personality function, but crates
+//!   which do not trigger a panic can be assured that this function is never
+//!   called. The `lang` attribute is called `eh_personality`.
 
 #![stable(feature = "core", since = "1.6.0")]
 #![doc(
     html_playground_url = "https://play.rust-lang.org/",
     issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
     test(no_crate_inject, attr(deny(warnings))),
-    test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
+    test(attr(allow(dead_code, deprecated, unused_variables, unused_mut, duplicate_features)))
 )]
 #![doc(rust_logo)]
-#![doc(cfg_hide(
-    no_fp_fmt_parse,
-    target_pointer_width = "16",
-    target_pointer_width = "32",
-    target_pointer_width = "64",
-    target_has_atomic = "8",
-    target_has_atomic = "16",
-    target_has_atomic = "32",
-    target_has_atomic = "64",
-    target_has_atomic = "ptr",
-    target_has_atomic_equal_alignment = "8",
-    target_has_atomic_equal_alignment = "16",
-    target_has_atomic_equal_alignment = "32",
-    target_has_atomic_equal_alignment = "64",
-    target_has_atomic_equal_alignment = "ptr",
-    target_has_atomic_load_store = "8",
-    target_has_atomic_load_store = "16",
-    target_has_atomic_load_store = "32",
-    target_has_atomic_load_store = "64",
-    target_has_atomic_load_store = "ptr",
+#![doc(auto_cfg(
+    hide(no_fp_fmt_parse),
+    hide(target_pointer_width, values("16", "32", "64")),
+    hide(
+        target_has_atomic,
+        target_has_atomic_primitive_alignment,
+        target_has_atomic_load_store,
+        values("8", "16", "32", "64", "ptr"),
+    ),
 ))]
 #![no_core]
 #![rustc_coherence_is_core]
@@ -79,7 +68,7 @@
 // Lints:
 #![deny(rust_2021_incompatible_or_patterns)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![deny(fuzzy_provenance_casts)]
+#![deny(implicit_provenance_casts)]
 #![warn(deprecated_in_future)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -87,47 +76,31 @@
 #![allow(incomplete_features)]
 #![warn(multiple_supertrait_upcastable)]
 #![allow(internal_features)]
+#![allow(unused_features)]
 #![deny(ffi_unwind_calls)]
 #![warn(unreachable_pub)]
-// Do not check link redundancy on bootstraping phase
+// Do not check link redundancy on bootstrapping phase
 #![allow(rustdoc::redundant_explicit_links)]
 #![warn(rustdoc::unescaped_backticks)]
 //
 // Library features:
 // tidy-alphabetical-start
-#![feature(array_ptr_get)]
 #![feature(asm_experimental_arch)]
-#![feature(bigint_helper_methods)]
-#![feature(bstr)]
 #![feature(bstr_internals)]
-#![feature(cfg_match)]
+#![feature(cfg_target_has_reliable_f16_f128)]
 #![feature(const_carrying_mul_add)]
+#![feature(const_cmp)]
+#![feature(const_destruct)]
 #![feature(const_eval_select)]
+#![feature(const_select_unpredictable)]
 #![feature(core_intrinsics)]
 #![feature(coverage_attribute)]
 #![feature(disjoint_bitor)]
-#![feature(internal_impls_macro)]
-#![feature(ip)]
-#![feature(is_ascii_octdigit)]
-#![feature(lazy_get)]
-#![feature(link_cfg)]
-#![feature(non_null_from_ref)]
+#![feature(io_const_error)]
 #![feature(offset_of_enum)]
 #![feature(panic_internals)]
-#![feature(ptr_alignment_type)]
-#![feature(ptr_metadata)]
-#![feature(set_ptr_value)]
-#![feature(slice_as_array)]
-#![feature(slice_ptr_get)]
-#![feature(str_internals)]
-#![feature(str_split_inclusive_remainder)]
-#![feature(str_split_remainder)]
+#![feature(pattern_type_macro)]
 #![feature(ub_checks)]
-#![feature(unchecked_neg)]
-#![feature(unchecked_shifts)]
-#![feature(unsafe_pinned)]
-#![feature(utf16_extra)]
-#![feature(variant_count)]
 // tidy-alphabetical-end
 //
 // Language features:
@@ -139,28 +112,34 @@
 #![feature(auto_traits)]
 #![feature(cfg_sanitize)]
 #![feature(cfg_target_has_atomic)]
-#![feature(cfg_target_has_atomic_equal_alignment)]
 #![feature(cfg_ub_checks)]
+#![feature(const_closures)]
 #![feature(const_precise_live_drops)]
 #![feature(const_trait_impl)]
 #![feature(decl_macro)]
 #![feature(deprecated_suggestion)]
+#![feature(derive_const)]
+#![feature(diagnostic_on_const)]
+#![feature(diagnostic_on_unmatched_args)]
+#![feature(diagnostic_opaque)]
 #![feature(doc_cfg)]
-#![feature(doc_cfg_hide)]
 #![feature(doc_notable_trait)]
 #![feature(extern_types)]
-#![feature(f128)]
 #![feature(f16)]
+#![feature(f128)]
+#![feature(field_projections)]
+#![feature(final_associated_functions)]
 #![feature(freeze_impls)]
 #![feature(fundamental)]
-#![feature(generic_arg_infer)]
-#![feature(if_let_guard)]
+#![feature(funnel_shifts)]
+#![feature(impl_restriction)]
 #![feature(intra_doc_pointers)]
 #![feature(intrinsics)]
 #![feature(lang_items)]
-#![feature(let_chains)]
+#![feature(link_cfg)]
 #![feature(link_llvm_intrinsics)]
 #![feature(macro_metavar_expr)]
+#![feature(macro_metavar_expr_concat)]
 #![feature(marker_trait_attr)]
 #![feature(min_specialization)]
 #![feature(multiple_supertrait_upcastable)]
@@ -169,9 +148,10 @@
 #![feature(never_type)]
 #![feature(no_core)]
 #![feature(optimize_attribute)]
+#![feature(pattern_types)]
+#![feature(pin_macro_internals)]
 #![feature(prelude_import)]
 #![feature(repr_simd)]
-#![feature(rustc_allow_const_fn_unstable)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
 #![feature(simd_ffi)]
@@ -181,6 +161,7 @@
 #![feature(trait_alias)]
 #![feature(transparent_unions)]
 #![feature(try_blocks)]
+#![feature(uint_carryless_mul)]
 #![feature(unboxed_closures)]
 #![feature(unsized_fn_params)]
 #![feature(with_negative_coherence)]
@@ -190,18 +171,17 @@
 // tidy-alphabetical-start
 #![feature(aarch64_unstable_target_feature)]
 #![feature(arm_target_feature)]
-#![feature(avx512_target_feature)]
+#![feature(avx10_target_feature)]
+#![feature(clflushopt_target_feature)]
 #![feature(hexagon_target_feature)]
-#![feature(keylocker_x86)]
 #![feature(loongarch_target_feature)]
 #![feature(mips_target_feature)]
+#![feature(movrs_target_feature)]
+#![feature(nvptx_target_feature)]
 #![feature(powerpc_target_feature)]
 #![feature(riscv_target_feature)]
 #![feature(rtm_target_feature)]
 #![feature(s390x_target_feature)]
-#![feature(sha512_sm_x86)]
-#![feature(sse4a_target_feature)]
-#![feature(tbm_target_feature)]
 #![feature(wasm_target_feature)]
 #![feature(x86_amx_intrinsics)]
 // tidy-alphabetical-end
@@ -210,6 +190,10 @@
 #[allow(unused_extern_crates)]
 extern crate self as core;
 
+/* The core prelude, not as all-encompassing as the std prelude */
+// The compiler expects the prelude definition to be defined before it's use statement.
+pub mod prelude;
+
 #[prelude_import]
 #[allow(unused)]
 use prelude::rust_2024::*;
@@ -217,71 +201,47 @@ use prelude::rust_2024::*;
 #[macro_use]
 mod macros;
 
-#[unstable(feature = "assert_matches", issue = "82775")]
-/// Unstable module containing the unstable `assert_matches` macro.
-pub mod assert_matches {
-    #[unstable(feature = "assert_matches", issue = "82775")]
-    pub use crate::macros::{assert_matches, debug_assert_matches};
+#[stable(feature = "assert_matches", since = "1.96.0")]
+pub use crate::macros::{assert_matches, debug_assert_matches};
+
+#[unstable(feature = "derive_from", issue = "144889")]
+/// Unstable module containing the unstable `From` derive macro.
+pub mod from {
+    #[unstable(feature = "derive_from", issue = "144889")]
+    pub use crate::macros::builtin::From;
 }
 
 // We don't export this through #[macro_export] for now, to avoid breakage.
 #[unstable(feature = "autodiff", issue = "124509")]
-/// Unstable module containing the unstable `autodiff` macro.
+#[doc = include_str!("../../core/src/autodiff.md")]
 pub mod autodiff {
     #[unstable(feature = "autodiff", issue = "124509")]
-    pub use crate::macros::builtin::autodiff;
+    pub use crate::macros::builtin::{autodiff_forward, autodiff_reverse};
 }
+
+#[unstable(feature = "gpu_offload", issue = "131513")]
+#[doc = include_str!("../../core/src/offload.md")]
+pub mod offload;
 
 #[unstable(feature = "contracts", issue = "128044")]
 pub mod contracts;
 
-#[unstable(feature = "cfg_match", issue = "115585")]
-pub use crate::macros::cfg_match;
+#[unstable(feature = "derive_macro_global_path", issue = "154645")]
+pub use crate::macros::builtin::derive;
+#[stable(feature = "cfg_select", since = "1.95.0")]
+pub use crate::macros::cfg_select;
 
 #[macro_use]
 mod internal_macros;
 
-#[path = "num/shells/int_macros.rs"]
-#[macro_use]
-mod int_macros;
-
-#[rustc_diagnostic_item = "i128_legacy_mod"]
-#[path = "num/shells/i128.rs"]
-pub mod i128;
-#[rustc_diagnostic_item = "i16_legacy_mod"]
-#[path = "num/shells/i16.rs"]
-pub mod i16;
-#[rustc_diagnostic_item = "i32_legacy_mod"]
-#[path = "num/shells/i32.rs"]
-pub mod i32;
-#[rustc_diagnostic_item = "i64_legacy_mod"]
-#[path = "num/shells/i64.rs"]
-pub mod i64;
-#[rustc_diagnostic_item = "i8_legacy_mod"]
-#[path = "num/shells/i8.rs"]
-pub mod i8;
-#[rustc_diagnostic_item = "isize_legacy_mod"]
-#[path = "num/shells/isize.rs"]
-pub mod isize;
-
-#[rustc_diagnostic_item = "u128_legacy_mod"]
-#[path = "num/shells/u128.rs"]
-pub mod u128;
-#[rustc_diagnostic_item = "u16_legacy_mod"]
-#[path = "num/shells/u16.rs"]
-pub mod u16;
-#[rustc_diagnostic_item = "u32_legacy_mod"]
-#[path = "num/shells/u32.rs"]
-pub mod u32;
-#[rustc_diagnostic_item = "u64_legacy_mod"]
-#[path = "num/shells/u64.rs"]
-pub mod u64;
-#[rustc_diagnostic_item = "u8_legacy_mod"]
-#[path = "num/shells/u8.rs"]
-pub mod u8;
-#[rustc_diagnostic_item = "usize_legacy_mod"]
-#[path = "num/shells/usize.rs"]
-pub mod usize;
+#[path = "num/shells/legacy_int_modules.rs"]
+mod legacy_int_modules;
+#[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated)]
+pub use legacy_int_modules::{i8, i16, i32, i64, isize, u8, u16, u32, u64, usize};
+#[stable(feature = "i128", since = "1.26.0")]
+#[allow(deprecated)]
+pub use legacy_int_modules::{i128, u128};
 
 #[path = "num/f128.rs"]
 pub mod f128;
@@ -295,15 +255,13 @@ pub mod f64;
 #[macro_use]
 pub mod num;
 
-/* The core prelude, not as all-encompassing as the std prelude */
-
-pub mod prelude;
-
 /* Core modules for ownership management */
 
 pub mod hint;
 pub mod intrinsics;
 pub mod mem;
+#[unstable(feature = "profiling_marker_api", issue = "148197")]
+pub mod profiling;
 pub mod ptr;
 #[unstable(feature = "ub_checks", issue = "none")]
 pub mod ub_checks;
@@ -316,6 +274,9 @@ pub mod cmp;
 pub mod convert;
 pub mod default;
 pub mod error;
+#[unstable(feature = "field_projections", issue = "145383")]
+pub mod field;
+pub mod index;
 pub mod marker;
 pub mod ops;
 
@@ -332,19 +293,22 @@ pub mod bstr;
 pub mod cell;
 pub mod char;
 pub mod ffi;
-#[unstable(feature = "core_io_borrowed_buf", issue = "117693")]
+#[unstable(feature = "core_io", issue = "154046")]
 pub mod io;
 pub mod iter;
 pub mod net;
 pub mod option;
+pub mod os;
 pub mod panic;
 pub mod panicking;
 #[unstable(feature = "pattern_type_macro", issue = "123646")]
 pub mod pat;
 pub mod pin;
+#[unstable(feature = "abort_immediate", issue = "154601")]
+pub mod process;
 #[unstable(feature = "random", issue = "130703")]
 pub mod random;
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_inclusive_api", since = "1.95.0")]
 pub mod range;
 pub mod result;
 pub mod sync;
@@ -356,6 +320,8 @@ pub mod hash;
 pub mod slice;
 pub mod str;
 pub mod time;
+
+pub mod wtf8;
 
 pub mod unicode;
 
@@ -372,6 +338,9 @@ mod bool;
 mod escape;
 mod tuple;
 mod unit;
+#[cfg_attr(feature = "nightly", not(bootstrap))]
+#[unstable(feature = "view_type_macro", issue = "155938")]
+pub mod view;
 
 #[stable(feature = "core_primitive", since = "1.43.0")]
 pub mod primitive;
@@ -419,4 +388,17 @@ pub mod simd {
     pub use crate::core_simd::simd::*;
 }
 
+// Include private modules that exist solely to provide rustdoc
+// documentation for built-in attributes. Using `include!` because rustdoc
+// only looks for these modules at the crate level.
+include!("attribute_docs.rs");
+
+// Include a number of private modules that exist solely to provide
+// the rustdoc documentation for the existing keywords. Using `include!`
+// because rustdoc only looks for these modules at the crate level.
+include!("keyword_docs.rs");
+
+// Include a number of private modules that exist solely to provide
+// the rustdoc documentation for primitive types. Using `include!`
+// because rustdoc only looks for these modules at the crate level.
 include!("primitive_docs.rs");

@@ -1,24 +1,22 @@
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
-#![allow(static_mut_refs)]
-
 use core::alloc::{Allocator, Layout};
 use core::num::NonZero;
 use core::ptr::NonNull;
 use core::{assert_eq, assert_ne};
 use std::alloc::System;
-use std::assert_matches::assert_matches;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::TryReserveErrorKind::*;
 use std::fmt::Debug;
-use std::hint;
 use std::iter::InPlaceIterable;
 use std::mem::swap;
 use std::ops::Bound::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::vec::{Drain, IntoIter};
+use std::vec::{Drain, IntoIter, PeekMut};
+use std::{assert_matches, hint};
+
+use crate::testing::macros::struct_with_counted_drop;
 
 struct DropCounter<'a> {
     count: &'a mut u32,
@@ -548,32 +546,25 @@ fn test_cmp() {
 
 #[test]
 fn test_vec_truncate_drop() {
-    static mut DROPS: u32 = 0;
-    struct Elem(#[allow(dead_code)] i32);
-    impl Drop for Elem {
-        fn drop(&mut self) {
-            unsafe {
-                DROPS += 1;
-            }
-        }
-    }
+    struct_with_counted_drop!(Elem(i32), DROPS);
 
     let mut v = vec![Elem(1), Elem(2), Elem(3), Elem(4), Elem(5)];
-    assert_eq!(unsafe { DROPS }, 0);
+
+    assert_eq!(DROPS.get(), 0);
     v.truncate(3);
-    assert_eq!(unsafe { DROPS }, 2);
+    assert_eq!(DROPS.get(), 2);
     v.truncate(0);
-    assert_eq!(unsafe { DROPS }, 5);
+    assert_eq!(DROPS.get(), 5);
 }
 
 #[test]
 #[should_panic]
 fn test_vec_truncate_fail() {
     struct BadElem(i32);
+
     impl Drop for BadElem {
         fn drop(&mut self) {
-            let BadElem(ref mut x) = *self;
-            if *x == 0xbadbeef {
+            if let BadElem(0xbadbeef) = self {
                 panic!("BadElem panic: 0xbadbeef")
             }
         }
@@ -636,6 +627,21 @@ fn test_slice_out_of_bounds_5() {
 fn test_swap_remove_empty() {
     let mut vec = Vec::<i32>::new();
     vec.swap_remove(0);
+}
+
+#[test]
+fn test_try_remove() {
+    let mut vec = vec![1, 2, 3];
+    // We are attempting to remove vec[0] which contains 1
+    assert_eq!(vec.try_remove(0), Some(1));
+    // Now `vec` looks like: [2, 3]
+    // We will now try to remove vec[2] which does not exist
+    // This should return `None`
+    assert_eq!(vec.try_remove(2), None);
+
+    // We will try the same thing with an empty vector
+    let mut v: Vec<u8> = vec![];
+    assert!(v.try_remove(0).is_none());
 }
 
 #[test]
@@ -812,22 +818,7 @@ fn test_drain_end_overflow() {
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_drain_leak() {
-    static mut DROPS: i32 = 0;
-
-    #[derive(Debug, PartialEq)]
-    struct D(u32, bool);
-
-    impl Drop for D {
-        fn drop(&mut self) {
-            unsafe {
-                DROPS += 1;
-            }
-
-            if self.1 {
-                panic!("panic in `drop`");
-            }
-        }
-    }
+    struct_with_counted_drop!(D(u32, bool), DROPS => |this: &D| if this.1 { panic!("panic in `drop`"); });
 
     let mut v = vec![
         D(0, false),
@@ -844,7 +835,7 @@ fn test_drain_leak() {
     }))
     .ok();
 
-    assert_eq!(unsafe { DROPS }, 4);
+    assert_eq!(DROPS.get(), 4);
     assert_eq!(v, vec![D(0, false), D(1, false), D(6, false),]);
 }
 
@@ -1037,6 +1028,15 @@ fn test_into_iter_next_chunk() {
 }
 
 #[test]
+fn test_into_iter_next_chunk_back() {
+    let mut iter = b"lorem".to_vec().into_iter();
+
+    assert_eq!(iter.next_chunk_back().unwrap(), [b'e', b'm']); // N is inferred as 2
+    assert_eq!(iter.next_chunk_back().unwrap(), [b'l', b'o', b'r']); // N is inferred as 3
+    assert_eq!(iter.next_chunk_back::<4>().unwrap_err().as_slice(), &[]); // N is explicitly 4
+}
+
+#[test]
 fn test_into_iter_clone() {
     fn iter_equal<I: Iterator<Item = i32>>(it: I, slice: &[i32]) {
         let v: Vec<i32> = it.collect();
@@ -1057,27 +1057,13 @@ fn test_into_iter_clone() {
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_into_iter_leak() {
-    static mut DROPS: i32 = 0;
-
-    struct D(bool);
-
-    impl Drop for D {
-        fn drop(&mut self) {
-            unsafe {
-                DROPS += 1;
-            }
-
-            if self.0 {
-                panic!("panic in `drop`");
-            }
-        }
-    }
+    struct_with_counted_drop!(D(bool), DROPS => |this: &D| if this.0 { panic!("panic in `drop`"); });
 
     let v = vec![D(false), D(true), D(false)];
 
     catch_unwind(move || drop(v.into_iter())).ok();
 
-    assert_eq!(unsafe { DROPS }, 3);
+    assert_eq!(DROPS.get(), 3);
 }
 
 #[test]
@@ -1133,7 +1119,7 @@ fn test_into_iter_zst() {
     struct AlignedZstWithDrop([u64; 0]);
     impl Drop for AlignedZstWithDrop {
         fn drop(&mut self) {
-            let addr = self as *mut _ as usize;
+            let addr = (self as *mut Self).addr();
             assert!(hint::black_box(addr) % align_of::<u64>() == 0);
         }
     }
@@ -1153,6 +1139,14 @@ fn test_into_iter_zst() {
 
     let mut it = vec![C, C].into_iter();
     it.next_chunk::<4>().unwrap_err();
+    drop(it);
+
+    let mut it = vec![C, C].into_iter();
+    it.next_chunk_back::<1>().unwrap();
+    drop(it);
+
+    let mut it = vec![C, C].into_iter();
+    it.next_chunk_back::<4>().unwrap_err();
     drop(it);
 }
 
@@ -1274,55 +1268,31 @@ fn test_from_iter_specialization_panic_during_iteration_drops() {
 
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
-#[allow(static_mut_refs)]
 fn test_from_iter_specialization_panic_during_drop_doesnt_leak() {
-    static mut DROP_COUNTER_OLD: [usize; 5] = [0; 5];
-    static mut DROP_COUNTER_NEW: [usize; 2] = [0; 2];
-
-    #[derive(Debug)]
-    struct Old(usize);
-
-    impl Drop for Old {
-        fn drop(&mut self) {
-            unsafe {
-                DROP_COUNTER_OLD[self.0] += 1;
+    struct_with_counted_drop!(
+        Old(usize), DROP_COUNTER_OLD[|this: &Old| this.0, usize] =>
+            |this: &Old| {
+                if this.0 == 3 { panic!(); } println!("Dropped Old: {}", this.0)
             }
-
-            if self.0 == 3 {
-                panic!();
-            }
-
-            println!("Dropped Old: {}", self.0);
-        }
-    }
-
-    #[derive(Debug)]
-    struct New(usize);
-
-    impl Drop for New {
-        fn drop(&mut self) {
-            unsafe {
-                DROP_COUNTER_NEW[self.0] += 1;
-            }
-
-            println!("Dropped New: {}", self.0);
-        }
-    }
+    );
+    struct_with_counted_drop!(
+        New(usize), DROP_COUNTER_NEW[|this: &New| this.0, usize] =>
+            |this: &New| println!("Dropped New: {}", this.0)
+    );
 
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let v = vec![Old(0), Old(1), Old(2), Old(3), Old(4)];
         let _ = v.into_iter().map(|x| New(x.0)).take(2).collect::<Vec<_>>();
     }));
 
-    assert_eq!(unsafe { DROP_COUNTER_OLD[0] }, 1);
-    assert_eq!(unsafe { DROP_COUNTER_OLD[1] }, 1);
-    assert_eq!(unsafe { DROP_COUNTER_OLD[2] }, 1);
-    assert_eq!(unsafe { DROP_COUNTER_OLD[3] }, 1);
-    assert_eq!(unsafe { DROP_COUNTER_OLD[4] }, 1);
+    DROP_COUNTER_OLD.with_borrow(|c| assert_eq!(c.get(&0), Some(&1)));
+    DROP_COUNTER_OLD.with_borrow(|c| assert_eq!(c.get(&1), Some(&1)));
+    DROP_COUNTER_OLD.with_borrow(|c| assert_eq!(c.get(&2), Some(&1)));
+    DROP_COUNTER_OLD.with_borrow(|c| assert_eq!(c.get(&3), Some(&1)));
+    DROP_COUNTER_OLD.with_borrow(|c| assert_eq!(c.get(&4), Some(&1)));
 
-    assert_eq!(unsafe { DROP_COUNTER_NEW[0] }, 1);
-    assert_eq!(unsafe { DROP_COUNTER_NEW[1] }, 1);
+    DROP_COUNTER_NEW.with_borrow(|c| assert_eq!(c.get(&0), Some(&1)));
+    DROP_COUNTER_NEW.with_borrow(|c| assert_eq!(c.get(&1), Some(&1)));
 }
 
 // regression test for issue #85322. Peekable previously implemented InPlaceIterable,
@@ -1403,10 +1373,10 @@ fn overaligned_allocations() {
     for i in 0..0x1000 {
         v.reserve_exact(i);
         assert!(v[0].0 == 273);
-        assert!(v.as_ptr() as usize & 0xff == 0);
+        assert!(v.as_ptr().addr() & 0xff == 0);
         v.shrink_to_fit();
         assert!(v[0].0 == 273);
-        assert!(v.as_ptr() as usize & 0xff == 0);
+        assert!(v.as_ptr().addr() & 0xff == 0);
     }
 }
 
@@ -1694,6 +1664,21 @@ fn extract_if_unconsumed() {
     let drain = vec.extract_if(.., |&mut x| x % 2 != 0);
     drop(drain);
     assert_eq!(vec, [1, 2, 3, 4]);
+}
+
+#[test]
+fn extract_if_debug() {
+    let mut vec = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let mut drain = vec.extract_if(1..5, |&mut x| x % 2 != 0);
+    assert_eq!(
+        format!("{drain:?}"),
+        "ExtractIf { retained: [1], remainder: [2, 3, 4, 5], skipped_tail: [6, 7, 8], .. }"
+    );
+    drain.next().unwrap();
+    assert_eq!(
+        format!("{drain:?}"),
+        "ExtractIf { retained: [1, 2], remainder: [4, 5], skipped_tail: [6, 7, 8], .. }"
+    );
 }
 
 #[test]
@@ -2346,20 +2331,6 @@ fn test_vec_swap() {
 }
 
 #[test]
-fn test_extend_from_within_spec() {
-    #[derive(Copy)]
-    struct CopyOnly;
-
-    impl Clone for CopyOnly {
-        fn clone(&self) -> Self {
-            panic!("extend_from_within must use specialization on copy");
-        }
-    }
-
-    vec![CopyOnly, CopyOnly].extend_from_within(..);
-}
-
-#[test]
 fn test_extend_from_within_clone() {
     let mut v = vec![String::from("sssss"), String::from("12334567890"), String::from("c")];
     v.extend_from_within(1..);
@@ -2615,12 +2586,12 @@ fn test_box_zero_allocator() {
             } else {
                 unsafe { std::alloc::alloc(layout) }
             };
-            Ok(NonNull::slice_from_raw_parts(NonNull::new(ptr).ok_or(AllocError)?, layout.size()))
+            Ok(NonNull::new(ptr).ok_or(AllocError)?.cast_slice(layout.size()))
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             if layout.size() == 0 {
-                let addr = ptr.as_ptr() as usize;
+                let addr = ptr.as_ptr().addr();
                 let mut state = self.state.borrow_mut();
                 std::println!("freeing {addr}");
                 assert!(state.0.remove(&addr), "ZST free that wasn't allocated");
@@ -2698,6 +2669,24 @@ fn test_pop_if_mutates() {
     assert_eq!(v, [2]);
 }
 
+#[test]
+fn test_peek_mut() {
+    let mut vec = Vec::new();
+    assert!(vec.peek_mut().is_none());
+    vec.push(1);
+    vec.push(2);
+    let mut p = vec.peek_mut().unwrap();
+    assert_eq!(*p, 2);
+    *p = 0;
+    assert_eq!(*p, 0);
+    drop(p);
+    assert_eq!(vec, vec![1, 0]);
+    let p = vec.peek_mut().unwrap();
+    let p = PeekMut::pop(p);
+    assert_eq!(p, 0);
+    assert_eq!(vec, vec![1]);
+}
+
 /// This assortment of tests, in combination with miri, verifies we handle UB on fishy arguments
 /// in the stdlib. Draining and extending the allocation are fairly well-tested earlier, but
 /// `vec.insert(usize::MAX, val)` once slipped by!
@@ -2747,4 +2736,97 @@ fn vec_null_ptr_roundtrip() {
     let roundtripped = vec![zero; 1].pop().unwrap();
     let new = roundtripped.with_addr(ptr.addr());
     unsafe { new.read() };
+}
+
+// Regression test for Undefined Behavior (UB) caused by IntoIter::nth_back (#148682)
+// when dealing with high-aligned Zero-Sized Types (ZSTs).
+use std::collections::{BTreeMap, BinaryHeap, HashMap, LinkedList, VecDeque};
+#[test]
+fn zst_collections_iter_nth_back_regression() {
+    #[repr(align(8))]
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+    struct Thing;
+    let v = vec![Thing, Thing];
+    let _ = v.into_iter().nth_back(1);
+    let mut d = VecDeque::new();
+    d.push_back(Thing);
+    d.push_back(Thing);
+    let _ = d.into_iter().nth_back(1);
+    let mut map = BTreeMap::new();
+    map.insert(0, Thing);
+    map.insert(1, Thing);
+    let _ = map.into_values().nth_back(0);
+    let mut hash_map = HashMap::new();
+    hash_map.insert(1, Thing);
+    hash_map.insert(2, Thing);
+    let _ = hash_map.into_values().nth(1);
+    let mut heap = BinaryHeap::new();
+    heap.push(Thing);
+    heap.push(Thing);
+    let _ = heap.into_iter().nth_back(1);
+    let mut list = LinkedList::new();
+    list.push_back(Thing);
+    list.push_back(Thing);
+    let _ = list.into_iter().nth_back(1);
+}
+
+#[test]
+fn const_heap() {
+    const X: &'static [u32] = {
+        let mut v = Vec::with_capacity(6);
+        let mut x = 1;
+        while x < 42 {
+            v.push(x);
+            x *= 2;
+        }
+        assert!(v.len() == 6);
+        v.const_make_global()
+    };
+
+    assert_eq!([1, 2, 4, 8, 16, 32], X);
+}
+
+// regression test for issue #153158. `const_make_global` previously assumed `Vec<T>`'s buf
+// always has a heap allocation, which lead to compilation errors.
+#[test]
+fn const_make_global_empty_or_zst_regression() {
+    const EMPTY_SLICE: &'static [i32] = {
+        let empty_vec: Vec<i32> = Vec::new();
+        empty_vec.const_make_global()
+    };
+
+    assert_eq!(EMPTY_SLICE, &[]);
+
+    const ZST_SLICE: &'static [()] = {
+        let mut zst_vec: Vec<()> = Vec::new();
+        zst_vec.push(());
+        zst_vec.push(());
+        zst_vec.push(());
+        zst_vec.const_make_global()
+    };
+
+    assert_eq!(ZST_SLICE, &[(), (), ()]);
+}
+
+#[test]
+fn const_heap_vec_macro() {
+    const X: &'static [u32] = {
+        let x: Vec<u32> = vec![];
+        assert!(x == []);
+        x.const_make_global()
+    };
+
+    const Y: &'static [u32] = {
+        let y: Vec<u32> = vec![1, 2, 3];
+        assert!(y == [1, 2, 3]);
+        y.const_make_global()
+    };
+
+    // This arm isn't const yet.
+    // const Z: &'static [u32] = {
+    //     vec![4; 2].const_make_global()
+    // };
+
+    assert_eq!(X, []);
+    assert_eq!(Y, [1, 2, 3]);
 }

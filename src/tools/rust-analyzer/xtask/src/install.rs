@@ -2,10 +2,13 @@
 
 use std::{env, path::PathBuf, str};
 
-use anyhow::{bail, format_err, Context};
-use xshell::{cmd, Shell};
+use anyhow::{Context, bail, format_err};
+use xshell::{Shell, cmd};
 
-use crate::flags::{self, Malloc};
+use crate::{
+    flags::{self, Malloc, PgoTrainingCrate},
+    util::detect_target,
+};
 
 impl flags::Install {
     pub(crate) fn run(self, sh: &Shell) -> anyhow::Result<()> {
@@ -35,6 +38,22 @@ const VS_CODES: &[&str] = &["code", "code-exploration", "code-insiders", "codium
 pub(crate) struct ServerOpt {
     pub(crate) malloc: Malloc,
     pub(crate) dev_rel: bool,
+    pub(crate) pgo: Option<PgoTrainingCrate>,
+    pub(crate) force_always_assert: bool,
+}
+
+impl ServerOpt {
+    fn to_features(&self) -> Vec<&'static str> {
+        let malloc_features = self.malloc.to_features();
+        let mut features = Vec::with_capacity(
+            malloc_features.len() + if self.force_always_assert { 2 } else { 0 },
+        );
+        features.extend(malloc_features);
+        if self.force_always_assert {
+            features.extend(["--features", "force-always-assert"]);
+        }
+        features
+    }
 }
 
 pub(crate) struct ProcMacroServerOpt {
@@ -89,12 +108,8 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
     };
 
     // Find the appropriate VS Code binary.
-    let lifetime_extender;
     let candidates: &[&str] = match client_opt.code_bin.as_deref() {
-        Some(it) => {
-            lifetime_extender = [it];
-            &lifetime_extender[..]
-        }
+        Some(it) => &[it],
         None => VS_CODES,
     };
     let code = candidates
@@ -132,18 +147,43 @@ fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
 }
 
 fn install_server(sh: &Shell, opts: ServerOpt) -> anyhow::Result<()> {
-    let features = opts.malloc.to_features();
+    let features = &opts.to_features();
     let profile = if opts.dev_rel { "dev-rel" } else { "release" };
 
-    let cmd = cmd!(sh, "cargo install --path crates/rust-analyzer --profile={profile} --locked --force --features force-always-assert {features...}");
-    cmd.run()?;
+    let mut install_cmd = cmd!(
+        sh,
+        "cargo install --path crates/rust-analyzer --profile={profile} --locked --force {features...}"
+    );
+
+    if let Some(train_crate) = opts.pgo {
+        let target = detect_target(sh);
+        let build_cmd = cmd!(
+            sh,
+            "cargo build --manifest-path ./crates/rust-analyzer/Cargo.toml --bin rust-analyzer --target {target} --profile={profile} --locked {features...}"
+        );
+
+        let profile = crate::pgo::gather_pgo_profile(sh, build_cmd, &target, train_crate)?;
+        install_cmd = crate::pgo::apply_pgo_to_cmd(install_cmd, &profile);
+    }
+
+    install_cmd.run()?;
     Ok(())
 }
 
 fn install_proc_macro_server(sh: &Shell, opts: ProcMacroServerOpt) -> anyhow::Result<()> {
     let profile = if opts.dev_rel { "dev-rel" } else { "release" };
 
-    let cmd = cmd!(sh, "cargo +nightly install --path crates/proc-macro-srv-cli --profile={profile} --locked --force --features sysroot-abi");
+    let mut cmd = cmd!(
+        sh,
+        "cargo install --path crates/proc-macro-srv-cli --profile={profile} --locked --force --features in-rust-tree"
+    );
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_none() {
+        cmd = cmd.env("RUSTUP_TOOLCHAIN", "nightly");
+    } else {
+        cmd = cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
+
     cmd.run()?;
+
     Ok(())
 }

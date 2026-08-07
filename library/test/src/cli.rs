@@ -57,6 +57,7 @@ fn optgroups() -> getopts::Options {
         .optflag("", "test", "Run tests and not benchmarks")
         .optflag("", "bench", "Run benchmarks instead of tests")
         .optflag("", "list", "List all tests and benchmarks")
+        .optflag("", "fail-fast", "Don't start new tests after the first failure")
         .optflag("h", "help", "Display this message")
         .optopt("", "logfile", "Write logs to the specified file (deprecated)", "PATH")
         .optflag(
@@ -162,18 +163,17 @@ tests whose names contain the filter are run. Multiple filter strings may
 be passed, which will run all tests matching any of the filters.
 
 By default, all tests are run in parallel. This can be altered with the
---test-threads flag or the RUST_TEST_THREADS environment variable when running
-tests (set it to 1).
+--test-threads flag when running tests (set it to 1).
 
-By default, the tests are run in alphabetical order. Use --shuffle or set
-RUST_TEST_SHUFFLE to run the tests in random order. Pass the generated
-"shuffle seed" to --shuffle-seed (or set RUST_TEST_SHUFFLE_SEED) to run the
-tests in the same order again. Note that --shuffle and --shuffle-seed do not
-affect whether the tests are run in parallel.
+By default, the tests are run in alphabetical order. Use --shuffle to run
+the tests in random order. Pass the generated "shuffle seed" to
+--shuffle-seed to run the tests in the same order again. Note that
+--shuffle and --shuffle-seed do not affect whether the tests are run in
+parallel.
 
 All tests have their standard output and standard error captured by default.
-This can be overridden with the --no-capture flag or setting RUST_TEST_NOCAPTURE
-environment variable to a value other than "0". Logging is not captured by default.
+This can be overridden with the --no-capture flag to a value other than "0".
+Logging is not captured by default.
 
 Test Attributes:
 
@@ -261,6 +261,7 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
     // Unstable flags
     let force_run_in_process = unstable_optflag!(matches, allow_unstable, "force-run-in-process");
     let exclude_should_panic = unstable_optflag!(matches, allow_unstable, "exclude-should-panic");
+    let fail_fast = unstable_optflag!(matches, allow_unstable, "fail-fast");
     let time_options = get_time_options(&matches, allow_unstable)?;
     let shuffle = get_shuffle(&matches, allow_unstable)?;
     let shuffle_seed = get_shuffle_seed(&matches, allow_unstable)?;
@@ -307,21 +308,20 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
         skip,
         time_options,
         options,
-        fail_fast: false,
+        fail_fast,
     };
 
     Ok(test_opts)
 }
 
-// FIXME: Copied from librustc_ast until linkage errors are resolved. Issue #47566
 fn is_nightly() -> bool {
-    // Whether this is a feature-staged build, i.e., on the beta or stable channel
-    let disable_unstable_features =
-        option_env!("CFG_DISABLE_UNSTABLE_FEATURES").map(|s| s != "0").unwrap_or(false);
-    // Whether we should enable unstable features for bootstrapping
+    // Whether the current rustc version should allow unstable features
+    let enable_unstable_features = cfg!(enable_unstable_features);
+
+    // The runtime override for unstable features
     let bootstrap = env::var("RUSTC_BOOTSTRAP").is_ok();
 
-    bootstrap || !disable_unstable_features
+    bootstrap || enable_unstable_features
 }
 
 // Gets the CLI options associated with `report-time` feature.

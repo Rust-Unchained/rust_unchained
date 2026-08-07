@@ -55,7 +55,7 @@
 //! `specialization` or `min_specialization` is enabled to implement these
 //! traits.
 //!
-//! ### rustc_unsafe_specialization_marker
+//! ### rustc_allow_lifetime_dependent_specialization
 //!
 //! There are also some specialization on traits with no methods, including the
 //! stable `FusedIterator` trait. We allow marking marker traits with an
@@ -79,8 +79,8 @@ use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::traits::{self, ObligationCtxt, translate_args_with_cause, wf};
 use tracing::{debug, instrument};
 
-use crate::errors::GenericArgsOnOverriddenImpl;
-use crate::{constrained_generic_params as cgp, errors};
+use crate::diagnostics::GenericArgsOnOverriddenImpl;
+use crate::{constrained_generic_params as cgp, diagnostics};
 
 pub(super) fn check_min_specialization(
     tcx: TyCtxt<'_>,
@@ -93,7 +93,7 @@ pub(super) fn check_min_specialization(
 }
 
 fn parent_specialization_node(tcx: TyCtxt<'_>, impl1_def_id: LocalDefId) -> Option<Node> {
-    let trait_ref = tcx.impl_trait_ref(impl1_def_id)?;
+    let trait_ref = tcx.impl_trait_ref(impl1_def_id);
     let trait_def = tcx.trait_def(trait_ref.skip_binder().def_id);
 
     let impl2_node = trait_def.ancestors(tcx, impl1_def_id.to_def_id()).ok()?.nth(1)?;
@@ -146,7 +146,7 @@ fn check_has_items(
         && tcx.associated_item_def_ids(impl1_def_id).is_empty()
     {
         let base_impl_span = tcx.def_span(impl2_id);
-        return Err(tcx.dcx().emit_err(errors::EmptySpecialization { span, base_impl_span }));
+        return Err(tcx.dcx().emit_err(diagnostics::EmptySpecialization { span, base_impl_span }));
     }
     Ok(())
 }
@@ -183,14 +183,14 @@ fn get_impl_args(
         &ObligationCause::misc(impl1_span, impl1_def_id),
     );
 
-    let errors = ocx.select_all_or_error();
+    let errors = ocx.evaluate_obligations_error_on_ambiguity();
     if !errors.is_empty() {
         let guar = ocx.infcx.err_ctxt().report_fulfillment_errors(errors);
         return Err(guar);
     }
 
     let assumed_wf_types = ocx.assumed_wf_types_and_report_errors(param_env, impl1_def_id)?;
-    let _ = ocx.resolve_regions_and_report_errors(impl1_def_id, param_env, assumed_wf_types);
+    ocx.resolve_regions_and_report_errors(impl1_def_id, param_env, assumed_wf_types)?;
     let Ok(impl2_args) = infcx.fully_resolve(impl2_args) else {
         let span = tcx.def_span(impl1_def_id);
         let guar = tcx.dcx().emit_err(GenericArgsOnOverriddenImpl { span });
@@ -212,19 +212,19 @@ fn unconstrained_parent_impl_args<'tcx>(
     impl_def_id: DefId,
     impl_args: GenericArgsRef<'tcx>,
 ) -> Vec<GenericArg<'tcx>> {
-    let impl_generic_predicates = tcx.predicates_of(impl_def_id);
+    let impl_generic_clauses = tcx.clauses_of(impl_def_id);
     let mut unconstrained_parameters = FxHashSet::default();
     let mut constrained_params = FxHashSet::default();
-    let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).map(ty::EarlyBinder::instantiate_identity);
+    let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).instantiate_identity().skip_norm_wip();
 
     // Unfortunately the functions in `constrained_generic_parameters` don't do
     // what we want here. We want only a list of constrained parameters while
     // the functions in `cgp` add the constrained parameters to a list of
     // unconstrained parameters.
-    for (clause, _) in impl_generic_predicates.predicates.iter() {
+    for (clause, _) in impl_generic_clauses.clauses.iter() {
         if let ty::ClauseKind::Projection(proj) = clause.kind().skip_binder() {
             let unbound_trait_ref = proj.projection_term.trait_ref(tcx);
-            if Some(unbound_trait_ref) == impl_trait_ref {
+            if unbound_trait_ref == impl_trait_ref {
                 continue;
             }
 
@@ -275,7 +275,7 @@ fn check_duplicate_params<'tcx>(
     span: Span,
 ) -> Result<(), ErrorGuaranteed> {
     let mut base_params = cgp::parameters_for(tcx, parent_args, true);
-    base_params.sort_by_key(|param| param.0);
+    base_params.sort_unstable();
     if let (_, [duplicate, ..]) = base_params.partition_dedup() {
         let param = impl1_args[duplicate.0 as usize];
         return Err(tcx
@@ -300,7 +300,7 @@ fn check_static_lifetimes<'tcx>(
     span: Span,
 ) -> Result<(), ErrorGuaranteed> {
     if tcx.any_free_region_meets(parent_args, |r| r.is_static()) {
-        return Err(tcx.dcx().emit_err(errors::StaticSpecialize { span }));
+        return Err(tcx.dcx().emit_err(diagnostics::StaticSpecialize { span }));
     }
     Ok(())
 }
@@ -324,27 +324,30 @@ fn check_predicates<'tcx>(
     impl2_args: GenericArgsRef<'tcx>,
     span: Span,
 ) -> Result<(), ErrorGuaranteed> {
-    let impl1_predicates: Vec<_> = traits::elaborate(
+    let impl1_clauses: Vec<(ty::Clause<'_>, _)> = traits::elaborate(
         tcx,
-        tcx.predicates_of(impl1_def_id).instantiate(tcx, impl1_args).into_iter(),
+        tcx.clauses_of(impl1_def_id)
+            .instantiate(tcx, impl1_args)
+            .into_iter()
+            .map(|(c, s)| (c.skip_norm_wip(), s)),
     )
     .collect();
 
-    let mut impl2_predicates = if impl2_node.is_from_trait() {
+    let mut impl2_clauses: Vec<ty::Clause<'_>> = if impl2_node.is_from_trait() {
         // Always applicable traits have to be always applicable without any
         // assumptions.
         Vec::new()
     } else {
         traits::elaborate(
             tcx,
-            tcx.predicates_of(impl2_node.def_id())
+            tcx.clauses_of(impl2_node.def_id())
                 .instantiate(tcx, impl2_args)
                 .into_iter()
-                .map(|(c, _s)| c.as_predicate()),
+                .map(|(c, _s)| c.skip_norm_wip()),
         )
         .collect()
     };
-    debug!(?impl1_predicates, ?impl2_predicates);
+    debug!(?impl1_clauses, ?impl2_clauses);
 
     // Since impls of always applicable traits don't get to assume anything, we
     // can also assume their supertraits apply.
@@ -361,7 +364,7 @@ fn check_predicates<'tcx>(
     // which is sound because we forbid impls like the following
     //
     // impl<D: Debug> AlwaysApplicable for D { }
-    let always_applicable_traits = impl1_predicates
+    let always_applicable_traits = impl1_clauses
         .iter()
         .copied()
         .filter(|&(clause, _span)| {
@@ -370,10 +373,10 @@ fn check_predicates<'tcx>(
                 Some(TraitSpecializationKind::AlwaysApplicable)
             )
         })
-        .map(|(c, _span)| c.as_predicate());
+        .map(|(c, _span)| c);
 
     // Include the well-formed predicates of the type parameters of the impl.
-    for arg in tcx.impl_trait_ref(impl1_def_id).unwrap().instantiate_identity().args {
+    for arg in tcx.impl_trait_ref(impl1_def_id).instantiate_identity().skip_norm_wip().args {
         let Some(term) = arg.as_term() else {
             continue;
         };
@@ -383,50 +386,20 @@ fn check_predicates<'tcx>(
                 .unwrap();
 
         assert!(!obligations.has_infer());
-        impl2_predicates
-            .extend(traits::elaborate(tcx, obligations).map(|obligation| obligation.predicate))
+        impl2_clauses.extend(
+            traits::elaborate(tcx, obligations)
+                .filter_map(|obligation| obligation.predicate.as_clause()),
+        )
     }
-    impl2_predicates.extend(traits::elaborate(tcx, always_applicable_traits));
+    impl2_clauses.extend(traits::elaborate(tcx, always_applicable_traits));
 
     let mut res = Ok(());
-    for (clause, span) in impl1_predicates {
-        if !impl2_predicates.iter().any(|pred2| trait_predicates_eq(clause.as_predicate(), *pred2))
-        {
-            res = res.and(check_specialization_on(tcx, clause, span))
+    for (clause1, span) in impl1_clauses {
+        if !impl2_clauses.iter().any(|&clause2| clause1 == clause2) {
+            res = res.and(check_specialization_on(tcx, clause1, span))
         }
     }
     res
-}
-
-/// Checks if some predicate on the specializing impl (`predicate1`) is the same
-/// as some predicate on the base impl (`predicate2`).
-///
-/// This basically just checks syntactic equivalence, but is a little more
-/// forgiving since we want to equate `T: Tr` with `T: ~const Tr` so this can work:
-///
-/// ```ignore (illustrative)
-/// #[rustc_specialization_trait]
-/// trait Specialize { }
-///
-/// impl<T: Bound> Tr for T { }
-/// impl<T: ~const Bound + Specialize> const Tr for T { }
-/// ```
-///
-/// However, we *don't* want to allow the reverse, i.e., when the bound on the
-/// specializing impl is not as const as the bound on the base impl:
-///
-/// ```ignore (illustrative)
-/// impl<T: ~const Bound> const Tr for T { }
-/// impl<T: Bound + Specialize> const Tr for T { } // should be T: ~const Bound
-/// ```
-///
-/// So we make that check in this function and try to raise a helpful error message.
-fn trait_predicates_eq<'tcx>(
-    predicate1: ty::Predicate<'tcx>,
-    predicate2: ty::Predicate<'tcx>,
-) -> bool {
-    // FIXME(const_trait_impl)
-    predicate1 == predicate2
 }
 
 #[instrument(level = "debug", skip(tcx))]
@@ -499,6 +472,7 @@ fn trait_specialization_kind<'tcx>(
         | ty::ClauseKind::ConstArgHasType(..)
         | ty::ClauseKind::WellFormed(_)
         | ty::ClauseKind::ConstEvaluatable(..)
+        | ty::ClauseKind::UnstableFeature(_)
         | ty::ClauseKind::HostEffect(..) => None,
     }
 }

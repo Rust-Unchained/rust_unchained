@@ -1,4 +1,6 @@
-// Regression test for #122561
+// Regression test for <https://github.com/rust-lang/rust/issues/122561>.
+//
+// Tests suggestions for type mismatch of loop expressions.
 
 fn for_infinite() -> bool {
     for i in 0.. {
@@ -64,6 +66,24 @@ fn while_zero_times() -> bool {
     while false {
     //~^ ERROR mismatched types
         return true;
+    }
+}
+
+fn while_let_binding() -> bool {
+    while let x = false {
+    //~^ ERROR mismatched types
+        if x {
+            return true;
+        }
+    }
+}
+
+fn while_let_tuple() -> bool {
+    while let (x, _) = (false, true) {
+    //~^ ERROR mismatched types
+        if x {
+            return true;
+        }
     }
 }
 

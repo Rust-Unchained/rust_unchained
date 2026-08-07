@@ -1,9 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::LateContext;
-use rustc_span::sym;
+use rustc_span::{Symbol, sym};
 
 use super::NEEDLESS_OPTION_TAKE;
 
@@ -35,27 +35,27 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, recv: &'
 
 fn is_expr_option(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let expr_type = cx.typeck_results().expr_ty(expr);
-    is_type_diagnostic_item(cx, expr_type, sym::Option)
+    expr_type.is_diag_item(cx, sym::Option)
 }
 
 /// Returns the string of the function call that creates the temporary.
 /// When this function is called, we are reasonably certain that the `ExprKind` is either
 /// `Call` or `MethodCall` because we already checked that the expression is not
 /// `is_syntactic_place_expr()`.
-fn source_of_temporary_value<'a>(expr: &'a Expr<'_>) -> Option<&'a str> {
+fn source_of_temporary_value(expr: &Expr<'_>) -> Option<Symbol> {
     match expr.peel_borrows().kind {
         ExprKind::Call(function, _) => {
             if let ExprKind::Path(QPath::Resolved(_, func_path)) = function.kind
                 && !func_path.segments.is_empty()
             {
-                return Some(func_path.segments[0].ident.name.as_str());
+                return Some(func_path.segments[0].ident.name);
             }
             if let ExprKind::Path(QPath::TypeRelative(_, func_path_segment)) = function.kind {
-                return Some(func_path_segment.ident.name.as_str());
+                return Some(func_path_segment.ident.name);
             }
             None
         },
-        ExprKind::MethodCall(path_segment, ..) => Some(path_segment.ident.name.as_str()),
+        ExprKind::MethodCall(path_segment, ..) => Some(path_segment.ident.name),
         _ => None,
     }
 }

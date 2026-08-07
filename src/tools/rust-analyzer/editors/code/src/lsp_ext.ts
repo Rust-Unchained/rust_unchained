@@ -46,9 +46,6 @@ export const rebuildProcMacros = new lc.RequestType0<null, void>("rust-analyzer/
 export const runFlycheck = new lc.NotificationType<{
     textDocument: lc.TextDocumentIdentifier | null;
 }>("rust-analyzer/runFlycheck");
-export const syntaxTree = new lc.RequestType<SyntaxTreeParams, string, void>(
-    "rust-analyzer/syntaxTree",
-);
 export const viewSyntaxTree = new lc.RequestType<ViewSyntaxTreeParams, string, void>(
     "rust-analyzer/viewSyntaxTree",
 );
@@ -69,6 +66,24 @@ export const interpretFunction = new lc.RequestType<lc.TextDocumentPositionParam
 );
 export const viewItemTree = new lc.RequestType<ViewItemTreeParams, string, void>(
     "rust-analyzer/viewItemTree",
+);
+export type EvaluatePredicateParams = {
+    text: string;
+    textDocument: lc.TextDocumentIdentifier;
+    position: lc.Position;
+};
+export type PredicateEvaluationStatus = "holds" | "notProven" | "invalid" | "unsupported";
+export type EvaluatePredicateResult = {
+    status: PredicateEvaluationStatus;
+    message: string;
+};
+export const evaluatePredicate = new lc.RequestType<
+    EvaluatePredicateParams,
+    EvaluatePredicateResult,
+    void
+>("rust-analyzer/evaluatePredicate");
+export const getFailedObligations = new lc.RequestType<lc.TextDocumentPositionParams, string, void>(
+    "rust-analyzer/getFailedObligations",
 );
 
 export type DiscoverTestParams = { testId?: string | undefined };
@@ -194,6 +209,11 @@ export const parentModule = new lc.RequestType<
     lc.LocationLink[] | null,
     void
 >("experimental/parentModule");
+export const childModules = new lc.RequestType<
+    lc.TextDocumentPositionParams,
+    lc.LocationLink[] | null,
+    void
+>("experimental/childModules");
 export const runnables = new lc.RequestType<RunnablesParams, Runnable[], void>(
     "experimental/runnables",
 );
@@ -295,14 +315,14 @@ export type SsrParams = {
 };
 
 export type RecursiveMemoryLayoutNode = {
-    item_name: string;
+    itemName: string;
     typename: string;
     size: number;
     alignment: number;
     offset: number;
-    parent_idx: number;
-    children_start: number;
-    children_len: number;
+    parentIdx: number;
+    childrenStart: number;
+    childrenLen: number;
 };
 export type RecursiveMemoryLayout = {
     nodes: RecursiveMemoryLayoutNode[];

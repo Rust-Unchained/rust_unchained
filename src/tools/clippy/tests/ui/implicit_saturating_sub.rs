@@ -1,4 +1,4 @@
-#![allow(unused_assignments, unused_mut, clippy::assign_op_pattern)]
+#![allow(clippy::assign_op_pattern)]
 #![warn(clippy::implicit_saturating_sub)]
 
 use std::cmp::PartialEq;
@@ -322,6 +322,37 @@ fn arbitrary_expression() {
 
     let _ = if with_side_effect(a) > a {
         with_side_effect(a) - a
+    } else {
+        0
+    };
+}
+
+fn issue16307() {
+    let x: u8 = 100;
+    let y = if x >= 100 { 0 } else { 100 - x };
+    //~^ implicit_saturating_sub
+
+    println!("{y}");
+}
+
+fn wrongly_unmangled_macros() {
+    macro_rules! test_big {
+        ($val:expr) => {
+            ($val * 2 + 1)
+        };
+    }
+
+    macro_rules! test_little {
+        ($val:expr) => {
+            ($val * 2 + 0)
+        };
+    }
+
+    let a = 15u64;
+    let b = 20u64;
+    let _ = if test_big!(a) > test_little!(b) {
+        //~^ implicit_saturating_sub
+        test_big!(a) - test_little!(b)
     } else {
         0
     };

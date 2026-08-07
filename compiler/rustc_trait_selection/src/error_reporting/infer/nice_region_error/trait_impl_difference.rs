@@ -5,18 +5,19 @@ use rustc_hir::def::{Namespace, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{Visitor, walk_ty};
 use rustc_hir::{self as hir, AmbigArg};
+use rustc_infer::infer::SubregionOrigin;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::ExpectedFound;
 use rustc_middle::ty::print::RegionHighlightMode;
-use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
-use rustc_span::Span;
+use rustc_middle::ty::{self, RegionExt, TyCtxt, TypeVisitable};
+use rustc_span::{Ident, Span};
 use tracing::debug;
 
+use crate::diagnostics::{ConsiderBorrowingParamHelp, TraitImplDiff};
 use crate::error_reporting::infer::nice_region_error::NiceRegionError;
 use crate::error_reporting::infer::nice_region_error::placeholder_error::Highlighted;
-use crate::errors::{ConsiderBorrowingParamHelp, RelationshipHelp, TraitImplDiff};
-use crate::infer::{RegionResolutionError, Subtype, ValuePairs};
+use crate::infer::{RegionResolutionError, ValuePairs};
 
 impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// Print the error message for lifetime errors when the `impl` doesn't conform to the `trait`.
@@ -32,7 +33,8 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             _sup,
             _,
         ) = error.clone()
-            && let (Subtype(sup_trace), Subtype(sub_trace)) = (&sup_origin, &sub_origin)
+            && let (SubregionOrigin::Subtype(sup_trace), SubregionOrigin::Subtype(sub_trace)) =
+                (&sup_origin, &sub_origin)
             && let &ObligationCauseCode::CompareImplItem { trait_item_def_id, .. } =
                 sub_trace.cause.code()
             && sub_trace.values == sup_trace.values
@@ -58,14 +60,15 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         // Mark all unnamed regions in the type with a number.
         // This diagnostic is called in response to lifetime errors, so be informative.
         struct HighlightBuilder<'tcx> {
+            tcx: TyCtxt<'tcx>,
             highlight: RegionHighlightMode<'tcx>,
             counter: usize,
         }
 
         impl<'tcx> HighlightBuilder<'tcx> {
-            fn build(sig: ty::PolyFnSig<'tcx>) -> RegionHighlightMode<'tcx> {
+            fn build(tcx: TyCtxt<'tcx>, sig: ty::PolyFnSig<'tcx>) -> RegionHighlightMode<'tcx> {
                 let mut builder =
-                    HighlightBuilder { highlight: RegionHighlightMode::default(), counter: 1 };
+                    HighlightBuilder { tcx, highlight: RegionHighlightMode::default(), counter: 1 };
                 sig.visit_with(&mut builder);
                 builder.highlight
             }
@@ -73,15 +76,23 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 
         impl<'tcx> ty::TypeVisitor<TyCtxt<'tcx>> for HighlightBuilder<'tcx> {
             fn visit_region(&mut self, r: ty::Region<'tcx>) {
-                if !r.has_name() && self.counter <= 3 {
+                if !r.is_named(self.tcx) && self.counter <= 3 {
                     self.highlight.highlighting_region(r, self.counter);
                     self.counter += 1;
                 }
             }
         }
 
-        let expected_highlight = HighlightBuilder::build(expected);
         let tcx = self.cx.tcx;
+        let mut expected_highlight = HighlightBuilder::build(tcx, expected);
+        let expected_short = Highlighted {
+            highlight: expected_highlight,
+            ns: Namespace::TypeNS,
+            tcx,
+            value: expected,
+        }
+        .to_string();
+        expected_highlight.keep_regions = false;
         let expected = Highlighted {
             highlight: expected_highlight,
             ns: Namespace::TypeNS,
@@ -89,22 +100,26 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             value: expected,
         }
         .to_string();
-        let found_highlight = HighlightBuilder::build(found);
+        let mut found_highlight = HighlightBuilder::build(tcx, found);
+        let found_short =
+            Highlighted { highlight: found_highlight, ns: Namespace::TypeNS, tcx, value: found }
+                .to_string();
+        found_highlight.keep_regions = false;
         let found =
             Highlighted { highlight: found_highlight, ns: Namespace::TypeNS, tcx, value: found }
                 .to_string();
 
         // Get the span of all the used type parameters in the method.
         let assoc_item = self.tcx().associated_item(trait_item_def_id);
-        let mut visitor = TypeParamSpanVisitor { tcx: self.tcx(), types: vec![] };
+        let mut visitor =
+            TypeParamSpanVisitor { tcx: self.tcx(), types: vec![], elided_lifetime_paths: vec![] };
         match assoc_item.kind {
             ty::AssocKind::Fn { .. } => {
                 if let Some(hir_id) =
                     assoc_item.def_id.as_local().map(|id| self.tcx().local_def_id_to_hir_id(id))
+                    && let Some(decl) = self.tcx().hir_fn_decl_by_hir_id(hir_id)
                 {
-                    if let Some(decl) = self.tcx().hir_fn_decl_by_hir_id(hir_id) {
-                        visitor.visit_fn_decl(decl);
-                    }
+                    visitor.visit_fn_decl(decl);
                 }
             }
             _ => {}
@@ -115,18 +130,56 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
             trait_sp,
             note: (),
             param_help: ConsiderBorrowingParamHelp { spans: visitor.types.to_vec() },
-            rel_help: visitor.types.is_empty().then_some(RelationshipHelp),
+            rel_help: visitor.types.is_empty(),
             expected,
             found,
+            expected_short,
+            found_short,
         };
 
-        self.tcx().dcx().emit_err(diag)
+        let mut diag = self.tcx().dcx().create_err(diag);
+        // A limit not to make diag verbose.
+        const ELIDED_LIFETIME_NOTE_LIMIT: usize = 5;
+        let elided_lifetime_paths = visitor.elided_lifetime_paths;
+        let total_elided_lifetime_paths = elided_lifetime_paths.len();
+        let shown_elided_lifetime_paths = if tcx.sess.opts.verbose {
+            total_elided_lifetime_paths
+        } else {
+            ELIDED_LIFETIME_NOTE_LIMIT
+        };
+
+        for elided in elided_lifetime_paths.into_iter().take(shown_elided_lifetime_paths) {
+            diag.span_note(
+                elided.span,
+                format!("`{}` here is elided as `{}`", elided.ident, elided.shorthand),
+            );
+        }
+        if total_elided_lifetime_paths > shown_elided_lifetime_paths {
+            diag.note(format!(
+                "and {} more elided lifetime{} in type paths",
+                total_elided_lifetime_paths - shown_elided_lifetime_paths,
+                if total_elided_lifetime_paths - shown_elided_lifetime_paths == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
+        }
+        diag.emit()
     }
+}
+
+#[derive(Clone)]
+struct ElidedLifetimeInPath {
+    span: Span,
+    ident: Ident,
+    shorthand: String,
 }
 
 struct TypeParamSpanVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     types: Vec<Span>,
+    elided_lifetime_paths: Vec<ElidedLifetimeInPath>,
 }
 
 impl<'tcx> Visitor<'tcx> for TypeParamSpanVisitor<'tcx> {
@@ -134,6 +187,83 @@ impl<'tcx> Visitor<'tcx> for TypeParamSpanVisitor<'tcx> {
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
+    }
+
+    fn visit_qpath(&mut self, qpath: &'tcx hir::QPath<'tcx>, id: hir::HirId, _span: Span) {
+        fn record_elided_lifetimes(
+            tcx: TyCtxt<'_>,
+            elided_lifetime_paths: &mut Vec<ElidedLifetimeInPath>,
+            segment: &hir::PathSegment<'_>,
+        ) {
+            let Some(args) = segment.args else { return };
+            if args.parenthesized != hir::GenericArgsParentheses::No {
+                // Our diagnostic rendering below uses `<...>` syntax; skip cases like `Fn(..) -> ..`.
+                return;
+            }
+            let elided_count = args
+                .args
+                .iter()
+                .filter(|arg| {
+                    let hir::GenericArg::Lifetime(l) = arg else { return false };
+                    l.syntax == hir::LifetimeSyntax::Implicit
+                        && matches!(l.source, hir::LifetimeSource::Path { .. })
+                })
+                .count();
+            if elided_count == 0
+                || elided_lifetime_paths.iter().any(|p| p.span == segment.ident.span)
+            {
+                return;
+            }
+
+            let sm = tcx.sess.source_map();
+            let mut parts = args
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    hir::GenericArg::Lifetime(l) => {
+                        if l.syntax == hir::LifetimeSyntax::Implicit
+                            && matches!(l.source, hir::LifetimeSource::Path { .. })
+                        {
+                            "'_".to_string()
+                        } else {
+                            sm.span_to_snippet(l.ident.span)
+                                .unwrap_or_else(|_| format!("'{}", l.ident.name))
+                        }
+                    }
+                    hir::GenericArg::Type(ty) => {
+                        sm.span_to_snippet(ty.span).unwrap_or_else(|_| "..".to_string())
+                    }
+                    hir::GenericArg::Const(ct) => {
+                        sm.span_to_snippet(ct.span).unwrap_or_else(|_| "..".to_string())
+                    }
+                    hir::GenericArg::Infer(_) => "_".to_string(),
+                })
+                .collect::<Vec<_>>();
+            parts.extend(args.constraints.iter().map(|constraint| {
+                sm.span_to_snippet(constraint.span)
+                    .unwrap_or_else(|_| format!("{} = ..", constraint.ident))
+            }));
+            let shorthand = format!("{}<{}>", segment.ident, parts.join(", "));
+
+            elided_lifetime_paths.push(ElidedLifetimeInPath {
+                span: segment.ident.span,
+                ident: segment.ident,
+                shorthand,
+            });
+        }
+
+        match qpath {
+            hir::QPath::Resolved(_, path) => {
+                for segment in path.segments {
+                    record_elided_lifetimes(self.tcx, &mut self.elided_lifetime_paths, segment);
+                }
+            }
+            hir::QPath::TypeRelative(_, segment) => {
+                record_elided_lifetimes(self.tcx, &mut self.elided_lifetime_paths, segment);
+            }
+        }
+
+        hir::intravisit::walk_qpath(self, qpath, id);
     }
 
     fn visit_ty(&mut self, arg: &'tcx hir::Ty<'tcx, AmbigArg>) {

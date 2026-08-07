@@ -98,7 +98,6 @@ fn test_env_set_var() {
 
 #[test]
 #[cfg_attr(not(any(unix, windows)), ignore, allow(unused))]
-#[allow(deprecated)]
 fn env_home_dir() {
     use std::path::PathBuf;
 
@@ -110,8 +109,8 @@ fn env_home_dir() {
         }
     }
 
-    cfg_if::cfg_if! {
-        if #[cfg(unix)] {
+    cfg_select! {
+        unix => {
             let oldhome = var_to_os_string(var("HOME"));
 
             unsafe {
@@ -130,7 +129,8 @@ fn env_home_dir() {
             }
 
             if let Some(oldhome) = oldhome { unsafe { set_var("HOME", oldhome); } }
-        } else if #[cfg(windows)] {
+        }
+        windows => {
             let oldhome = var_to_os_string(var("HOME"));
             let olduserprofile = var_to_os_string(var("USERPROFILE"));
 
@@ -159,6 +159,7 @@ fn env_home_dir() {
                 if let Some(olduserprofile) = olduserprofile { set_var("USERPROFILE", olduserprofile); }
             }
         }
+        _ => {}
     }
 }
 

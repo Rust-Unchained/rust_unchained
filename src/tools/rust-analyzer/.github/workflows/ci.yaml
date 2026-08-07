@@ -15,8 +15,12 @@ env:
   CARGO_NET_RETRY: 10
   CI: 1
   RUST_BACKTRACE: short
-  RUSTFLAGS: "-D warnings -D elided_lifetimes_in_paths -D explicit_outlives_requirements -D unsafe_op_in_unsafe_fn -D unused_extern_crates -D unused_lifetimes -D unreachable_pub"
   RUSTUP_MAX_RETRIES: 10
+  RUSTFLAGS: "-D warnings -W unreachable-pub --cfg no_salsa_async_drops"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   changes:
@@ -25,51 +29,50 @@ jobs:
       pull-requests: read
     outputs:
       typescript: ${{ steps.filter.outputs.typescript }}
-      proc_macros: ${{ steps.filter.outputs.proc_macros }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@1441771bbfdd59dcd748680ee64ebd8faab1a242
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
         with:
           filters: |
             typescript:
               - 'editors/code/**'
-            proc_macros:
-              - 'crates/tt/**'
-              - 'crates/proc-macro-api/**'
-              - 'crates/proc-macro-srv/**'
-              - 'crates/proc-macro-srv-cli/**'
 
   proc-macro-srv:
-    needs: changes
-    if: github.repository == 'rust-lang/rust-analyzer' && needs.changes.outputs.proc_macros == 'true'
+    if: github.repository == 'rust-lang/rust-analyzer'
     name: proc-macro-srv
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Install rustup-toolchain-install-master
+        run: cargo install rustup-toolchain-install-master@1.11.0
+
+      # Install a pinned rustc commit to avoid surprises
       - name: Install Rust toolchain
         run: |
-          rustup update --no-self-update nightly
-          rustup default nightly
-          rustup component add --toolchain nightly rust-src rustfmt
+          RUSTC_VERSION=$(cat rust-version)
+          rustup-toolchain-install-master ${RUSTC_VERSION} -c cargo -c rust-src -c rustfmt -c rustc-dev -c llvm-tools
+          rustup default ${RUSTC_VERSION}
+
+      # Emulate a nightly toolchain, because the toolchain installed above does not have "nightly"
+      # in its version string.
+      - name: Emulate a nightly toolchain
+        run: echo "RUSTC_BOOTSTRAP=1" >> $GITHUB_ENV
+
       # https://github.com/actions-rust-lang/setup-rust-toolchain/blob/main/rust.json
       - name: Install Rust Problem Matcher
-        if: matrix.os == 'ubuntu-latest'
         run: echo "::add-matcher::.github/rust.json"
 
-      - name: Cache Dependencies
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
-
-      - name: Bump opt-level
-        if: matrix.os == 'ubuntu-latest'
-        run: sed -i '/\[profile.dev]/a opt-level=1' Cargo.toml
-
       - name: Test
-        run: cargo test --features sysroot-abi -p rust-analyzer -p proc-macro-srv -p proc-macro-srv-cli -p proc-macro-api -- --quiet
+        run: cargo test --features in-rust-tree -p proc-macro-srv -p proc-macro-srv-cli -p proc-macro-api -- --quiet
+
+      - name: Check salsa dependency
+        run: "! (cargo tree -p proc-macro-srv-cli -p proc-macro-srv -p proc-macro-srv-cli -p proc-macro-api -i salsa)"
 
   rust:
     if: github.repository == 'rust-lang/rust-analyzer'
@@ -85,7 +88,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -93,60 +96,127 @@ jobs:
         run: |
           rustup update --no-self-update stable
           rustup default stable
-          rustup component add --toolchain stable rust-src
-          # We always use a nightly rustfmt, regardless of channel, because we need
-          # --file-lines.
+          rustup component add --toolchain stable rust-src rustfmt
+          # We also install a nightly rustfmt, because we use `--file-lines` in
+          # a test.
           rustup toolchain install nightly --profile minimal --component rustfmt
       # https://github.com/actions-rust-lang/setup-rust-toolchain/blob/main/rust.json
       - name: Install Rust Problem Matcher
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'macos-latest'
         run: echo "::add-matcher::.github/rust.json"
 
-      - name: Cache Dependencies
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+      # - name: Cache Dependencies
+      #   uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+      #   with:
+      #     workspaces: |
+      #       . -> target
+      #       ./crates/proc-macro-srv/proc-macro-test/imp -> target
 
-      - name: Bump opt-level
-        if: matrix.os == 'ubuntu-latest'
-        run: sed -i '/\[profile.dev]/a opt-level=1' Cargo.toml
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Codegen checks (rust-analyzer)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo codegen --check
 
-      - name: Compile (tests)
-        run: cargo test --no-run --locked
+      - name: Run tests
+        run: cargo nextest run --no-fail-fast --hide-progress-bar
 
-      # It's faster to `test` before `build` ¯\_(ツ)_/¯
-      - name: Compile (rust-analyzer)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo build --quiet
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@cargo-machete
 
-      - name: Test
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest' || github.event_name == 'push'
-        run: cargo test -- --quiet
+      - name: Run cargo-machete
+        run: cargo machete
 
-      - name: Switch to stable toolchain
+  analysis-stats:
+    if: github.repository == 'rust-lang/rust-analyzer'
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_BOOTSTRAP: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
-          rustup component add --toolchain stable rust-src clippy
           rustup default stable
+          rustup component add rustfmt
 
-      - name: Run analysis-stats on rust-analyzer
-        if: matrix.os == 'ubuntu-latest'
-        run: target/${{ matrix.target }}/debug/rust-analyzer analysis-stats .
+      # - name: Cache Dependencies
+      #   uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
 
-      - name: Run analysis-stats on the rust standard libraries
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          RUSTC_BOOTSTRAP: 1
-        run: target/${{ matrix.target }}/debug/rust-analyzer analysis-stats --with-deps --no-sysroot --no-test $(rustc --print sysroot)/lib/rustlib/src/rust/library/
+      - name: Bump opt-level
+        run: sed -i '/\[profile.dev]/a opt-level=1' Cargo.toml
 
-      - name: clippy
-        if: matrix.os == 'windows-latest'
-        run: cargo clippy --all-targets -- -D clippy::disallowed_macros -D clippy::dbg_macro -D clippy::todo -D clippy::print_stdout -D clippy::print_stderr
+      - run: cargo build -p rust-analyzer
 
-      - name: rustfmt
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt -- --check
+      - name: ./rust-analyzer
+        run: ./target/debug/rust-analyzer analysis-stats . -q
+
+      - name: sysroot/lib/rustlib/src/rust/library/
+        run: ./target/debug/rust-analyzer analysis-stats --with-deps --no-sysroot --no-test $(rustc --print sysroot)/lib/rustlib/src/rust/library/ -q
+
+  rustfmt:
+    if: github.repository == 'rust-lang/rust-analyzer'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt
+
+      - run: cargo fmt -- --check
+
+  clippy:
+    if: github.repository == 'rust-lang/rust-analyzer'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # Note that clippy output is currently dependent on whether rust-src is installed,
+      # https://github.com/rust-lang/rust-clippy/issues/14625
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add --toolchain stable rust-src clippy
+
+      # https://github.com/actions-rust-lang/setup-rust-toolchain/blob/main/rust.json
+      - name: Install Rust Problem Matcher
+        run: echo "::add-matcher::.github/rust.json"
+
+      - run: cargo clippy --all-targets -- -D clippy::disallowed_macros -D clippy::dbg_macro -D clippy::todo -D clippy::print_stdout -D clippy::print_stderr
+
+  miri:
+    if: github.repository == 'rust-lang/rust-analyzer'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          # FIXME: Pin nightly due to a regression in miri on nightly-2026-02-12.
+          # See https://github.com/rust-lang/miri/issues/4855.
+          # Revert to plain `nightly` once this is fixed upstream.
+          rustup toolchain install nightly-2026-02-10
+          rustup default nightly-2026-02-10
+          rustup component add miri
+
+      # - name: Cache Dependencies
+      #   uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+
+      - run: cargo miri test -p intern
 
   # Weird targets to catch non-portable code
   rust-cross:
@@ -154,32 +224,31 @@ jobs:
     name: Rust Cross
     runs-on: ubuntu-latest
 
-    env:
-      targets: "powerpc-unknown-linux-gnu x86_64-unknown-linux-musl"
-      # The rust-analyzer binary is not expected to compile on WASM, but the IDE
-      # crate should
-      targets_ide: "wasm32-unknown-unknown"
+    strategy:
+      matrix:
+        target: [powerpc-unknown-linux-gnu, x86_64-unknown-linux-musl, wasm32-unknown-unknown]
+        include:
+          # The rust-analyzer binary is not expected to compile on WASM, but the IDE
+          # crate should
+          - target: wasm32-unknown-unknown
+            ide-only: true
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: |
           rustup update --no-self-update stable
-          rustup target add ${{ env.targets }} ${{ env.targets_ide }}
+          rustup target add ${{ matrix.target }}
 
-      - name: Cache Dependencies
-        uses: Swatinem/rust-cache@9bdad043e88c75890e36ad3bbc8d27f0090dd609
+      # - name: Cache Dependencies
+      #   uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
 
-      - name: Check
-        run: |
-          for target in ${{ env.targets }}; do
-            cargo check --target=$target --all-targets
-          done
-          for target in ${{ env.targets_ide }}; do
-            cargo check -p ide --target=$target --all-targets
-          done
+      - run: cargo check --target=${{ matrix.target }} --all-targets -p ide
+        if: ${{ matrix.ide-only }}
+      - run: cargo check --target=${{ matrix.target }} --all-targets
+        if: ${{ !matrix.ide-only }}
 
   typescript:
     needs: changes
@@ -194,10 +263,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Nodejs
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -247,13 +316,13 @@ jobs:
     timeout-minutes: 10
     env:
       FORCE_COLOR: 1
-      TYPOS_VERSION: v1.28.3
+      TYPOS_VERSION: v1.38.1
     steps:
       - name: download typos
         run: curl -LsSf https://github.com/crate-ci/typos/releases/download/$TYPOS_VERSION/typos-$TYPOS_VERSION-x86_64-unknown-linux-musl.tar.gz | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -261,7 +330,18 @@ jobs:
         run: typos
 
   conclusion:
-    needs: [rust, rust-cross, typescript, typo-check, proc-macro-srv]
+    needs:
+      [
+        rust,
+        rust-cross,
+        typescript,
+        typo-check,
+        proc-macro-srv,
+        miri,
+        rustfmt,
+        clippy,
+        analysis-stats,
+      ]
     # We need to ensure this job does *not* get skipped if its dependencies fail,
     # because a skipped job is considered a success by GitHub. So we have to
     # overwrite `if:`. We use `!cancelled()` to ensure the job does still not get run
@@ -278,3 +358,21 @@ jobs:
           jq -C <<< '${{ toJson(needs) }}'
           # Check if all jobs that we depend on (in the needs array) were successful (or have been skipped).
           jq --exit-status 'all(.result == "success" or .result == "skipped")' <<< '${{ toJson(needs) }}'
+
+  cancel-if-matrix-failed:
+    needs: rust
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel parallel jobs
+        run: |
+          if jq --exit-status 'all(.result == "success" or .result == "skipped")' <<< '${{ toJson(needs) }}'; then
+            exit 0
+          fi
+          # https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#cancel-a-workflow-run
+          curl -L \
+          -X POST \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel

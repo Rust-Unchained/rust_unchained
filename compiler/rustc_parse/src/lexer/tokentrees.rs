@@ -3,7 +3,9 @@ use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, Toke
 use rustc_ast_pretty::pprust::token_to_string;
 use rustc_errors::Diag;
 
-use super::diagnostics::{report_suspicious_mismatch_block, same_indentation_level};
+use super::diagnostics::{
+    report_missing_open_delim, report_suspicious_mismatch_block, same_indentation_level,
+};
 use super::{Lexer, UnmatchedDelim};
 
 impl<'psess, 'src> Lexer<'psess, 'src> {
@@ -12,7 +14,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
     pub(super) fn lex_token_trees(
         &mut self,
         is_delimited: bool,
-    ) -> Result<(Spacing, TokenStream), Vec<Diag<'psess>>> {
+    ) -> Result<(Spacing, TokenStream), Diag<'psess>> {
         // Move past the opening delimiter.
         let open_spacing = self.bump_minimal();
 
@@ -33,11 +35,11 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 return if is_delimited {
                     Ok((open_spacing, TokenStream::new(buf)))
                 } else {
-                    Err(vec![self.close_delim_err(delim)])
+                    Err(self.close_delim_err(delim))
                 };
             } else if self.token.kind == token::Eof {
                 return if is_delimited {
-                    Err(vec![self.eof_err()])
+                    Err(self.eof_err())
                 } else {
                     Ok((open_spacing, TokenStream::new(buf)))
                 };
@@ -49,49 +51,10 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         }
     }
 
-    fn eof_err(&mut self) -> Diag<'psess> {
-        let msg = "this file contains an unclosed delimiter";
-        let mut err = self.dcx().struct_span_err(self.token.span, msg);
-
-        let unclosed_delimiter_show_limit = 5;
-        let len = usize::min(unclosed_delimiter_show_limit, self.diag_info.open_delimiters.len());
-        for &(_, span) in &self.diag_info.open_delimiters[..len] {
-            err.span_label(span, "unclosed delimiter");
-            self.diag_info.unmatched_delims.push(UnmatchedDelim {
-                found_delim: None,
-                found_span: self.token.span,
-                unclosed_span: Some(span),
-                candidate_span: None,
-            });
-        }
-
-        if let Some((_, span)) = self.diag_info.open_delimiters.get(unclosed_delimiter_show_limit)
-            && self.diag_info.open_delimiters.len() >= unclosed_delimiter_show_limit + 2
-        {
-            err.span_label(
-                *span,
-                format!(
-                    "another {} unclosed delimiters begin from here",
-                    self.diag_info.open_delimiters.len() - unclosed_delimiter_show_limit
-                ),
-            );
-        }
-
-        if let Some((delim, _)) = self.diag_info.open_delimiters.last() {
-            report_suspicious_mismatch_block(
-                &mut err,
-                &self.diag_info,
-                self.psess.source_map(),
-                *delim,
-            )
-        }
-        err
-    }
-
     fn lex_token_tree_open_delim(
         &mut self,
         open_delim: Delimiter,
-    ) -> Result<TokenTree, Vec<Diag<'psess>>> {
+    ) -> Result<TokenTree, Diag<'psess>> {
         // The span for beginning of the delimited section.
         let pre_span = self.token.span;
 
@@ -109,12 +72,11 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         let close_spacing = if let Some(close_delim) = self.token.kind.close_delim() {
             if close_delim == open_delim {
                 // Correct delimiter.
-                let (open_delimiter, open_delimiter_span) =
-                    self.diag_info.open_delimiters.pop().unwrap();
+                self.diag_info.open_delimiters.pop().unwrap();
                 let close_delimiter_span = self.token.span;
 
                 if tts.is_empty() && close_delim == Delimiter::Brace {
-                    let empty_block_span = open_delimiter_span.to(close_delimiter_span);
+                    let empty_block_span = pre_span.to(close_delimiter_span);
                     if !sm.is_multiline(empty_block_span) {
                         // Only track if the block is in the form of `{}`, otherwise it is
                         // likely that it was written on purpose.
@@ -123,11 +85,18 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 }
 
                 // only add braces
-                if let (Delimiter::Brace, Delimiter::Brace) = (open_delimiter, open_delim) {
+                if Delimiter::Brace == open_delim {
                     // Add all the matching spans, we will sort by span later
-                    self.diag_info
-                        .matching_block_spans
-                        .push((open_delimiter_span, close_delimiter_span));
+                    self.diag_info.matching_block_spans.push((pre_span, close_delimiter_span));
+                }
+
+                // A brace-delimited block whose first token is `&&`/`||` usually means
+                // the user meant to continue an if-let chain, e.g. `if let P = e { && cond {`.
+                if Delimiter::Brace == open_delim
+                    && let Some(TokenTree::Token(tok, _)) = tts.iter().next()
+                    && matches!(tok.kind, token::AndAnd | token::OrOr)
+                {
+                    self.diag_info.if_let_chain_hint_spans.push(tok.span);
                 }
 
                 // Move past the closing delimiter.
@@ -154,7 +123,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                             candidate = Some(*delimiter_span);
                         }
                     }
-                    let (_, _) = self.diag_info.open_delimiters.pop().unwrap();
+                    self.diag_info.open_delimiters.pop().unwrap();
                     self.diag_info.unmatched_delims.push(UnmatchedDelim {
                         found_delim: Some(close_delim),
                         found_span: self.token.span,
@@ -204,13 +173,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             } else if let Some(glued) = self.token.glue(&next_tok) {
                 self.token = glued;
             } else {
-                let this_spacing = if next_tok.is_punct() {
-                    Spacing::Joint
-                } else if next_tok == token::Eof {
-                    Spacing::Alone
-                } else {
-                    Spacing::JointHidden
-                };
+                let this_spacing = self.calculate_spacing(&next_tok);
                 break (this_spacing, next_tok);
             }
         };
@@ -221,21 +184,62 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
     // Cut-down version of `bump` used when the token kind is known in advance.
     fn bump_minimal(&mut self) -> Spacing {
         let (next_tok, is_next_tok_preceded_by_whitespace) = self.next_token_from_cursor();
-
         let this_spacing = if is_next_tok_preceded_by_whitespace {
             Spacing::Alone
         } else {
-            if next_tok.is_punct() {
-                Spacing::Joint
-            } else if next_tok == token::Eof {
-                Spacing::Alone
-            } else {
-                Spacing::JointHidden
-            }
+            self.calculate_spacing(&next_tok)
         };
-
         self.token = next_tok;
         this_spacing
+    }
+
+    fn calculate_spacing(&self, next_tok: &Token) -> Spacing {
+        if next_tok.is_punct() {
+            Spacing::Joint
+        } else if *next_tok == token::Eof {
+            Spacing::Alone
+        } else {
+            Spacing::JointHidden
+        }
+    }
+
+    fn eof_err(&mut self) -> Diag<'psess> {
+        const UNCLOSED_DELIMITER_SHOW_LIMIT: usize = 5;
+        let msg = "this file contains an unclosed delimiter";
+        let mut err = self.dcx().struct_span_err(self.token.span, msg);
+
+        let len = usize::min(UNCLOSED_DELIMITER_SHOW_LIMIT, self.diag_info.open_delimiters.len());
+        for &(_, span) in &self.diag_info.open_delimiters[..len] {
+            err.span_label(span, "unclosed delimiter");
+            self.diag_info.unmatched_delims.push(UnmatchedDelim {
+                found_delim: None,
+                found_span: self.token.span,
+                unclosed_span: Some(span),
+                candidate_span: None,
+            });
+        }
+
+        if let Some((_, span)) = self.diag_info.open_delimiters.get(UNCLOSED_DELIMITER_SHOW_LIMIT)
+            && self.diag_info.open_delimiters.len() >= UNCLOSED_DELIMITER_SHOW_LIMIT + 2
+        {
+            err.span_label(
+                *span,
+                format!(
+                    "another {} unclosed delimiters begin from here",
+                    self.diag_info.open_delimiters.len() - UNCLOSED_DELIMITER_SHOW_LIMIT
+                ),
+            );
+        }
+
+        if let Some((delim, _)) = self.diag_info.open_delimiters.last() {
+            report_suspicious_mismatch_block(
+                &mut err,
+                &self.diag_info,
+                self.psess.source_map(),
+                *delim,
+            )
+        }
+        err
     }
 
     fn close_delim_err(&mut self, delim: Delimiter) -> Diag<'psess> {
@@ -244,7 +248,16 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         let msg = format!("unexpected closing delimiter: `{token_str}`");
         let mut err = self.dcx().struct_span_err(self.token.span, msg);
 
-        report_suspicious_mismatch_block(&mut err, &self.diag_info, self.psess.source_map(), delim);
+        // if there is no missing open delim, report suspicious mismatch block
+        if !report_missing_open_delim(&mut err, &mut self.diag_info.unmatched_delims) {
+            report_suspicious_mismatch_block(
+                &mut err,
+                &self.diag_info,
+                self.psess.source_map(),
+                delim,
+            );
+        }
+
         err.span_label(self.token.span, "unexpected closing delimiter");
         err
     }

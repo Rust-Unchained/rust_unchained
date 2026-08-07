@@ -1,4 +1,6 @@
-use crate::spec::{PanicStrategy, Target, TargetMetadata, TargetOptions};
+use crate::spec::{
+    Arch, Cc, LinkerFlavor, Lld, PanicStrategy, Target, TargetMetadata, TargetOptions,
+};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -17,7 +19,7 @@ pub(crate) fn target() -> Target {
             ":2048:2048"
         )
         .into(),
-        arch: "hexagon".into(),
+        arch: Arch::Hexagon,
 
         options: TargetOptions {
             cpu: "hexagonv60".into(),
@@ -27,6 +29,8 @@ pub(crate) fn target() -> Target {
             max_atomic_width: Some(32),
             emit_debug_gdb_scripts: false,
             c_enum_min_bits: Some(8),
+            linker: Some("rust-lld".into()),
+            linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             ..Default::default()
         },
     }

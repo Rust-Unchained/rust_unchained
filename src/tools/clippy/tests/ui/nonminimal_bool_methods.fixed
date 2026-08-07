@@ -1,5 +1,5 @@
-#![allow(unused, clippy::diverging_sub_expression, clippy::needless_if)]
 #![warn(clippy::nonminimal_bool)]
+#![expect(clippy::diverging_sub_expression, clippy::needless_ifs)]
 
 fn methods_with_negation() {
     let a: Option<i32> = unimplemented!();
@@ -240,6 +240,11 @@ fn issue_13436() {
         let opt = Some(500);
         _ = !opt.is_some_and(|x| x < 1000);
     }
+}
+
+fn issue16014() {
+    (vec![1, 2, 3] > vec![1, 2, 3, 3]);
+    //~^ nonminimal_bool
 }
 
 fn main() {}

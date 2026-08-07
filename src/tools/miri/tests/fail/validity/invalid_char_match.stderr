@@ -5,17 +5,15 @@ LL | /             match *ptr {
 LL | |                 '0' => ret,
 LL | |                 _ => ret,
 LL | |             }
-   | |_____________^ interpreting an invalid 32-bit value as a char: $HEX
+   | |_____________^ Undefined Behavior occurred here
    |
    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
-   = note: BACKTRACE:
-   = note: inside `switch_int` at tests/fail/validity/invalid_char_match.rs:LL:CC
-note: inside `main`
-  --> tests/fail/validity/invalid_char_match.rs:LL:CC
-   |
-LL |     switch_int(&v as *const u32 as *const char);
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: stack backtrace:
+           0: switch_int
+               at tests/fail/validity/invalid_char_match.rs:LL:CC
+           1: main
+               at tests/fail/validity/invalid_char_match.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

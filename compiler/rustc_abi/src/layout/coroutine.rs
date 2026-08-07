@@ -27,7 +27,7 @@ use tracing::{debug, trace};
 
 use crate::{
     BackendRepr, FieldsShape, HasDataLayout, Integer, LayoutData, Primitive, ReprOptions, Scalar,
-    StructKind, TagEncoding, Variants, WrappingRange,
+    StructKind, TagEncoding, VariantLayout, Variants, WrappingRange,
 };
 
 /// Overlap eligibility and variant assignment for each CoroutineSavedLocal.
@@ -158,7 +158,7 @@ pub(super) fn layout<
     // Build a prefix layout, including "promoting" all ineligible
     // locals as part of the prefix. We compute the layout of all of
     // these fields at once to get optimal packing.
-    let tag_index = prefix_layouts.len();
+    let tag_index = prefix_layouts.next_index();
 
     // `variant_fields` already accounts for the reserved variants, so no need to add them.
     let max_discr = (variant_fields.len() - 1) as u128;
@@ -182,33 +182,29 @@ pub(super) fn layout<
     // CoroutineLayout.
     debug!("prefix = {:#?}", prefix);
     let (outer_fields, promoted_offsets, promoted_memory_index) = match prefix.fields {
-        FieldsShape::Arbitrary { mut offsets, memory_index } => {
-            let mut inverse_memory_index = memory_index.invert_bijective_mapping();
-
+        FieldsShape::Arbitrary { mut offsets, in_memory_order } => {
             // "a" (`0..b_start`) and "b" (`b_start..`) correspond to
             // "outer" and "promoted" fields respectively.
-            let b_start = FieldIdx::new(tag_index + 1);
+            let b_start = tag_index.plus(1);
             let offsets_b = IndexVec::from_raw(offsets.raw.split_off(b_start.index()));
             let offsets_a = offsets;
 
-            // Disentangle the "a" and "b" components of `inverse_memory_index`
+            // Disentangle the "a" and "b" components of `in_memory_order`
             // by preserving the order but keeping only one disjoint "half" each.
             // FIXME(eddyb) build a better abstraction for permutations, if possible.
-            let inverse_memory_index_b: IndexVec<u32, FieldIdx> = inverse_memory_index
-                .iter()
-                .filter_map(|&i| i.index().checked_sub(b_start.index()).map(FieldIdx::new))
-                .collect();
-            inverse_memory_index.raw.retain(|&i| i.index() < b_start.index());
-            let inverse_memory_index_a = inverse_memory_index;
-
-            // Since `inverse_memory_index_{a,b}` each only refer to their
-            // respective fields, they can be safely inverted
-            let memory_index_a = inverse_memory_index_a.invert_bijective_mapping();
-            let memory_index_b = inverse_memory_index_b.invert_bijective_mapping();
+            let mut in_memory_order_a = IndexVec::<u32, FieldIdx>::new();
+            let mut in_memory_order_b = IndexVec::<u32, FieldIdx>::new();
+            for i in in_memory_order {
+                if let Some(j) = i.index().checked_sub(b_start.index()) {
+                    in_memory_order_b.push(FieldIdx::new(j));
+                } else {
+                    in_memory_order_a.push(i);
+                }
+            }
 
             let outer_fields =
-                FieldsShape::Arbitrary { offsets: offsets_a, memory_index: memory_index_a };
-            (outer_fields, offsets_b, memory_index_b)
+                FieldsShape::Arbitrary { offsets: offsets_a, in_memory_order: in_memory_order_a };
+            (outer_fields, offsets_b, in_memory_order_b.invert_bijective_mapping())
         }
         _ => unreachable!(),
     };
@@ -234,9 +230,8 @@ pub(super) fn layout<
                 &ReprOptions::default(),
                 StructKind::Prefixed(prefix_size, prefix_align.abi),
             )?;
-            variant.variants = Variants::Single { index };
 
-            let FieldsShape::Arbitrary { offsets, memory_index } = variant.fields else {
+            let FieldsShape::Arbitrary { offsets, in_memory_order } = variant.fields else {
                 unreachable!();
             };
 
@@ -249,8 +244,9 @@ pub(super) fn layout<
             // promoted fields were being used, but leave the elements not in the
             // subset as `invalid_field_idx`, which we can filter out later to
             // obtain a valid (bijective) mapping.
+            let memory_index = in_memory_order.invert_bijective_mapping();
             let invalid_field_idx = promoted_memory_index.len() + memory_index.len();
-            let mut combined_inverse_memory_index =
+            let mut combined_in_memory_order =
                 IndexVec::from_elem_n(FieldIdx::new(invalid_field_idx), invalid_field_idx);
 
             let mut offsets_and_memory_index = iter::zip(offsets, memory_index);
@@ -268,24 +264,23 @@ pub(super) fn layout<
                             (promoted_offsets[field_idx], promoted_memory_index[field_idx])
                         }
                     };
-                    combined_inverse_memory_index[memory_index] = i;
+                    combined_in_memory_order[memory_index] = i;
                     offset
                 })
                 .collect();
 
-            // Remove the unused slots and invert the mapping to obtain the
-            // combined `memory_index` (also see previous comment).
-            combined_inverse_memory_index.raw.retain(|&i| i.index() != invalid_field_idx);
-            let combined_memory_index = combined_inverse_memory_index.invert_bijective_mapping();
+            // Remove the unused slots to obtain the combined `in_memory_order`
+            // (also see previous comment).
+            combined_in_memory_order.raw.retain(|&i| i.index() != invalid_field_idx);
 
             variant.fields = FieldsShape::Arbitrary {
                 offsets: combined_offsets,
-                memory_index: combined_memory_index,
+                in_memory_order: combined_in_memory_order,
             };
 
             size = size.max(variant.size);
             align = align.max(variant.align);
-            Ok(variant)
+            Ok(VariantLayout::from_layout(variant))
         })
         .collect::<Result<IndexVec<VariantIdx, _>, _>>()?;
 

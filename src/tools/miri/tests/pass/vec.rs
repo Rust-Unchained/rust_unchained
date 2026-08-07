@@ -1,7 +1,7 @@
-//@revisions: stack tree tree_uniq
+//@revisions: stack tree tree_implicit_writes
 //@compile-flags: -Zmiri-strict-provenance
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-implicit-writes
 //@[tree]compile-flags: -Zmiri-tree-borrows
-//@[tree_uniq]compile-flags: -Zmiri-tree-borrows -Zmiri-unique-is-unique
 #![feature(iter_advance_by, iter_next_chunk)]
 
 // Gather all references from a mutable iterator and make sure Miri notices if
@@ -170,6 +170,33 @@ fn miri_issue_2759() {
     input.replace_range(0..0, "0");
 }
 
+/// This was skirting the edge of UB, let's make sure it remains on the sound side.
+/// Context: <https://github.com/rust-lang/rust/pull/141032>.
+fn extract_if() {
+    let mut v = vec![Box::new(0u64), Box::new(1u64)];
+    for item in v.extract_if(.., |x| **x == 0) {
+        drop(item);
+    }
+}
+
+fn vec_macro_cleanup() {
+    // Ensure memory gets deallocated when control flow leaves the `vec!` macro.
+    #[allow(unreachable_code)]
+    loop {
+        let _v = vec![Box::new(0), break];
+    }
+
+    fn panic<T>() -> T {
+        panic!()
+    }
+    // Ensure all memory gets deallocated on a panic: the `Box` we construct, and the `Box`
+    // constructed inside `vec!` to eventually turn into a `Vec`.
+    std::panic::catch_unwind(|| {
+        let _v = vec![Box::new(0), panic()];
+    })
+    .unwrap_err();
+}
+
 fn main() {
     assert_eq!(vec_reallocate().len(), 5);
 
@@ -200,4 +227,6 @@ fn main() {
     swap_remove();
     reverse();
     miri_issue_2759();
+    extract_if();
+    vec_macro_cleanup();
 }

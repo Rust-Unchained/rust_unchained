@@ -3,9 +3,12 @@
 use std::cmp::Ordering;
 
 use cranelift_module::*;
+use rustc_const_eval::interpret::CTFE_ALLOC_SALT;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir::interpret::{AllocId, GlobalAlloc, Scalar, read_target_uint};
+use rustc_middle::mir::interpret::{
+    AllocId, GlobalAlloc, PointerArithmetic, Scalar, read_target_uint,
+};
 use rustc_middle::ty::{ExistentialTraitRef, ScalarInt};
 
 use crate::prelude::*;
@@ -50,7 +53,7 @@ pub(crate) fn codegen_tls_ref<'tcx>(
 ) -> CValue<'tcx> {
     let tls_ptr = if !def_id.is_local() && fx.tcx.needs_thread_local_shim(def_id) {
         let instance = ty::Instance {
-            def: ty::InstanceKind::ThreadLocalShim(def_id),
+            def: ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(def_id)),
             args: ty::GenericArgs::empty(),
         };
         let func_ref = fx.get_function_ref(instance);
@@ -62,7 +65,7 @@ pub(crate) fn codegen_tls_ref<'tcx>(
             // For a declaration the stated mutability doesn't matter.
             false,
         );
-        let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
         if fx.clif_comments.enabled() {
             fx.add_comment(local_data_id, format!("tls {:?}", def_id));
         }
@@ -74,7 +77,7 @@ pub(crate) fn codegen_tls_ref<'tcx>(
 pub(crate) fn eval_mir_constant<'tcx>(
     fx: &FunctionCx<'_, '_, 'tcx>,
     constant: &ConstOperand<'tcx>,
-) -> (ConstValue<'tcx>, Ty<'tcx>) {
+) -> (ConstValue, Ty<'tcx>) {
     let cv = fx.monomorphize(constant.const_);
     // This cannot fail because we checked all required_consts in advance.
     let val = cv
@@ -93,7 +96,7 @@ pub(crate) fn codegen_constant_operand<'tcx>(
 
 pub(crate) fn codegen_const_value<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
-    const_val: ConstValue<'tcx>,
+    const_val: ConstValue,
     ty: Ty<'tcx>,
 ) -> CValue<'tcx> {
     let layout = fx.layout_of(ty);
@@ -108,7 +111,7 @@ pub(crate) fn codegen_const_value<'tcx>(
         ConstValue::Scalar(x) => match x {
             Scalar::Int(int) => {
                 if fx.clif_type(layout.ty).is_some() {
-                    return CValue::const_val(fx, layout, int);
+                    CValue::const_val(fx, layout, int)
                 } else {
                     let raw_val = int.size().truncate(int.to_bits(int.size()));
                     let val = match int.size().bytes() {
@@ -128,17 +131,16 @@ pub(crate) fn codegen_const_value<'tcx>(
                     // FIXME avoid this extra copy to the stack and directly write to the final
                     // destination
                     let place = CPlace::new_stack_slot(fx, layout);
-                    place.to_ptr().store(fx, val, MemFlags::trusted());
+                    place.to_ptr().store(fx, val, MemFlagsData::trusted());
                     place.to_cvalue(fx)
                 }
             }
             Scalar::Ptr(ptr, _size) => {
-                let (prov, offset) = ptr.into_parts(); // we know the `offset` is relative
+                let (prov, offset) = ptr.prov_and_relative_offset();
                 let alloc_id = prov.alloc_id();
                 let base_addr = match fx.tcx.global_alloc(alloc_id) {
                     GlobalAlloc::Memory(alloc) => {
                         if alloc.inner().len() == 0 {
-                            assert_eq!(offset, Size::ZERO);
                             fx.bcx.ins().iconst(fx.pointer_type, alloc.inner().align.bytes() as i64)
                         } else {
                             let data_id = data_id_for_alloc_id(
@@ -148,17 +150,16 @@ pub(crate) fn codegen_const_value<'tcx>(
                                 alloc.inner().mutability,
                             );
                             let local_data_id =
-                                fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+                                fx.module.declare_data_in_func(data_id, fx.bcx.func);
                             if fx.clif_comments.enabled() {
                                 fx.add_comment(local_data_id, format!("{:?}", alloc_id));
                             }
-                            fx.bcx.ins().global_value(fx.pointer_type, local_data_id)
+                            fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
                         }
                     }
                     GlobalAlloc::Function { instance, .. } => {
                         let func_id = crate::abi::import_function(fx.tcx, fx.module, instance);
-                        let local_func_id =
-                            fx.module.declare_func_in_func(func_id, &mut fx.bcx.func);
+                        let local_func_id = fx.module.declare_func_in_func(func_id, fx.bcx.func);
                         fx.bcx.ins().func_addr(fx.pointer_type, local_func_id)
                     }
                     GlobalAlloc::VTable(ty, dyn_ty) => {
@@ -171,9 +172,15 @@ pub(crate) fn codegen_const_value<'tcx>(
                                 fx.tcx.instantiate_bound_regions_with_erased(principal)
                             }),
                         );
-                        let local_data_id =
-                            fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
-                        fx.bcx.ins().global_value(fx.pointer_type, local_data_id)
+                        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
+                        fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+                    }
+                    GlobalAlloc::TypeId { .. } => {
+                        return CValue::const_val(
+                            fx,
+                            layout,
+                            ScalarInt::try_from_target_usize(offset.bytes(), fx.tcx).unwrap(),
+                        );
                     }
                     GlobalAlloc::Static(def_id) => {
                         assert!(fx.tcx.is_static(def_id));
@@ -182,16 +189,27 @@ pub(crate) fn codegen_const_value<'tcx>(
                             // For a declaration the stated mutability doesn't matter.
                             false,
                         );
-                        let local_data_id =
-                            fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+                        let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
                         if fx.clif_comments.enabled() {
                             fx.add_comment(local_data_id, format!("{:?}", def_id));
                         }
-                        fx.bcx.ins().global_value(fx.pointer_type, local_data_id)
+                        if fx
+                            .tcx
+                            .codegen_fn_attrs(def_id)
+                            .flags
+                            .contains(CodegenFnAttrFlags::THREAD_LOCAL)
+                        {
+                            fx.bcx.ins().tls_value(fx.pointer_type, local_data_id)
+                        } else {
+                            fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
+                        }
                     }
                 };
                 let val = if offset.bytes() != 0 {
-                    fx.bcx.ins().iadd_imm(base_addr, i64::try_from(offset.bytes()).unwrap())
+                    fx.bcx.ins().iadd_imm_u(
+                        base_addr,
+                        fx.tcx.truncate_to_target_usize(offset.bytes()) as i64,
+                    )
                 } else {
                     base_addr
                 };
@@ -199,36 +217,31 @@ pub(crate) fn codegen_const_value<'tcx>(
             }
         },
         ConstValue::Indirect { alloc_id, offset } => CValue::by_ref(
-            pointer_for_allocation(fx, alloc_id)
+            Pointer::new(pointer_for_allocation(fx, alloc_id))
                 .offset_i64(fx, i64::try_from(offset.bytes()).unwrap()),
             layout,
         ),
-        ConstValue::Slice { data, meta } => {
-            let alloc_id = fx.tcx.reserve_and_set_memory_alloc(data);
-            let ptr = pointer_for_allocation(fx, alloc_id).get_addr(fx);
+        ConstValue::Slice { alloc_id, meta } => {
+            let ptr = pointer_for_allocation(fx, alloc_id);
             let len = fx.bcx.ins().iconst(fx.pointer_type, meta as i64);
             CValue::by_val_pair(ptr, len, layout)
         }
     }
 }
 
-fn pointer_for_allocation<'tcx>(
-    fx: &mut FunctionCx<'_, '_, 'tcx>,
-    alloc_id: AllocId,
-) -> crate::pointer::Pointer {
+fn pointer_for_allocation<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, alloc_id: AllocId) -> Value {
     let alloc = fx.tcx.global_alloc(alloc_id).unwrap_memory();
     let data_id =
         data_id_for_alloc_id(&mut fx.constants_cx, fx.module, alloc_id, alloc.inner().mutability);
 
-    let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+    let local_data_id = fx.module.declare_data_in_func(data_id, fx.bcx.func);
     if fx.clif_comments.enabled() {
         fx.add_comment(local_data_id, format!("{:?}", alloc_id));
     }
-    let global_ptr = fx.bcx.ins().global_value(fx.pointer_type, local_data_id);
-    crate::pointer::Pointer::new(global_ptr)
+    fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
 }
 
-pub(crate) fn data_id_for_alloc_id(
+fn data_id_for_alloc_id(
     cx: &mut ConstantCx,
     module: &mut dyn Module,
     alloc_id: AllocId,
@@ -249,6 +262,11 @@ pub(crate) fn data_id_for_vtable<'tcx>(
 ) -> DataId {
     let alloc_id = tcx.vtable_allocation((ty, trait_ref));
     data_id_for_alloc_id(cx, module, alloc_id, Mutability::Not)
+}
+
+pub(crate) fn pointer_for_anonymous_str(fx: &mut FunctionCx<'_, '_, '_>, msg: &str) -> Value {
+    let alloc_id = fx.tcx.allocate_bytes_dedup(msg.as_bytes(), CTFE_ALLOC_SALT);
+    pointer_for_allocation(fx, alloc_id)
 }
 
 fn data_id_for_static(
@@ -275,8 +293,8 @@ fn data_id_for_static(
             .abi
             .bytes();
 
-        let linkage = if import_linkage == rustc_middle::mir::mono::Linkage::ExternalWeak
-            || import_linkage == rustc_middle::mir::mono::Linkage::WeakAny
+        let linkage = if import_linkage == rustc_hir::attrs::Linkage::ExternalWeak
+            || import_linkage == rustc_hir::attrs::Linkage::WeakAny
         {
             Linkage::Preemptible
         } else {
@@ -304,12 +322,15 @@ fn data_id_for_static(
         // `extern_with_linkage_foo` will instead be initialized to
         // zero.
 
-        let ref_name = format!("_rust_extern_with_linkage_{}", symbol_name);
+        let ref_name = format!(
+            "_rust_extern_with_linkage_{:016x}_{symbol_name}",
+            tcx.stable_crate_id(LOCAL_CRATE)
+        );
         let ref_data_id = module.declare_data(&ref_name, Linkage::Local, false, false).unwrap();
         let mut data = DataDescription::new();
         data.set_align(align);
         let data_gv = module.declare_data_in_data(data_id, &mut data);
-        data.define(std::iter::repeat(0).take(pointer_ty(tcx).bytes() as usize).collect());
+        data.define(std::iter::repeat_n(0, pointer_ty(tcx).bytes() as usize).collect());
         data.write_data_addr(0, data_gv, 0);
         match module.define_data(ref_data_id, &data) {
             // Every time the static is referenced there will be another definition of this global,
@@ -323,15 +344,15 @@ fn data_id_for_static(
 
     let linkage = if definition {
         crate::linkage::get_static_linkage(tcx, def_id)
-    } else if attrs.linkage == Some(rustc_middle::mir::mono::Linkage::ExternalWeak)
-        || attrs.linkage == Some(rustc_middle::mir::mono::Linkage::WeakAny)
+    } else if attrs.linkage == Some(rustc_hir::attrs::Linkage::ExternalWeak)
+        || attrs.linkage == Some(rustc_hir::attrs::Linkage::WeakAny)
     {
         Linkage::Preemptible
     } else {
         Linkage::Import
     };
 
-    let data_id = match module.declare_data(
+    match module.declare_data(
         symbol_name,
         linkage,
         definition_writable,
@@ -342,9 +363,7 @@ fn data_id_for_static(
             "attempt to declare `{symbol_name}` as static, but it was already declared as function"
         )),
         Err(err) => Err::<_, _>(err).unwrap(),
-    };
-
-    data_id
+    }
 }
 
 fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut ConstantCx) {
@@ -354,12 +373,15 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
             continue;
         }
 
+        let mut data = DataDescription::new();
+
         let (data_id, alloc, section_name) = match todo_item {
             TodoItem::Alloc(alloc_id) => {
                 let alloc = match tcx.global_alloc(alloc_id) {
                     GlobalAlloc::Memory(alloc) => alloc,
                     GlobalAlloc::Function { .. }
                     | GlobalAlloc::Static(_)
+                    | GlobalAlloc::TypeId { .. }
                     | GlobalAlloc::VTable(..) => {
                         unreachable!()
                     }
@@ -371,7 +393,10 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                 (data_id, alloc, None)
             }
             TodoItem::Static(def_id) => {
-                let section_name = tcx.codegen_fn_attrs(def_id).link_section;
+                let codegen_fn_attrs = tcx.codegen_fn_attrs(def_id);
+                let section_name = codegen_fn_attrs.link_section;
+
+                data.set_used(codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER));
 
                 let alloc = tcx.eval_static_initializer(def_id).unwrap();
 
@@ -386,7 +411,6 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
             }
         };
 
-        let mut data = DataDescription::new();
         let alloc = alloc.inner();
         data.set_align(alloc.align.bytes());
 
@@ -432,7 +456,8 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
             } else {
                 ("", section_name.as_str())
             };
-            data.set_segment_section(segment_name, section_name);
+            // FIXME pass correct section flags on Mach-O
+            data.set_segment_section(segment_name, section_name, 0);
         }
 
         let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(0..alloc.len()).to_vec();
@@ -443,7 +468,7 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
             let addend = {
                 let endianness = tcx.data_layout.endian;
                 let offset = offset.bytes() as usize;
-                let ptr_size = tcx.data_layout.pointer_size;
+                let ptr_size = tcx.data_layout.pointer_size();
                 let bytes = &alloc.inspect_with_uninit_and_ptr_outside_interpreter(
                     offset..offset + ptr_size.bytes() as usize,
                 );
@@ -471,6 +496,11 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                         .principal()
                         .map(|principal| tcx.instantiate_bound_regions_with_erased(principal)),
                 ),
+                GlobalAlloc::TypeId { .. } => {
+                    // Nothing to do, the bytes/offset of this pointer have already been written together with all other bytes,
+                    // so we just need to drop this provenance.
+                    continue;
+                }
                 GlobalAlloc::Static(def_id) => {
                     if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
                     {
@@ -512,6 +542,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
     operand: &Operand<'tcx>,
 ) -> Option<ScalarInt> {
     match operand {
+        Operand::RuntimeChecks(checks) => Some(checks.value(fx.tcx.sess).into()),
         Operand::Constant(const_) => eval_mir_constant(fx, const_).0.try_to_scalar_int(),
         // FIXME(rust-lang/rust#85105): Casts like `IMM8 as u32` result in the const being stored
         // inside a temporary before being passed to the intrinsic requiring the const argument.
@@ -563,7 +594,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                                         };
                                     computed_scalar_int = Some(scalar_int);
                                 }
-                                Rvalue::Use(operand) => {
+                                Rvalue::Use(operand, _) => {
                                     computed_scalar_int = mir_operand_get_const_val(fx, operand)
                                 }
                                 _ => return None,
@@ -574,7 +605,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                         {
                             return None;
                         }
-                        StatementKind::Intrinsic(ref intrinsic) => match **intrinsic {
+                        StatementKind::Intrinsic(intrinsic) => match **intrinsic {
                             NonDivergingIntrinsic::CopyNonOverlapping(..) => return None,
                             NonDivergingIntrinsic::Assume(..) => {}
                         },
@@ -582,10 +613,8 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                         StatementKind::Assign(_)
                         | StatementKind::FakeRead(_)
                         | StatementKind::SetDiscriminant { .. }
-                        | StatementKind::Deinit(_)
                         | StatementKind::StorageLive(_)
                         | StatementKind::StorageDead(_)
-                        | StatementKind::Retag(_, _)
                         | StatementKind::AscribeUserType(_, _)
                         | StatementKind::PlaceMention(..)
                         | StatementKind::Coverage(_)

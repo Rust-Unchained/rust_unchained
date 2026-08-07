@@ -1,10 +1,9 @@
 //! This module resolves `mod foo;` declaration to file.
 use arrayvec::ArrayVec;
-use base_db::AnchoredPath;
-use hir_expand::{name::Name, HirFileIdExt};
-use span::EditionedFileId;
+use base_db::{AnchoredPath, SourceDatabase};
+use hir_expand::{EditionedFileId, name::Name};
 
-use crate::{db::DefDatabase, HirFileId};
+use crate::HirFileId;
 
 const MOD_DEPTH_LIMIT: usize = 32;
 
@@ -59,7 +58,7 @@ impl ModDir {
 
     pub(super) fn resolve_declaration(
         &self,
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         file_id: HirFileId,
         name: &Name,
         attr_path: Option<&str>,
@@ -77,9 +76,9 @@ impl ModDir {
             }
         };
 
-        let orig_file_id = file_id.original_file_respecting_includes(db.upcast());
+        let orig_file_id = file_id.original_file_respecting_includes(db);
         for candidate in candidate_files.iter() {
-            let path = AnchoredPath { anchor: orig_file_id.file_id(), path: candidate.as_str() };
+            let path = AnchoredPath { anchor: orig_file_id.file_id(db), path: candidate.as_str() };
             if let Some(file_id) = db.resolve_path(path) {
                 let is_mod_rs = candidate.ends_with("/mod.rs");
 
@@ -87,12 +86,12 @@ impl ModDir {
                 let dir_path = if root_dir_owner {
                     DirPath::empty()
                 } else {
-                    DirPath::new(format!("{}/", name))
+                    DirPath::new(format!("{name}/"))
                 };
                 if let Some(mod_dir) = self.child(dir_path, !root_dir_owner) {
                     return Ok((
                         // FIXME: Edition, is this rightr?
-                        EditionedFileId::new(file_id, orig_file_id.edition()),
+                        EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
                         is_mod_rs,
                         mod_dir,
                     ));
@@ -150,13 +149,7 @@ impl DirPath {
         if attr.starts_with("./") {
             attr = &attr["./".len()..];
         }
-        let tmp;
-        let attr = if attr.contains('\\') {
-            tmp = attr.replace('\\', "/");
-            &tmp
-        } else {
-            attr
-        };
+        let attr = if attr.contains('\\') { &attr.replace('\\', "/") } else { attr };
         let res = format!("{base}{attr}");
         res
     }

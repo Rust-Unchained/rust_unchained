@@ -5,8 +5,10 @@
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{LangItem, lang_items};
-use rustc_middle::ty::{AssocItemContainer, GenericArgsRef, Instance, Ty, TyCtxt, TypingEnv};
-use rustc_span::{DesugaringKind, Ident, Span, sym};
+use rustc_middle::ty::{
+    self, AssocContainer, GenericArgsRef, Instance, Ty, TyCtxt, TypingEnv, Unnormalized,
+};
+use rustc_span::{DUMMY_SP, DesugaringKind, Ident, Span, sym};
 use tracing::debug;
 
 use crate::traits::specialization_graph;
@@ -15,6 +17,8 @@ use crate::traits::specialization_graph;
 pub enum CallDesugaringKind {
     /// for _ in x {} calls x.into_iter()
     ForLoopIntoIter,
+    /// for await _ in x {} calls x.into_async_iter()
+    ForLoopIntoAsyncIter,
     /// for _ in x {} calls iter.next()
     ForLoopNext,
     /// x? calls x.branch()
@@ -28,12 +32,25 @@ pub enum CallDesugaringKind {
 }
 
 impl CallDesugaringKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            CallDesugaringKind::ForLoopIntoIter => "`for` loop",
+            CallDesugaringKind::ForLoopIntoAsyncIter => "`for await` loop",
+            CallDesugaringKind::ForLoopNext => "`for` loop",
+            CallDesugaringKind::QuestionBranch => "question mark operator",
+            CallDesugaringKind::QuestionFromResidual => "question mark operator",
+            CallDesugaringKind::TryBlockFromOutput => "try block",
+            CallDesugaringKind::Await => "`await`",
+        }
+    }
+
     pub fn trait_def_id(self, tcx: TyCtxt<'_>) -> DefId {
         match self {
             Self::ForLoopIntoIter => tcx.get_diagnostic_item(sym::IntoIterator).unwrap(),
-            Self::ForLoopNext => tcx.require_lang_item(LangItem::Iterator, None),
+            Self::ForLoopIntoAsyncIter => tcx.get_diagnostic_item(sym::IntoAsyncIterator).unwrap(),
+            Self::ForLoopNext => tcx.require_lang_item(LangItem::Iterator, DUMMY_SP),
             Self::QuestionBranch | Self::TryBlockFromOutput => {
-                tcx.require_lang_item(LangItem::Try, None)
+                tcx.require_lang_item(LangItem::Try, DUMMY_SP)
             }
             Self::QuestionFromResidual => tcx.get_diagnostic_item(sym::FromResidual).unwrap(),
             Self::Await => tcx.get_diagnostic_item(sym::IntoFuture).unwrap(),
@@ -76,8 +93,9 @@ pub fn call_kind<'tcx>(
     let parent = tcx.opt_associated_item(method_did).and_then(|assoc| {
         let container_id = assoc.container_id(tcx);
         match assoc.container {
-            AssocItemContainer::Impl => tcx.trait_id_of_impl(container_id),
-            AssocItemContainer::Trait => Some(container_id),
+            AssocContainer::InherentImpl => None,
+            AssocContainer::TraitImpl(_) => Some(tcx.impl_trait_id(container_id)),
+            AssocContainer::Trait => Some(container_id),
         }
     });
 
@@ -101,7 +119,12 @@ pub fn call_kind<'tcx>(
             tcx.get_diagnostic_item(sym::deref_target).expect("deref method but no deref target");
         let deref_target_ty = tcx.normalize_erasing_regions(
             typing_env,
-            Ty::new_projection(tcx, deref_target_def_id, method_args),
+            Unnormalized::new(Ty::new_projection(
+                tcx,
+                ty::IsRigid::No,
+                deref_target_def_id,
+                method_args,
+            )),
         );
         let deref_target_span = if let Ok(Some(instance)) =
             Instance::try_resolve(tcx, typing_env, method_did, method_args)
@@ -128,6 +151,10 @@ pub fn call_kind<'tcx>(
         && fn_call_span.desugaring_kind() == Some(DesugaringKind::ForLoop)
     {
         Some((CallDesugaringKind::ForLoopIntoIter, method_args.type_at(0)))
+    } else if tcx.is_lang_item(method_did, LangItem::IntoAsyncIterIntoIter)
+        && fn_call_span.desugaring_kind() == Some(DesugaringKind::ForLoop)
+    {
+        Some((CallDesugaringKind::ForLoopIntoAsyncIter, method_args.type_at(0)))
     } else if tcx.is_lang_item(method_did, LangItem::IteratorNext)
         && fn_call_span.desugaring_kind() == Some(DesugaringKind::ForLoop)
     {

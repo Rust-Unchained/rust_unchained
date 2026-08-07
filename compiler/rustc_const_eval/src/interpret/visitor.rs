@@ -3,10 +3,8 @@
 
 use std::num::NonZero;
 
-use rustc_abi::{FieldIdx, FieldsShape, VariantIdx, Variants};
-use rustc_index::IndexVec;
+use rustc_abi::{FieldsShape, VariantIdx, Variants};
 use rustc_middle::mir::interpret::InterpResult;
-use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Ty};
 use tracing::trace;
 
@@ -14,6 +12,9 @@ use super::{InterpCx, MPlaceTy, Machine, Projectable, interp_ok, throw_inval};
 
 /// How to traverse a value and what to do when we are at the leaves.
 pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
+    // The `From<MPlaceTy>` rules out `ImmTy`... we could use a `TryFrom` instead since the only
+    // case we need this is visiting something unsized which cannot happen when visiting an `ImmTy`.
+    // But so far this was just not needed.
     type V: Projectable<'tcx, M::Provenance> + From<MPlaceTy<'tcx, M::Provenance>>;
 
     /// The visitor must have an `InterpCx` in it.
@@ -23,18 +24,6 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
     #[inline(always)]
     fn read_discriminant(&mut self, v: &Self::V) -> InterpResult<'tcx, VariantIdx> {
         self.ecx().read_discriminant(&v.to_op(self.ecx())?)
-    }
-
-    /// This function provides the chance to reorder the order in which fields are visited for
-    /// `FieldsShape::Aggregate`.
-    ///
-    /// The default means we iterate in source declaration order; alternatively this can do some
-    /// work with `memory_index` to iterate in memory order.
-    #[inline(always)]
-    fn aggregate_field_iter(
-        memory_index: &IndexVec<FieldIdx, u32>,
-    ) -> impl Iterator<Item = FieldIdx> + 'static {
-        memory_index.indices()
     }
 
     // Recursive actions, ready to be overloaded.
@@ -53,6 +42,11 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
     /// pointee type is the actual `T`. `box_ty` provides the full type of the `Box` itself.
     #[inline(always)]
     fn visit_box(&mut self, _box_ty: Ty<'tcx>, _v: &Self::V) -> InterpResult<'tcx> {
+        interp_ok(())
+    }
+    /// Visits the given type after it has been found to have no variants.
+    #[inline(always)]
+    fn visit_variantless(&mut self, _v: &Self::V) -> InterpResult<'tcx> {
         interp_ok(())
     }
 
@@ -91,7 +85,7 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
         // Special treatment for special types, where the (static) layout is not sufficient.
         match *ty.kind() {
             // If it is a trait object, switch to the real type that was used to create it.
-            ty::Dynamic(data, _, ty::Dyn) => {
+            ty::Dynamic(data, _) => {
                 // Dyn types. This is unsized, and the actual dynamic type of the data is given by the
                 // vtable stored in the place metadata.
                 // unsized values are never immediate, so we can assert_mem_place
@@ -101,24 +95,6 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
                 trace!("walk_value: dyn object layout: {:#?}", inner_mplace.layout);
                 // recurse with the inner type
                 return self.visit_field(v, 0, &inner_mplace.into());
-            }
-            ty::Dynamic(data, _, ty::DynStar) => {
-                // DynStar types. Very different from a dyn type (but strangely part of the
-                // same variant in `TyKind`): These are pairs where the 2nd component is the
-                // vtable, and the first component is the data (which must be ptr-sized).
-
-                // First make sure the vtable can be read at its type.
-                // The type of this vtable is fake, it claims to be a reference to some actual memory but that isn't true.
-                // So we transmute it to a raw pointer.
-                let raw_ptr_ty = Ty::new_mut_ptr(*self.ecx().tcx, self.ecx().tcx.types.unit);
-                let raw_ptr_ty = self.ecx().layout_of(raw_ptr_ty)?;
-                let vtable_field =
-                    self.ecx().project_field(v, 1)?.transmute(raw_ptr_ty, self.ecx())?;
-                self.visit_field(v, 1, &vtable_field)?;
-
-                // Then unpack the first field, and continue.
-                let data = self.ecx().unpack_dyn_star(v, data)?;
-                return self.visit_field(v, 0, &data);
             }
             // Slices do not need special handling here: they have `Array` field
             // placement with length 0, so we enter the `Array` case below which
@@ -138,26 +114,9 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
                 // allocator field. We also assert tons of things to ensure we do not miss
                 // any other fields.
 
-                // `Box` has two fields: the pointer we care about, and the allocator.
-                assert_eq!(v.layout().fields.count(), 2, "`Box` must have exactly 2 fields");
-                let (unique_ptr, alloc) =
-                    (self.ecx().project_field(v, 0)?, self.ecx().project_field(v, 1)?);
-                // Unfortunately there is some type junk in the way here: `unique_ptr` is a `Unique`...
-                // (which means another 2 fields, the second of which is a `PhantomData`)
-                assert_eq!(unique_ptr.layout().fields.count(), 2);
-                let (nonnull_ptr, phantom) = (
-                    self.ecx().project_field(&unique_ptr, 0)?,
-                    self.ecx().project_field(&unique_ptr, 1)?,
-                );
-                assert!(
-                    phantom.layout().ty.ty_adt_def().is_some_and(|adt| adt.is_phantom_data()),
-                    "2nd field of `Unique` should be PhantomData but is {:?}",
-                    phantom.layout().ty,
-                );
-                // ... that contains a `NonNull`... (gladly, only a single field here)
-                assert_eq!(nonnull_ptr.layout().fields.count(), 1);
-                let raw_ptr = self.ecx().project_field(&nonnull_ptr, 0)?; // the actual raw ptr
-                // ... whose only field finally is a raw ptr we can dereference.
+                let (raw_ptr, alloc) = self.ecx().project_to_ptr_in_box(v)?;
+
+                // Hand the actual pointer to the visitor.
                 self.visit_box(ty, &raw_ptr)?;
 
                 // The second `Box` field is the allocator, which we recursively check for validity
@@ -186,11 +145,10 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
             &FieldsShape::Union(fields) => {
                 self.visit_union(v, fields)?;
             }
-            FieldsShape::Arbitrary { memory_index, .. } => {
-                for idx in Self::aggregate_field_iter(memory_index) {
-                    let idx = idx.as_usize();
+            FieldsShape::Arbitrary { in_memory_order, .. } => {
+                for idx in in_memory_order.iter().copied() {
                     let field = self.ecx().project_field(v, idx)?;
-                    self.visit_field(v, idx, &field)?;
+                    self.visit_field(v, idx.as_usize(), &field)?;
                 }
             }
             FieldsShape::Array { .. } => {
@@ -219,7 +177,11 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
                 self.visit_variant(v, idx, &inner)?;
             }
             // For single-variant layouts, we already did everything there is to do.
-            Variants::Single { .. } | Variants::Empty => {}
+            Variants::Single { .. } => {}
+            // Non-variant layouts need special treatment by the visitor.
+            Variants::Empty => {
+                self.visit_variantless(v)?;
+            }
         }
 
         interp_ok(())

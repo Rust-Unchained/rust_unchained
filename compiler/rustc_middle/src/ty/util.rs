@@ -4,18 +4,19 @@ use std::{fmt, iter};
 
 use rustc_abi::{Float, Integer, IntegerType, Size};
 use rustc_apfloat::Float as _;
+use rustc_data_structures::Limit;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hashes::Hash128;
-use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
+use rustc_hir::{self as hir, find_attr};
 use rustc_index::bit_set::GrowableBitSet;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, extension};
-use rustc_session::Limit;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
 use rustc_span::sym;
+use rustc_type_ir::solve::SizedTraitKind;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
 
@@ -23,15 +24,16 @@ use super::TypingEnv;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::mir;
 use crate::query::Providers;
+use crate::traits::ObligationCause;
 use crate::ty::layout::{FloatExt, IntegerExt};
 use crate::ty::{
     self, Asyncness, FallibleTypeFolder, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeFoldable,
-    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Upcast, fold_regions,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Unnormalized, Upcast,
 };
 
 #[derive(Copy, Clone, Debug)]
 pub struct Discr<'tcx> {
-    /// Bit representation of the discriminant (e.g., `-128i8` is `0xFF_u128`).
+    /// Bit representation of the discriminant (e.g., `-1i8` is `0xFF_u128`).
     pub val: u128,
     pub ty: Ty<'tcx>,
 }
@@ -130,14 +132,13 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Creates a hash of the type `Ty` which will be the same no matter what crate
     /// context it's calculated within. This is used by the `type_id` intrinsic.
     pub fn type_id_hash(self, ty: Ty<'tcx>) -> Hash128 {
-        // We want the type_id be independent of the types free regions, so we
-        // erase them. The erase_regions() call will also anonymize bound
-        // regions, which is desirable too.
-        let ty = self.erase_regions(ty);
+        // We don't have region information, so we erase all free regions. Equal types
+        // must have the same `TypeId`, so we must anonymize all bound regions as well.
+        let ty = self.erase_and_anonymize_regions(ty);
 
         self.with_stable_hashing_context(|mut hcx| {
             let mut hasher = StableHasher::new();
-            hcx.while_hashing_spans(false, |hcx| ty.hash_stable(hcx, &mut hasher));
+            hcx.while_hashing_spans(false, |hcx| ty.stable_hash(hcx, &mut hasher));
             hasher.finish()
         })
     }
@@ -164,7 +165,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 | DefKind::AssocTy
                 | DefKind::Fn
                 | DefKind::AssocFn
-                | DefKind::AssocConst
+                | DefKind::AssocConst { .. }
                 | DefKind::Impl { .. },
                 def_id,
             ) => Some(def_id),
@@ -215,8 +216,13 @@ impl<'tcx> TyCtxt<'tcx> {
         ty: Ty<'tcx>,
         typing_env: ty::TypingEnv<'tcx>,
     ) -> Ty<'tcx> {
-        let tcx = self;
-        tcx.struct_tail_raw(ty, |ty| tcx.normalize_erasing_regions(typing_env, ty), || {})
+        self.assert_fully_normalized(typing_env, ty);
+        self.struct_tail_raw(
+            ty,
+            &ObligationCause::dummy(),
+            |ty| self.normalize_erasing_regions(typing_env, ty),
+            || {},
+        )
     }
 
     /// Returns true if a type has metadata.
@@ -248,7 +254,8 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn struct_tail_raw(
         self,
         mut ty: Ty<'tcx>,
-        mut normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
+        cause: &ObligationCause<'tcx>,
+        mut normalize: impl FnMut(Unnormalized<'tcx, Ty<'tcx>>) -> Ty<'tcx>,
         // This is currently used to allow us to walk a ValTree
         // in lockstep with the type in order to get the ValTree branch that
         // corresponds to an unsized field.
@@ -261,9 +268,11 @@ impl<'tcx> TyCtxt<'tcx> {
                     Limit(0) => Limit(2),
                     limit => limit * 2,
                 };
-                let reported = self
-                    .dcx()
-                    .emit_err(crate::error::RecursionLimitReached { ty, suggested_limit });
+                let reported = self.dcx().emit_err(crate::error::RecursionLimitReached {
+                    span: cause.span,
+                    ty,
+                    suggested_limit,
+                });
                 return Ty::new_error(self, reported);
             }
             match *ty.kind() {
@@ -274,7 +283,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     match def.non_enum_variant().tail_opt() {
                         Some(field) => {
                             f();
-                            ty = field.ty(self, args);
+                            ty = normalize(field.ty(self, args));
                         }
                         None => break,
                     }
@@ -290,15 +299,6 @@ impl<'tcx> TyCtxt<'tcx> {
                 ty::Pat(inner, _) => {
                     f();
                     ty = inner;
-                }
-
-                ty::Alias(..) => {
-                    let normalized = normalize(ty);
-                    if ty == normalized {
-                        return ty;
-                    } else {
-                        ty = normalized;
-                    }
                 }
 
                 _ => {
@@ -324,9 +324,9 @@ impl<'tcx> TyCtxt<'tcx> {
         target: Ty<'tcx>,
         typing_env: ty::TypingEnv<'tcx>,
     ) -> (Ty<'tcx>, Ty<'tcx>) {
-        let tcx = self;
-        tcx.struct_lockstep_tails_raw(source, target, |ty| {
-            tcx.normalize_erasing_regions(typing_env, ty)
+        self.assert_fully_normalized(typing_env, (source, target));
+        self.struct_lockstep_tails_raw(source, target, |ty| {
+            self.normalize_erasing_regions(typing_env, ty)
         })
     }
 
@@ -342,7 +342,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         source: Ty<'tcx>,
         target: Ty<'tcx>,
-        normalize: impl Fn(Ty<'tcx>) -> Ty<'tcx>,
+        normalize: impl Fn(Unnormalized<'tcx, Ty<'tcx>>) -> Ty<'tcx>,
     ) -> (Ty<'tcx>, Ty<'tcx>) {
         let (mut a, mut b) = (source, target);
         loop {
@@ -351,8 +351,8 @@ impl<'tcx> TyCtxt<'tcx> {
                     if a_def == b_def && a_def.is_struct() =>
                 {
                     if let Some(f) = a_def.non_enum_variant().tail_opt() {
-                        a = f.ty(self, a_args);
-                        b = f.ty(self, b_args);
+                        a = normalize(f.ty(self, a_args));
+                        b = normalize(f.ty(self, b_args));
                     } else {
                         break;
                     }
@@ -363,20 +363,6 @@ impl<'tcx> TyCtxt<'tcx> {
                         b = *b_tys.last().unwrap();
                     } else {
                         break;
-                    }
-                }
-                (ty::Alias(..), _) | (_, ty::Alias(..)) => {
-                    // If either side is a projection, attempt to
-                    // progress via normalization. (Should be safe to
-                    // apply to both sides as normalization is
-                    // idempotent.)
-                    let a_norm = normalize(a);
-                    let b_norm = normalize(b);
-                    if a == a_norm && b == b_norm {
-                        break;
-                    } else {
-                        a = a_norm;
-                        b = b_norm;
                     }
                 }
 
@@ -393,7 +379,7 @@ impl<'tcx> TyCtxt<'tcx> {
         validate: impl Fn(Self, LocalDefId) -> Result<(), ErrorGuaranteed>,
     ) -> Option<ty::Destructor> {
         let drop_trait = self.lang_items().drop_trait()?;
-        self.ensure_ok().coherent_trait(drop_trait).ok()?;
+        self.ensure_result().coherent_trait(drop_trait).ok()?;
 
         let mut dtor_candidate = None;
         // `Drop` impls can only be written in the same crate as the adt, and cannot be blanket impls
@@ -408,7 +394,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 continue;
             }
 
-            let Some(item_id) = self.associated_item_def_ids(impl_did).first() else {
+            let Some(&item_id) = self.associated_item_def_ids(impl_did).first() else {
                 self.dcx()
                     .span_delayed_bug(self.def_span(impl_did), "Drop impl without drop function");
                 continue;
@@ -426,7 +412,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     .delay_as_bug();
             }
 
-            dtor_candidate = Some(*item_id);
+            dtor_candidate = Some(item_id);
         }
 
         let did = dtor_candidate?;
@@ -440,7 +426,7 @@ impl<'tcx> TyCtxt<'tcx> {
         validate: impl Fn(Self, LocalDefId) -> Result<(), ErrorGuaranteed>,
     ) -> Option<ty::AsyncDestructor> {
         let async_drop_trait = self.lang_items().async_drop_trait()?;
-        self.ensure_ok().coherent_trait(async_drop_trait).ok()?;
+        self.ensure_result().coherent_trait(async_drop_trait).ok()?;
 
         let mut dtor_candidate = None;
         // `AsyncDrop` impls can only be written in the same crate as the adt, and cannot be blanket impls
@@ -465,26 +451,7 @@ impl<'tcx> TyCtxt<'tcx> {
             dtor_candidate = Some(impl_did);
         }
 
-        Some(ty::AsyncDestructor { impl_did: dtor_candidate? })
-    }
-
-    /// Returns async drop glue morphology for a definition. To get async drop
-    /// glue morphology for a type see [`Ty::async_drop_glue_morphology`].
-    //
-    // FIXME: consider making this a query
-    pub fn async_drop_glue_morphology(self, did: DefId) -> AsyncDropGlueMorphology {
-        let ty: Ty<'tcx> = self.type_of(did).instantiate_identity();
-
-        // Async drop glue morphology is an internal detail, so
-        // using `TypingMode::PostAnalysis` probably should be fine.
-        let typing_env = ty::TypingEnv::fully_monomorphized();
-        if ty.needs_async_drop(self, typing_env) {
-            AsyncDropGlueMorphology::Custom
-        } else if ty.needs_drop(self, typing_env) {
-            AsyncDropGlueMorphology::DeferredDropInPlace
-        } else {
-            AsyncDropGlueMorphology::Noop
-        }
+        Some(ty::AsyncDestructor { impl_did: dtor_candidate?.into() })
     }
 
     /// Returns the set of types that are required to be alive in
@@ -527,16 +494,20 @@ impl<'tcx> TyCtxt<'tcx> {
         // <P1, P2, P0>, and then look up which of the impl args refer to
         // parameters marked as pure.
 
-        let impl_args = match *self.type_of(impl_def_id).instantiate_identity().kind() {
-            ty::Adt(def_, args) if def_ == def => args,
-            _ => span_bug!(self.def_span(impl_def_id), "expected ADT for self type of `Drop` impl"),
-        };
+        let impl_args =
+            match *self.type_of(impl_def_id).instantiate_identity().skip_norm_wip().kind() {
+                ty::Adt(def_, args) if def_ == def => args,
+                _ => span_bug!(
+                    self.def_span(impl_def_id),
+                    "expected ADT for self type of `Drop` impl"
+                ),
+            };
 
         let item_args = ty::GenericArgs::identity_for_item(self, def.did());
 
         let result = iter::zip(item_args, impl_args)
-            .filter(|&(_, k)| {
-                match k.unpack() {
+            .filter(|&(_, arg)| {
+                match arg.kind() {
                     GenericArgKind::Lifetime(region) => match region.kind() {
                         ty::ReEarlyParam(ebr) => {
                             !impl_generics.region_param(ebr, self).pure_wrt_drop
@@ -573,7 +544,7 @@ impl<'tcx> TyCtxt<'tcx> {
         let mut seen = GrowableBitSet::default();
         let mut seen_late = FxHashSet::default();
         for arg in args {
-            match arg.unpack() {
+            match arg.kind() {
                 GenericArgKind::Lifetime(lt) => match (ignore_regions, lt.kind()) {
                     (CheckRegions::FromFunction, ty::ReBound(di, reg)) => {
                         if !seen_late.insert((di, reg)) {
@@ -617,9 +588,8 @@ impl<'tcx> TyCtxt<'tcx> {
     /// have the same `DefKind`.
     ///
     /// Note that closures have a `DefId`, but the closure *expression* also has a
-    // `HirId` that is located within the context where the closure appears (and, sadly,
-    // a corresponding `NodeId`, since those are not yet phased out). The parent of
-    // the closure's `DefId` will also be the context where it appears.
+    /// `HirId` that is located within the context where the closure appears. The
+    /// parent of the closure's `DefId` will also be the context where it appears.
     pub fn is_closure_like(self, def_id: DefId) -> bool {
         matches!(self.def_kind(def_id), DefKind::Closure)
     }
@@ -627,10 +597,39 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Returns `true` if `def_id` refers to a definition that does not have its own
     /// type-checking context, i.e. closure, coroutine or inline const.
     pub fn is_typeck_child(self, def_id: DefId) -> bool {
-        matches!(
-            self.def_kind(def_id),
-            DefKind::Closure | DefKind::InlineConst | DefKind::SyntheticCoroutineBody
-        )
+        match self.def_kind(def_id) {
+            DefKind::AnonConst => {
+                self.anon_const_kind(def_id) == ty::AnonConstKind::NonTypeSystemInline
+            }
+            DefKind::Closure | DefKind::SyntheticCoroutineBody => true,
+            DefKind::Mod
+            | DefKind::Struct
+            | DefKind::Union
+            | DefKind::Enum
+            | DefKind::Variant
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::ForeignTy
+            | DefKind::TraitAlias
+            | DefKind::AssocTy
+            | DefKind::TyParam
+            | DefKind::Fn
+            | DefKind::Const { .. }
+            | DefKind::ConstParam
+            | DefKind::Static { .. }
+            | DefKind::Ctor(_, _)
+            | DefKind::AssocFn
+            | DefKind::AssocConst { .. }
+            | DefKind::Macro(_)
+            | DefKind::ExternCrate
+            | DefKind::Use
+            | DefKind::ForeignMod
+            | DefKind::OpaqueTy
+            | DefKind::Field
+            | DefKind::LifetimeParam
+            | DefKind::GlobalAsm
+            | DefKind::Impl { .. } => false,
+        }
     }
 
     /// Returns `true` if `def_id` refers to a trait (i.e., `trait Foo { ... }`).
@@ -654,16 +653,26 @@ impl<'tcx> TyCtxt<'tcx> {
     /// has its own type-checking context or "inference environment".
     ///
     /// For example, a closure has its own `DefId`, but it is type-checked
-    /// with the containing item. Similarly, an inline const block has its
-    /// own `DefId` but it is type-checked together with the containing item.
-    ///
-    /// Therefore, when we fetch the
-    /// `typeck` the closure, for example, we really wind up
-    /// fetching the `typeck` the enclosing fn item.
+    /// with the containing item. Therefore, when we fetch the `typeck` of the closure,
+    /// for example, we really wind up fetching the `typeck` of the enclosing fn item.
     pub fn typeck_root_def_id(self, def_id: DefId) -> DefId {
         let mut def_id = def_id;
         while self.is_typeck_child(def_id) {
             def_id = self.parent(def_id);
+        }
+        def_id
+    }
+
+    /// Given the `LocalDefId`, returns the `LocalDefId` of the innermost item that
+    /// has its own type-checking context or "inference environment".
+    ///
+    /// For example, a closure has its own `LocalDefId`, but it is type-checked
+    /// with the containing item. Therefore, when we fetch the `typeck` of the closure,
+    /// for example, we really wind up fetching the `typeck` of the enclosing fn item.
+    pub fn typeck_root_def_id_local(self, def_id: LocalDefId) -> LocalDefId {
+        let mut def_id = def_id;
+        while self.is_typeck_child(def_id.to_def_id()) {
+            def_id = self.local_parent(def_id);
         }
         def_id
     }
@@ -728,7 +737,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
     /// Returns the type a reference to the thread local takes in MIR.
     pub fn thread_local_ptr_ty(self, def_id: DefId) -> Ty<'tcx> {
-        let static_ty = self.type_of(def_id).instantiate_identity();
+        let static_ty = self.type_of(def_id).instantiate_identity().skip_norm_wip();
         if self.is_mutable_static(def_id) {
             Ty::new_mut_ptr(self, static_ty)
         } else if self.is_foreign_item(def_id) {
@@ -754,40 +763,6 @@ impl<'tcx> TyCtxt<'tcx> {
         } else {
             Ty::new_imm_ref(self, self.lifetimes.re_erased, static_ty)
         }
-    }
-
-    /// Return the set of types that should be taken into account when checking
-    /// trait bounds on a coroutine's internal state. This properly replaces
-    /// `ReErased` with new existential bound lifetimes.
-    pub fn coroutine_hidden_types(
-        self,
-        def_id: DefId,
-    ) -> ty::EarlyBinder<'tcx, ty::Binder<'tcx, &'tcx ty::List<Ty<'tcx>>>> {
-        let coroutine_layout = self.mir_coroutine_witnesses(def_id);
-        let mut vars = vec![];
-        let bound_tys = self.mk_type_list_from_iter(
-            coroutine_layout
-                .as_ref()
-                .map_or_else(|| [].iter(), |l| l.field_tys.iter())
-                .filter(|decl| !decl.ignore_for_traits)
-                .map(|decl| {
-                    let ty = fold_regions(self, decl.ty, |re, debruijn| {
-                        assert_eq!(re, self.lifetimes.re_erased);
-                        let var = ty::BoundVar::from_usize(vars.len());
-                        vars.push(ty::BoundVariableKind::Region(ty::BoundRegionKind::Anon));
-                        ty::Region::new_bound(
-                            self,
-                            debruijn,
-                            ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon },
-                        )
-                    });
-                    ty
-                }),
-        );
-        ty::EarlyBinder::bind(ty::Binder::bind_with_vars(
-            bound_tys,
-            self.mk_bound_variable_kinds(&vars),
-        ))
     }
 
     /// Expands the given impl trait type, stopping if the type is recursive.
@@ -820,6 +795,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn def_kind_descr(self, def_kind: DefKind, def_id: DefId) -> &'static str {
         match def_kind {
             DefKind::AssocFn if self.associated_item(def_id).is_method() => "method",
+            DefKind::AssocTy if self.opt_rpitit_info(def_id).is_some() => "opaque type",
             DefKind::Closure if let Some(coroutine_kind) = self.coroutine_kind(def_id) => {
                 match coroutine_kind {
                     hir::CoroutineKind::Desugared(
@@ -950,18 +926,20 @@ impl<'tcx> TyCtxt<'tcx> {
     /// [free]: ty::Free
     /// [expand_free_alias_tys]: Self::expand_free_alias_tys
     pub fn peel_off_free_alias_tys(self, mut ty: Ty<'tcx>) -> Ty<'tcx> {
-        let ty::Alias(ty::Free, _) = ty.kind() else { return ty };
+        let ty::Alias(_, ty::AliasTy { kind: ty::Free { .. }, .. }) = ty.kind() else {
+            return ty;
+        };
 
         let limit = self.recursion_limit();
         let mut depth = 0;
 
-        while let ty::Alias(ty::Free, alias) = ty.kind() {
+        while let &ty::Alias(_, ty::AliasTy { kind: ty::Free { def_id }, args, .. }) = ty.kind() {
             if !limit.value_within_limit(depth) {
                 let guar = self.dcx().delayed_bug("overflow expanding free alias type");
                 return Ty::new_error(self, guar);
             }
 
-            ty = self.type_of(alias.def_id).instantiate(self, alias.args);
+            ty = self.type_of(def_id).instantiate(self, args).skip_normalization();
             depth += 1;
         }
 
@@ -972,22 +950,23 @@ impl<'tcx> TyCtxt<'tcx> {
     // its (un)captured regions.
     pub fn opt_alias_variances(
         self,
-        kind: impl Into<ty::AliasTermKind>,
-        def_id: DefId,
+        kind: impl Into<ty::AliasTermKind<'tcx>>,
     ) -> Option<&'tcx [ty::Variance]> {
         match kind.into() {
-            ty::AliasTermKind::ProjectionTy => {
+            ty::AliasTermKind::ProjectionTy { def_id } => {
                 if self.is_impl_trait_in_trait(def_id) {
                     Some(self.variances_of(def_id))
                 } else {
                     None
                 }
             }
-            ty::AliasTermKind::OpaqueTy => Some(self.variances_of(def_id)),
-            ty::AliasTermKind::InherentTy
-            | ty::AliasTermKind::FreeTy
-            | ty::AliasTermKind::UnevaluatedConst
-            | ty::AliasTermKind::ProjectionConst => None,
+            ty::AliasTermKind::OpaqueTy { def_id } => Some(self.variances_of(def_id)),
+            ty::AliasTermKind::InherentTy { .. }
+            | ty::AliasTermKind::InherentConst { .. }
+            | ty::AliasTermKind::FreeTy { .. }
+            | ty::AliasTermKind::FreeConst { .. }
+            | ty::AliasTermKind::AnonConst { .. }
+            | ty::AliasTermKind::ProjectionConst { .. } => None,
         }
     }
 }
@@ -1022,7 +1001,7 @@ impl<'tcx> OpaqueTypeExpander<'tcx> {
                 Some(expanded_ty) => *expanded_ty,
                 None => {
                     let generic_ty = self.tcx.type_of(def_id);
-                    let concrete_ty = generic_ty.instantiate(self.tcx, args);
+                    let concrete_ty = generic_ty.instantiate(self.tcx, args).skip_normalization();
                     let expanded_ty = self.fold_ty(concrete_ty);
                     self.expanded_cache.insert((def_id, args), expanded_ty);
                     expanded_ty
@@ -1048,7 +1027,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
     }
 
     fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) = *t.kind() {
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *t.kind() {
             self.expand_opaque_ty(def_id, args).unwrap_or(t)
         } else if t.has_opaque_types() {
             t.super_fold_with(self)
@@ -1092,7 +1071,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for FreeAliasTypeExpander<'tcx> {
         if !ty.has_type_flags(ty::TypeFlags::HAS_TY_FREE_ALIAS) {
             return ty;
         }
-        let ty::Alias(ty::Free, alias) = ty.kind() else {
+        let &ty::Alias(_, ty::AliasTy { kind: ty::Free { def_id }, args, .. }) = ty.kind() else {
             return ty.super_fold_with(self);
         };
         if !self.tcx.recursion_limit().value_within_limit(self.depth) {
@@ -1101,9 +1080,15 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for FreeAliasTypeExpander<'tcx> {
         }
 
         self.depth += 1;
-        ensure_sufficient_stack(|| {
-            self.tcx.type_of(alias.def_id).instantiate(self.tcx, alias.args).fold_with(self)
-        })
+        let ty = ensure_sufficient_stack(|| {
+            self.tcx
+                .type_of(def_id)
+                .instantiate(self.tcx, args)
+                .skip_normalization()
+                .fold_with(self)
+        });
+        self.depth -= 1;
+        ty
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
@@ -1112,18 +1097,6 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for FreeAliasTypeExpander<'tcx> {
         }
         ct.super_fold_with(self)
     }
-}
-
-/// Indicates the form of `AsyncDestruct::Destructor`. Used to simplify async
-/// drop glue for types not using async drop.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AsyncDropGlueMorphology {
-    /// Async destructor simply does nothing
-    Noop,
-    /// Async destructor simply runs `drop_in_place`
-    DeferredDropInPlace,
-    /// Async destructor has custom logic
-    Custom,
 }
 
 impl<'tcx> Ty<'tcx> {
@@ -1195,7 +1168,8 @@ impl<'tcx> Ty<'tcx> {
     /// strange rules like `<T as Foo<'static>>::Bar: Sized` that
     /// actually carry lifetime requirements.
     pub fn is_sized(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
-        self.is_trivially_sized(tcx) || tcx.is_sized_raw(typing_env.as_query_input(self))
+        self.has_trivial_sizedness(tcx, SizedTraitKind::Sized)
+            || tcx.is_sized_raw(typing_env.as_query_input(self))
     }
 
     /// Checks whether values of this type `T` implement the `Freeze`
@@ -1245,14 +1219,23 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
+    /// Checks whether values of this type `T` implement the `UnsafeUnpin` trait.
+    pub fn is_unsafe_unpin(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
+        self.is_trivially_unpin() || tcx.is_unsafe_unpin_raw(typing_env.as_query_input(self))
+    }
+
     /// Checks whether values of this type `T` implement the `Unpin` trait.
+    ///
+    /// Note that this is a safe trait, so it cannot be very semantically meaningful.
+    /// However, as a hack to mitigate <https://github.com/rust-lang/rust/issues/63818> until a
+    /// proper solution is implemented, we do give special semantics to the `Unpin` trait.
     pub fn is_unpin(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
         self.is_trivially_unpin() || tcx.is_unpin_raw(typing_env.as_query_input(self))
     }
 
-    /// Fast path helper for testing if a type is `Unpin`.
+    /// Fast path helper for testing if a type is `Unpin` *and* `UnsafeUnpin`.
     ///
-    /// Returning true means the type is known to be `Unpin`. Returning
+    /// Returning true means the type is known to be `Unpin` and `UnsafeUnpin`. Returning
     /// `false` means nothing -- could be `Unpin`, might not be.
     fn is_trivially_unpin(self) -> bool {
         match self.kind() {
@@ -1295,16 +1278,17 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
-    /// Get morphology of the async drop glue, needed for types which do not
-    /// use async drop. To get async drop glue morphology for a definition see
-    /// [`TyCtxt::async_drop_glue_morphology`]. Used for `AsyncDestruct::Destructor`
-    /// type construction.
-    //
-    // FIXME: implement optimization to not instantiate a certain morphology of
-    // async drop glue too soon to allow per type optimizations, see array case
-    // for more info. Perhaps then remove this method and use `needs_(async_)drop`
-    // instead.
-    pub fn async_drop_glue_morphology(self, tcx: TyCtxt<'tcx>) -> AsyncDropGlueMorphology {
+    /// Checks whether values of this type `T` implement the `AsyncDrop` trait.
+    pub fn is_async_drop(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
+        !self.is_trivially_not_async_drop()
+            && tcx.is_async_drop_raw(typing_env.as_query_input(self))
+    }
+
+    /// Fast path helper for testing if a type is `AsyncDrop`.
+    ///
+    /// Returning true means the type is known to be `!AsyncDrop`. Returning
+    /// `false` means nothing -- could be `AsyncDrop`, might not be.
+    fn is_trivially_not_async_drop(self) -> bool {
         match self.kind() {
             ty::Int(_)
             | ty::Uint(_)
@@ -1316,46 +1300,26 @@ impl<'tcx> Ty<'tcx> {
             | ty::Ref(..)
             | ty::RawPtr(..)
             | ty::FnDef(..)
-            | ty::FnPtr(..)
-            | ty::Infer(ty::FreshIntTy(_))
-            | ty::Infer(ty::FreshFloatTy(_)) => AsyncDropGlueMorphology::Noop,
-
+            | ty::Error(_)
+            | ty::FnPtr(..) => true,
             // FIXME(unsafe_binders):
-            ty::UnsafeBinder(_) => todo!(),
-
-            ty::Tuple(tys) if tys.is_empty() => AsyncDropGlueMorphology::Noop,
-            ty::Adt(adt_def, _) if adt_def.is_manually_drop() => AsyncDropGlueMorphology::Noop,
-
-            // Foreign types can never have destructors.
-            ty::Foreign(_) => AsyncDropGlueMorphology::Noop,
-
-            // FIXME: implement dynamic types async drops
-            ty::Error(_) | ty::Dynamic(..) => AsyncDropGlueMorphology::DeferredDropInPlace,
-
-            ty::Tuple(_) | ty::Array(_, _) | ty::Slice(_) => {
-                // Assume worst-case scenario, because we can instantiate async
-                // destructors in different orders:
-                //
-                // 1. Instantiate [T; N] with T = String and N = 0
-                // 2. Instantiate <[String; 0] as AsyncDestruct>::Destructor
-                //
-                // And viceversa, thus we cannot rely on String not using async
-                // drop or array having zero (0) elements
-                AsyncDropGlueMorphology::Custom
+            ty::UnsafeBinder(_) => unimplemented!(),
+            ty::Tuple(fields) => fields.iter().all(Self::is_trivially_not_async_drop),
+            ty::Pat(elem_ty, _) | ty::Slice(elem_ty) | ty::Array(elem_ty, _) => {
+                elem_ty.is_trivially_not_async_drop()
             }
-            ty::Pat(ty, _) => ty.async_drop_glue_morphology(tcx),
-
-            ty::Adt(adt_def, _) => tcx.async_drop_glue_morphology(adt_def.did()),
-
-            ty::Closure(did, _)
-            | ty::CoroutineClosure(did, _)
-            | ty::Coroutine(did, _)
-            | ty::CoroutineWitness(did, _) => tcx.async_drop_glue_morphology(*did),
-
-            ty::Alias(..) | ty::Param(_) | ty::Bound(..) | ty::Placeholder(..) | ty::Infer(_) => {
-                // No specifics, but would usually mean forwarding async drop glue
-                AsyncDropGlueMorphology::Custom
-            }
+            ty::Adt(..)
+            | ty::Bound(..)
+            | ty::Closure(..)
+            | ty::CoroutineClosure(..)
+            | ty::Dynamic(..)
+            | ty::Foreign(_)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..)
+            | ty::Infer(_)
+            | ty::Alias(..)
+            | ty::Param(_)
+            | ty::Placeholder(_) => false,
         }
     }
 
@@ -1385,8 +1349,8 @@ impl<'tcx> Ty<'tcx> {
                 // query keys used. If normalization fails, we just use `query_ty`.
                 debug_assert!(!typing_env.param_env.has_infer());
                 let query_ty = tcx
-                    .try_normalize_erasing_regions(typing_env, query_ty)
-                    .unwrap_or_else(|_| tcx.erase_regions(query_ty));
+                    .try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(query_ty))
+                    .unwrap_or_else(|_| tcx.erase_and_anonymize_regions(query_ty));
 
                 tcx.needs_drop_raw(typing_env.as_query_input(query_ty))
             }
@@ -1401,9 +1365,6 @@ impl<'tcx> Ty<'tcx> {
     /// (Note that this implies that if `ty` has an async destructor attached,
     /// then `needs_async_drop` will definitely return `true` for `ty`.)
     ///
-    /// When constructing `AsyncDestruct::Destructor` type, use
-    /// [`Ty::async_drop_glue_morphology`] instead.
-    //
     // FIXME(zetanumbers): Note that this method is used to check eligible types
     // in unions.
     #[inline]
@@ -1425,8 +1386,8 @@ impl<'tcx> Ty<'tcx> {
                 // If normalization fails, we just use `query_ty`.
                 debug_assert!(!typing_env.has_infer());
                 let query_ty = tcx
-                    .try_normalize_erasing_regions(typing_env, query_ty)
-                    .unwrap_or_else(|_| tcx.erase_regions(query_ty));
+                    .try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(query_ty))
+                    .unwrap_or_else(|_| tcx.erase_and_anonymize_regions(query_ty));
 
                 tcx.needs_async_drop_raw(typing_env.as_query_input(query_ty))
             }
@@ -1455,18 +1416,22 @@ impl<'tcx> Ty<'tcx> {
                     _ => self,
                 };
 
-                // FIXME(#86868): We should be canonicalizing, or else moving this to a method of inference
-                // context, or *something* like that, but for now just avoid passing inference
-                // variables to queries that can't cope with them. Instead, conservatively
-                // return "true" (may change drop order).
+                // FIXME
+                // We should be canonicalizing, or else moving this to a method of inference
+                // context, or *something* like that,
+                // but for now just avoid passing inference variables
+                // to queries that can't cope with them.
+                // Instead, conservatively return "true" (may change drop order).
                 if query_ty.has_infer() {
                     return true;
                 }
 
                 // This doesn't depend on regions, so try to minimize distinct
                 // query keys used.
-                let erased = tcx.normalize_erasing_regions(typing_env, query_ty);
-                tcx.has_significant_drop_raw(typing_env.as_query_input(erased))
+                // FIX: Use try_normalize to avoid crashing. If it fails, return true.
+                tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(query_ty))
+                    .map(|erased| tcx.has_significant_drop_raw(typing_env.as_query_input(erased)))
+                    .unwrap_or(true)
             }
         }
     }
@@ -1543,12 +1508,6 @@ impl<'tcx> Ty<'tcx> {
             ty = *inner_ty;
         }
         ty
-    }
-
-    // FIXME(compiler-errors): Think about removing this.
-    #[inline]
-    pub fn outer_exclusive_binder(self) -> ty::DebruijnIndex {
-        self.0.outer_exclusive_binder
     }
 }
 
@@ -1713,7 +1672,7 @@ where
     }
 }
 
-#[derive(Copy, Clone, Debug, HashStable, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Debug, StableHash, TyEncodable, TyDecodable)]
 pub struct AlwaysRequiresDrop;
 
 /// Reveals all opaque types in the given value, replacing them
@@ -1737,16 +1696,12 @@ pub fn reveal_opaque_types_in_bounds<'tcx>(
 
 /// Determines whether an item is directly annotated with `doc(hidden)`.
 fn is_doc_hidden(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    tcx.get_attrs(def_id, sym::doc)
-        .filter_map(|attr| attr.meta_item_list())
-        .any(|items| items.iter().any(|item| item.has_name(sym::hidden)))
+    find_attr!(tcx, def_id, Doc(doc) if doc.hidden.is_some())
 }
 
 /// Determines whether an item is annotated with `doc(notable_trait)`.
 pub fn is_doc_notable_trait(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    tcx.get_attrs(def_id, sym::doc)
-        .filter_map(|attr| attr.meta_item_list())
-        .any(|items| items.iter().any(|item| item.has_name(sym::notable_trait)))
+    find_attr!(tcx, def_id, Doc(doc) if doc.notable_trait.is_some())
 }
 
 /// Determines whether an item is an intrinsic (which may be via Abi or via the `rustc_intrinsic` attribute).
@@ -1755,7 +1710,7 @@ pub fn is_doc_notable_trait(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 /// the compiler to make some assumptions about its shape; if the user doesn't use a feature gate, they may
 /// cause an ICE that we otherwise may want to prevent.
 pub fn intrinsic_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::IntrinsicDef> {
-    if tcx.features().intrinsics() && tcx.has_attr(def_id, sym::rustc_intrinsic) {
+    if tcx.features().intrinsics() && find_attr!(tcx, def_id, RustcIntrinsic) {
         let must_be_overridden = match tcx.hir_node_by_def_id(def_id) {
             hir::Node::Item(hir::Item { kind: hir::ItemKind::Fn { has_body, .. }, .. }) => {
                 !has_body
@@ -1763,9 +1718,9 @@ pub fn intrinsic_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::Intrinsi
             _ => true,
         };
         Some(ty::IntrinsicDef {
-            name: tcx.item_name(def_id.into()),
+            name: tcx.item_name(def_id),
             must_be_overridden,
-            const_stable: tcx.has_attr(def_id, sym::rustc_intrinsic_const_stable_indirect),
+            const_stable: find_attr!(tcx, def_id, RustcIntrinsicConstStableIndirect),
         })
     } else {
         None

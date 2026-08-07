@@ -1,20 +1,19 @@
 //! See [`AssistContext`].
 
-use hir::{FileRange, Semantics};
-use ide_db::EditionedFileId;
-use ide_db::{label::Label, FileId, RootDatabase};
+use hir::{EditionedFileId, FileRange, Semantics};
+use ide_db::{FileId, RootDatabase, label::Label};
 use syntax::Edition;
 use syntax::{
-    algo::{self, find_node_at_offset, find_node_at_range},
     AstNode, AstToken, Direction, SourceFile, SyntaxElement, SyntaxKind, SyntaxToken, TextRange,
     TextSize, TokenAtOffset,
+    algo::{self, find_node_at_offset, find_node_at_range},
 };
 
 use crate::{
-    assist_config::AssistConfig, Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel,
+    Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel, assist_config::AssistConfig,
 };
 
-pub(crate) use ide_db::source_change::{SourceChangeBuilder, TreeMutator};
+pub(crate) use ide_db::source_change::SourceChangeBuilder;
 
 /// `AssistContext` allows to apply an assist or check if it could be applied.
 ///
@@ -46,9 +45,9 @@ pub(crate) use ide_db::source_change::{SourceChangeBuilder, TreeMutator};
 /// Note, however, that we don't actually use such two-phase logic at the
 /// moment, because the LSP API is pretty awkward in this place, and it's much
 /// easier to just compute the edit eagerly :-)
-pub(crate) struct AssistContext<'a> {
+pub(crate) struct AssistContext<'a, 'db> {
     pub(crate) config: &'a AssistConfig,
-    pub(crate) sema: Semantics<'a, RootDatabase>,
+    pub(crate) sema: Semantics<'db, RootDatabase>,
     frange: FileRange,
     trimmed_range: TextRange,
     source_file: SourceFile,
@@ -58,12 +57,12 @@ pub(crate) struct AssistContext<'a> {
     covering_element: SyntaxElement,
 }
 
-impl<'a> AssistContext<'a> {
+impl<'a, 'db> AssistContext<'a, 'db> {
     pub(crate) fn new(
-        sema: Semantics<'a, RootDatabase>,
+        sema: Semantics<'db, RootDatabase>,
         config: &'a AssistConfig,
         frange: FileRange,
-    ) -> AssistContext<'a> {
+    ) -> AssistContext<'a, 'db> {
         let source_file = sema.parse(frange.file_id);
 
         let start = frange.range.start();
@@ -96,7 +95,7 @@ impl<'a> AssistContext<'a> {
         }
     }
 
-    pub(crate) fn db(&self) -> &RootDatabase {
+    pub(crate) fn db(&self) -> &'db RootDatabase {
         self.sema.db
     }
 
@@ -105,12 +104,16 @@ impl<'a> AssistContext<'a> {
         self.frange.range.start()
     }
 
+    pub(crate) fn vfs_file_id(&self) -> FileId {
+        self.frange.file_id.file_id(self.db())
+    }
+
     pub(crate) fn file_id(&self) -> EditionedFileId {
         self.frange.file_id
     }
 
     pub(crate) fn edition(&self) -> Edition {
-        self.frange.file_id.edition()
+        self.frange.file_id.edition(self.db())
     }
 
     pub(crate) fn has_empty_selection(&self) -> bool {
@@ -162,10 +165,10 @@ pub(crate) struct Assists {
 }
 
 impl Assists {
-    pub(crate) fn new(ctx: &AssistContext<'_>, resolve: AssistResolveStrategy) -> Assists {
+    pub(crate) fn new(ctx: &AssistContext<'_, '_>, resolve: AssistResolveStrategy) -> Assists {
         Assists {
             resolve,
-            file: ctx.frange.file_id.file_id(),
+            file: ctx.frange.file_id.file_id(ctx.db()),
             buf: Vec::new(),
             allowed: ctx.config.allowed.clone(),
         }

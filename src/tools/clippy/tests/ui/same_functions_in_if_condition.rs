@@ -1,9 +1,6 @@
 #![feature(adt_const_params)]
-#![deny(clippy::same_functions_in_if_condition)]
-// ifs_same_cond warning is different from `ifs_same_cond`.
-// clippy::if_same_then_else, clippy::comparison_chain -- all empty blocks
-#![allow(incomplete_features)]
-#![allow(clippy::if_same_then_else, clippy::ifs_same_cond, clippy::uninlined_format_args)]
+#![warn(clippy::same_functions_in_if_condition)]
+#![expect(clippy::ifs_same_cond)]
 
 use std::marker::ConstParamTy;
 
@@ -31,34 +28,34 @@ fn ifs_same_cond_fn() {
     let obj = Struct;
 
     if function() {
-    } else if function() {
         //~^ same_functions_in_if_condition
+    } else if function() {
     }
 
     if fn_arg(a) {
-    } else if fn_arg(a) {
         //~^ same_functions_in_if_condition
+    } else if fn_arg(a) {
     }
 
     if obj.method() {
-    } else if obj.method() {
         //~^ same_functions_in_if_condition
+    } else if obj.method() {
     }
 
     if obj.method_arg(a) {
-    } else if obj.method_arg(a) {
         //~^ same_functions_in_if_condition
+    } else if obj.method_arg(a) {
     }
 
     let mut v = vec![1];
     if v.pop().is_none() {
-    } else if v.pop().is_none() {
         //~^ same_functions_in_if_condition
+    } else if v.pop().is_none() {
     }
 
     if v.len() == 42 {
-    } else if v.len() == 42 {
         //~^ same_functions_in_if_condition
+    } else if v.len() == 42 {
     }
 
     if v.len() == 1 {

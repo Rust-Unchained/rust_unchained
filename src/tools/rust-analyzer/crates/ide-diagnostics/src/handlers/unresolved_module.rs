@@ -1,15 +1,14 @@
-use hir::{db::ExpandDatabase, HirFileIdExt};
 use ide_db::{assists::Assist, base_db::AnchoredPathBuf, source_change::FileSystemEdit};
 use itertools::Itertools;
 use syntax::AstNode;
 
-use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 
 // Diagnostic: unresolved-module
 //
 // This diagnostic is triggered if rust-analyzer is unable to discover referred module.
 pub(crate) fn unresolved_module(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::UnresolvedModule,
 ) -> Diagnostic {
     Diagnostic::new_with_syntax_node_ptr(
@@ -28,11 +27,12 @@ pub(crate) fn unresolved_module(
         },
         d.decl.map(|it| it.into()),
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedModule) -> Option<Vec<Assist>> {
-    let root = ctx.sema.db.parse_or_expand(d.decl.file_id);
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::UnresolvedModule) -> Option<Vec<Assist>> {
+    let root = d.decl.file_id.parse_or_expand(ctx.sema.db);
     let unresolved_module = d.decl.value.to_node(&root);
     Some(
         d.candidates
@@ -43,7 +43,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedModule) -> Option<Vec<
                     &format!("Create module at `{candidate}`"),
                     FileSystemEdit::CreateFile {
                         dst: AnchoredPathBuf {
-                            anchor: d.decl.file_id.original_file(ctx.sema.db).file_id(),
+                            anchor: d.decl.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
                             path: candidate.clone(),
                         },
                         initial_contents: "".to_owned(),

@@ -10,6 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [lib]
+doctest = false
 
 [dependencies]
 serde.workspace = true
@@ -23,10 +24,18 @@ indexmap.workspace = true
 paths = { workspace = true, features = ["serde1"] }
 tt.workspace = true
 stdx.workspace = true
+proc-macro-srv = {workspace = true, optional = true}
 # span = {workspace = true, default-features = false} does not work
 span = { path = "../span", version = "0.0.0", default-features = false}
 
 intern.workspace = true
+postcard.workspace = true
+semver.workspace = true
+rayon.workspace = true
+
+[features]
+in-rust-tree = ["proc-macro-srv", "proc-macro-srv/in-rust-tree"]
+default = []
 
 [lints]
 workspace = true

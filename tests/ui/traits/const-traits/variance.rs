@@ -1,11 +1,10 @@
 #![feature(rustc_attrs, const_trait_impl)]
 #![allow(internal_features)]
-#![rustc_variance_of_opaques]
+#![rustc_dump_variances_of_opaques]
 
-#[const_trait]
-trait Foo {}
+const trait Foo {}
 
-impl const Foo for () {}
+const impl Foo for () {}
 
 fn foo<'a: 'a>() -> impl const Foo {}
 //~^ ERROR ['a: *]

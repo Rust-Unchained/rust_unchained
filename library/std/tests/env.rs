@@ -16,7 +16,7 @@ fn test_self_exe_path() {
 
 #[test]
 fn test() {
-    assert!((!Path::new("test-path").is_absolute()));
+    assert!(!Path::new("test-path").is_absolute());
 
     #[cfg(not(target_env = "sgx"))]
     current_dir().unwrap();
@@ -57,6 +57,23 @@ fn split_paths_unix() {
     assert!(check_parse("/", &mut ["/"]));
     assert!(check_parse("/:", &mut ["/", ""]));
     assert!(check_parse("/:/usr/local", &mut ["/", "/usr/local"]));
+}
+
+#[test]
+#[cfg(target_os = "uefi")]
+fn split_paths_uefi() {
+    use std::path::PathBuf;
+
+    fn check_parse(unparsed: &str, parsed: &[&str]) -> bool {
+        split_paths(unparsed).collect::<Vec<_>>()
+            == parsed.iter().map(|s| PathBuf::from(*s)).collect::<Vec<_>>()
+    }
+
+    assert!(check_parse("", &mut [""]));
+    assert!(check_parse(";;", &mut ["", "", ""]));
+    assert!(check_parse(r"fs0:\", &mut [r"fs0:\"]));
+    assert!(check_parse(r"fs0:\;", &mut [r"fs0:\", ""]));
+    assert!(check_parse(r"fs0:\;fs0:\boot\", &mut [r"fs0:\", r"fs0:\boot\"]));
 }
 
 #[test]

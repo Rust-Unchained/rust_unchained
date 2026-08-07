@@ -1,26 +1,20 @@
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::ty::is_c_void;
-use clippy_utils::{get_parent_expr, is_hir_ty_cfg_dependant};
+use clippy_utils::{get_parent_expr, is_hir_ty_cfg_dependant, sym};
 use rustc_hir::{Expr, ExprKind, GenericArg};
 use rustc_lint::LateContext;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::sym;
 
 use super::CAST_PTR_ALIGNMENT;
 
-pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>) {
-    if let ExprKind::Cast(cast_expr, cast_to) = expr.kind {
-        if is_hir_ty_cfg_dependant(cx, cast_to) {
-            return;
-        }
-        let (cast_from, cast_to) = (
-            cx.typeck_results().expr_ty(cast_expr),
-            cx.typeck_results().expr_ty(expr),
-        );
-        lint_cast_ptr_alignment(cx, expr, cast_from, cast_to);
-    } else if let ExprKind::MethodCall(method_path, self_arg, [], _) = &expr.kind
-        && method_path.ident.name.as_str() == "cast"
+pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, cast_from: Ty<'tcx>, cast_to: Ty<'tcx>) {
+    lint_cast_ptr_alignment(cx, expr, cast_from, cast_to);
+}
+
+pub(super) fn check_cast_method(cx: &LateContext<'_>, expr: &Expr<'_>) {
+    if let ExprKind::MethodCall(method_path, self_arg, [], _) = &expr.kind
+        && method_path.ident.name == sym::cast
         && let Some(generic_args) = method_path.args
         && let [GenericArg::Type(cast_to)] = generic_args.args
         // There probably is no obvious reason to do this, just to be consistent with `as` cases.
@@ -49,8 +43,8 @@ fn lint_cast_ptr_alignment<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>, cast_f
             expr.span,
             format!(
                 "casting from `{cast_from}` to a more-strictly-aligned pointer (`{cast_to}`) ({} < {} bytes)",
-                from_layout.align.abi.bytes(),
-                to_layout.align.abi.bytes(),
+                from_layout.align.bytes(),
+                to_layout.align.bytes(),
             ),
         );
     }
@@ -62,10 +56,15 @@ fn is_used_as_unaligned(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
     };
     match parent.kind {
         ExprKind::MethodCall(name, self_arg, ..) if self_arg.hir_id == e.hir_id => {
-            if matches!(name.ident.as_str(), "read_unaligned" | "write_unaligned")
+            if matches!(name.ident.name, sym::read_unaligned | sym::write_unaligned)
                 && let Some(def_id) = cx.typeck_results().type_dependent_def_id(parent.hir_id)
-                && let Some(def_id) = cx.tcx.impl_of_method(def_id)
-                && cx.tcx.type_of(def_id).instantiate_identity().is_raw_ptr()
+                && let Some(def_id) = cx.tcx.impl_of_assoc(def_id)
+                && cx
+                    .tcx
+                    .type_of(def_id)
+                    .instantiate_identity()
+                    .skip_norm_wip()
+                    .is_raw_ptr()
             {
                 true
             } else {
@@ -75,14 +74,13 @@ fn is_used_as_unaligned(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
         ExprKind::Call(func, [arg, ..]) if arg.hir_id == e.hir_id => {
             if let ExprKind::Path(path) = &func.kind
                 && let Some(def_id) = cx.qpath_res(path, func.hir_id).opt_def_id()
+                && let Some(name) = cx.tcx.get_diagnostic_name(def_id)
                 && matches!(
-                    cx.tcx.get_diagnostic_name(def_id),
-                    Some(
-                        sym::ptr_write_unaligned
-                            | sym::ptr_read_unaligned
-                            | sym::intrinsics_unaligned_volatile_load
-                            | sym::intrinsics_unaligned_volatile_store
-                    )
+                    name,
+                    sym::ptr_write_unaligned
+                        | sym::ptr_read_unaligned
+                        | sym::intrinsics_unaligned_volatile_load
+                        | sym::intrinsics_unaligned_volatile_store
                 )
             {
                 true

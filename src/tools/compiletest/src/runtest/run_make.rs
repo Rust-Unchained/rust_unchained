@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::{env, fs};
 
@@ -5,14 +6,15 @@ use build_helper::fs::{ignore_not_found, recursive_remove};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{ProcRes, TestCx, disable_error_reporting};
-use crate::util::{copy_dir_all, dylib_env_var};
+use crate::common::TestSuite;
+use crate::util::{ArgFileCommand, copy_dir_all, dylib_env_var};
 
 impl TestCx<'_> {
     pub(super) fn run_rmake_test(&self) {
-        // For `run-make` V2, we need to perform 2 steps to build and run a `run-make` V2 recipe
+        // For `run-make`, we need to perform 2 steps to build and run a `run-make` recipe
         // (`rmake.rs`) to run the actual tests. The support library is already built as a tool rust
         // library and is available under
-        // `build/$HOST/stage0-bootstrap-tools/$TARGET/release/librun_make_support.rlib`.
+        // `build/$HOST/bootstrap-tools/$TARGET/release/librun_make_support.rlib`.
         //
         // 1. We need to build the recipe `rmake.rs` as a binary and link in the `run_make_support`
         //    library.
@@ -63,21 +65,21 @@ impl TestCx<'_> {
         //
         // ```
         // build/<target_triple>/
-        // ├── stage0-bootstrap-tools/
+        // ├── bootstrap-tools/
         // │   ├── <host_triple>/release/librun_make_support.rlib   // <- support rlib itself
-        // │   ├── <host_triple>/release/deps/                      // <- deps
-        // │   └── release/deps/                                    // <- deps of deps
+        // │   ├── <host_triple>/release/build/<pkg>/<hash>/out     // <- deps
+        // │   └── release/build/<pkg>/<hash>/out                   // <- deps of deps
         // ```
         //
         // FIXME(jieyouxu): there almost certainly is a better way to do this (specifically how the
         // support lib and its deps are organized), but this seems to work for now.
 
-        let tools_bin = host_build_root.join("stage0-bootstrap-tools");
+        let tools_bin = host_build_root.join("bootstrap-tools");
         let support_host_path = tools_bin.join(&self.config.host).join("release");
         let support_lib_path = support_host_path.join("librun_make_support.rlib");
 
-        let support_lib_deps = support_host_path.join("deps");
-        let support_lib_deps_deps = tools_bin.join("release").join("deps");
+        let support_lib_deps = discover_out_dirs(support_host_path.join("build"));
+        let support_lib_deps_deps = discover_out_dirs(tools_bin.join("release").join("build"));
 
         // To compile the recipe with rustc, we need to provide suitable dynamic library search
         // paths to rustc. This includes both:
@@ -99,6 +101,10 @@ impl TestCx<'_> {
             p
         };
 
+        let out_dirs_to_args = |paths: Vec<PathBuf>| {
+            paths.into_iter().map(|p| format!("-Ldependency={}", p.display())).collect::<Vec<_>>()
+        };
+
         // run-make-support and run-make tests are compiled using the stage0 compiler
         // If the stage is 0, then the compiler that we test (either bootstrap or an explicitly
         // set compiler) is the one that actually compiled run-make-support.
@@ -107,7 +113,7 @@ impl TestCx<'_> {
             .stage0_rustc_path
             .as_ref()
             .expect("stage0 rustc is required to run run-make tests");
-        let mut rustc = Command::new(&stage0_rustc);
+        let mut rustc = ArgFileCommand::new(&stage0_rustc);
         rustc
             // `rmake.rs` **must** be buildable by a stable compiler, it may not use *any* unstable
             // library or compiler features. Here, we force the stage 0 rustc to consider itself as
@@ -118,13 +124,13 @@ impl TestCx<'_> {
             .arg(&recipe_bin)
             // Specify library search paths for `run_make_support`.
             .arg(format!("-Ldependency={}", &support_lib_path.parent().unwrap()))
-            .arg(format!("-Ldependency={}", &support_lib_deps))
-            .arg(format!("-Ldependency={}", &support_lib_deps_deps))
+            .args(out_dirs_to_args(support_lib_deps))
+            .args(out_dirs_to_args(support_lib_deps_deps))
             // Provide `run_make_support` as extern prelude, so test writers don't need to write
             // `extern run_make_support;`.
             .arg("--extern")
             .arg(format!("run_make_support={}", &support_lib_path))
-            .arg("--edition=2021")
+            .arg("--edition=2024")
             .arg(&self.testpaths.file.join("rmake.rs"))
             .arg("-Cprefer-dynamic");
 
@@ -133,7 +139,7 @@ impl TestCx<'_> {
         rustc.arg("-Dunused_must_use");
 
         // Now run rustc to build the recipe.
-        let res = self.run_command_to_procres(&mut rustc);
+        let res = self.run_command_to_procres(rustc);
         if !res.status.success() {
             self.fatal_proc_rec("run-make test failed: could not build `rmake.rs` recipe", &res);
         }
@@ -171,10 +177,10 @@ impl TestCx<'_> {
             .env(dylib_env_var(), &env::join_paths(recipe_dylib_search_paths).unwrap())
             // Provide the directory to libraries that are needed to run the *compiler* invoked
             // by the recipe.
-            .env("HOST_RUSTC_DYLIB_PATH", &self.config.compile_lib_path)
+            .env("HOST_RUSTC_DYLIB_PATH", &self.config.host_compile_lib_path)
             // Provide the directory to libraries that might be needed to run binaries created
             // by a compiler invoked by the recipe.
-            .env("TARGET_EXE_DYLIB_PATH", &self.config.run_lib_path)
+            .env("TARGET_EXE_DYLIB_PATH", &self.config.target_run_lib_path)
             // Provide the target.
             .env("TARGET", &self.config.target)
             // Some tests unfortunately still need Python, so provide path to a Python interpreter.
@@ -189,8 +195,12 @@ impl TestCx<'_> {
             // through a specific CI runner).
             .env("LLVM_COMPONENTS", &self.config.llvm_components);
 
-        if let Some(ref cargo) = self.config.cargo_path {
-            cmd.env("CARGO", cargo);
+        // The `run-make-cargo` and `build-std` suites need an in-tree `cargo`, `run-make` does not.
+        if matches!(self.config.suite, TestSuite::RunMakeCargo | TestSuite::BuildStd) {
+            cmd.env(
+                "CARGO",
+                self.config.cargo_path.as_ref().expect("cargo must be built and made available"),
+            );
         }
 
         if let Some(ref rustdoc) = self.config.rustdoc_path {
@@ -220,6 +230,39 @@ impl TestCx<'_> {
         if let Some(ref remote_test_client) = self.config.remote_test_client {
             cmd.env("REMOTE_TEST_CLIENT", remote_test_client);
         }
+
+        if let Some(runner) = &self.config.runner {
+            cmd.env("RUNNER", runner);
+        }
+
+        // Guard against externally-set env vars.
+        // Set env var to enable verbose output for successful commands.
+        // Only set when --verbose-run-make-subprocess-output is passed.
+        cmd.env_remove("__RMAKE_VERBOSE_SUBPROCESS_OUTPUT");
+        if self.config.verbose_run_make_subprocess_output {
+            cmd.env("__RMAKE_VERBOSE_SUBPROCESS_OUTPUT", "1");
+        }
+
+        cmd.env_remove("__RUSTC_DEBUG_ASSERTIONS_ENABLED");
+        if self.config.with_rustc_debug_assertions {
+            // Used for `run_make_support::env::rustc_debug_assertions_enabled`.
+            cmd.env("__RUSTC_DEBUG_ASSERTIONS_ENABLED", "1");
+        }
+
+        cmd.env_remove("__STD_DEBUG_ASSERTIONS_ENABLED");
+        if self.config.with_std_debug_assertions {
+            // Used for `run_make_support::env::std_debug_assertions_enabled`.
+            cmd.env("__STD_DEBUG_ASSERTIONS_ENABLED", "1");
+        }
+
+        cmd.env_remove("__STD_REMAP_DEBUGINFO_ENABLED");
+        if self.config.with_std_remap_debuginfo {
+            // Used for `run_make_support::env::std_remap_debuginfo_enabled`.
+            cmd.env("__STD_REMAP_DEBUGINFO_ENABLED", "1");
+        }
+
+        // Used for `run_make_support::env::jobs`.
+        cmd.env("__BOOTSTRAP_JOBS", self.config.jobs.to_string());
 
         // We don't want RUSTFLAGS set from the outside to interfere with
         // compiler flags set in the test cases:
@@ -291,11 +334,27 @@ impl TestCx<'_> {
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
         // This conditions on `status.success()` so we don't print output twice on error.
-        // NOTE: this code is called from a libtest thread, so it's hidden by default unless --nocapture is passed.
+        // NOTE: this code is called from an executor thread, so it's hidden by default unless --no-capture is passed.
         self.dump_output(status.success(), &cmd.get_program().to_string_lossy(), &stdout, &stderr);
         if !status.success() {
             let res = ProcRes { status, stdout, stderr, truncated, cmdline: format!("{:?}", cmd) };
             self.fatal_proc_rec("rmake recipe failed to complete", &res);
         }
     }
+}
+
+/// Gets all of the `out` dirs in a given Cargo `build-dir/<profile>/build` dir.
+fn discover_out_dirs(dir: Utf8PathBuf) -> Vec<PathBuf> {
+    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
+    let contents = dir
+        .read_dir()
+        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", dir, e))
+        .map(|e| e.unwrap())
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
+        .map(|e| e.path())
+        .filter(|path| path.ends_with("out"))
+        .collect::<Vec<_>>();
+
+    return contents;
 }

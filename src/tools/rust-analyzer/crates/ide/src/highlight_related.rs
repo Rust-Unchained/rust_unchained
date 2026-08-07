@@ -1,25 +1,26 @@
 use std::iter;
 
-use hir::{db, FilePosition, FileRange, HirFileId, InFile, Semantics};
+use hir::{EditionedFileId, FilePosition, FileRange, HirFileId, InFile, Semantics};
 use ide_db::{
+    FxHashMap, FxHashSet, RootDatabase,
+    base_db::SourceDatabase,
     defs::{Definition, IdentClass},
     helpers::pick_best_token,
     search::{FileReference, ReferenceCategory, SearchScope},
     syntax_helpers::node_ext::{
-        eq_label_lt, for_each_tail_expr, full_path_of_name_ref, is_closure_or_blk_with_modif,
-        preorder_expr_with_ctx_checker,
+        eq_label_lt, find_loops, for_each_tail_expr, full_path_of_name_ref,
+        is_closure_or_blk_with_modif, preorder_expr_with_ctx_checker,
     },
-    FxHashMap, FxHashSet, RootDatabase,
 };
-use span::EditionedFileId;
 use syntax::{
-    ast::{self, HasLoopBody},
-    match_ast, AstNode,
+    AstNode,
     SyntaxKind::{self, IDENT, INT_NUMBER},
-    SyntaxToken, TextRange, WalkEvent, T,
+    SyntaxToken, T, TextRange, WalkEvent,
+    ast::{self, HasLoopBody},
+    match_ast,
 };
 
-use crate::{goto_definition, navigation_target::ToNav, NavigationTarget, TryToNav};
+use crate::{NavigationTarget, TryToNav, goto_definition, navigation_target::ToNav};
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct HighlightedRange {
@@ -37,7 +38,10 @@ pub struct HighlightRelatedConfig {
     pub break_points: bool,
     pub closure_captures: bool,
     pub yield_points: bool,
+    pub branch_exit_points: bool,
 }
+
+type HighlightMap = FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>;
 
 // Feature: Highlight Related
 //
@@ -57,15 +61,13 @@ pub(crate) fn highlight_related(
     ide_db::FilePosition { offset, file_id }: ide_db::FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
     let _p = tracing::info_span!("highlight_related").entered();
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let syntax = sema.parse(file_id).syntax().clone();
 
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
         T![?] => 4, // prefer `?` when the cursor is sandwiched like in `await$0?`
-        T![->] => 4,
-        kind if kind.is_keyword(file_id.edition()) => 3,
+        T![->] | T![=>] => 4,
+        kind if kind.is_keyword(file_id.edition(sema.db)) => 3,
         IDENT | INT_NUMBER => 2,
         T![|] => 1,
         _ => 0,
@@ -78,6 +80,9 @@ pub(crate) fn highlight_related(
         T![fn] | T![return] | T![->] if config.exit_points => {
             highlight_exit_points(sema, token).remove(&file_id)
         }
+        T![match] | T![=>] | T![if] if config.branch_exit_points => {
+            highlight_branch_exit_points(sema, token).remove(&file_id)
+        }
         T![await] | T![async] if config.yield_points => {
             highlight_yield_points(sema, token).remove(&file_id)
         }
@@ -86,6 +91,9 @@ pub(crate) fn highlight_related(
         }
         T![break] | T![loop] | T![while] | T![continue] if config.break_points => {
             highlight_break_points(sema, token).remove(&file_id)
+        }
+        T![unsafe] if token.parent().and_then(ast::BlockExpr::cast).is_some() => {
+            highlight_unsafe_points(sema, token).remove(&file_id)
         }
         T![|] if config.closure_captures => highlight_closure_captures(sema, token, file_id),
         T![move] if config.closure_captures => highlight_closure_captures(sema, token, file_id),
@@ -132,7 +140,7 @@ fn highlight_closure_captures(
                     .sources(sema.db)
                     .into_iter()
                     .flat_map(|x| x.to_nav(sema.db))
-                    .filter(|decl| decl.file_id == file_id)
+                    .filter(|decl| decl.file_id == file_id.file_id(sema.db))
                     .filter_map(|decl| decl.focus_range)
                     .map(move |range| HighlightedRange { range, category })
                     .chain(usages)
@@ -146,13 +154,16 @@ fn highlight_references(
     token: SyntaxToken,
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
-    let defs = if let Some((range, resolution)) =
+    let defs = if let Some((range, _, _, resolution)) =
         sema.check_for_format_args_template(token.clone(), offset)
     {
         match resolution.map(Definition::from) {
             Some(def) => iter::once(def).collect(),
             None => {
-                return Some(vec![HighlightedRange { range, category: ReferenceCategory::empty() }])
+                return Some(vec![HighlightedRange {
+                    range,
+                    category: ReferenceCategory::empty(),
+                }]);
             }
         }
     } else {
@@ -224,6 +235,23 @@ fn highlight_references(
             }
         }
 
+        // highlight the tail expr of the labelled block
+        if matches!(def, Definition::Label(_)) {
+            let label = token.parent_ancestors().nth(1).and_then(ast::Label::cast);
+            if let Some(block) =
+                label.and_then(|label| label.syntax().parent()).and_then(ast::BlockExpr::cast)
+            {
+                for_each_tail_expr(&block.into(), &mut |tail| {
+                    if !matches!(tail, ast::Expr::BreakExpr(_)) {
+                        res.insert(HighlightedRange {
+                            range: tail.syntax().text_range(),
+                            category: ReferenceCategory::empty(),
+                        });
+                    }
+                });
+            }
+        }
+
         // highlight the defs themselves
         match def {
             Definition::Local(local) => {
@@ -236,7 +264,7 @@ fn highlight_references(
                     .sources(sema.db)
                     .into_iter()
                     .flat_map(|x| x.to_nav(sema.db))
-                    .filter(|decl| decl.file_id == file_id)
+                    .filter(|decl| decl.file_id == file_id.file_id(sema.db))
                     .filter_map(|decl| decl.focus_range)
                     .map(|range| HighlightedRange { range, category })
                     .for_each(|x| {
@@ -248,13 +276,13 @@ fn highlight_references(
                     Definition::Module(module) => {
                         NavigationTarget::from_module_to_decl(sema.db, module)
                     }
-                    def => match def.try_to_nav(sema.db) {
+                    def => match def.try_to_nav(sema) {
                         Some(it) => it,
                         None => continue,
                     },
                 };
                 for nav in navs {
-                    if nav.file_id != file_id {
+                    if nav.file_id != file_id.file_id(sema.db) {
                         continue;
                     }
                     let hl_range = nav.focus_range.map(|range| {
@@ -274,18 +302,96 @@ fn highlight_references(
     }
 
     res.extend(usages);
-    if res.is_empty() {
-        None
-    } else {
-        Some(res.into_iter().collect())
+    if res.is_empty() { None } else { Some(res.into_iter().collect()) }
+}
+
+pub(crate) fn highlight_branch_exit_points(
+    sema: &Semantics<'_, RootDatabase>,
+    token: SyntaxToken,
+) -> FxHashMap<EditionedFileId, Vec<HighlightedRange>> {
+    let mut highlights: HighlightMap = FxHashMap::default();
+
+    let push_to_highlights = |file_id, range, highlights: &mut HighlightMap| {
+        if let Some(FileRange { file_id, range }) = original_frange(sema.db, file_id, range) {
+            let hrange = HighlightedRange { category: ReferenceCategory::empty(), range };
+            highlights.entry(file_id).or_default().insert(hrange);
+        }
+    };
+
+    let push_tail_expr = |tail: Option<ast::Expr>, highlights: &mut HighlightMap| {
+        let Some(tail) = tail else {
+            return;
+        };
+
+        for_each_tail_expr(&tail, &mut |tail| {
+            let file_id = sema.hir_file_for(tail.syntax());
+            let range = tail.syntax().text_range();
+            push_to_highlights(file_id, Some(range), highlights);
+        });
+    };
+
+    let nodes = goto_definition::find_branch_root(sema, &token).into_iter();
+    match token.kind() {
+        T![match] => {
+            for match_expr in nodes.filter_map(ast::MatchExpr::cast) {
+                let file_id = sema.hir_file_for(match_expr.syntax());
+                let range = match_expr.match_token().map(|token| token.text_range());
+                push_to_highlights(file_id, range, &mut highlights);
+
+                let Some(arm_list) = match_expr.match_arm_list() else {
+                    continue;
+                };
+                for arm in arm_list.arms() {
+                    push_tail_expr(arm.expr(), &mut highlights);
+                }
+            }
+        }
+        T![=>] => {
+            for arm in nodes.filter_map(ast::MatchArm::cast) {
+                let file_id = sema.hir_file_for(arm.syntax());
+                let range = arm.fat_arrow_token().map(|token| token.text_range());
+                push_to_highlights(file_id, range, &mut highlights);
+
+                push_tail_expr(arm.expr(), &mut highlights);
+            }
+        }
+        T![if] => {
+            for mut if_to_process in nodes.map(ast::IfExpr::cast) {
+                while let Some(cur_if) = if_to_process.take() {
+                    let file_id = sema.hir_file_for(cur_if.syntax());
+
+                    let if_kw_range = cur_if.if_token().map(|token| token.text_range());
+                    push_to_highlights(file_id, if_kw_range, &mut highlights);
+
+                    if let Some(then_block) = cur_if.then_branch() {
+                        push_tail_expr(Some(then_block.into()), &mut highlights);
+                    }
+
+                    match cur_if.else_branch() {
+                        Some(ast::ElseBranch::Block(else_block)) => {
+                            push_tail_expr(Some(else_block.into()), &mut highlights);
+                            if_to_process = None;
+                        }
+                        Some(ast::ElseBranch::IfExpr(nested_if)) => if_to_process = Some(nested_if),
+                        None => if_to_process = None,
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+
+    highlights
+        .into_iter()
+        .map(|(file_id, ranges)| (file_id, ranges.into_iter().collect()))
+        .collect()
 }
 
 fn hl_exit_points(
     sema: &Semantics<'_, RootDatabase>,
     def_token: Option<SyntaxToken>,
     body: ast::Expr,
-) -> Option<FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>> {
+) -> Option<HighlightMap> {
     let mut highlights: FxHashMap<EditionedFileId, FxHashSet<_>> = FxHashMap::default();
 
     let mut push_to_highlights = |file_id, range| {
@@ -368,7 +474,7 @@ pub(crate) fn highlight_exit_points(
                 },
                 ast::BlockExpr(blk) => match blk.modifier() {
                     Some(ast::BlockModifier::Async(t)) => hl_exit_points(sema, Some(t), blk.into()),
-                    Some(ast::BlockModifier::Try(t)) if token.kind() != T![return] => {
+                    Some(ast::BlockModifier::Try { try_token: t, .. }) if token.kind() != T![return] => {
                         hl_exit_points(sema, Some(t), blk.into())
                     },
                     _ => continue,
@@ -392,7 +498,7 @@ pub(crate) fn highlight_break_points(
         loop_token: Option<SyntaxToken>,
         label: Option<ast::Label>,
         expr: ast::Expr,
-    ) -> Option<FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>> {
+    ) -> Option<HighlightMap> {
         let mut highlights: FxHashMap<EditionedFileId, FxHashSet<_>> = FxHashMap::default();
 
         let mut push_to_highlights = |file_id, range| {
@@ -442,10 +548,22 @@ pub(crate) fn highlight_break_points(
                 push_to_highlights(file_id, text_range);
             });
 
+        if matches!(expr, ast::Expr::BlockExpr(_)) {
+            for_each_tail_expr(&expr, &mut |tail| {
+                if matches!(tail, ast::Expr::BreakExpr(_)) {
+                    return;
+                }
+
+                let file_id = sema.hir_file_for(tail.syntax());
+                let range = tail.syntax().text_range();
+                push_to_highlights(file_id, Some(range));
+            });
+        }
+
         Some(highlights)
     }
 
-    let Some(loops) = goto_definition::find_loops(sema, &token) else {
+    let Some(loops) = find_loops(sema, &token) else {
         return FxHashMap::default();
     };
 
@@ -473,7 +591,7 @@ pub(crate) fn highlight_yield_points(
         sema: &Semantics<'_, RootDatabase>,
         async_token: Option<SyntaxToken>,
         body: Option<ast::Expr>,
-    ) -> Option<FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>> {
+    ) -> Option<HighlightMap> {
         let mut highlights: FxHashMap<EditionedFileId, FxHashSet<_>> = FxHashMap::default();
 
         let mut push_to_highlights = |file_id, range| {
@@ -550,7 +668,10 @@ fn cover_range(r0: Option<TextRange>, r1: Option<TextRange>) -> Option<TextRange
     }
 }
 
-fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSet<Definition> {
+fn find_defs<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    token: SyntaxToken,
+) -> FxHashSet<Definition<'db>> {
     sema.descend_into_macros_exact(token)
         .into_iter()
         .filter_map(|token| IdentClass::classify_token(sema, &token))
@@ -559,17 +680,14 @@ fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSe
 }
 
 fn original_frange(
-    db: &dyn db::ExpandDatabase,
+    db: &dyn SourceDatabase,
     file_id: HirFileId,
     text_range: Option<TextRange>,
 ) -> Option<FileRange> {
     InFile::new(file_id, text_range?).original_node_file_range_opt(db).map(|(frange, _)| frange)
 }
 
-fn merge_map(
-    res: &mut FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>,
-    new: Option<FxHashMap<EditionedFileId, FxHashSet<HighlightedRange>>>,
-) {
+fn merge_map(res: &mut HighlightMap, new: Option<HighlightMap>) {
     let Some(new) = new else {
         return;
     };
@@ -581,14 +699,14 @@ fn merge_map(
 /// Preorder walk all the expression's child expressions.
 /// For macro calls, the callback will be called on the expanded expressions after
 /// visiting the macro call itself.
-struct WalkExpandedExprCtx<'a> {
-    sema: &'a Semantics<'a, RootDatabase>,
+struct WalkExpandedExprCtx<'a, 'db> {
+    sema: &'a Semantics<'db, RootDatabase>,
     depth: usize,
     check_ctx: &'static dyn Fn(&ast::Expr) -> bool,
 }
 
-impl<'a> WalkExpandedExprCtx<'a> {
-    fn new(sema: &'a Semantics<'a, RootDatabase>) -> Self {
+impl<'a, 'db> WalkExpandedExprCtx<'a, 'db> {
+    fn new(sema: &'a Semantics<'db, RootDatabase>) -> Self {
         Self { sema, depth: 0, check_ctx: &is_closure_or_blk_with_modif }
     }
 
@@ -606,20 +724,19 @@ impl<'a> WalkExpandedExprCtx<'a> {
                         self.depth += 1;
                     }
 
-                    if let ast::Expr::MacroExpr(expr) = expr {
-                        if let Some(expanded) =
+                    if let ast::Expr::MacroExpr(expr) = expr
+                        && let Some(expanded) =
                             expr.macro_call().and_then(|call| self.sema.expand_macro_call(&call))
-                        {
-                            match_ast! {
-                                match expanded {
-                                    ast::MacroStmts(it) => {
-                                        self.handle_expanded(it, cb);
-                                    },
-                                    ast::Expr(it) => {
-                                        self.walk(&it, cb);
-                                    },
-                                    _ => {}
-                                }
+                    {
+                        match_ast! {
+                            match (expanded.value) {
+                                ast::MacroStmts(it) => {
+                                    self.handle_expanded(it, cb);
+                                },
+                                ast::Expr(it) => {
+                                    self.walk(&it, cb);
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -639,10 +756,10 @@ impl<'a> WalkExpandedExprCtx<'a> {
         }
 
         for stmt in expanded.statements() {
-            if let ast::Stmt::ExprStmt(stmt) = stmt {
-                if let Some(expr) = stmt.expr() {
-                    self.walk(&expr, cb);
-                }
+            if let ast::Stmt::ExprStmt(stmt) = stmt
+                && let Some(expr) = stmt.expr()
+            {
+                self.walk(&expr, cb);
             }
         }
     }
@@ -667,6 +784,42 @@ impl<'a> WalkExpandedExprCtx<'a> {
     }
 }
 
+pub(crate) fn highlight_unsafe_points(
+    sema: &Semantics<'_, RootDatabase>,
+    token: SyntaxToken,
+) -> FxHashMap<EditionedFileId, Vec<HighlightedRange>> {
+    fn hl(
+        sema: &Semantics<'_, RootDatabase>,
+        unsafe_token: &SyntaxToken,
+        block_expr: Option<ast::BlockExpr>,
+    ) -> Option<FxHashMap<EditionedFileId, Vec<HighlightedRange>>> {
+        let mut highlights: FxHashMap<EditionedFileId, Vec<_>> = FxHashMap::default();
+
+        let mut push_to_highlights = |file_id, range| {
+            if let Some(FileRange { file_id, range }) = original_frange(sema.db, file_id, range) {
+                let hrange = HighlightedRange { category: ReferenceCategory::empty(), range };
+                highlights.entry(file_id).or_default().push(hrange);
+            }
+        };
+
+        // highlight unsafe keyword itself
+        let unsafe_token_file_id = sema.hir_file_for(&unsafe_token.parent()?);
+        push_to_highlights(unsafe_token_file_id, Some(unsafe_token.text_range()));
+
+        // highlight unsafe operations
+        if let Some(block) = block_expr {
+            let unsafe_ops = sema.get_unsafe_ops_for_unsafe_block(block);
+            for unsafe_op in unsafe_ops {
+                push_to_highlights(unsafe_op.file_id, Some(unsafe_op.value.text_range()));
+            }
+        }
+
+        Some(highlights)
+    }
+
+    hl(sema, &token, token.parent().and_then(ast::BlockExpr::cast)).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -681,6 +834,7 @@ mod tests {
         references: true,
         closure_captures: true,
         yield_points: true,
+        branch_exit_points: true,
     };
 
     #[track_caller]
@@ -713,6 +867,32 @@ mod tests {
         expected.sort_by_key(|(range, _)| range.start());
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_hl_unsafe_block() {
+        check(
+            r#"
+fn foo() {
+    unsafe fn this_is_unsafe_function() {}
+
+    unsa$0fe {
+  //^^^^^^
+        let raw_ptr = &42 as *const i32;
+        let val = *raw_ptr;
+                //^^^^^^^^
+
+        let mut_ptr = &mut 5 as *mut i32;
+        *mut_ptr = 10;
+      //^^^^^^^^
+
+        this_is_unsafe_function();
+      //^^^^^^^^^^^^^^^^^^^^^^^^^
+    }
+
+}
+"#,
+        );
     }
 
     #[test]
@@ -1907,6 +2087,7 @@ fn test() {
     fn return_in_macros() {
         check(
             r#"
+//- minicore: fn
 macro_rules! N {
     ($i:ident, $x:expr, $blk:expr) => {
         for $i in 0..$x {
@@ -2040,6 +2221,62 @@ fn main() {
     }
 
     #[test]
+    fn nested_match() {
+        check(
+            r#"
+fn main() {
+    match$0 0 {
+ // ^^^^^
+        0 => match 1 {
+            1 => 2,
+              // ^
+            _ => 3,
+              // ^
+        },
+        _ => 4,
+          // ^
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn single_arm_highlight() {
+        check(
+            r#"
+fn main() {
+    match 0 {
+        0 =>$0 {
+       // ^^
+            let x = 1;
+            x
+         // ^
+        }
+        _ => 2,
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn no_branches_when_disabled() {
+        let config = HighlightRelatedConfig { branch_exit_points: false, ..ENABLED_CONFIG };
+        check_with_config(
+            r#"
+fn main() {
+    match$0 0 {
+        0 => 1,
+        _ => 2,
+    }
+}
+"#,
+            config,
+        );
+    }
+
+    #[test]
     fn asm() {
         check(
             r#"
@@ -2067,5 +2304,275 @@ pub unsafe fn bootstrap() -> ! {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn complex_arms_highlight() {
+        check(
+            r#"
+fn calculate(n: i32) -> i32 { n * 2 }
+
+fn main() {
+    match$0 Some(1) {
+ // ^^^^^
+        Some(x) => match x {
+            0 => { let y = x; y },
+                           // ^
+            1 => calculate(x),
+               //^^^^^^^^^^^^
+            _ => (|| 6)(),
+              // ^^^^^^^^
+        },
+        None => loop {
+            break 5;
+         // ^^^^^^^
+        },
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn match_in_macro_highlight() {
+        check(
+            r#"
+macro_rules! M {
+    ($e:expr) => { $e };
+}
+
+fn main() {
+    M!{
+        match$0 Some(1) {
+     // ^^^^^
+            Some(x) => x,
+                    // ^
+            None => 0,
+                 // ^
+        }
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn match_in_macro_highlight_2() {
+        check(
+            r#"
+macro_rules! match_ast {
+    (match $node:ident { $($tt:tt)* }) => { $crate::match_ast!(match ($node) { $($tt)* }) };
+
+    (match ($node:expr) {
+        $( $( $path:ident )::+ ($it:pat) => $res:expr, )*
+        _ => $catch_all:expr $(,)?
+    }) => {{
+        $( if let Some($it) = $($path::)+cast($node.clone()) { $res } else )*
+        { $catch_all }
+    }};
+}
+
+fn main() {
+    match_ast! {
+        match$0 Some(1) {
+            Some(x) => x,
+        }
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn nested_if_else() {
+        check(
+            r#"
+fn main() {
+    if$0 true {
+ // ^^
+        if false {
+            1
+         // ^
+        } else {
+            2
+         // ^
+        }
+    } else {
+        3
+     // ^
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn if_else_if_highlight() {
+        check(
+            r#"
+fn main() {
+    if$0 true {
+ // ^^
+        1
+     // ^
+    } else if false {
+        // ^^
+        2
+     // ^
+    } else {
+        3
+     // ^
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn complex_if_branches() {
+        check(
+            r#"
+fn calculate(n: i32) -> i32 { n * 2 }
+
+fn main() {
+    if$0 true {
+ // ^^
+        let x = 5;
+        calculate(x)
+     // ^^^^^^^^^^^^
+    } else if false {
+        // ^^
+        (|| 10)()
+     // ^^^^^^^^^
+    } else {
+        loop {
+            break 15;
+         // ^^^^^^^^
+        }
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn if_in_macro_highlight() {
+        check(
+            r#"
+macro_rules! M {
+    ($e:expr) => { $e };
+}
+
+fn main() {
+    M!{
+        if$0 true {
+     // ^^
+            5
+         // ^
+        } else {
+            10
+         // ^^
+        }
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn match_in_macro() {
+        // We should not highlight the outer `match` expression.
+        check(
+            r#"
+macro_rules! M {
+    (match) => { 1 };
+}
+
+fn main() {
+    match Some(1) {
+        Some(x) => x,
+        None => {
+            M!(match$0)
+        }
+    }
+}
+            "#,
+        )
+    }
+
+    #[test]
+    fn labeled_block_tail_expr() {
+        check(
+            r#"
+fn foo() {
+    'a: {
+ // ^^^
+        if true { break$0 'a 0; }
+               // ^^^^^^^^
+        5
+     // ^
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn labeled_block_tail_expr_2() {
+        check(
+            r#"
+fn foo() {
+    let _ = 'b$0lk: {
+         // ^^^^
+        let x = 1;
+        if true { break 'blk 42; }
+                     // ^^^^
+        if false { break 'blk 24; }
+                      // ^^^^
+        100
+     // ^^^
+    };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn different_unsafe_block() {
+        check(
+            r#"
+fn main() {
+    unsafe$0 {
+ // ^^^^^^
+        *(0 as *const u8)
+     // ^^^^^^^^^^^^^^^^^
+    };
+    unsafe { *(1 as *const u8) };
+    unsafe { *(2 as *const u8) };
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn async_fn_param() {
+        check(
+            r#"
+async fn get_double_async(num$0: u32) -> u32 {
+                       // ^^^
+    num
+ // ^^^ read
+}
+        "#,
+        );
+        check(
+            r#"
+async fn get_double_async((num$0,): (u32,)) -> u32 {
+                        // ^^^
+    num
+ // ^^^ read
+}
+        "#,
+        );
     }
 }

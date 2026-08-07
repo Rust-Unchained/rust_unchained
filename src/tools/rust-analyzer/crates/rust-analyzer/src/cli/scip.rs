@@ -7,8 +7,8 @@ use ide::{
     RootDatabase, StaticIndex, StaticIndexedFile, SymbolInformationKind, TextRange, TokenId,
     TokenStaticData, VendoredLibrariesConfig,
 };
-use ide_db::LineIndexDatabase;
-use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
+use ide_db::line_index;
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use rustc_hash::{FxHashMap, FxHashSet};
 use scip::types::{self as scip_types, SymbolInformation};
 use tracing::error;
@@ -25,7 +25,7 @@ impl flags::Scip {
         eprintln!("Generating SCIP start...");
         let now = Instant::now();
 
-        let no_progress = &|s| (eprintln!("rust-analyzer: Loading {s}"));
+        let no_progress = &|s| eprintln!("rust-analyzer: Loading {s}");
         let root =
             vfs::AbsPathBuf::assert_utf8(std::env::current_dir()?.join(&self.path)).normalize();
 
@@ -52,6 +52,8 @@ impl flags::Scip {
             load_out_dirs_from_check: true,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: true,
+            num_worker_threads: self.num_threads.unwrap_or_else(num_cpus::get_physical),
+            proc_macro_processes: config.proc_macro_num_processes(),
         };
         let cargo_config = config.cargo(None);
         let (db, vfs, _) = load_workspace_at(
@@ -128,7 +130,7 @@ impl flags::Scip {
             };
 
         // Generates symbols from token monikers.
-        let mut symbol_generator = SymbolGenerator::new();
+        let mut symbol_generator = SymbolGenerator::default();
 
         for StaticIndexedFile { file_id, tokens, .. } in si.files {
             symbol_generator.clear_document_local_state();
@@ -189,6 +191,13 @@ impl flags::Scip {
                     symbol_roles |= scip_types::SymbolRole::Definition as i32;
                 }
 
+                let enclosing_range = match token.definition_body {
+                    Some(def_body) if def_body.file_id == file_id => {
+                        text_range_to_scip_range(&line_index, def_body.range)
+                    }
+                    _ => Vec::new(),
+                };
+
                 occurrences.push(scip_types::Occurrence {
                     range: text_range_to_scip_range(&line_index, text_range),
                     symbol,
@@ -197,7 +206,7 @@ impl flags::Scip {
                     syntax_kind: Default::default(),
                     diagnostics: Vec::new(),
                     special_fields: Default::default(),
-                    enclosing_range: Vec::new(),
+                    enclosing_range,
                 });
             }
 
@@ -228,7 +237,7 @@ impl flags::Scip {
             let token = si.tokens.get(id).unwrap();
 
             let Some(definition) = token.definition else {
-                break;
+                continue;
             };
 
             let file_id = definition.file_id;
@@ -265,10 +274,10 @@ impl flags::Scip {
         };
 
         if !duplicate_symbol_errors.is_empty() {
-            eprintln!("{}", DUPLICATE_SYMBOLS_MESSAGE);
+            eprintln!("{DUPLICATE_SYMBOLS_MESSAGE}");
             for (source_location, symbol) in duplicate_symbol_errors {
-                eprintln!("{}", source_location);
-                eprintln!("  Duplicate symbol: {}", symbol);
+                eprintln!("{source_location}");
+                eprintln!("  Duplicate symbol: {symbol}");
                 eprintln!();
             }
         }
@@ -339,7 +348,7 @@ fn get_relative_filepath(
 
 fn get_line_index(db: &RootDatabase, file_id: FileId) -> LineIndex {
     LineIndex {
-        index: db.line_index(file_id),
+        index: line_index(db, file_id).clone(),
         encoding: PositionEncoding::Utf8,
         endings: LineEndings::Unix,
     }
@@ -417,16 +426,13 @@ struct TokenSymbols {
     is_inherent_impl: bool,
 }
 
+#[derive(Default)]
 struct SymbolGenerator {
     token_to_symbols: FxHashMap<TokenId, Option<TokenSymbols>>,
     local_count: usize,
 }
 
 impl SymbolGenerator {
-    fn new() -> Self {
-        SymbolGenerator { token_to_symbols: FxHashMap::default(), local_count: 0 }
-    }
-
     fn clear_document_local_state(&mut self) {
         self.local_count = 0;
     }
@@ -511,6 +517,7 @@ fn moniker_descriptors(identifier: &MonikerIdentifier) -> Vec<scip_types::Descri
 #[cfg(test)]
 mod test {
     use super::*;
+    use hir::FileRangeWrapper;
     use ide::{FilePosition, TextSize};
     use test_fixture::ChangeFixture;
     use vfs::VfsPath;
@@ -522,7 +529,8 @@ mod test {
         let (file_id, range_or_offset) =
             change_fixture.file_position.expect("expected a marker ()");
         let offset = range_or_offset.expect_offset();
-        (host, FilePosition { file_id: file_id.into(), offset })
+        let position = FilePosition { file_id: file_id.file_id(), offset };
+        (host, position)
     }
 
     /// If expected == "", then assert that there are no symbols (this is basically local symbol)
@@ -594,6 +602,29 @@ pub mod example_mod {
 }
 "#,
             "rust-analyzer cargo foo 0.1.0 example_mod/func().",
+        );
+    }
+
+    #[test]
+    fn operator_overload() {
+        check_symbol(
+            r#"
+//- minicore: add
+//- /workspace/lib.rs crate:main
+use core::ops::AddAssign;
+
+struct S;
+
+impl AddAssign for S {
+    fn add_assign(&mut self, _rhs: Self) {}
+}
+
+fn main() {
+    let mut s = S;
+    s +=$0 S;
+}
+"#,
+            "rust-analyzer cargo main . impl#[S][`AddAssign<Self>`]add_assign().",
         );
     }
 
@@ -888,5 +919,97 @@ pub mod example_mod {
         let token = si.tokens.get(*token_id).unwrap();
 
         assert_eq!(token.documentation.as_ref().map(|d| d.as_str()), Some("foo"));
+    }
+
+    #[test]
+    fn function_has_enclosing_range() {
+        let s = "fn foo() {}";
+
+        let mut host = AnalysisHost::default();
+        let change_fixture = ChangeFixture::parse(s);
+        host.raw_database_mut().apply_change(change_fixture.change);
+
+        let analysis = host.analysis();
+        let si = StaticIndex::compute(
+            &analysis,
+            VendoredLibrariesConfig::Included {
+                workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
+            },
+        );
+
+        let file = si.files.first().unwrap();
+        let (_, token_id) = file.tokens.get(1).unwrap(); // first token is file module, second is `foo`
+        let token = si.tokens.get(*token_id).unwrap();
+
+        let expected_range = FileRangeWrapper {
+            file_id: FileId::from_raw(0),
+            range: TextRange::new(0.into(), 11.into()),
+        };
+
+        assert_eq!(token.definition_body, Some(expected_range));
+    }
+
+    #[test]
+    fn function_enclosing_range_trivia() {
+        let s = "fn first() {}\n// belongs to first\n/// second docs\nfn second() {}";
+
+        let mut host = AnalysisHost::default();
+        let change_fixture = ChangeFixture::parse(s);
+        host.raw_database_mut().apply_change(change_fixture.change);
+
+        let analysis = host.analysis();
+        let si = StaticIndex::compute(
+            &analysis,
+            VendoredLibrariesConfig::Included {
+                workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
+            },
+        );
+
+        let file = si.files.first().unwrap();
+        let token = file
+            .tokens
+            .iter()
+            .filter_map(|(_, token_id)| si.tokens.get(*token_id))
+            .find(|token| token.display_name.as_deref() == Some("second"))
+            .unwrap();
+
+        let definition_body = token.definition_body.unwrap();
+        assert_eq!(
+            definition_body.range.start(),
+            TextSize::new(s.find("/// second docs").unwrap() as u32)
+        );
+        assert_eq!(definition_body.range.end(), TextSize::of(s));
+    }
+
+    #[test]
+    fn const_enclosing_range_trivia() {
+        let s = "const FOO_ONE: i32 = 123; // one\nconst FOO_TWO: i32 = 123; // two";
+
+        let mut host = AnalysisHost::default();
+        let change_fixture = ChangeFixture::parse(s);
+        host.raw_database_mut().apply_change(change_fixture.change);
+
+        let analysis = host.analysis();
+        let si = StaticIndex::compute(
+            &analysis,
+            VendoredLibrariesConfig::Included {
+                workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
+            },
+        );
+
+        let file = si.files.first().unwrap();
+        let token = file
+            .tokens
+            .iter()
+            .filter_map(|(_, token_id)| si.tokens.get(*token_id))
+            .find(|token| token.display_name.as_deref() == Some("FOO_TWO"))
+            .unwrap();
+
+        let definition_body = token.definition_body.unwrap();
+        assert_eq!(
+            definition_body.range.start(),
+            TextSize::new(s.find("const FOO_TWO").unwrap() as u32)
+        );
+        assert_eq!(definition_body.range.end(), TextSize::new(s.find(" // two").unwrap() as u32));
     }
 }

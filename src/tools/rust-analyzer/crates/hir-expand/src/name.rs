@@ -2,8 +2,9 @@
 
 use std::fmt;
 
-use intern::{sym, Symbol};
-use span::{Edition, SyntaxContextId};
+use base_db::SourceDatabase;
+use intern::{Symbol, sym};
+use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
 use syntax::{ast, format_smolstr};
 
@@ -33,12 +34,14 @@ impl fmt::Debug for Name {
 }
 
 impl Ord for Name {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.symbol.as_str().cmp(other.symbol.as_str())
     }
 }
 
 impl PartialOrd for Name {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -46,91 +49,80 @@ impl PartialOrd for Name {
 
 // No need to strip `r#`, all comparisons are done against well-known symbols.
 impl PartialEq<Symbol> for Name {
+    #[inline]
     fn eq(&self, sym: &Symbol) -> bool {
         self.symbol == *sym
     }
 }
 
 impl PartialEq<&Symbol> for Name {
+    #[inline]
     fn eq(&self, &sym: &&Symbol) -> bool {
         self.symbol == *sym
     }
 }
 
 impl PartialEq<Name> for Symbol {
+    #[inline]
     fn eq(&self, name: &Name) -> bool {
         *self == name.symbol
     }
 }
 
 impl PartialEq<Name> for &Symbol {
+    #[inline]
     fn eq(&self, name: &Name) -> bool {
         **self == name.symbol
     }
 }
 
 impl Name {
+    #[inline]
     fn new_text(text: &str) -> Name {
         Name { symbol: Symbol::intern(text), ctx: () }
     }
 
-    pub fn new(text: &str, mut ctx: SyntaxContextId) -> Name {
+    #[inline]
+    pub fn new(text: &str, mut ctx: SyntaxContext) -> Name {
         // For comparisons etc. we remove the edition, because sometimes we search for some `Name`
         // and we don't know which edition it came from.
         // Can't do that for all `SyntaxContextId`s because it breaks Salsa.
         ctx.remove_root_edition();
         _ = ctx;
-        match text.strip_prefix("r#") {
-            Some(text) => Self::new_text(text),
-            None => Self::new_text(text),
-        }
+        let text = text.strip_prefix("r#").unwrap_or(text);
+        Self::new_text(text)
     }
 
+    #[inline]
     pub fn new_root(text: &str) -> Name {
         // The edition doesn't matter for hygiene.
-        Self::new(text, SyntaxContextId::root(Edition::Edition2015))
+        Self::new(text, SyntaxContext::root(Edition::Edition2015))
     }
 
+    #[inline]
     pub fn new_tuple_field(idx: usize) -> Name {
-        let symbol = match idx {
-            0 => sym::INTEGER_0.clone(),
-            1 => sym::INTEGER_1.clone(),
-            2 => sym::INTEGER_2.clone(),
-            3 => sym::INTEGER_3.clone(),
-            4 => sym::INTEGER_4.clone(),
-            5 => sym::INTEGER_5.clone(),
-            6 => sym::INTEGER_6.clone(),
-            7 => sym::INTEGER_7.clone(),
-            8 => sym::INTEGER_8.clone(),
-            9 => sym::INTEGER_9.clone(),
-            10 => sym::INTEGER_10.clone(),
-            11 => sym::INTEGER_11.clone(),
-            12 => sym::INTEGER_12.clone(),
-            13 => sym::INTEGER_13.clone(),
-            14 => sym::INTEGER_14.clone(),
-            15 => sym::INTEGER_15.clone(),
-            _ => Symbol::intern(&idx.to_string()),
-        };
-        Name { symbol, ctx: () }
+        Name::new_symbol_root(sym::Integer::get(idx))
     }
 
-    pub fn new_lifetime(lt: &ast::Lifetime) -> Name {
-        let text = lt.text();
-        match text.strip_prefix("'r#") {
-            Some(text) => Self::new_text(&format_smolstr!("'{text}")),
-            None => Self::new_text(text.as_str()),
+    #[inline]
+    pub fn new_lifetime(lt: &str) -> Name {
+        match lt.strip_prefix("'r#") {
+            Some(lt) => Self::new_text(&format_smolstr!("'{lt}")),
+            None => Self::new_text(lt),
         }
     }
 
-    pub fn new_symbol(symbol: Symbol, ctx: SyntaxContextId) -> Self {
+    #[inline]
+    pub fn new_symbol(symbol: Symbol, ctx: SyntaxContext) -> Self {
         debug_assert!(!symbol.as_str().starts_with("r#"));
         _ = ctx;
         Self { symbol, ctx: () }
     }
 
     // FIXME: This needs to go once we have hygiene
+    #[inline]
     pub fn new_symbol_root(sym: Symbol) -> Self {
-        Self::new_symbol(sym, SyntaxContextId::root(Edition::Edition2015))
+        Self::new_symbol(sym, SyntaxContext::root(Edition::Edition2015))
     }
 
     /// A fake name for things missing in the source code.
@@ -142,8 +134,9 @@ impl Name {
     /// Ideally, we want a `gensym` semantics for missing names -- each missing
     /// name is equal only to itself. It's not clear how to implement this in
     /// salsa though, so we punt on that bit for a moment.
+    #[inline]
     pub const fn missing() -> Name {
-        Name { symbol: sym::consts::MISSING_NAME, ctx: () }
+        Name { symbol: sym::MISSING_NAME, ctx: () }
     }
 
     /// Returns true if this is a fake name for things missing in the source code. See
@@ -151,23 +144,27 @@ impl Name {
     ///
     /// Use this method instead of comparing with `Self::missing()` as missing names
     /// (ideally should) have a `gensym` semantics.
+    #[inline]
     pub fn is_missing(&self) -> bool {
-        self == &Name::missing()
+        self.symbol == sym::MISSING_NAME
     }
 
     /// Generates a new name that attempts to be unique. Should only be used when body lowering and
     /// creating desugared locals and labels. The caller is responsible for picking an index
     /// that is stable across re-executions
+    #[inline]
     pub fn generate_new_name(idx: usize) -> Name {
-        Name::new_text(&format!("<ra@gennew>{idx}"))
+        Name::new_symbol_root(sym::RaGeneratedName::get(idx))
     }
 
     /// Returns the tuple index this name represents if it is a tuple field.
+    #[inline]
     pub fn as_tuple_index(&self) -> Option<usize> {
-        self.symbol.as_str().parse().ok()
+        sym::Integer::as_uint(&self.symbol)
     }
 
     /// Whether this name needs to be escaped in the given edition via `r#`.
+    #[inline]
     pub fn needs_escape(&self, edition: Edition) -> bool {
         is_raw_identifier(self.symbol.as_str(), edition)
     }
@@ -176,13 +173,15 @@ impl Name {
     ///
     /// Do not use this for user-facing text, use `display` instead to handle editions properly.
     // FIXME: This should take a database argument to hide the interning
+    #[inline]
     pub fn as_str(&self) -> &str {
         self.symbol.as_str()
     }
 
+    #[inline]
     pub fn display<'a>(
         &'a self,
-        db: &dyn crate::db::ExpandDatabase,
+        db: &dyn SourceDatabase,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         _ = db;
@@ -191,26 +190,51 @@ impl Name {
 
     // FIXME: Remove this in favor of `display`, see fixme on `as_str`
     #[doc(hidden)]
+    #[inline]
     pub fn display_no_db(&self, edition: Edition) -> impl fmt::Display + '_ {
-        Display { name: self, needs_escaping: is_raw_identifier(self.symbol.as_str(), edition) }
+        Display { name: self, edition }
     }
 
+    #[inline]
     pub fn symbol(&self) -> &Symbol {
         &self.symbol
     }
+
+    #[inline]
+    pub fn is_generated(&self) -> bool {
+        is_generated(self.as_str())
+    }
+}
+
+#[inline]
+pub fn is_generated(name: &str) -> bool {
+    name.starts_with("<ra@gennew>")
 }
 
 struct Display<'a> {
     name: &'a Name,
-    needs_escaping: bool,
+    edition: Edition,
 }
 
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.needs_escaping {
-            write!(f, "r#")?;
+        let mut symbol = self.name.symbol.as_str();
+
+        if symbol == "'static" {
+            // FIXME: '`static` can also be a label, and there it does need escaping.
+            // But knowing where it is will require adding a parameter to `display()`,
+            // and that is an infectious change.
+            return f.write_str(symbol);
         }
-        fmt::Display::fmt(self.name.symbol.as_str(), f)
+
+        if let Some(s) = symbol.strip_prefix('\'') {
+            f.write_str("'")?;
+            symbol = s;
+        }
+        if is_raw_identifier(symbol, self.edition) {
+            f.write_str("r#")?;
+        }
+        f.write_str(symbol)
     }
 }
 
@@ -222,14 +246,14 @@ impl AsName for ast::NameRef {
     fn as_name(&self) -> Name {
         match self.as_tuple_field() {
             Some(idx) => Name::new_tuple_field(idx),
-            None => Name::new_root(&self.text()),
+            None => Name::new_root(self.text()),
         }
     }
 }
 
 impl AsName for ast::Name {
     fn as_name(&self) -> Name {
-        Name::new_root(&self.text())
+        Name::new_root(self.text())
     }
 }
 
@@ -242,7 +266,7 @@ impl AsName for ast::NameOrNameRef {
     }
 }
 
-impl<Span> AsName for tt::Ident<Span> {
+impl AsName for tt::Ident {
     fn as_name(&self) -> Name {
         Name::new_root(self.sym.as_str())
     }
@@ -260,7 +284,7 @@ impl AsName for ast::FieldKind {
     }
 }
 
-impl AsName for base_db::Dependency {
+impl AsName for base_db::BuiltDependency {
     fn as_name(&self) -> Name {
         Name::new_symbol_root((*self.name).clone())
     }

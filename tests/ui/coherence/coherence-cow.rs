@@ -1,7 +1,7 @@
 //@ build-pass
 //@ revisions: re_a re_b re_c
 
-#![cfg_attr(any(), re_a, re_b, re_c)]
+#![cfg_attr(false, re_a, re_b, re_c)]
 
 //@ aux-build:coherence_lib.rs
 

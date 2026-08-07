@@ -21,50 +21,47 @@ use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_ast::visit::{FnCtxt, FnKind};
 use rustc_ast::{self as ast, *};
 use rustc_ast_pretty::pprust::expr_to_string;
-use rustc_errors::{Applicability, LintDiagnostic};
-use rustc_feature::{AttributeGate, BuiltinAttribute, GateIssue, Stability, deprecated_attributes};
-use rustc_hir as hir;
+use rustc_attr_parsing::AttributeParser;
+use rustc_errors::{Applicability, Diagnostic, msg};
+use rustc_feature::GateIssue;
+use rustc_hir::attrs::{AttributeKind, DocAttribute};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
 use rustc_hir::intravisit::FnKind as HirFnKind;
-use rustc_hir::{Body, FnDecl, GenericParamKind, PatKind, PredicateOrigin};
+use rustc_hir::{self as hir, Body, FnDecl, ImplItemImplKind, PatKind, PredicateOrigin, find_attr};
 use rustc_middle::bug;
-use rustc_middle::lint::LevelAndSource;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, Upcast, VariantDef};
-use rustc_session::lint::FutureIncompatibilityReason;
+use rustc_middle::ty::{
+    self, AssocContainer, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast, VariantDef,
+};
 // hardwired lints from rustc_lint_defs
 pub use rustc_session::lint::builtin::*;
+use rustc_session::lint::fcw;
 use rustc_session::{declare_lint, declare_lint_pass, impl_lint_pass};
 use rustc_span::edition::Edition;
-use rustc_span::source_map::Spanned;
-use rustc_span::{BytePos, Ident, InnerSpan, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Spanned, Symbol, kw, sym};
 use rustc_target::asm::InlineAsmArch;
 use rustc_trait_selection::infer::{InferCtxtExt, TyCtxtInferExt};
+use rustc_trait_selection::traits;
 use rustc_trait_selection::traits::misc::type_allowed_to_implement_copy;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
-use rustc_trait_selection::traits::{self};
 
-use crate::errors::BuiltinEllipsisInclusiveRangePatterns;
+use crate::diagnostics::BuiltinEllipsisInclusiveRangePatterns;
 use crate::lints::{
-    BuiltinAnonymousParams, BuiltinConstNoMangle, BuiltinDeprecatedAttrLink,
-    BuiltinDeprecatedAttrLinkSuggestion, BuiltinDerefNullptr, BuiltinDoubleNegations,
+    BuiltinAnonymousParams, BuiltinConstNoMangle, BuiltinDerefNullptr, BuiltinDoubleNegations,
     BuiltinDoubleNegationsAddParens, BuiltinEllipsisInclusiveRangePatternsLint,
     BuiltinExplicitOutlives, BuiltinExplicitOutlivesSuggestion, BuiltinFeatureIssueNote,
     BuiltinIncompleteFeatures, BuiltinIncompleteFeaturesHelp, BuiltinInternalFeatures,
     BuiltinKeywordIdents, BuiltinMissingCopyImpl, BuiltinMissingDebugImpl, BuiltinMissingDoc,
-    BuiltinMutablesTransmutes, BuiltinNoMangleGeneric, BuiltinNonShorthandFieldPatterns,
-    BuiltinSpecialModuleNameUsed, BuiltinTrivialBounds, BuiltinTypeAliasBounds,
-    BuiltinUngatedAsyncFnTrackCaller, BuiltinUnpermittedTypeInit, BuiltinUnpermittedTypeInitSub,
-    BuiltinUnreachablePub, BuiltinUnsafe, BuiltinUnstableFeatures, BuiltinUnusedDocComment,
-    BuiltinUnusedDocCommentSub, BuiltinWhileTrue, InvalidAsmLabel,
+    BuiltinMutablesTransmutes, BuiltinNonShorthandFieldPatterns, BuiltinSpecialModuleNameUsed,
+    BuiltinTrivialBounds, BuiltinTypeAliasBounds, BuiltinUngatedAsyncFnTrackCaller,
+    BuiltinUnpermittedTypeInit, BuiltinUnpermittedTypeInitSub, BuiltinUnreachablePub,
+    BuiltinUnsafe, BuiltinUnstableFeatures, BuiltinUnusedDocComment, BuiltinUnusedDocCommentSub,
+    BuiltinWhileTrue, EqInternalMethodImplemented, InvalidAsmLabel,
 };
-use crate::nonstandard_style::{MethodLateContext, method_context};
-use crate::{
-    EarlyContext, EarlyLintPass, LateContext, LateLintPass, Level, LintContext,
-    fluent_generated as fluent,
-};
+use crate::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
+
 declare_lint! {
     /// The `while_true` lint detects `while true { }`.
     ///
@@ -152,7 +149,10 @@ declare_lint_pass!(NonShorthandFieldPatterns => [NON_SHORTHAND_FIELD_PATTERNS]);
 
 impl<'tcx> LateLintPass<'tcx> for NonShorthandFieldPatterns {
     fn check_pat(&mut self, cx: &LateContext<'_>, pat: &hir::Pat<'_>) {
-        if let PatKind::Struct(ref qpath, field_pats, _) = pat.kind {
+        // The result shouldn't be tainted, otherwise it will cause ICE.
+        if let PatKind::Struct(ref qpath, field_pats, _) = pat.kind
+            && cx.typeck_results().tainted_by_errors.is_none()
+        {
             let variant = cx
                 .typeck_results()
                 .pat_ty(pat)
@@ -189,46 +189,6 @@ impl<'tcx> LateLintPass<'tcx> for NonShorthandFieldPatterns {
     }
 }
 
-declare_lint! {
-    /// The `unsafe_code` lint catches usage of `unsafe` code and other
-    /// potentially unsound constructs like `no_mangle`, `export_name`,
-    /// and `link_section`.
-    ///
-    /// ### Example
-    ///
-    /// ```rust,compile_fail
-    /// #![deny(unsafe_code)]
-    /// fn main() {
-    ///     unsafe {
-    ///
-    ///     }
-    /// }
-    ///
-    /// #[no_mangle]
-    /// fn func_0() { }
-    ///
-    /// #[export_name = "exported_symbol_name"]
-    /// pub fn name_in_rust() { }
-    ///
-    /// #[no_mangle]
-    /// #[link_section = ".example_section"]
-    /// pub static VAR1: u32 = 1;
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// This lint is intended to restrict the usage of `unsafe` blocks and other
-    /// constructs (including, but not limited to `no_mangle`, `link_section`
-    /// and `export_name` attributes) wrong usage of which causes undefined
-    /// behavior.
-    UNSAFE_CODE,
-    Allow,
-    "usage of `unsafe` code and other potentially unsound constructs",
-    @eval_always = true
-}
-
 declare_lint_pass!(UnsafeCode => [UNSAFE_CODE]);
 
 impl UnsafeCode {
@@ -236,7 +196,7 @@ impl UnsafeCode {
         &self,
         cx: &EarlyContext<'_>,
         span: Span,
-        decorate: impl for<'a> LintDiagnostic<'a, ()>,
+        decorate: impl for<'a> Diagnostic<'a, ()>,
     ) {
         // This comes from a macro that has `#[allow_internal_unsafe]`.
         if span.allows_unsafe() {
@@ -248,12 +208,6 @@ impl UnsafeCode {
 }
 
 impl EarlyLintPass for UnsafeCode {
-    fn check_attribute(&mut self, cx: &EarlyContext<'_>, attr: &ast::Attribute) {
-        if attr.has_name(sym::allow_internal_unsafe) {
-            self.report_unsafe(cx, attr.span, BuiltinUnsafe::AllowInternalUnsafe);
-        }
-    }
-
     #[inline]
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
         if let ast::ExprKind::Block(ref blk, _) = e.kind {
@@ -266,40 +220,15 @@ impl EarlyLintPass for UnsafeCode {
 
     fn check_item(&mut self, cx: &EarlyContext<'_>, it: &ast::Item) {
         match it.kind {
-            ast::ItemKind::Trait(box ast::Trait { safety: ast::Safety::Unsafe(_), .. }) => {
+            ast::ItemKind::Trait(ast::Trait { safety: ast::Safety::Unsafe(_), .. }) => {
                 self.report_unsafe(cx, it.span, BuiltinUnsafe::UnsafeTrait);
             }
 
-            ast::ItemKind::Impl(box ast::Impl { safety: ast::Safety::Unsafe(_), .. }) => {
+            ast::ItemKind::Impl(ast::Impl {
+                of_trait: Some(ast::TraitImplHeader { safety: ast::Safety::Unsafe(_), .. }),
+                ..
+            }) => {
                 self.report_unsafe(cx, it.span, BuiltinUnsafe::UnsafeImpl);
-            }
-
-            ast::ItemKind::Fn(..) => {
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::no_mangle) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::NoMangleFn);
-                }
-
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::export_name) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::ExportNameFn);
-                }
-
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::link_section) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::LinkSectionFn);
-                }
-            }
-
-            ast::ItemKind::Static(..) => {
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::no_mangle) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::NoMangleStatic);
-                }
-
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::export_name) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::ExportNameStatic);
-                }
-
-                if let Some(attr) = attr::find_by_name(&it.attrs, sym::link_section) {
-                    self.report_unsafe(cx, attr.span, BuiltinUnsafe::LinkSectionStatic);
-                }
             }
 
             ast::ItemKind::GlobalAsm(..) => {
@@ -312,18 +241,19 @@ impl EarlyLintPass for UnsafeCode {
                 }
             }
 
-            _ => {}
-        }
-    }
+            ast::ItemKind::MacroDef(..) => {
+                if let Some(hir::Attribute::Parsed(AttributeKind::AllowInternalUnsafe(span))) =
+                    AttributeParser::parse_limited_sym(
+                        cx.builder.sess(),
+                        &it.attrs,
+                        &[sym::allow_internal_unsafe],
+                    )
+                {
+                    self.report_unsafe(cx, span, BuiltinUnsafe::AllowInternalUnsafe);
+                }
+            }
 
-    fn check_impl_item(&mut self, cx: &EarlyContext<'_>, it: &ast::AssocItem) {
-        if let ast::AssocItemKind::Fn(..) = it.kind {
-            if let Some(attr) = attr::find_by_name(&it.attrs, sym::no_mangle) {
-                self.report_unsafe(cx, attr.span, BuiltinUnsafe::NoMangleMethod);
-            }
-            if let Some(attr) = attr::find_by_name(&it.attrs, sym::export_name) {
-                self.report_unsafe(cx, attr.span, BuiltinUnsafe::ExportNameMethod);
-            }
+            _ => {}
         }
     }
 
@@ -381,24 +311,14 @@ pub struct MissingDoc;
 impl_lint_pass!(MissingDoc => [MISSING_DOCS]);
 
 fn has_doc(attr: &hir::Attribute) -> bool {
-    if attr.is_doc_comment() {
+    if matches!(attr, hir::Attribute::Parsed(AttributeKind::DocComment { .. })) {
         return true;
     }
 
-    if !attr.has_name(sym::doc) {
-        return false;
-    }
-
-    if attr.value_str().is_some() {
+    if let hir::Attribute::Parsed(AttributeKind::Doc(d)) = attr
+        && matches!(d.as_ref(), DocAttribute { hidden: Some(..), .. })
+    {
         return true;
-    }
-
-    if let Some(list) = attr.meta_item_list() {
-        for meta in list {
-            if meta.has_name(sym::hidden) {
-                return true;
-            }
-        }
     }
 
     false
@@ -458,16 +378,16 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
-        let context = method_context(cx, impl_item.owner_id.def_id);
+        let container = cx.tcx.associated_item(impl_item.owner_id.def_id).container;
 
-        match context {
+        match container {
             // If the method is an impl for a trait, don't doc.
-            MethodLateContext::TraitImpl => return,
-            MethodLateContext::TraitAutoImpl => {}
+            AssocContainer::TraitImpl(_) => return,
+            AssocContainer::Trait => {}
             // If the method is an impl for an item with docs_hidden, don't doc.
-            MethodLateContext::PlainImpl => {
+            AssocContainer::InherentImpl => {
                 let parent = cx.tcx.hir_get_parent_item(impl_item.hir_id());
-                let impl_ty = cx.tcx.type_of(parent).instantiate_identity();
+                let impl_ty = cx.tcx.type_of(parent).instantiate_identity().skip_norm_wip();
                 let outerdef = match impl_ty.kind() {
                     ty::Adt(def, _) => Some(def.did()),
                     ty::Foreign(def_id) => Some(*def_id),
@@ -545,22 +465,22 @@ impl<'tcx> LateLintPass<'tcx> for MissingCopyImplementations {
             return;
         }
         let (def, ty) = match item.kind {
-            hir::ItemKind::Struct(_, _, ast_generics) => {
-                if !ast_generics.params.is_empty() {
+            hir::ItemKind::Struct(_, generics, _) => {
+                if !generics.params.is_empty() {
                     return;
                 }
                 let def = cx.tcx.adt_def(item.owner_id);
                 (def, Ty::new_adt(cx.tcx, def, ty::List::empty()))
             }
-            hir::ItemKind::Union(_, _, ast_generics) => {
-                if !ast_generics.params.is_empty() {
+            hir::ItemKind::Union(_, generics, _) => {
+                if !generics.params.is_empty() {
                     return;
                 }
                 let def = cx.tcx.adt_def(item.owner_id);
                 (def, Ty::new_adt(cx.tcx, def, ty::List::empty()))
             }
-            hir::ItemKind::Enum(_, _, ast_generics) => {
-                if !ast_generics.params.is_empty() {
+            hir::ItemKind::Enum(_, generics, _) => {
+                if !generics.params.is_empty() {
                     return;
                 }
                 let def = cx.tcx.adt_def(item.owner_id);
@@ -576,7 +496,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingCopyImplementations {
         // and recommending Copy might be a bad idea.
         for field in def.all_fields() {
             let did = field.did;
-            if cx.tcx.type_of(did).instantiate_identity().is_raw_ptr() {
+            if cx.tcx.type_of(did).instantiate_identity().skip_norm_wip().is_raw_ptr() {
                 return;
             }
         }
@@ -635,7 +555,8 @@ fn type_implements_negative_copy_modulo_regions<'tcx>(
     typing_env: ty::TypingEnv<'tcx>,
 ) -> bool {
     let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
-    let trait_ref = ty::TraitRef::new(tcx, tcx.require_lang_item(hir::LangItem::Copy, None), [ty]);
+    let trait_ref =
+        ty::TraitRef::new(tcx, tcx.require_lang_item(hir::LangItem::Copy, DUMMY_SP), [ty]);
     let pred = ty::TraitPredicate { trait_ref, polarity: ty::PredicatePolarity::Negative };
     let obligation = traits::Obligation {
         cause: traits::ObligationCause::dummy(),
@@ -685,36 +606,61 @@ impl_lint_pass!(MissingDebugImplementations => [MISSING_DEBUG_IMPLEMENTATIONS]);
 
 impl<'tcx> LateLintPass<'tcx> for MissingDebugImplementations {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
-        if !cx.effective_visibilities.is_reachable(item.owner_id.def_id) {
+        let def_id = item.owner_id.def_id;
+        if !cx.effective_visibilities.is_reachable(def_id) {
             return;
         }
 
-        match item.kind {
-            hir::ItemKind::Struct(..) | hir::ItemKind::Union(..) | hir::ItemKind::Enum(..) => {}
+        let is_generic = match item.kind {
+            hir::ItemKind::Struct(_, generics, _)
+            | hir::ItemKind::Union(_, generics, _)
+            | hir::ItemKind::Enum(_, generics, _) => !generics.params.is_empty(),
             _ => return,
-        }
+        };
+
+        let tcx = cx.tcx;
 
         // Avoid listing trait impls if the trait is allowed.
-        let LevelAndSource { level, .. } =
-            cx.tcx.lint_level_at_node(MISSING_DEBUG_IMPLEMENTATIONS, item.hir_id());
-        if level == Level::Allow {
+        if tcx.lint_level_spec_at_node(MISSING_DEBUG_IMPLEMENTATIONS, item.hir_id()).is_allow() {
             return;
         }
 
-        let Some(debug) = cx.tcx.get_diagnostic_item(sym::Debug) else { return };
+        let Some(debug) = tcx.get_diagnostic_item(sym::Debug) else { return };
 
-        let has_impl = cx
-            .tcx
-            .non_blanket_impls_for_ty(debug, cx.tcx.type_of(item.owner_id).instantiate_identity())
+        let ty = tcx.type_of(item.owner_id);
+        if tcx
+            .non_blanket_impls_for_ty(debug, ty.instantiate_identity().skip_norm_wip())
             .next()
-            .is_some();
-        if !has_impl {
-            cx.emit_span_lint(
-                MISSING_DEBUG_IMPLEMENTATIONS,
-                item.span,
-                BuiltinMissingDebugImpl { tcx: cx.tcx, def_id: debug },
-            );
+            .is_some()
+        {
+            return;
         }
+
+        let infcx = tcx.infer_ctxt().build(cx.typing_mode());
+        if is_generic {
+            let args = infcx.fresh_args_for_item(item.span, def_id.to_def_id());
+            if infcx
+                .type_implements_trait_shallow(
+                    debug,
+                    ty.instantiate(tcx, args).skip_norm_wip(),
+                    cx.param_env,
+                )
+                .is_some()
+            {
+                return;
+            }
+        } else if infcx
+            .type_implements_trait(debug, [ty.instantiate_identity().skip_norm_wip()], cx.param_env)
+            .must_apply_modulo_regions()
+        {
+            return;
+        }
+
+        cx.emit_span_lint(
+            MISSING_DEBUG_IMPLEMENTATIONS,
+            item.span,
+            BuiltinMissingDebugImpl { tcx: cx.tcx, def_id: debug },
+        );
     }
 }
 
@@ -761,8 +707,7 @@ declare_lint! {
     Warn,
     "detects anonymous parameters",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2018),
-        reference: "issue #41686 <https://github.com/rust-lang/rust/issues/41686>",
+        reason: fcw!(EditionError 2018 "trait-fn-parameters"),
     };
 }
 
@@ -777,7 +722,7 @@ impl EarlyLintPass for AnonymousParameters {
             // This is a hard error in future editions; avoid linting and erroring
             return;
         }
-        if let ast::AssocItemKind::Fn(box Fn { ref sig, .. }) = it.kind {
+        if let ast::AssocItemKind::Fn(Fn { ref sig, .. }) = it.kind {
             for arg in sig.decl.inputs.iter() {
                 if let ast::PatKind::Missing = arg.pat.kind {
                     let ty_snip = cx.sess().source_map().span_to_snippet(arg.ty.span);
@@ -798,53 +743,6 @@ impl EarlyLintPass for AnonymousParameters {
     }
 }
 
-/// Check for use of attributes which have been deprecated.
-#[derive(Clone)]
-pub struct DeprecatedAttr {
-    // This is not free to compute, so we want to keep it around, rather than
-    // compute it for every attribute.
-    depr_attrs: Vec<&'static BuiltinAttribute>,
-}
-
-impl_lint_pass!(DeprecatedAttr => []);
-
-impl Default for DeprecatedAttr {
-    fn default() -> Self {
-        DeprecatedAttr { depr_attrs: deprecated_attributes() }
-    }
-}
-
-impl EarlyLintPass for DeprecatedAttr {
-    fn check_attribute(&mut self, cx: &EarlyContext<'_>, attr: &ast::Attribute) {
-        for BuiltinAttribute { name, gate, .. } in &self.depr_attrs {
-            if attr.ident().map(|ident| ident.name) == Some(*name) {
-                if let &AttributeGate::Gated(
-                    Stability::Deprecated(link, suggestion),
-                    name,
-                    reason,
-                    _,
-                ) = gate
-                {
-                    let suggestion = match suggestion {
-                        Some(msg) => {
-                            BuiltinDeprecatedAttrLinkSuggestion::Msg { suggestion: attr.span, msg }
-                        }
-                        None => {
-                            BuiltinDeprecatedAttrLinkSuggestion::Default { suggestion: attr.span }
-                        }
-                    };
-                    cx.emit_span_lint(
-                        DEPRECATED,
-                        attr.span,
-                        BuiltinDeprecatedAttrLink { name, reason, link, suggestion },
-                    );
-                }
-                return;
-            }
-        }
-    }
-}
-
 fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &[ast::Attribute]) {
     use rustc_ast::token::CommentKind;
 
@@ -854,19 +752,23 @@ fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &
     let mut sugared_span: Option<Span> = None;
 
     while let Some(attr) = attrs.next() {
-        let is_doc_comment = attr.is_doc_comment();
+        let (is_doc_comment, is_doc_attribute) = match &attr.kind {
+            AttrKind::DocComment(..) => (true, false),
+            AttrKind::Normal(normal) if normal.item.path == sym::doc => (true, true),
+            _ => (false, false),
+        };
         if is_doc_comment {
             sugared_span =
                 Some(sugared_span.map_or(attr.span, |span| span.with_hi(attr.span.hi())));
         }
 
-        if attrs.peek().is_some_and(|next_attr| next_attr.is_doc_comment()) {
+        if !is_doc_attribute && attrs.peek().is_some_and(|next_attr| next_attr.is_doc_comment()) {
             continue;
         }
 
         let span = sugared_span.take().unwrap_or(attr.span);
 
-        if is_doc_comment || attr.has_name(sym::doc) {
+        if is_doc_comment || is_doc_attribute {
             let sub = match attr.kind {
                 AttrKind::DocComment(CommentKind::Line, _) | AttrKind::Normal(..) => {
                     BuiltinUnusedDocCommentSub::PlainHelp
@@ -874,6 +776,7 @@ fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &
                 AttrKind::DocComment(CommentKind::Block, _) => {
                     BuiltinUnusedDocCommentSub::BlockHelp
                 }
+                AttrKind::Synthetic(..) => unreachable!(),
             };
             cx.emit_span_lint(
                 UNUSED_DOC_COMMENTS,
@@ -967,74 +870,45 @@ declare_lint! {
     "const items will not have their symbols exported"
 }
 
-declare_lint! {
-    /// The `no_mangle_generic_items` lint detects generic items that must be
-    /// mangled.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// #[unsafe(no_mangle)]
-    /// fn foo<T>(t: T) {}
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// A function with generics must have its symbol mangled to accommodate
-    /// the generic parameter. The [`no_mangle` attribute] has no effect in
-    /// this situation, and should be removed.
-    ///
-    /// [`no_mangle` attribute]: https://doc.rust-lang.org/reference/abi.html#the-no_mangle-attribute
-    NO_MANGLE_GENERIC_ITEMS,
-    Warn,
-    "generic items must be mangled"
-}
+declare_lint_pass!(InvalidNoMangleItems => [NO_MANGLE_CONST_ITEMS]);
 
-declare_lint_pass!(InvalidNoMangleItems => [NO_MANGLE_CONST_ITEMS, NO_MANGLE_GENERIC_ITEMS]);
+impl InvalidNoMangleItems {
+    fn check_no_mangle_on_generic_fn(
+        &self,
+        cx: &LateContext<'_>,
+        attr_span: Span,
+        def_id: LocalDefId,
+    ) {
+        let generics = cx.tcx.generics_of(def_id);
+        if generics.requires_monomorphization(cx.tcx) {
+            cx.tcx.dcx().emit_err(crate::diagnostics::BuiltinNoMangleGeneric {
+                span: cx.tcx.def_span(def_id),
+                suggestion: attr_span,
+            });
+        }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for InvalidNoMangleItems {
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
         let attrs = cx.tcx.hir_attrs(it.hir_id());
-        let check_no_mangle_on_generic_fn = |no_mangle_attr: &hir::Attribute,
-                                             impl_generics: Option<&hir::Generics<'_>>,
-                                             generics: &hir::Generics<'_>,
-                                             span| {
-            for param in
-                generics.params.iter().chain(impl_generics.map(|g| g.params).into_iter().flatten())
-            {
-                match param.kind {
-                    GenericParamKind::Lifetime { .. } => {}
-                    GenericParamKind::Type { .. } | GenericParamKind::Const { .. } => {
-                        cx.emit_span_lint(
-                            NO_MANGLE_GENERIC_ITEMS,
-                            span,
-                            BuiltinNoMangleGeneric { suggestion: no_mangle_attr.span() },
-                        );
-                        break;
-                    }
-                }
-            }
-        };
         match it.kind {
-            hir::ItemKind::Fn { generics, .. } => {
-                if let Some(no_mangle_attr) = attr::find_by_name(attrs, sym::no_mangle) {
-                    check_no_mangle_on_generic_fn(no_mangle_attr, None, generics, it.span);
+            hir::ItemKind::Fn { .. } => {
+                if let Some(attr_span) = find_attr!(attrs, ExportName {span, ..} => *span)
+                    .or_else(|| find_attr!(attrs, NoMangle(span) => *span))
+                {
+                    self.check_no_mangle_on_generic_fn(cx, attr_span, it.owner_id.def_id);
                 }
             }
-            hir::ItemKind::Const(..) => {
-                if attr::contains_name(attrs, sym::no_mangle) {
-                    // account for "pub const" (#45562)
-                    let start = cx
-                        .tcx
-                        .sess
-                        .source_map()
-                        .span_to_snippet(it.span)
-                        .map(|snippet| snippet.find("const").unwrap_or(0))
-                        .unwrap_or(0) as u32;
-                    // `const` is 5 chars
-                    let suggestion = it.span.with_hi(BytePos(it.span.lo().0 + start + 5));
+            hir::ItemKind::Const(ident, generics, ..) => {
+                if find_attr!(attrs, NoMangle(..)) {
+                    let suggestion =
+                        if generics.params.is_empty() && generics.where_clause_span.is_empty() {
+                            // account for "pub const" (#45562)
+                            Some(it.span.until(ident.span))
+                        } else {
+                            None
+                        };
 
                     // Const items do not refer to a particular location in memory, and therefore
                     // don't have anything to attach a symbol to
@@ -1045,20 +919,18 @@ impl<'tcx> LateLintPass<'tcx> for InvalidNoMangleItems {
                     );
                 }
             }
-            hir::ItemKind::Impl(hir::Impl { generics, items, .. }) => {
-                for it in *items {
-                    if let hir::AssocItemKind::Fn { .. } = it.kind {
-                        if let Some(no_mangle_attr) =
-                            attr::find_by_name(cx.tcx.hir_attrs(it.id.hir_id()), sym::no_mangle)
-                        {
-                            check_no_mangle_on_generic_fn(
-                                no_mangle_attr,
-                                Some(generics),
-                                cx.tcx.hir_get_generics(it.id.owner_id.def_id).unwrap(),
-                                it.span,
-                            );
-                        }
-                    }
+            _ => {}
+        }
+    }
+
+    fn check_impl_item(&mut self, cx: &LateContext<'_>, it: &hir::ImplItem<'_>) {
+        let attrs = cx.tcx.hir_attrs(it.hir_id());
+        match it.kind {
+            hir::ImplItemKind::Fn { .. } => {
+                if let Some(attr_span) = find_attr!(attrs, ExportName {span, ..} => *span)
+                    .or_else(|| find_attr!(attrs, NoMangle(span) => *span))
+                {
+                    self.check_no_mangle_on_generic_fn(cx, attr_span, it.owner_id.def_id);
                 }
             }
             _ => {}
@@ -1109,11 +981,8 @@ impl<'tcx> LateLintPass<'tcx> for MutableTransmutes {
             cx: &LateContext<'tcx>,
             expr: &hir::Expr<'_>,
         ) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
-            let def = if let hir::ExprKind::Path(ref qpath) = expr.kind {
-                cx.qpath_res(qpath, expr.hir_id)
-            } else {
-                return None;
-            };
+            let hir::ExprKind::Path(ref qpath) = expr.kind else { return None };
+            let def = cx.qpath_res(qpath, expr.hir_id);
             if let Res::Def(DefKind::Fn, did) = def {
                 if !def_id_is_transmute(cx, did) {
                     return None;
@@ -1165,12 +1034,10 @@ declare_lint_pass!(
 );
 
 impl<'tcx> LateLintPass<'tcx> for UnstableFeatures {
-    fn check_attribute(&mut self, cx: &LateContext<'_>, attr: &hir::Attribute) {
-        if attr.has_name(sym::feature)
-            && let Some(items) = attr.meta_item_list()
-        {
-            for item in items {
-                cx.emit_span_lint(UNSTABLE_FEATURES, item.span(), BuiltinUnstableFeatures);
+    fn check_attributes(&mut self, cx: &LateContext<'_>, attrs: &[hir::Attribute]) {
+        if let Some(features) = find_attr!(attrs, Feature(features, _) => features) {
+            for feature in features {
+                cx.emit_span_lint(UNSTABLE_FEATURES, feature.span, BuiltinUnstableFeatures);
             }
         }
     }
@@ -1221,11 +1088,11 @@ impl<'tcx> LateLintPass<'tcx> for UngatedAsyncFnTrackCaller {
         if fn_kind.asyncness().is_async()
             && !cx.tcx.features().async_fn_track_caller()
             // Now, check if the function has the `#[track_caller]` attribute
-            && let Some(attr) = cx.tcx.get_attr(def_id, sym::track_caller)
+            && let Some(attr_span) = find_attr!(cx.tcx, def_id, TrackCaller(span) => *span)
         {
             cx.emit_span_lint(
                 UNGATED_ASYNC_FN_TRACK_CALLER,
-                attr.span(),
+                attr_span,
                 BuiltinUngatedAsyncFnTrackCaller { label: span, session: &cx.tcx.sess },
             );
         }
@@ -1296,7 +1163,7 @@ impl UnreachablePub {
                 && let parent_parent = cx
                     .tcx
                     .parent_module_from_def_id(cx.tcx.parent_module_from_def_id(def_id).into())
-                && *restricted_did == parent_parent.to_local_def_id()
+                && *restricted_did == parent_parent
                 && !restricted_did.to_def_id().is_crate_root()
             {
                 "pub(super)"
@@ -1352,9 +1219,8 @@ impl<'tcx> LateLintPass<'tcx> for UnreachablePub {
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
-        // Only lint inherent impl items.
-        if cx.tcx.associated_item(impl_item.owner_id).trait_item_def_id.is_none() {
-            self.perform_lint(cx, "item", impl_item.owner_id.def_id, impl_item.vis_span, false);
+        if let ImplItemImplKind::Inherent { vis_span } = impl_item.impl_kind {
+            self.perform_lint(cx, "item", impl_item.owner_id.def_id, vis_span, false);
         }
     }
 }
@@ -1415,22 +1281,22 @@ impl TypeAliasBounds {
 
 impl<'tcx> LateLintPass<'tcx> for TypeAliasBounds {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
-        let hir::ItemKind::TyAlias(_, hir_ty, generics) = item.kind else { return };
+        let hir::ItemKind::TyAlias(_, generics, hir_ty) = item.kind else { return };
 
         // There must not be a where clause.
         if generics.predicates.is_empty() {
             return;
         }
 
-        // Bounds of lazy type aliases and TAITs are respected.
-        if cx.tcx.type_alias_is_lazy(item.owner_id) {
+        // Bounds of checked type aliases and TAITs are respected.
+        if cx.tcx.type_alias_is_checked(item.owner_id) {
             return;
         }
 
         // FIXME(generic_const_exprs): Revisit this before stabilization.
         // See also `tests/ui/const-generics/generic_const_exprs/type-alias-bounds.rs`.
-        let ty = cx.tcx.type_of(item.owner_id).instantiate_identity();
-        if ty.has_type_flags(ty::TypeFlags::HAS_CT_PROJECTION)
+        let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
+        if ty.has_type_flags(ty::TypeFlags::HAS_CONST_ALIAS)
             && cx.tcx.features().generic_const_exprs()
         {
             return;
@@ -1554,15 +1420,15 @@ impl<'tcx> LateLintPass<'tcx> for TrivialConstraints {
         use rustc_middle::ty::ClauseKind;
 
         if cx.tcx.features().trivial_bounds() {
-            let predicates = cx.tcx.predicates_of(item.owner_id);
-            for &(predicate, span) in predicates.predicates {
-                let predicate_kind_name = match predicate.kind().skip_binder() {
+            let gen_clauses = cx.tcx.clauses_of(item.owner_id);
+            for &(clause, span) in gen_clauses.clauses {
+                let clause_kind_name = match clause.kind().skip_binder() {
                     ClauseKind::Trait(..) => "trait",
-                    ClauseKind::TypeOutlives(..) |
-                    ClauseKind::RegionOutlives(..) => "lifetime",
+                    ClauseKind::TypeOutlives(..) | ClauseKind::RegionOutlives(..) => "lifetime",
 
+                    ClauseKind::UnstableFeature(_)
                     // `ConstArgHasType` is never global as `ct` is always a param
-                    ClauseKind::ConstArgHasType(..)
+                    | ClauseKind::ConstArgHasType(..)
                     // Ignore projections, as they can only be global
                     // if the trait bound is global
                     | ClauseKind::Projection(..)
@@ -1573,11 +1439,11 @@ impl<'tcx> LateLintPass<'tcx> for TrivialConstraints {
                     // Users don't write this directly, only via another trait ref.
                     | ty::ClauseKind::HostEffect(..) => continue,
                 };
-                if predicate.is_global() {
+                if clause.is_global() {
                     cx.emit_span_lint(
                         TRIVIAL_BOUNDS,
                         span,
-                        BuiltinTrivialBounds { predicate_kind_name, predicate },
+                        BuiltinTrivialBounds { clause_kind_name, clause },
                     );
                 }
             }
@@ -1626,6 +1492,8 @@ impl EarlyLintPass for DoubleNegations {
         if let ExprKind::Unary(UnOp::Neg, ref inner) = expr.kind
             && let ExprKind::Unary(UnOp::Neg, ref inner2) = inner.kind
             && !matches!(inner2.kind, ExprKind::Unary(UnOp::Neg, _))
+            // Don't lint if this jumps macro expansion boundary (Issue #143980)
+            && expr.span.eq_ctxt(inner.span)
         {
             cx.emit_span_lint(
                 DOUBLE_NEGATIONS,
@@ -1641,28 +1509,29 @@ impl EarlyLintPass for DoubleNegations {
     }
 }
 
-declare_lint_pass!(
-    /// Does nothing as a lint pass, but registers some `Lint`s
-    /// which are used by other parts of the compiler.
-    SoftLints => [
-        WHILE_TRUE,
-        NON_SHORTHAND_FIELD_PATTERNS,
-        UNSAFE_CODE,
-        MISSING_DOCS,
-        MISSING_COPY_IMPLEMENTATIONS,
-        MISSING_DEBUG_IMPLEMENTATIONS,
-        ANONYMOUS_PARAMETERS,
-        UNUSED_DOC_COMMENTS,
-        NO_MANGLE_CONST_ITEMS,
-        NO_MANGLE_GENERIC_ITEMS,
-        MUTABLE_TRANSMUTES,
-        UNSTABLE_FEATURES,
-        UNREACHABLE_PUB,
-        TYPE_ALIAS_BOUNDS,
-        TRIVIAL_BOUNDS,
-        DOUBLE_NEGATIONS
-    ]
-);
+pub mod soft {
+    use super::*;
+
+    pub fn lint_vec() -> crate::LintVec {
+        vec![
+            WHILE_TRUE,
+            NON_SHORTHAND_FIELD_PATTERNS,
+            UNSAFE_CODE,
+            MISSING_DOCS,
+            MISSING_COPY_IMPLEMENTATIONS,
+            MISSING_DEBUG_IMPLEMENTATIONS,
+            ANONYMOUS_PARAMETERS,
+            UNUSED_DOC_COMMENTS,
+            NO_MANGLE_CONST_ITEMS,
+            MUTABLE_TRANSMUTES,
+            UNSTABLE_FEATURES,
+            UNREACHABLE_PUB,
+            TYPE_ALIAS_BOUNDS,
+            TRIVIAL_BOUNDS,
+            DOUBLE_NEGATIONS,
+        ]
+    }
+}
 
 declare_lint! {
     /// The `ellipsis_inclusive_range_patterns` lint detects the [`...` range
@@ -1692,8 +1561,7 @@ declare_lint! {
     Warn,
     "`...` range patterns are deprecated",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
-        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2021/warnings-promoted-to-error.html>",
+        reason: fcw!(EditionError 2021 "warnings-promoted-to-error"),
     };
 }
 
@@ -1730,7 +1598,7 @@ impl EarlyLintPass for EllipsisInclusiveRangePatterns {
         }
 
         let (parentheses, endpoints) = match &pat.kind {
-            PatKind::Ref(subpat, _) => (true, matches_ellipsis_pat(subpat)),
+            PatKind::Ref(subpat, _, _) => (true, matches_ellipsis_pat(subpat)),
             _ => (false, matches_ellipsis_pat(pat)),
         };
 
@@ -1828,8 +1696,7 @@ declare_lint! {
     Allow,
     "detects edition keywords being used as an identifier",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2018),
-        reference: "issue #49716 <https://github.com/rust-lang/rust/issues/49716>",
+        reason: fcw!(EditionError 2018 "new-keywords"),
     };
 }
 
@@ -1873,8 +1740,7 @@ declare_lint! {
     Allow,
     "detects edition keywords being used as an identifier",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2024),
-        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2024/gen-keyword.html>",
+        reason: fcw!(EditionError 2024 "gen-keyword"),
     };
 }
 
@@ -1988,7 +1854,7 @@ impl ExplicitOutlivesRequirements {
 
         inferred_outlives
             .filter_map(|(clause, _)| match clause.kind().skip_binder() {
-                ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(a, b)) => match a.kind() {
+                ty::ClauseKind::RegionOutlives(ty::OutlivesClause(a, b)) => match a.kind() {
                     ty::ReEarlyParam(ebr)
                         if item_generics.region_param(ebr, tcx).def_id == lifetime.to_def_id() =>
                     {
@@ -2007,7 +1873,7 @@ impl ExplicitOutlivesRequirements {
     ) -> Vec<ty::Region<'tcx>> {
         inferred_outlives
             .filter_map(|(clause, _)| match clause.kind().skip_binder() {
-                ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) => {
+                ty::ClauseKind::TypeOutlives(ty::OutlivesClause(a, b)) => {
                     a.is_param(index).then_some(b)
                 }
                 _ => None,
@@ -2118,9 +1984,9 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
         use rustc_middle::middle::resolve_bound_vars::ResolvedArg;
 
         let def_id = item.owner_id.def_id;
-        if let hir::ItemKind::Struct(_, _, hir_generics)
-        | hir::ItemKind::Enum(_, _, hir_generics)
-        | hir::ItemKind::Union(_, _, hir_generics) = item.kind
+        if let hir::ItemKind::Struct(_, generics, _)
+        | hir::ItemKind::Enum(_, generics, _)
+        | hir::ItemKind::Union(_, generics, _) = item.kind
         {
             let inferred_outlives = cx.tcx.inferred_outlives_of(def_id);
             if inferred_outlives.is_empty() {
@@ -2128,7 +1994,7 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
             }
 
             let ty_generics = cx.tcx.generics_of(def_id);
-            let num_where_predicates = hir_generics
+            let num_where_predicates = generics
                 .predicates
                 .iter()
                 .filter(|predicate| predicate.kind.in_where_clause())
@@ -2138,7 +2004,7 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
             let mut lint_spans = Vec::new();
             let mut where_lint_spans = Vec::new();
             let mut dropped_where_predicate_count = 0;
-            for (i, where_predicate) in hir_generics.predicates.iter().enumerate() {
+            for (i, where_predicate) in generics.predicates.iter().enumerate() {
                 let (relevant_lifetimes, bounds, predicate_span, in_where_clause) =
                     match where_predicate.kind {
                         hir::WherePredicateKind::RegionPredicate(predicate) => {
@@ -2173,6 +2039,24 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                                         continue;
                                     };
                                     let index = ty_generics.param_def_id_to_index[&def_id];
+                                    // Removing a `T: 'r` outlives bound can silently change
+                                    // the object lifetime default for `Struct<'r, dyn Trait>`
+                                    // (RFC 599): the explicit bound sets the default to `'r`,
+                                    // so removing it may change it to `'static` (or cause an
+                                    // ambiguity error if there is no unique default). Only
+                                    // suppress the lint for non-higher-ranked predicates when
+                                    // T is not `Sized` (i.e. can hold trait object types).
+                                    // Higher-ranked predicates (`for<'x> T: 'r`) are excluded
+                                    // from RFC 599 object lifetime defaulting and are always
+                                    // safe to remove.
+                                    if predicate.bound_generic_params.is_empty() {
+                                        let ty_param = &ty_generics.own_params[index as usize];
+                                        let param_ty =
+                                            Ty::new_param(cx.tcx, ty_param.index, ty_param.name);
+                                        if !param_ty.is_sized(cx.tcx, cx.typing_env()) {
+                                            continue;
+                                        }
+                                    }
                                     (
                                         Self::lifetimes_outliving_type(
                                             // don't warn if the inferred span actually came from the predicate we're looking at
@@ -2192,7 +2076,6 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                                 }
                             }
                         }
-                        _ => continue,
                     };
                 if relevant_lifetimes.is_empty() {
                     continue;
@@ -2221,7 +2104,7 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                     } else if i + 1 < num_where_predicates {
                         // If all the bounds on a predicate were inferable and there are
                         // further predicates, we want to eat the trailing comma.
-                        let next_predicate_span = hir_generics.predicates[i + 1].span;
+                        let next_predicate_span = generics.predicates[i + 1].span;
                         if next_predicate_span.from_expansion() {
                             where_lint_spans.push(predicate_span);
                         } else {
@@ -2230,7 +2113,7 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                         }
                     } else {
                         // Eat the optional trailing comma after the last predicate.
-                        let where_span = hir_generics.where_clause_span;
+                        let where_span = generics.where_clause_span;
                         if where_span.from_expansion() {
                             where_lint_spans.push(predicate_span);
                         } else {
@@ -2248,18 +2131,18 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
 
             // If all predicates in where clause are inferable, drop the entire clause
             // (including the `where`)
-            if hir_generics.has_where_clause_predicates
+            if generics.has_where_clause_predicates
                 && dropped_where_predicate_count == num_where_predicates
             {
-                let where_span = hir_generics.where_clause_span;
+                let where_span = generics.where_clause_span;
                 // Extend the where clause back to the closing `>` of the
                 // generics, except for tuple struct, which have the `where`
                 // after the fields of the struct.
                 let full_where_span =
-                    if let hir::ItemKind::Struct(_, hir::VariantData::Tuple(..), _) = item.kind {
+                    if let hir::ItemKind::Struct(_, _, hir::VariantData::Tuple(..)) = item.kind {
                         where_span
                     } else {
-                        hir_generics.span.shrink_to_hi().to(where_span)
+                        generics.span.shrink_to_hi().to(where_span)
                     };
 
                 // Due to macro expansions, the `full_where_span` might not actually contain all
@@ -2291,10 +2174,10 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                     EXPLICIT_OUTLIVES_REQUIREMENTS,
                     lint_spans.clone(),
                     BuiltinExplicitOutlives {
-                        count: bound_count,
                         suggestion: BuiltinExplicitOutlivesSuggestion {
                             spans: lint_spans,
                             applicability,
+                            count: bound_count,
                         },
                     },
                 );
@@ -2361,20 +2244,17 @@ declare_lint_pass!(
 impl EarlyLintPass for IncompleteInternalFeatures {
     fn check_crate(&mut self, cx: &EarlyContext<'_>, _: &ast::Crate) {
         let features = cx.builder.features();
-        let lang_features =
-            features.enabled_lang_features().iter().map(|feat| (feat.gate_name, feat.attr_sp));
-        let lib_features =
-            features.enabled_lib_features().iter().map(|feat| (feat.gate_name, feat.attr_sp));
 
-        lang_features
-            .chain(lib_features)
+        features
+            .enabled_features_iter_stable_order()
             .filter(|(name, _)| features.incomplete(*name) || features.internal(*name))
             .for_each(|(name, span)| {
                 if features.incomplete(name) {
                     let note = rustc_feature::find_feature_issue(name, GateIssue::Language)
                         .map(|n| BuiltinFeatureIssueNote { n });
-                    let help =
-                        HAS_MIN_FEATURES.contains(&name).then_some(BuiltinIncompleteFeaturesHelp);
+                    let help = HAS_MIN_FEATURES
+                        .contains(&name)
+                        .then_some(BuiltinIncompleteFeaturesHelp { name });
 
                     cx.emit_span_lint(
                         INCOMPLETE_FEATURES,
@@ -2485,16 +2365,16 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
 
         /// Determine if this expression is a "dangerous initialization".
         fn is_dangerous_init(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<InitKind> {
-            if let hir::ExprKind::Call(path_expr, args) = expr.kind {
+            if let hir::ExprKind::Call(path_expr, args) = expr.kind
                 // Find calls to `mem::{uninitialized,zeroed}` methods.
-                if let hir::ExprKind::Path(ref qpath) = path_expr.kind {
-                    let def_id = cx.qpath_res(qpath, path_expr.hir_id).opt_def_id()?;
-                    match cx.tcx.get_diagnostic_name(def_id) {
-                        Some(sym::mem_zeroed) => return Some(InitKind::Zeroed),
-                        Some(sym::mem_uninitialized) => return Some(InitKind::Uninit),
-                        Some(sym::transmute) if is_zero(&args[0]) => return Some(InitKind::Zeroed),
-                        _ => {}
-                    }
+                && let hir::ExprKind::Path(ref qpath) = path_expr.kind
+            {
+                let def_id = cx.qpath_res(qpath, path_expr.hir_id).opt_def_id()?;
+                match cx.tcx.get_diagnostic_name(def_id) {
+                    Some(sym::mem_zeroed) => return Some(InitKind::Zeroed),
+                    Some(sym::mem_uninitialized) => return Some(InitKind::Uninit),
+                    Some(sym::transmute) if is_zero(&args[0]) => return Some(InitKind::Zeroed),
+                    _ => {}
                 }
             } else if let hir::ExprKind::MethodCall(_, receiver, ..) = expr.kind {
                 // Find problematic calls to `MaybeUninit::assume_init`.
@@ -2502,14 +2382,14 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
                 if cx.tcx.is_diagnostic_item(sym::assume_init, def_id) {
                     // This is a call to *some* method named `assume_init`.
                     // See if the `self` parameter is one of the dangerous constructors.
-                    if let hir::ExprKind::Call(path_expr, _) = receiver.kind {
-                        if let hir::ExprKind::Path(ref qpath) = path_expr.kind {
-                            let def_id = cx.qpath_res(qpath, path_expr.hir_id).opt_def_id()?;
-                            match cx.tcx.get_diagnostic_name(def_id) {
-                                Some(sym::maybe_uninit_zeroed) => return Some(InitKind::Zeroed),
-                                Some(sym::maybe_uninit_uninit) => return Some(InitKind::Uninit),
-                                _ => {}
-                            }
+                    if let hir::ExprKind::Call(path_expr, _) = receiver.kind
+                        && let hir::ExprKind::Path(ref qpath) = path_expr.kind
+                    {
+                        let def_id = cx.qpath_res(qpath, path_expr.hir_id).opt_def_id()?;
+                        match cx.tcx.get_diagnostic_name(def_id) {
+                            Some(sym::maybe_uninit_zeroed) => return Some(InitKind::Zeroed),
+                            Some(sym::maybe_uninit_uninit) => return Some(InitKind::Uninit),
+                            _ => {}
                         }
                     }
                 }
@@ -2527,24 +2407,26 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
             init: InitKind,
         ) -> Option<InitError> {
             let mut field_err = variant.fields.iter().find_map(|field| {
-                ty_find_init_error(cx, field.ty(cx.tcx, args), init).map(|mut err| {
-                    if !field.did.is_local() {
-                        err
-                    } else if err.span.is_none() {
-                        err.span = Some(cx.tcx.def_span(field.did));
-                        write!(&mut err.message, " (in this {descr})").unwrap();
-                        err
-                    } else {
-                        InitError::from(format!("in this {descr}"))
-                            .spanned(cx.tcx.def_span(field.did))
-                            .nested(err)
-                    }
-                })
+                ty_find_init_error(cx, field.ty(cx.tcx, args).skip_norm_wip(), init).map(
+                    |mut err| {
+                        if !field.did.is_local() {
+                            err
+                        } else if err.span.is_none() {
+                            err.span = Some(cx.tcx.def_span(field.did));
+                            write!(&mut err.message, " (in this {descr})").unwrap();
+                            err
+                        } else {
+                            InitError::from(format!("in this {descr}"))
+                                .spanned(cx.tcx.def_span(field.did))
+                                .nested(err)
+                        }
+                    },
+                )
             });
 
             // Check if this ADT has a constrained layout (like `NonNull` and friends).
             if let Ok(layout) = cx.tcx.layout_of(cx.typing_env().as_query_input(ty)) {
-                if let BackendRepr::Scalar(scalar) | BackendRepr::ScalarPair(scalar, _) =
+                if let BackendRepr::Scalar(scalar) | BackendRepr::ScalarPair { a: scalar, .. } =
                     &layout.backend_repr
                 {
                     let range = scalar.valid_range(cx);
@@ -2579,7 +2461,10 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
             ty: Ty<'tcx>,
             init: InitKind,
         ) -> Option<InitError> {
-            let ty = cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty).unwrap_or(ty);
+            let ty = cx
+                .tcx
+                .try_normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(ty))
+                .unwrap_or(ty);
 
             match ty.kind() {
                 // Primitive types that don't like 0 as a value.
@@ -2700,8 +2585,12 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
             let conjured_ty = cx.typeck_results().expr_ty(expr);
             if let Some(err) = with_no_trimmed_paths!(ty_find_init_error(cx, conjured_ty, init)) {
                 let msg = match init {
-                    InitKind::Zeroed => fluent::lint_builtin_unpermitted_type_init_zeroed,
-                    InitKind::Uninit => fluent::lint_builtin_unpermitted_type_init_uninit,
+                    InitKind::Zeroed => {
+                        msg!("the type `{$ty}` does not permit zero-initialization")
+                    }
+                    InitKind::Uninit => {
+                        msg!("the type `{$ty}` does not permit being left uninitialized")
+                    }
                 };
                 let sub = BuiltinUnpermittedTypeInitSub { err };
                 cx.emit_span_lint(
@@ -2726,7 +2615,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust,no_run
+    /// ```rust,compile_fail
     /// # #![allow(unused)]
     /// use std::ptr;
     /// unsafe {
@@ -2745,7 +2634,7 @@ declare_lint! {
     ///
     /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
     pub DEREF_NULLPTR,
-    Warn,
+    Deny,
     "detects when an null pointer is dereferenced"
 }
 
@@ -2755,6 +2644,16 @@ impl<'tcx> LateLintPass<'tcx> for DerefNullPtr {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &hir::Expr<'_>) {
         /// test if expression is a null ptr
         fn is_null_ptr(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
+            let pointer_ty = cx.typeck_results().expr_ty(expr);
+            let ty::RawPtr(pointee, _) = pointer_ty.kind() else {
+                return false;
+            };
+            if let Ok(layout) = cx.tcx.layout_of(cx.typing_env().as_query_input(*pointee)) {
+                if layout.layout.size() == rustc_abi::Size::ZERO {
+                    return false;
+                }
+            }
+
             match &expr.kind {
                 hir::ExprKind::Cast(expr, ty) => {
                     if let hir::TyKind::Ptr(_) = ty.kind {
@@ -2763,13 +2662,13 @@ impl<'tcx> LateLintPass<'tcx> for DerefNullPtr {
                 }
                 // check for call to `core::ptr::null` or `core::ptr::null_mut`
                 hir::ExprKind::Call(path, _) => {
-                    if let hir::ExprKind::Path(ref qpath) = path.kind {
-                        if let Some(def_id) = cx.qpath_res(qpath, path.hir_id).opt_def_id() {
-                            return matches!(
-                                cx.tcx.get_diagnostic_name(def_id),
-                                Some(sym::ptr_null | sym::ptr_null_mut)
-                            );
-                        }
+                    if let hir::ExprKind::Path(ref qpath) = path.kind
+                        && let Some(def_id) = cx.qpath_res(qpath, path.hir_id).opt_def_id()
+                    {
+                        return matches!(
+                            cx.tcx.get_diagnostic_name(def_id),
+                            Some(sym::ptr_null | sym::ptr_null_mut)
+                        );
                     }
                 }
                 _ => {}
@@ -2904,12 +2803,77 @@ enum AsmLabelKind {
     Binary,
 }
 
+/// Checks if a potential label is actually a Hexagon register span notation.
+///
+/// Hexagon assembly uses register span notation like `r1:0`, `V5:4.w`, `p1:0` etc.
+/// These follow the pattern: `[letter][digit(s)]:[digit(s)][optional_suffix]`
+///
+/// Returns `true` if the string matches a valid Hexagon register span pattern.
+pub fn is_hexagon_register_span(possible_label: &str) -> bool {
+    // Extract the full register span from the context
+    if let Some(colon_idx) = possible_label.find(':') {
+        let after_colon = &possible_label[colon_idx + 1..];
+        is_hexagon_register_span_impl(&possible_label[..colon_idx], after_colon)
+    } else {
+        false
+    }
+}
+
+/// Helper function for use within the lint when we have statement context.
+fn is_hexagon_register_span_context(
+    possible_label: &str,
+    statement: &str,
+    colon_idx: usize,
+) -> bool {
+    // Extract what comes after the colon in the statement
+    let after_colon_start = colon_idx + 1;
+    if after_colon_start >= statement.len() {
+        return false;
+    }
+
+    // Get the part after the colon, up to the next whitespace or special character
+    let after_colon_full = &statement[after_colon_start..];
+    let after_colon = after_colon_full
+        .chars()
+        .take_while(|&c| c.is_ascii_alphanumeric() || c == '.')
+        .collect::<String>();
+
+    is_hexagon_register_span_impl(possible_label, &after_colon)
+}
+
+/// Core implementation for checking hexagon register spans.
+fn is_hexagon_register_span_impl(before_colon: &str, after_colon: &str) -> bool {
+    if before_colon.len() < 1 || after_colon.is_empty() {
+        return false;
+    }
+
+    let mut chars = before_colon.chars();
+    let start = chars.next().unwrap();
+
+    // Must start with a letter (r, V, p, etc.)
+    if !start.is_ascii_alphabetic() {
+        return false;
+    }
+
+    let rest = &before_colon[1..];
+
+    // Check if the part after the first letter is all digits and non-empty
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Check if after colon starts with digits (may have suffix like .w, .h)
+    let digits_after = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+
+    !digits_after.is_empty()
+}
+
 impl<'tcx> LateLintPass<'tcx> for AsmLabels {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         if let hir::Expr {
             kind:
                 hir::ExprKind::InlineAsm(hir::InlineAsm {
-                    asm_macro: AsmMacro::Asm | AsmMacro::NakedAsm,
+                    asm_macro: asm_macro @ (AsmMacro::Asm | AsmMacro::NakedAsm),
                     template_strs,
                     options,
                     ..
@@ -2917,6 +2881,15 @@ impl<'tcx> LateLintPass<'tcx> for AsmLabels {
             ..
         } = expr
         {
+            // Non-generic naked functions are allowed to define arbitrary
+            // labels.
+            if *asm_macro == AsmMacro::NakedAsm {
+                let def_id = expr.hir_id.owner.def_id;
+                if !cx.tcx.generics_of(def_id).requires_monomorphization(cx.tcx) {
+                    return;
+                }
+            }
+
             // asm with `options(raw)` does not do replacement with `{` and `}`.
             let raw = options.contains(InlineAsmOptions::RAW);
 
@@ -2977,9 +2950,17 @@ impl<'tcx> LateLintPass<'tcx> for AsmLabels {
                             break 'label_loop;
                         }
 
+                        // Check for Hexagon register span notation (e.g., "r1:0", "V5:4", "V3:2.w")
+                        // This is valid Hexagon assembly syntax, not a label
+                        if matches!(cx.tcx.sess.asm_arch, Some(InlineAsmArch::Hexagon))
+                            && is_hexagon_register_span_context(possible_label, statement, idx)
+                        {
+                            break 'label_loop;
+                        }
+
                         for c in chars {
                             // Inside a template format arg, any character is permitted for the
-                            // puproses of label detection because we assume that it can be
+                            // purposes of label detection because we assume that it can be
                             // replaced with some other valid label string later. `options(raw)`
                             // asm blocks cannot have format args, so they are excluded from this
                             // special case.
@@ -3116,7 +3097,7 @@ impl EarlyLintPass for SpecialModuleName {
             if let ast::ItemKind::Mod(
                 _,
                 ident,
-                ast::ModKind::Unloaded | ast::ModKind::Loaded(_, ast::Inline::No, _, _),
+                ast::ModKind::Unloaded | ast::ModKind::Loaded(_, ast::Inline::No { .. }, _),
             ) = item.kind
             {
                 if item.attrs.iter().any(|a| a.has_name(sym::path)) {
@@ -3137,6 +3118,65 @@ impl EarlyLintPass for SpecialModuleName {
                     _ => continue,
                 }
             }
+        }
+    }
+}
+
+declare_lint! {
+    /// The `internal_eq_trait_method_impls` lint detects manual
+    /// implementations of `Eq::assert_receiver_is_total_eq`.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// #[derive(PartialEq)]
+    /// pub struct Foo;
+    ///
+    /// impl Eq for Foo {
+    ///     fn assert_receiver_is_total_eq(&self) {}
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// This method existed so that `#[derive(Eq)]` could check that all
+    /// fields of a type implement `Eq`. Other users were never supposed
+    /// to implement it and it was hidden from documentation.
+    ///
+    /// Unfortunately, it was not explicitly marked as unstable and some
+    /// people have now mistakenly assumed they had to implement this method.
+    ///
+    /// As the method is never called by the standard library, you can safely
+    /// remove any implementations of the method and just write `impl Eq for Foo {}`.
+    ///
+    /// This is a [future-incompatible] lint to transition this to a hard
+    /// error in the future. See [issue #152336] for more details.
+    ///
+    /// [issue #152336]: https://github.com/rust-lang/rust/issues/152336
+    pub INTERNAL_EQ_TRAIT_METHOD_IMPLS,
+    Warn,
+    "manual implementation of the internal `Eq::assert_receiver_is_total_eq` method",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #152336),
+        report_in_deps: false,
+    };
+}
+
+declare_lint_pass!(InternalEqTraitMethodImpls => [INTERNAL_EQ_TRAIT_METHOD_IMPLS]);
+
+impl<'tcx> LateLintPass<'tcx> for InternalEqTraitMethodImpls {
+    fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx rustc_hir::ImplItem<'tcx>) {
+        if let ImplItemImplKind::Trait { defaultness: _, trait_item_def_id: Ok(trait_item_def_id) } =
+            item.impl_kind
+            && cx.tcx.is_diagnostic_item(sym::assert_receiver_is_total_eq, trait_item_def_id)
+        {
+            cx.emit_span_lint(
+                INTERNAL_EQ_TRAIT_METHOD_IMPLS,
+                item.span,
+                EqInternalMethodImplemented,
+            );
         }
     }
 }

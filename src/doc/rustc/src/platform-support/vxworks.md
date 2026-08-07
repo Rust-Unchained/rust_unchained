@@ -20,12 +20,19 @@ Target triplets available:
 ## Target maintainers
 
 [@biabbas](https://github.com/biabbas)
+[@hax0kartik](https://github.com/hax0kartik)
 
 ## Requirements
 
 ### OS version
 
 The minimum supported version is VxWorks 7.
+
+### Environment
+
+#### `WIND_RELEASE_ID`
+
+In VxWorks build environment, the environment variable `WIND_RELEASE_ID` indicates the VxWorks release version used for the build. The `WIND_RELEASE_ID` can be used to conditionally compile features/code or handle version specific behaviour.
 
 ## Building
 

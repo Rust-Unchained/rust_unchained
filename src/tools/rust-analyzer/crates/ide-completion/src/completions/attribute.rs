@@ -4,79 +4,64 @@
 
 use std::sync::LazyLock;
 
-use ide_db::{
-    generated::lints::{
-        Lint, CLIPPY_LINTS, CLIPPY_LINT_GROUPS, DEFAULT_LINTS, FEATURES, RUSTDOC_LINTS,
-    },
-    syntax_helpers::node_ext::parse_tt_as_comma_sep_paths,
-    FxHashMap, SymbolKind,
-};
+use ide_db::{FxHashMap, SymbolKind, syntax_helpers::node_ext::parse_tt_as_comma_sep_paths};
 use itertools::Itertools;
 use syntax::{
-    ast::{self, AttrKind},
     AstNode, Edition, SyntaxKind, T,
+    ast::{self, AttrKind},
 };
 
 use crate::{
+    Completions,
     context::{AttrCtx, CompletionContext, PathCompletionCtx, Qualified},
     item::CompletionItem,
-    Completions,
 };
 
 mod cfg;
 mod derive;
+mod diagnostic;
+mod feature;
 mod lint;
 mod macro_use;
 mod repr;
 
+pub(crate) use self::cfg::complete_cfg;
 pub(crate) use self::derive::complete_derive_path;
 
 /// Complete inputs to known builtin attributes as well as derive attributes
 pub(crate) fn complete_known_attribute_input(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    &colon_prefix: &bool,
-    fake_attribute_under_caret: &ast::Attr,
+    ctx: &CompletionContext<'_, '_>,
+    colon_prefix: bool,
+    fake_attribute_under_caret: &ast::TokenTreeMeta,
     extern_crate: Option<&ast::ExternCrate>,
 ) -> Option<()> {
     let attribute = fake_attribute_under_caret;
-    let name_ref = match attribute.path() {
-        Some(p) => Some(p.as_single_name_ref()?),
-        None => None,
-    };
-    let (path, tt) = name_ref.zip(attribute.token_tree())?;
-    tt.l_paren_token()?;
+    let path = attribute.path()?;
+    let segments = path.segments().map(|s| s.name_ref()).collect::<Option<Vec<_>>>()?;
+    let segments = segments.iter().map(|n| n.text()).collect::<Vec<_>>();
+    let tt = attribute.token_tree()?;
 
-    match path.text().as_str() {
-        "repr" => repr::complete_repr(acc, ctx, tt),
-        "feature" => lint::complete_lint(
+    match segments.as_slice() {
+        ["repr"] => repr::complete_repr(acc, ctx, &parse_comma_sep_expr(tt)?),
+        ["feature"] => {
+            feature::complete_feature(acc, ctx, &parse_tt_as_comma_sep_paths(tt, ctx.edition)?)
+        }
+        ["allow" | "expect" | "deny" | "forbid" | "warn"] => lint::complete_lint(
             acc,
             ctx,
             colon_prefix,
             &parse_tt_as_comma_sep_paths(tt, ctx.edition)?,
-            FEATURES,
         ),
-        "allow" | "expect" | "deny" | "forbid" | "warn" => {
-            let existing_lints = parse_tt_as_comma_sep_paths(tt, ctx.edition)?;
-
-            let lints: Vec<Lint> = CLIPPY_LINT_GROUPS
-                .iter()
-                .map(|g| &g.lint)
-                .chain(DEFAULT_LINTS)
-                .chain(CLIPPY_LINTS)
-                .chain(RUSTDOC_LINTS)
-                .cloned()
-                .collect();
-
-            lint::complete_lint(acc, ctx, colon_prefix, &existing_lints, &lints);
-        }
-        "cfg" => cfg::complete_cfg(acc, ctx),
-        "macro_use" => macro_use::complete_macro_use(
+        ["macro_use"] => macro_use::complete_macro_use(
             acc,
             ctx,
             extern_crate,
             &parse_tt_as_comma_sep_paths(tt, ctx.edition)?,
         ),
+        ["diagnostic", "on_unimplemented"] => {
+            diagnostic::complete_on_unimplemented(acc, ctx, &parse_comma_sep_expr(tt)?)
+        }
         _ => (),
     }
     Some(())
@@ -84,8 +69,8 @@ pub(crate) fn complete_known_attribute_input(
 
 pub(crate) fn complete_attribute_path(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     &AttrCtx { kind, annotated_item_kind, ref derive_helpers }: &AttrCtx,
 ) {
     let is_inner = kind == AttrKind::Inner;
@@ -139,6 +124,9 @@ pub(crate) fn complete_attribute_path(
         }
         Qualified::TypeAnchor { .. } | Qualified::With { .. } => {}
     }
+    let qualifier_path =
+        if let Qualified::With { path, .. } = qualified { Some(path) } else { None };
+    let qualifier_segments = qualifier_path.iter().flat_map(|q| q.segments()).collect::<Vec<_>>();
 
     let attributes = annotated_item_kind.and_then(|kind| {
         if ast::Expr::can_cast(kind) {
@@ -149,18 +137,32 @@ pub(crate) fn complete_attribute_path(
     });
 
     let add_completion = |attr_completion: &AttrCompletion| {
-        let mut item = CompletionItem::new(
-            SymbolKind::Attribute,
-            ctx.source_range(),
-            attr_completion.label,
-            ctx.edition,
-        );
+        // if we don't already have the qualifiers of the completion, then
+        // add the missing parts to the label and snippet
+        let mut label = attr_completion.label.to_owned();
+        let mut snippet = attr_completion.snippet.map(|s| s.to_owned());
+        let qualifiers = attr_completion.qualifiers;
+        let matching_qualifiers = qualifier_segments
+            .iter()
+            .zip(qualifiers)
+            .take_while(|(s, q)| s.name_ref().is_some_and(|t| t.text() == **q))
+            .count();
+        if matching_qualifiers != qualifiers.len() {
+            let prefix = qualifiers[matching_qualifiers..].join("::");
+            label = format!("{prefix}::{label}");
+            if let Some(s) = snippet.as_mut() {
+                *s = format!("{prefix}::{s}");
+            }
+        }
+
+        let mut item =
+            CompletionItem::new(SymbolKind::Attribute, ctx.source_range(), label, ctx.edition);
 
         if let Some(lookup) = attr_completion.lookup {
             item.lookup_by(lookup);
         }
 
-        if let Some((snippet, cap)) = attr_completion.snippet.zip(ctx.config.snippet_cap) {
+        if let Some((snippet, cap)) = snippet.zip(ctx.config.snippet_cap) {
             item.insert_snippet(cap, snippet);
         }
 
@@ -172,7 +174,7 @@ pub(crate) fn complete_attribute_path(
     match attributes {
         Some(applicable) => applicable
             .iter()
-            .flat_map(|name| ATTRIBUTES.binary_search_by(|attr| attr.key().cmp(name)).ok())
+            .flat_map(|name| ATTRIBUTES.binary_search_by_key(name, |attr| attr.key()).ok())
             .flat_map(|idx| ATTRIBUTES.get(idx))
             .for_each(add_completion),
         None if is_inner => ATTRIBUTES.iter().for_each(add_completion),
@@ -184,12 +186,17 @@ struct AttrCompletion {
     label: &'static str,
     lookup: Option<&'static str>,
     snippet: Option<&'static str>,
+    qualifiers: &'static [&'static str],
     prefer_inner: bool,
 }
 
 impl AttrCompletion {
     fn key(&self) -> &'static str {
         self.lookup.unwrap_or(self.label)
+    }
+
+    const fn qualifiers(self, qualifiers: &'static [&'static str]) -> AttrCompletion {
+        AttrCompletion { qualifiers, ..self }
     }
 
     const fn prefer_inner(self) -> AttrCompletion {
@@ -202,13 +209,13 @@ const fn attr(
     lookup: Option<&'static str>,
     snippet: Option<&'static str>,
 ) -> AttrCompletion {
-    AttrCompletion { label, lookup, snippet, prefer_inner: false }
+    AttrCompletion { label, lookup, snippet, qualifiers: &[], prefer_inner: false }
 }
 
 macro_rules! attrs {
     // attributes applicable to all items
     [@ { item $($tt:tt)* } {$($acc:tt)*}] => {
-        attrs!(@ { $($tt)* } { $($acc)*, "deprecated", "doc", "dochidden", "docalias", "must_use", "no_mangle" })
+        attrs!(@ { $($tt)* } { $($acc)*, "deprecated", "doc", "dochidden", "docalias", "docinclude", "must_use", "no_mangle", "unsafe" })
     };
     // attributes applicable to all adts
     [@ { adt $($tt:tt)* } {$($acc:tt)*}] => {
@@ -264,14 +271,14 @@ static KIND_TO_ATTRIBUTES: LazyLock<FxHashMap<SyntaxKind, &[&str]>> = LazyLock::
             FN,
             attrs!(
                 item, linkable,
-                "cold", "ignore", "inline", "must_use", "panic_handler", "proc_macro",
+                "cold", "ignore", "inline", "panic_handler", "proc_macro",
                 "proc_macro_derive", "proc_macro_attribute", "should_panic", "target_feature",
                 "test", "track_caller"
             ),
         ),
         (STATIC, attrs!(item, linkable, "global_allocator", "used")),
-        (TRAIT, attrs!(item, "must_use")),
-        (IMPL, attrs!(item, "automatically_derived")),
+        (TRAIT, attrs!(item, "diagnostic::on_unimplemented")),
+        (IMPL, attrs!(item, "automatically_derived", "diagnostic::do_not_recommend")),
         (ASSOC_ITEM_LIST, attrs!(item)),
         (EXTERN_BLOCK, attrs!(item, "link")),
         (EXTERN_ITEM_LIST, attrs!(item, "link")),
@@ -311,9 +318,18 @@ const ATTRIBUTES: &[AttrCompletion] = &[
     attr("deny(…)", Some("deny"), Some("deny(${0:lint})")),
     attr(r#"deprecated"#, Some("deprecated"), Some(r#"deprecated"#)),
     attr("derive(…)", Some("derive"), Some(r#"derive(${0:Debug})"#)),
+    attr("do_not_recommend", Some("diagnostic::do_not_recommend"), None)
+        .qualifiers(&["diagnostic"]),
+    attr(
+        "on_unimplemented",
+        Some("diagnostic::on_unimplemented"),
+        Some(r#"on_unimplemented(${0:keys})"#),
+    )
+    .qualifiers(&["diagnostic"]),
     attr(r#"doc = "…""#, Some("doc"), Some(r#"doc = "${0:docs}""#)),
     attr(r#"doc(alias = "…")"#, Some("docalias"), Some(r#"doc(alias = "${0:docs}")"#)),
     attr(r#"doc(hidden)"#, Some("dochidden"), Some(r#"doc(hidden)"#)),
+    attr(r#"doc = include_str!("…")"#, Some("docinclude"), Some(r#"doc = include_str!("$0")"#)),
     attr("expect(…)", Some("expect"), Some("expect(${0:lint})")),
     attr(
         r#"export_name = "…""#,
@@ -363,6 +379,7 @@ const ATTRIBUTES: &[AttrCompletion] = &[
     attr("track_caller", None, None),
     attr("type_length_limit = …", Some("type_length_limit"), Some("type_length_limit = ${0:128}"))
         .prefer_inner(),
+    attr("unsafe(…)", Some("unsafe"), Some("unsafe($0)")),
     attr("used", None, None),
     attr("warn(…)", Some("warn"), Some("warn(${0:lint})")),
     attr(
@@ -380,7 +397,7 @@ fn parse_comma_sep_expr(input: ast::TokenTree) -> Option<Vec<ast::Expr>> {
         .children_with_tokens()
         .skip(1)
         .take_while(|it| it.as_token() != Some(&r_paren));
-    let input_expressions = tokens.group_by(|tok| tok.kind() == T![,]);
+    let input_expressions = tokens.chunk_by(|tok| tok.kind() == T![,]);
     Some(
         input_expressions
             .into_iter()

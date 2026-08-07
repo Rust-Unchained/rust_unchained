@@ -2,12 +2,12 @@ use rustc_ast::{
     self as ast, AttrVec, DUMMY_NODE_ID, GenericBounds, GenericParam, GenericParamKind, TyKind,
     WhereClause, token,
 };
-use rustc_errors::{Applicability, PResult};
+use rustc_errors::{Applicability, Diag, PResult};
 use rustc_span::{Ident, Span, kw, sym};
 use thin_vec::ThinVec;
 
 use super::{ForceCollect, Parser, Trailing, UsePreAttrPos};
-use crate::errors::{
+use crate::diagnostics::{
     self, MultipleWhereClauses, UnexpectedDefaultValueForLifetimeInGenericParameters,
     UnexpectedSelfInGenericParameters, WhereClauseBeforeTupleStructBody,
     WhereClauseBeforeTupleStructBodySugg,
@@ -26,7 +26,7 @@ impl<'a> Parser<'a> {
     /// BOUND = LT_BOUND (e.g., `'a`)
     /// ```
     fn parse_lt_param_bounds(&mut self) -> GenericBounds {
-        let mut lifetimes = Vec::new();
+        let mut lifetimes = ThinVec::new();
         while self.check_lifetime() {
             lifetimes.push(ast::GenericBound::Outlives(self.expect_lifetime()));
 
@@ -86,7 +86,7 @@ impl<'a> Parser<'a> {
             }
             self.parse_generic_bounds()?
         } else {
-            Vec::new()
+            ThinVec::new()
         };
 
         let default = if self.eat(exp!(Eq)) { Some(self.parse_ty()?) } else { None };
@@ -109,18 +109,47 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword(exp!(Const))?;
         let ident = self.parse_ident()?;
-        self.expect(exp!(Colon))?;
+        if let Err(mut err) = self.expect(exp!(Colon)) {
+            return if self.token.kind == token::Comma || self.token.kind == token::Gt {
+                // Recover parse from `<const N>` where the type is missing.
+                let span = const_span.to(ident.span);
+                err.span_suggestion_verbose(
+                    ident.span.shrink_to_hi(),
+                    "you likely meant to write the type of the const parameter here",
+                    ": /* Type */".to_string(),
+                    Applicability::HasPlaceholders,
+                );
+                let kind = TyKind::Err(err.emit());
+                let ty = self.mk_ty(span, kind);
+                Ok(GenericParam {
+                    ident,
+                    id: ast::DUMMY_NODE_ID,
+                    attrs: preceding_attrs,
+                    bounds: ThinVec::new(),
+                    kind: GenericParamKind::Const { ty, span, default: None },
+                    is_placeholder: false,
+                    colon_span: None,
+                })
+            } else {
+                Err(err)
+            };
+        }
         let ty = self.parse_ty()?;
 
         // Parse optional const generics default value.
         let default = if self.eat(exp!(Eq)) { Some(self.parse_const_arg()?) } else { None };
+        let span = if let Some(ref default) = default {
+            const_span.to(default.value.span)
+        } else {
+            const_span.to(ty.span)
+        };
 
         Ok(GenericParam {
             ident,
             id: ast::DUMMY_NODE_ID,
             attrs: preceding_attrs,
-            bounds: Vec::new(),
-            kind: GenericParamKind::Const { ty, kw_span: const_span, default },
+            bounds: ThinVec::new(),
+            kind: GenericParamKind::Const { ty, span, default },
             is_placeholder: false,
             colon_span: None,
         })
@@ -137,6 +166,11 @@ impl<'a> Parser<'a> {
 
         // Parse optional const generics default value.
         let default = if self.eat(exp!(Eq)) { Some(self.parse_const_arg()?) } else { None };
+        let span = if let Some(ref default) = default {
+            mistyped_const_ident.span.to(default.value.span)
+        } else {
+            mistyped_const_ident.span.to(ty.span)
+        };
 
         self.dcx()
             .struct_span_err(
@@ -155,21 +189,26 @@ impl<'a> Parser<'a> {
             ident,
             id: ast::DUMMY_NODE_ID,
             attrs: preceding_attrs,
-            bounds: Vec::new(),
-            kind: GenericParamKind::Const { ty, kw_span: mistyped_const_ident.span, default },
+            bounds: ThinVec::new(),
+            kind: GenericParamKind::Const { ty, span, default },
             is_placeholder: false,
             colon_span: None,
         })
     }
 
-    /// Parses a (possibly empty) list of lifetime and type parameters, possibly including
-    /// a trailing comma and erroneous trailing attributes.
+    /// Parse a (possibly empty) list of generic (lifetime, type, const) parameters.
+    ///
+    /// ```ebnf
+    /// GenericParams = (GenericParam ("," GenericParam)* ","?)?
+    /// ```
     pub(super) fn parse_generic_params(&mut self) -> PResult<'a, ThinVec<ast::GenericParam>> {
         let mut params = ThinVec::new();
         let mut done = false;
+        let prev = self.parsing_generics;
+        self.parsing_generics = true;
         while !done {
             let attrs = self.parse_outer_attributes()?;
-            let param = self.collect_tokens(None, attrs, ForceCollect::No, |this, attrs| {
+            let param = match self.collect_tokens(None, attrs, ForceCollect::No, |this, attrs| {
                 if this.eat_keyword_noexpect(kw::SelfUpper) {
                     // `Self` as a generic param is invalid. Here we emit the diagnostic and continue parsing
                     // as if `Self` never existed.
@@ -186,7 +225,7 @@ impl<'a> Parser<'a> {
                     let (colon_span, bounds) = if this.eat(exp!(Colon)) {
                         (Some(this.prev_token.span), this.parse_lt_param_bounds())
                     } else {
-                        (None, Vec::new())
+                        (None, ThinVec::new())
                     };
 
                     if this.check_noexpect(&token::Eq) && this.look_ahead(1, |t| t.is_lifetime()) {
@@ -221,7 +260,7 @@ impl<'a> Parser<'a> {
                     let lo = this.token.span;
                     match this.parse_ty_where_predicate_kind() {
                         Ok(_) => {
-                            this.dcx().emit_err(errors::BadAssocTypeBounds {
+                            this.dcx().emit_err(diagnostics::BadAssocTypeBounds {
                                 span: lo.to(this.prev_token.span),
                             });
                             // FIXME - try to continue parsing other generics?
@@ -237,10 +276,11 @@ impl<'a> Parser<'a> {
                     // Check for trailing attributes and stop parsing.
                     if !attrs.is_empty() {
                         if !params.is_empty() {
-                            this.dcx().emit_err(errors::AttrAfterGeneric { span: attrs[0].span });
+                            this.dcx()
+                                .emit_err(diagnostics::AttrAfterGeneric { span: attrs[0].span });
                         } else {
                             this.dcx()
-                                .emit_err(errors::AttrWithoutGenerics { span: attrs[0].span });
+                                .emit_err(diagnostics::AttrWithoutGenerics { span: attrs[0].span });
                         }
                     }
                     return Ok((None, Trailing::No, UsePreAttrPos::No));
@@ -251,7 +291,13 @@ impl<'a> Parser<'a> {
                 }
                 // We just ate the comma, so no need to capture the trailing token.
                 Ok((param, Trailing::No, UsePreAttrPos::No))
-            })?;
+            }) {
+                Ok(param) => param,
+                Err(err) => {
+                    self.parsing_generics = prev;
+                    return Err(err);
+                }
+            };
 
             if let Some(param) = param {
                 params.push(param);
@@ -259,6 +305,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.parsing_generics = prev;
         Ok(params)
     }
 
@@ -274,7 +321,7 @@ impl<'a> Parser<'a> {
         // for example `fn invalid_path_separator::<T>() {}`
         if self.eat_noexpect(&token::PathSep) {
             self.dcx()
-                .emit_err(errors::InvalidPathSepInFnDefinition { span: self.prev_token.span });
+                .emit_err(diagnostics::InvalidPathSepInFnDefinition { span: self.prev_token.span });
         }
 
         let span_lo = self.token.span;
@@ -298,28 +345,49 @@ impl<'a> Parser<'a> {
 
     /// Parses an experimental fn contract
     /// (`contract_requires(WWW) contract_ensures(ZZZ)`)
-    pub(super) fn parse_contract(
-        &mut self,
-    ) -> PResult<'a, Option<rustc_ast::ptr::P<ast::FnContract>>> {
-        let requires = if self.eat_keyword_noexpect(exp!(ContractRequires).kw) {
-            self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
-            let precond = self.parse_expr()?;
-            Some(precond)
+    pub(super) fn parse_contract(&mut self) -> PResult<'a, Option<Box<ast::FnContract>>> {
+        let (declarations, requires) = self.parse_contract_requires()?;
+        let ensures = self.parse_contract_ensures()?;
+
+        if requires.is_none() && ensures.is_none() {
+            Ok(None)
         } else {
-            None
-        };
-        let ensures = if self.eat_keyword_noexpect(exp!(ContractEnsures).kw) {
+            Ok(Some(Box::new(ast::FnContract { declarations, requires, ensures })))
+        }
+    }
+
+    fn parse_contract_requires(
+        &mut self,
+    ) -> PResult<'a, (ThinVec<rustc_ast::Stmt>, Option<Box<rustc_ast::Expr>>)> {
+        Ok(if self.eat_keyword_noexpect(exp!(ContractRequires).kw) {
+            self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
+            let mut decls_and_precond = self.parse_block()?;
+
+            let precond = match decls_and_precond.stmts.pop() {
+                Some(precond) => match precond.kind {
+                    rustc_ast::StmtKind::Expr(expr) => expr,
+                    // Insert dummy node that will be rejected by typechecker to
+                    // avoid reinventing an error
+                    _ => self.mk_unit_expr(decls_and_precond.span),
+                },
+                None => self.mk_unit_expr(decls_and_precond.span),
+            };
+            let precond = self.mk_closure_expr(precond.span, precond);
+            let decls = decls_and_precond.stmts;
+            (decls, Some(precond))
+        } else {
+            (Default::default(), None)
+        })
+    }
+
+    fn parse_contract_ensures(&mut self) -> PResult<'a, Option<Box<rustc_ast::Expr>>> {
+        Ok(if self.eat_keyword_noexpect(exp!(ContractEnsures).kw) {
             self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
             let postcond = self.parse_expr()?;
             Some(postcond)
         } else {
             None
-        };
-        if requires.is_none() && ensures.is_none() {
-            Ok(None)
-        } else {
-            Ok(Some(rustc_ast::ptr::P(ast::FnContract { requires, ensures })))
-        }
+        })
     }
 
     /// Parses an optional where-clause.
@@ -353,6 +421,20 @@ impl<'a> Parser<'a> {
         if !self.eat_keyword(exp!(Where)) {
             return Ok((where_clause, None));
         }
+
+        if self.eat_noexpect(&token::Colon) {
+            let colon_span = self.prev_token.span;
+            self.dcx()
+                .struct_span_err(colon_span, "unexpected colon after `where`")
+                .with_span_suggestion_short(
+                    colon_span,
+                    "remove the colon",
+                    "",
+                    Applicability::MachineApplicable,
+                )
+                .emit();
+        }
+
         where_clause.has_where_token = true;
         let where_lo = self.prev_token.span;
 
@@ -361,7 +443,7 @@ impl<'a> Parser<'a> {
         // change we parse those generics now, but report an error.
         if self.choose_generics_over_qpath(0) {
             let generics = self.parse_generics()?;
-            self.dcx().emit_err(errors::WhereOnGenerics { span: generics.span });
+            self.dcx().emit_err(diagnostics::WhereOnGenerics { span: generics.span });
         }
 
         loop {
@@ -392,6 +474,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                 } else {
+                    if let [.., last] = &attrs[..] {
+                        if last.is_doc_comment() {
+                            this.dcx().emit_err(diagnostics::DocCommentDoesNotDocumentAnything {
+                                span: last.span,
+                                missing_comma: None,
+                            });
+                        } else {
+                            this.dcx().emit_err(diagnostics::AttrWithoutWherePredicates {
+                                span: last.span,
+                            });
+                        }
+                    }
                     None
                 };
                 let predicate = kind.map(|kind| ast::WherePredicate {
@@ -498,27 +592,49 @@ impl<'a> Parser<'a> {
         // * `for<'a> Trait1<'a>: Trait2<'a /* ok */>`
         // * `(for<'a> Trait1<'a>): Trait2<'a /* not ok */>`
         // * `for<'a> for<'b> Trait1<'a, 'b>: Trait2<'a /* ok */, 'b /* not ok */>`
-        let (lifetime_defs, _) = self.parse_late_bound_lifetime_defs()?;
+        let (bound_vars, _) = self.parse_higher_ranked_binder()?;
 
-        // Parse type with mandatory colon and (possibly empty) bounds,
-        // or with mandatory equality sign and the second type.
         let ty = self.parse_ty_for_where_clause()?;
+
         if self.eat(exp!(Colon)) {
+            // The bounds may be empty; we intentionally accept predicates like  `Ty:`.
             let bounds = self.parse_generic_bounds()?;
-            Ok(ast::WherePredicateKind::BoundPredicate(ast::WhereBoundPredicate {
-                bound_generic_params: lifetime_defs,
+
+            return Ok(ast::WherePredicateKind::BoundPredicate(ast::WhereBoundPredicate {
+                bound_generic_params: bound_vars,
                 bounded_ty: ty,
                 bounds,
-            }))
-        // FIXME: Decide what should be used here, `=` or `==`.
-        // FIXME: We are just dropping the binders in lifetime_defs on the floor here.
-        } else if self.eat(exp!(Eq)) || self.eat(exp!(EqEq)) {
-            let rhs_ty = self.parse_ty()?;
-            Ok(ast::WherePredicateKind::EqPredicate(ast::WhereEqPredicate { lhs_ty: ty, rhs_ty }))
-        } else {
-            self.maybe_recover_bounds_doubled_colon(&ty)?;
-            self.unexpected_any()
+            }));
         }
+
+        // NOTE: If we ever end up impl'ing and stabilizing equality predicates (#20041),
+        //       we need to pick between `=` and `==`, both is not an option!
+        if self.eat(exp!(Eq)) || self.eat(exp!(EqEq)) {
+            let lhs_ty = ty;
+            let rhs_ty = self.parse_ty()?;
+
+            // NOTE: If we ever end up impl'ing equality predicates,
+            //       we ought to track the binder in the AST node!
+            let _ = bound_vars;
+
+            let mut diag = self.dcx().struct_span_err(
+                lhs_ty.span.to(rhs_ty.span),
+                "general type equality constraints are not supported",
+            );
+            diag.note(
+                "see issue #20041 <https://github.com/rust-lang/rust/issues/20041> \
+                 for more information",
+            );
+            diag.span(lhs_ty.span.to(rhs_ty.span));
+            diag.span_label(lhs_ty.span.to(rhs_ty.span), "not supported");
+
+            suggest_replacing_equality_pred_with_assoc_item_constraint(&mut diag, *lhs_ty, *rhs_ty);
+
+            return Err(diag);
+        }
+
+        self.maybe_recover_bounds_doubled_colon(&ty)?;
+        self.unexpected_any()
     }
 
     pub(super) fn choose_generics_over_qpath(&self, start: usize) -> bool {
@@ -551,4 +667,62 @@ impl<'a> Parser<'a> {
                     })
                 || self.is_keyword_ahead(start + 1, &[kw::Const]))
     }
+}
+
+fn suggest_replacing_equality_pred_with_assoc_item_constraint(
+    diag: &mut Diag<'_>,
+    lhs_ty: ast::Ty,
+    rhs_ty: ast::Ty,
+) {
+    let TyKind::Path(qself, ast::Path { segments, .. }) = lhs_ty.kind else { return };
+
+    let mut parts = Vec::new();
+    let applicability = match qself {
+        // We have something like `Ty::Item<i32> = Rhs`.
+        None if let [self_ty_seg, assoc_item_seg] = &segments[..]
+            && self_ty_seg.ident.name != kw::PathRoot =>
+        {
+            parts.push((
+                self_ty_seg.span().between(assoc_item_seg.span()),
+                ": /* Trait */</* ... */".into(),
+            ));
+            Applicability::HasPlaceholders
+        }
+        Some(qself) if let [assoc_item_seg] = &segments[qself.position..] => {
+            parts.push((lhs_ty.span.until(qself.ty.span), String::new()));
+
+            // We have something like `<Option<usize> as self::Trait<i32>>::Item = Rhs`.
+            if let trait_segs @ [.., final_trait_seg] = &segments[..qself.position] {
+                parts.push((qself.ty.span.between(trait_segs[0].span()), ": ".into()));
+                let (span, snippet) = match &final_trait_seg.args {
+                    Some(args) => {
+                        let ast::GenericArgs::AngleBracketed(args) = args else { return };
+                        let Some(args) = args.args.last() else { return };
+                        (args.span(), ", ")
+                    }
+                    None => (final_trait_seg.span(), "<"),
+                };
+                parts.push((span.between(assoc_item_seg.span()), snippet.into()));
+                Applicability::MaybeIncorrect
+            }
+            // We have something like `<[u8]>::Item == Rhs`.
+            else {
+                parts.push((
+                    qself.ty.span.between(assoc_item_seg.span()),
+                    ": /* Trait */</* ... */".into(),
+                ));
+                Applicability::HasPlaceholders
+            }
+        }
+        _ => return,
+    };
+
+    parts.push((lhs_ty.span.between(rhs_ty.span), " = ".into()));
+    parts.push((rhs_ty.span.shrink_to_hi(), ">".into()));
+
+    diag.multipart_suggestion(
+        "replace it with an associated item constraint if possible",
+        parts,
+        applicability,
+    );
 }

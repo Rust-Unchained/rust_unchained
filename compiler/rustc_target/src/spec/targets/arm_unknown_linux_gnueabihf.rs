@@ -1,4 +1,6 @@
-use crate::spec::{FloatAbi, Target, TargetMetadata, TargetOptions, base};
+use crate::spec::{
+    Arch, CfgAbi, FloatAbi, SanitizerSet, Target, TargetMetadata, TargetOptions, base,
+};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -11,14 +13,20 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64".into(),
-        arch: "arm".into(),
+        arch: Arch::Arm,
         options: TargetOptions {
-            abi: "eabihf".into(),
+            cfg_abi: CfgAbi::EabiHf,
             llvm_floatabi: Some(FloatAbi::Hard),
-            features: "+strict-align,+v6,+vfp2,-d32".into(),
+            features: "+strict-align,+v6,+vfp2".into(),
             max_atomic_width: Some(64),
             mcount: "\u{1}__gnu_mcount_nc".into(),
             llvm_mcount_intrinsic: Some("llvm.arm.gnu.eabi.mcount".into()),
+            // The default on linux is to have `default_uwtable=true`, but on
+            // this target we get an "`__aeabi_unwind_cpp_pr0` not defined"
+            // linker error, so set it to `true` here.
+            // FIXME(#146996): Remove this override once #146996 has been fixed.
+            default_uwtable: false,
+            supported_sanitizers: SanitizerSet::ADDRESS,
             ..base::linux_gnu::opts()
         },
     }

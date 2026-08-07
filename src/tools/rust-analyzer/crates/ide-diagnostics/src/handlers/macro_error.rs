@@ -11,35 +11,42 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
 // Diagnostic: proc-macro-disabled
 //
 // This diagnostic is shown for proc macros that have been specifically disabled via `rust-analyzer.procMacro.ignored`.
-pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroError) -> Diagnostic {
+pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_, '_>, d: &hir::MacroError) -> Diagnostic {
     // Use more accurate position if available.
-    let display_range = ctx.resolve_precise_location(&d.node, d.precise_location);
+    let display_range = ctx.sema.diagnostics_display_range_for_range(d.range);
     Diagnostic::new(
         DiagnosticCode::Ra(d.kind, if d.error { Severity::Error } else { Severity::WeakWarning }),
         d.message.clone(),
         display_range,
     )
+    .stable()
 }
 
 // Diagnostic: macro-def-error
 //
 // This diagnostic is shown for macro expansion errors.
-pub(crate) fn macro_def_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroDefError) -> Diagnostic {
+pub(crate) fn macro_def_error(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::MacroDefError,
+) -> Diagnostic {
     // Use more accurate position if available.
-    let display_range =
-        ctx.resolve_precise_location(&d.node.map(|it| it.syntax_node_ptr()), d.name);
+    let display_range = match d.name {
+        Some(name) => ctx.sema.diagnostics_display_range_for_range(d.node.with_value(name)),
+        None => ctx.sema.diagnostics_display_range(d.node.map(|it| it.syntax_node_ptr())),
+    };
     Diagnostic::new(
         DiagnosticCode::Ra("macro-def-error", Severity::Error),
         d.message.clone(),
         display_range,
     )
+    .stable()
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{check_diagnostics, check_diagnostics_with_config},
         DiagnosticsConfig,
+        tests::{check_diagnostics, check_diagnostics_with_config},
     };
 
     #[test]
@@ -123,6 +130,7 @@ include!("foo/bar.rs");
 
     #[test]
     fn good_out_dir_diagnostic() {
+        // FIXME: The diagnostic here is duplicated for each eager expansion
         check_diagnostics(
             r#"
 #[rustc_builtin_macro]
@@ -132,23 +140,24 @@ macro_rules! env { () => {} }
 #[rustc_builtin_macro]
 macro_rules! concat { () => {} }
 
-  include!(concat!(env!("OUT_DIR"), "/out.rs"));
-                      //^^^^^^^^^ error: `OUT_DIR` not set, build scripts may have failed to run
+  include!(concat!(
+        // ^^^^^^ error: `OUT_DIR` not set, build scripts may have failed to run
+    env!(
+  //^^^ error: `OUT_DIR` not set, build scripts may have failed to run
+        "OUT_DIR"), "/out.rs"));
+      //^^^^^^^^^ error: `OUT_DIR` not set, build scripts may have failed to run
 "#,
         );
     }
 
     #[test]
-    fn register_attr_and_tool() {
-        cov_mark::check!(register_attr);
+    fn register_tool() {
         cov_mark::check!(register_tool);
         check_diagnostics(
             r#"
 #![register_tool(tool)]
-#![register_attr(attr)]
 
 #[tool::path]
-#[attr]
 struct S;
 "#,
         );
@@ -180,7 +189,7 @@ fn main() {
            //^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
 
     include!(concat!("does ", "not ", "exist"));
-                  //^^^^^^^^^^^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
+                  // ^^^^^^^^^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
 
     env!(invalid);
        //^^^^^^^ error: expected string literal
@@ -237,7 +246,8 @@ macro_rules! outer {
 
 fn f() {
     outer!();
-} //^^^^^^^^ error: leftover tokens
+} //^^^^^^ error: leftover tokens
+  //^^^^^^ error: Syntax Error in Expansion: expected expression
 "#,
         )
     }
@@ -286,7 +296,7 @@ include!("include-me.rs");
 //- /include-me.rs
 /// long doc that pushes the diagnostic range beyond the first file's text length
   #[err]
-//^^^^^^error: unresolved macro `err`
+ // ^^^ error: unresolved macro `err`
 mod prim_never {}
 "#,
         );
@@ -314,6 +324,23 @@ fn it_works() {
                // ^^^^^ error: expected literal
 }
 
+        "#,
+        );
+    }
+
+    #[test]
+    fn unimplemented_builtin_macro() {
+        check_diagnostics(
+            r#"
+#[rustc_builtin_macro]
+macro_rules! unimplemented_builtin_macro {
+          // ^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: unimplemented built-in macro
+    () => {};
+}
+
+ #[unimplemented_builtin_macro]
+// ^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: this built-in macro is not implemented
+struct Foo;
         "#,
         );
     }

@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
-import type * as lc from "vscode-languageclient/node";
+import * as lc from "vscode-languageclient/node";
 import * as ra from "./lsp_ext";
 
 import { Config, prepareVSCodeConfig } from "./config";
 import { createClient } from "./client";
 import {
+    findRustToolchainFiles,
     isCargoTomlEditor,
     isDocumentInWorkspace,
     isRustDocument,
@@ -125,7 +126,7 @@ export class Ctx implements RustAnalyzerExtensionApi {
         extCtx.subscriptions.push(this);
         this.version = extCtx.extension.packageJSON.version ?? "<unknown>";
         this._serverVersion = "<not running>";
-        this.config = new Config(extCtx.subscriptions);
+        this.config = new Config(extCtx);
         this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         this.updateStatusBarVisibility(vscode.window.activeTextEditor);
         this.statusBarActiveEditorListener = vscode.window.onDidChangeActiveTextEditor((editor) =>
@@ -148,6 +149,13 @@ export class Ctx implements RustAnalyzerExtensionApi {
         this.setServerStatus({
             health: "stopped",
         });
+    }
+
+    async addConfiguration(
+        extensionId: string,
+        configuration: Record<string, unknown>,
+    ): Promise<void> {
+        await this.config.addExtensionConfiguration(extensionId, configuration);
     }
 
     dispose() {
@@ -190,11 +198,11 @@ export class Ctx implements RustAnalyzerExtensionApi {
         }
 
         if (!this.traceOutputChannel) {
-            this.traceOutputChannel = new LazyOutputChannel("Rust Analyzer Language Server Trace");
+            this.traceOutputChannel = new LazyOutputChannel("rust-analyzer LSP Trace");
             this.pushExtCleanup(this.traceOutputChannel);
         }
         if (!this.outputChannel) {
-            this.outputChannel = vscode.window.createOutputChannel("Rust Analyzer Language Server");
+            this.outputChannel = vscode.window.createOutputChannel("rust-analyzer Language Server");
             this.pushExtCleanup(this.outputChannel);
         }
 
@@ -213,7 +221,14 @@ export class Ctx implements RustAnalyzerExtensionApi {
                     this.refreshServerStatus();
                 },
             );
-            const newEnv = Object.assign({}, process.env, this.config.serverExtraEnv);
+            const newEnv = { ...process.env };
+            for (const [k, v] of Object.entries(this.config.serverExtraEnv)) {
+                if (v) {
+                    newEnv[k] = v;
+                } else if (k in newEnv) {
+                    delete newEnv[k];
+                }
+            }
             const run: lc.Executable = {
                 command: this._serverPath,
                 options: { env: newEnv },
@@ -223,7 +238,7 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 debug: run,
             };
 
-            let rawInitializationOptions = vscode.workspace.getConfiguration("rust-analyzer");
+            let rawInitializationOptions = this.config.cfg;
 
             if (this.workspace.kind === "Detached Files") {
                 rawInitializationOptions = {
@@ -251,6 +266,17 @@ export class Ctx implements RustAnalyzerExtensionApi {
                 this._client.onNotification(ra.openServerLogs, () => {
                     this.outputChannel!.show();
                 }),
+            );
+            this.pushClientCleanup(
+                this._client.onNotification(
+                    lc.ShowMessageNotification.type,
+                    async (params: lc.ShowMessageParams) => {
+                        // When an MSRV warning is detected and a rust-toolchain file exists,
+                        // show an additional message with actionable guidance about adding
+                        // the rust-analyzer component.
+                        await handleMsrvWarning(params.message);
+                    },
+                ),
             );
         }
         return this._client;
@@ -578,3 +604,43 @@ export interface Disposable {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Cmd = (...args: any[]) => unknown;
+
+/**
+ * Pattern to detect MSRV warning messages from the rust-analyzer server.
+ */
+const MSRV_WARNING_PATTERN = /using an outdated toolchain version.*rust-analyzer only supports/is;
+
+/**
+ * Handles the MSRV warning by checking for rust-toolchain files and showing
+ * an enhanced message if found.
+ */
+export async function handleMsrvWarning(message: string): Promise<boolean> {
+    if (!MSRV_WARNING_PATTERN.test(message)) {
+        return false;
+    }
+
+    const toolchainFiles = await findRustToolchainFiles();
+    if (toolchainFiles.length === 0) {
+        return false;
+    }
+
+    const openFile = "Open rust-toolchain file";
+    const result = await vscode.window.showWarningMessage(
+        "Your workspace uses a rust-toolchain file with a toolchain too old for the extension shipped rust-analyzer to work properly. " +
+            "Consider adding the rust-analyzer component to the toolchain file to use a compatible rust-analyzer version. " +
+            "Add the following to your rust-toolchain file's `[toolchain]` section:\n" +
+            'components = ["rust-analyzer"]',
+        { modal: true },
+        openFile,
+    );
+
+    if (result === openFile) {
+        const fileToOpen = toolchainFiles[0];
+        if (fileToOpen) {
+            const document = await vscode.workspace.openTextDocument(fileToOpen);
+            await vscode.window.showTextDocument(document);
+        }
+    }
+
+    return true;
+}

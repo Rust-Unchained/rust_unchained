@@ -1,4 +1,6 @@
 //@ revisions: empty unprefixed all_unknown all_known mixed
+//@ revisions: enum_not_in_pass_names enum_in_pass_names
+//@ normalize-stderr: "note: valid MIR pass names are: .*" -> "note: valid MIR pass names are: $$PASS_NAMES"
 
 //@[empty] compile-flags: -Zmir-enable-passes=
 
@@ -13,6 +15,12 @@
 //@[mixed] check-pass
 //@[mixed] compile-flags: -Zmir-enable-passes=+ThisPassDoesNotExist,+CheckAlignment
 
+//@[enum_not_in_pass_names] check-pass
+//@[enum_not_in_pass_names] compile-flags: -Zmir-enable-passes=+SimplifyCfg
+
+//@[enum_in_pass_names] check-pass
+//@[enum_in_pass_names] compile-flags: -Zmir-enable-passes=+AddCallGuards
+
 fn main() {}
 
 //[empty]~? ERROR incorrect value `` for unstable option `mir-enable-passes`
@@ -23,3 +31,5 @@ fn main() {}
 //[all_unknown]~? WARN MIR pass `DoesNotExist` is unknown and will be ignored
 //[all_unknown]~? WARN MIR pass `ThisPass` is unknown and will be ignored
 //[all_unknown]~? WARN MIR pass `DoesNotExist` is unknown and will be ignored
+//[enum_not_in_pass_names]~? WARN MIR pass `SimplifyCfg` is unknown and will be ignored
+//[enum_not_in_pass_names]~? WARN MIR pass `SimplifyCfg` is unknown and will be ignored

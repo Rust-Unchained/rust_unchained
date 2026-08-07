@@ -3,10 +3,13 @@
 use std::fmt::Write;
 
 use cranelift_codegen::isa::CallConv;
+use rustc_abi::CanonAbi;
 use rustc_ast::ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_hir::LangItem;
+use rustc_middle::ty::layout::FnAbiOf;
 use rustc_span::sym;
 use rustc_target::asm::*;
+use rustc_target::spec::Arch;
 use target_lexicon::BinaryFormat;
 
 use crate::prelude::*;
@@ -51,6 +54,26 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
         return;
     }
 
+    if fx.tcx.sess.target.arch == Arch::S390x
+        && template.len() == 3
+        && template[0] == InlineAsmTemplatePiece::String("stfle 0(".into())
+        && let InlineAsmTemplatePiece::Placeholder { operand_idx: 0, modifier: None, span: _ } =
+            template[1]
+        && template[2] == InlineAsmTemplatePiece::String(")".into())
+    {
+        // FIXME no inline asm support for s390x yet, but stdarch needs it for feature detection
+        match destination {
+            Some(destination) => {
+                let destination_block = fx.get_block(destination);
+                fx.bcx.ins().jump(destination_block, &[]);
+            }
+            None => {
+                fx.bcx.ins().trap(TrapCode::user(1 /* unreachable */).unwrap());
+            }
+        }
+        return;
+    }
+
     let operands = operands
         .iter()
         .map(|operand| match *operand {
@@ -73,10 +96,18 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
             }
             InlineAsmOperand::Const { ref value } => {
                 let (const_value, ty) = crate::constant::eval_mir_constant(fx, value);
+                let mir::ConstValue::Scalar(scalar) = const_value else {
+                    span_bug!(
+                        span,
+                        "expected Scalar for promoted asm const, but got {:#?}",
+                        const_value
+                    )
+                };
+
                 let value = rustc_codegen_ssa::common::asm_const_to_str(
                     fx.tcx,
                     span,
-                    const_value,
+                    scalar.assert_scalar_int(),
                     fx.layout_of(ty),
                 );
                 CInlineAsmOperand::Const { value }
@@ -94,25 +125,35 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                         fx.tcx,
                         ty::TypingEnv::fully_monomorphized(),
                         def_id,
-                        args,
+                        args.no_bound_vars().unwrap(),
                     )
                     .unwrap();
                     let symbol = fx.tcx.symbol_name(instance);
 
-                    // Pass a wrapper rather than the function itself as the function itself may not
-                    // be exported from the main codegen unit and may thus be unreachable from the
-                    // object file created by an external assembler.
-                    let wrapper_name = format!(
-                        "__inline_asm_{}_wrapper_n{}",
-                        fx.cx.cgu_name.as_str().replace('.', "__").replace('-', "_"),
-                        fx.cx.inline_asm_index
-                    );
-                    fx.cx.inline_asm_index += 1;
-                    let sig =
-                        get_function_sig(fx.tcx, fx.target_config.default_call_conv, instance);
-                    create_wrapper_function(fx.module, sig, &wrapper_name, symbol.name);
+                    if FullyMonomorphizedLayoutCx(fx.tcx)
+                        .fn_abi_of_instance(instance, ty::List::empty())
+                        .conv
+                        == CanonAbi::Custom
+                    {
+                        // We can't create a wrapper for custom ABI functions.
+                        CInlineAsmOperand::Symbol { symbol: symbol.name.to_owned() }
+                    } else {
+                        // Pass a wrapper rather than the function itself as the function itself may not
+                        // be exported from the main codegen unit and may thus be unreachable from the
+                        // object file created by an external assembler.
+                        let wrapper_name = format!(
+                            "{}__inline_asm_{}_wrapper_n{}",
+                            fx.symbol_name,
+                            fx.cgu_name.as_str().replace('.', "__").replace('-', "_"),
+                            fx.inline_asm_index,
+                        );
+                        fx.inline_asm_index += 1;
+                        let sig =
+                            get_function_sig(fx.tcx, fx.target_config.default_call_conv, instance);
+                        create_wrapper_function(fx.module, sig, &wrapper_name, symbol.name);
 
-                    CInlineAsmOperand::Symbol { symbol: wrapper_name }
+                        CInlineAsmOperand::Symbol { symbol: wrapper_name }
+                    }
                 } else {
                     span_bug!(span, "invalid type for asm sym (fn)");
                 }
@@ -161,20 +202,20 @@ pub(crate) fn codegen_inline_asm_inner<'tcx>(
         stack_slots_input: Vec::new(),
         stack_slots_output: Vec::new(),
         stack_slot_size: Size::from_bytes(0),
-        is_naked: false,
     };
     asm_gen.allocate_registers();
     asm_gen.allocate_stack_slots();
 
     let asm_name = format!(
-        "__inline_asm_{}_n{}",
-        fx.cx.cgu_name.as_str().replace('.', "__").replace('-', "_"),
-        fx.cx.inline_asm_index
+        "{}__inline_asm_{}_n{}",
+        fx.symbol_name,
+        fx.cgu_name.as_str().replace('.', "__").replace('-', "_"),
+        fx.inline_asm_index,
     );
-    fx.cx.inline_asm_index += 1;
+    fx.inline_asm_index += 1;
 
     let generated_asm = asm_gen.generate_asm_wrapper(&asm_name);
-    fx.cx.global_asm.push_str(&generated_asm);
+    fx.inline_asm.push_str(&generated_asm);
 
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -201,114 +242,6 @@ pub(crate) fn codegen_inline_asm_inner<'tcx>(
     call_inline_asm(fx, &asm_name, asm_gen.stack_slot_size, inputs, outputs);
 }
 
-pub(crate) fn codegen_naked_asm<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    cx: &mut crate::CodegenCx,
-    module: &mut dyn Module,
-    instance: Instance<'tcx>,
-    span: Span,
-    symbol_name: &str,
-    template: &[InlineAsmTemplatePiece],
-    operands: &[InlineAsmOperand<'tcx>],
-    options: InlineAsmOptions,
-) {
-    // FIXME add .eh_frame unwind info directives
-
-    let operands = operands
-        .iter()
-        .map(|operand| match *operand {
-            InlineAsmOperand::In { .. }
-            | InlineAsmOperand::Out { .. }
-            | InlineAsmOperand::InOut { .. } => {
-                span_bug!(span, "invalid operand type for naked asm")
-            }
-            InlineAsmOperand::Const { ref value } => {
-                let cv = instance.instantiate_mir_and_normalize_erasing_regions(
-                    tcx,
-                    ty::TypingEnv::fully_monomorphized(),
-                    ty::EarlyBinder::bind(value.const_),
-                );
-                let const_value = cv
-                    .eval(tcx, ty::TypingEnv::fully_monomorphized(), value.span)
-                    .expect("erroneous constant missed by mono item collection");
-
-                let value = rustc_codegen_ssa::common::asm_const_to_str(
-                    tcx,
-                    span,
-                    const_value,
-                    FullyMonomorphizedLayoutCx(tcx).layout_of(cv.ty()),
-                );
-                CInlineAsmOperand::Const { value }
-            }
-            InlineAsmOperand::SymFn { ref value } => {
-                if cfg!(not(feature = "inline_asm_sym")) {
-                    tcx.dcx()
-                        .span_err(span, "asm! and global_asm! sym operands are not yet supported");
-                }
-
-                let const_ = instance.instantiate_mir_and_normalize_erasing_regions(
-                    tcx,
-                    ty::TypingEnv::fully_monomorphized(),
-                    ty::EarlyBinder::bind(value.const_),
-                );
-                if let ty::FnDef(def_id, args) = *const_.ty().kind() {
-                    let instance = ty::Instance::resolve_for_fn_ptr(
-                        tcx,
-                        ty::TypingEnv::fully_monomorphized(),
-                        def_id,
-                        args,
-                    )
-                    .unwrap();
-                    let symbol = tcx.symbol_name(instance);
-
-                    // Pass a wrapper rather than the function itself as the function itself may not
-                    // be exported from the main codegen unit and may thus be unreachable from the
-                    // object file created by an external assembler.
-                    let wrapper_name = format!(
-                        "__inline_asm_{}_wrapper_n{}",
-                        cx.cgu_name.as_str().replace('.', "__").replace('-', "_"),
-                        cx.inline_asm_index
-                    );
-                    cx.inline_asm_index += 1;
-                    let sig =
-                        get_function_sig(tcx, module.target_config().default_call_conv, instance);
-                    create_wrapper_function(module, sig, &wrapper_name, symbol.name);
-
-                    CInlineAsmOperand::Symbol { symbol: wrapper_name }
-                } else {
-                    span_bug!(span, "invalid type for asm sym (fn)");
-                }
-            }
-            InlineAsmOperand::SymStatic { def_id } => {
-                assert!(tcx.is_static(def_id));
-                let instance = Instance::mono(tcx, def_id);
-                CInlineAsmOperand::Symbol { symbol: tcx.symbol_name(instance).name.to_owned() }
-            }
-            InlineAsmOperand::Label { .. } => {
-                span_bug!(span, "asm! label operands are not yet supported");
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let asm_gen = InlineAssemblyGenerator {
-        tcx,
-        arch: tcx.sess.asm_arch.unwrap(),
-        enclosing_def_id: instance.def_id(),
-        template,
-        operands: &operands,
-        options,
-        registers: Vec::new(),
-        stack_slots_clobber: Vec::new(),
-        stack_slots_input: Vec::new(),
-        stack_slots_output: Vec::new(),
-        stack_slot_size: Size::from_bytes(0),
-        is_naked: true,
-    };
-
-    let generated_asm = asm_gen.generate_asm_wrapper(symbol_name);
-    cx.global_asm.push_str(&generated_asm);
-}
-
 struct InlineAssemblyGenerator<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     arch: InlineAsmArch,
@@ -321,13 +254,10 @@ struct InlineAssemblyGenerator<'a, 'tcx> {
     stack_slots_input: Vec<Option<Size>>,
     stack_slots_output: Vec<Option<Size>>,
     stack_slot_size: Size,
-    is_naked: bool,
 }
 
 impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
     fn allocate_registers(&mut self) {
-        assert!(!self.is_naked);
-
         let sess = self.tcx.sess;
         let map = allocatable_registers(
             self.arch,
@@ -451,8 +381,6 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
     }
 
     fn allocate_stack_slots(&mut self) {
-        assert!(!self.is_naked);
-
         let mut slot_size = Size::from_bytes(0);
         let mut slots_clobber = vec![None; self.operands.len()];
         let mut slots_input = vec![None; self.operands.len()];
@@ -504,13 +432,10 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
 
         // Allocate stack slots for inout
         for (i, operand) in self.operands.iter().enumerate() {
-            match *operand {
-                CInlineAsmOperand::InOut { reg, out_place: Some(_), .. } => {
-                    let slot = new_slot(reg.reg_class());
-                    slots_input[i] = Some(slot);
-                    slots_output[i] = Some(slot);
-                }
-                _ => (),
+            if let CInlineAsmOperand::InOut { reg, out_place: Some(_), .. } = *operand {
+                let slot = new_slot(reg.reg_class());
+                slots_input[i] = Some(slot);
+                slots_output[i] = Some(slot);
             }
         }
 
@@ -536,11 +461,8 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
 
         // Allocate stack slots for output
         for (i, operand) in self.operands.iter().enumerate() {
-            match *operand {
-                CInlineAsmOperand::Out { reg, place: Some(_), .. } => {
-                    slots_output[i] = Some(new_slot(reg.reg_class()));
-                }
-                _ => (),
+            if let CInlineAsmOperand::Out { reg, place: Some(_), .. } = *operand {
+                slots_output[i] = Some(new_slot(reg.reg_class()));
             }
         }
 
@@ -582,30 +504,29 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
         if is_x86 {
             generated_asm.push_str(".intel_syntax noprefix\n");
         }
-        if !self.is_naked {
-            Self::prologue(&mut generated_asm, self.arch);
 
-            // Save clobbered registers
-            if !self.options.contains(InlineAsmOptions::NORETURN) {
-                for (reg, slot) in self
-                    .registers
-                    .iter()
-                    .zip(self.stack_slots_clobber.iter().copied())
-                    .filter_map(|(r, s)| r.zip(s))
-                {
-                    Self::save_register(&mut generated_asm, self.arch, reg, slot);
-                }
-            }
+        Self::prologue(&mut generated_asm, self.arch);
 
-            // Write input registers
+        // Save clobbered registers
+        if !self.options.contains(InlineAsmOptions::NORETURN) {
             for (reg, slot) in self
                 .registers
                 .iter()
-                .zip(self.stack_slots_input.iter().copied())
+                .zip(self.stack_slots_clobber.iter().copied())
                 .filter_map(|(r, s)| r.zip(s))
             {
-                Self::restore_register(&mut generated_asm, self.arch, reg, slot);
+                Self::save_register(&mut generated_asm, self.arch, reg, slot);
             }
+        }
+
+        // Write input registers
+        for (reg, slot) in self
+            .registers
+            .iter()
+            .zip(self.stack_slots_input.iter().copied())
+            .filter_map(|(r, s)| r.zip(s))
+        {
+            Self::restore_register(&mut generated_asm, self.arch, reg, slot);
         }
 
         if is_x86 && self.options.contains(InlineAsmOptions::ATT_SYNTAX) {
@@ -640,39 +561,24 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
                             match self.arch {
                                 InlineAsmArch::X86_64 => match reg {
                                     InlineAsmReg::X86(reg)
-                                        if reg as u32 >= X86InlineAsmReg::xmm0 as u32
-                                            && reg as u32 <= X86InlineAsmReg::xmm15 as u32 =>
+                                        if matches!(
+                                            reg.reg_class(),
+                                            X86InlineAsmRegClass::xmm_reg
+                                                | X86InlineAsmRegClass::ymm_reg
+                                                | X86InlineAsmRegClass::zmm_reg
+                                        ) =>
                                     {
-                                        // rustc emits x0 rather than xmm0
-                                        let class = match *modifier {
-                                            None | Some('x') => "xmm",
-                                            Some('y') => "ymm",
-                                            Some('z') => "zmm",
-                                            _ => unreachable!(),
-                                        };
-                                        write!(
-                                            generated_asm,
-                                            "{class}{}",
-                                            reg as u32 - X86InlineAsmReg::xmm0 as u32
-                                        )
-                                        .unwrap();
+                                        // rustc emits x0/y0/z0 rather than xmm0/ymm0/zmm0
+                                        let name = reg.name();
+                                        if let Some(prefix) = modifier {
+                                            let index = &name[3..];
+                                            write!(generated_asm, "{prefix}mm{index}").unwrap();
+                                        } else {
+                                            write!(generated_asm, "{name}").unwrap();
+                                        }
                                     }
                                     _ => reg
                                         .emit(&mut generated_asm, InlineAsmArch::X86_64, *modifier)
-                                        .unwrap(),
-                                },
-                                InlineAsmArch::AArch64 => match reg {
-                                    InlineAsmReg::AArch64(reg) if reg.vreg_index().is_some() => {
-                                        // rustc emits v0 rather than q0
-                                        reg.emit(
-                                            &mut generated_asm,
-                                            InlineAsmArch::AArch64,
-                                            Some(modifier.unwrap_or('q')),
-                                        )
-                                        .unwrap()
-                                    }
-                                    _ => reg
-                                        .emit(&mut generated_asm, InlineAsmArch::AArch64, *modifier)
                                         .unwrap(),
                                 },
                                 _ => reg.emit(&mut generated_asm, self.arch, *modifier).unwrap(),
@@ -681,7 +587,13 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
                         CInlineAsmOperand::Const { ref value } => {
                             generated_asm.push_str(value);
                         }
-                        CInlineAsmOperand::Symbol { ref symbol } => generated_asm.push_str(symbol),
+                        CInlineAsmOperand::Symbol { ref symbol } => {
+                            if binary_format == BinaryFormat::Macho {
+                                generated_asm.push('_');
+                            }
+
+                            generated_asm.push_str(symbol);
+                        }
                     }
                 }
             }
@@ -701,32 +613,30 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
             generated_asm.push_str(".intel_syntax noprefix\n");
         }
 
-        if !self.is_naked {
-            if !self.options.contains(InlineAsmOptions::NORETURN) {
-                // Read output registers
-                for (reg, slot) in self
-                    .registers
-                    .iter()
-                    .zip(self.stack_slots_output.iter().copied())
-                    .filter_map(|(r, s)| r.zip(s))
-                {
-                    Self::save_register(&mut generated_asm, self.arch, reg, slot);
-                }
-
-                // Restore clobbered registers
-                for (reg, slot) in self
-                    .registers
-                    .iter()
-                    .zip(self.stack_slots_clobber.iter().copied())
-                    .filter_map(|(r, s)| r.zip(s))
-                {
-                    Self::restore_register(&mut generated_asm, self.arch, reg, slot);
-                }
-
-                Self::epilogue(&mut generated_asm, self.arch);
-            } else {
-                Self::epilogue_noreturn(&mut generated_asm, self.arch);
+        if !self.options.contains(InlineAsmOptions::NORETURN) {
+            // Read output registers
+            for (reg, slot) in self
+                .registers
+                .iter()
+                .zip(self.stack_slots_output.iter().copied())
+                .filter_map(|(r, s)| r.zip(s))
+            {
+                Self::save_register(&mut generated_asm, self.arch, reg, slot);
             }
+
+            // Restore clobbered registers
+            for (reg, slot) in self
+                .registers
+                .iter()
+                .zip(self.stack_slots_clobber.iter().copied())
+                .filter_map(|(r, s)| r.zip(s))
+            {
+                Self::restore_register(&mut generated_asm, self.arch, reg, slot);
+            }
+
+            Self::epilogue(&mut generated_asm, self.arch);
+        } else {
+            Self::epilogue_noreturn(&mut generated_asm, self.arch);
         }
 
         if is_x86 {
@@ -824,12 +734,17 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
             InlineAsmArch::X86_64 => {
                 match reg {
                     InlineAsmReg::X86(reg)
-                        if reg as u32 >= X86InlineAsmReg::xmm0 as u32
-                            && reg as u32 <= X86InlineAsmReg::xmm15 as u32 =>
+                        if matches!(
+                            reg.reg_class(),
+                            X86InlineAsmRegClass::xmm_reg
+                                | X86InlineAsmRegClass::ymm_reg
+                                | X86InlineAsmRegClass::zmm_reg
+                        ) =>
                     {
-                        // rustc emits x0 rather than xmm0
-                        write!(generated_asm, "    movups [rbx+0x{:x}], ", offset.bytes()).unwrap();
-                        write!(generated_asm, "xmm{}", reg as u32 - X86InlineAsmReg::xmm0 as u32)
+                        // rustc emits x0/y0/z0 rather than xmm0/ymm0/zmm0
+                        let name = reg.name();
+                        let mov = if name.starts_with("xmm") { "movups" } else { "vmovups" };
+                        write!(generated_asm, "    {mov} [rbx+0x{:x}], {name}", offset.bytes())
                             .unwrap();
                     }
                     _ => {
@@ -869,16 +784,17 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
             InlineAsmArch::X86_64 => {
                 match reg {
                     InlineAsmReg::X86(reg)
-                        if reg as u32 >= X86InlineAsmReg::xmm0 as u32
-                            && reg as u32 <= X86InlineAsmReg::xmm15 as u32 =>
+                        if matches!(
+                            reg.reg_class(),
+                            X86InlineAsmRegClass::xmm_reg
+                                | X86InlineAsmRegClass::ymm_reg
+                                | X86InlineAsmRegClass::zmm_reg
+                        ) =>
                     {
-                        // rustc emits x0 rather than xmm0
-                        write!(
-                            generated_asm,
-                            "    movups xmm{}",
-                            reg as u32 - X86InlineAsmReg::xmm0 as u32
-                        )
-                        .unwrap();
+                        // rustc emits x0/y0/z0 rather than xmm0/ymm0/zmm0
+                        let name = reg.name();
+                        let mov = if name.starts_with("xmm") { "movups" } else { "vmovups" };
+                        write!(generated_asm, "    {mov} {name}").unwrap();
                     }
                     _ => {
                         generated_asm.push_str("    mov ");
@@ -939,11 +855,12 @@ fn call_inline_asm<'tcx>(
         stack_slot.offset(fx, i32::try_from(offset.bytes()).unwrap().into()).store(
             fx,
             value,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
         );
     }
 
     let stack_slot_addr = stack_slot.get_addr(fx);
+    // FIXME use try_call once unwinding inline assembly is supported
     fx.bcx.ins().call(inline_asm_func, &[stack_slot_addr]);
 
     for (offset, place) in outputs {
@@ -956,7 +873,7 @@ fn call_inline_asm<'tcx>(
         let value = stack_slot.offset(fx, i32::try_from(offset.bytes()).unwrap().into()).load(
             fx,
             ty,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
         );
         place.write_cvalue(fx, CValue::by_val(value, place.layout()));
     }
@@ -964,19 +881,9 @@ fn call_inline_asm<'tcx>(
 
 fn asm_clif_type<'tcx>(fx: &FunctionCx<'_, '_, 'tcx>, ty: Ty<'tcx>) -> Option<types::Type> {
     match ty.kind() {
-        // Adapted from https://github.com/rust-lang/rust/blob/f3c66088610c1b80110297c2d9a8b5f9265b013f/compiler/rustc_hir_analysis/src/check/intrinsicck.rs#L136-L151
+        // Adapted from https://github.com/rust-lang/rust/blob/df44a57fd29fca899ce473f85ed64efd0708dd7c/compiler/rustc_hir_typeck/src/inline_asm.rs#L180-L183
         ty::Adt(adt, args) if fx.tcx.is_lang_item(adt.did(), LangItem::MaybeUninit) => {
-            let fields = &adt.non_enum_variant().fields;
-            let ty = fields[FieldIdx::from_u32(1)].ty(fx.tcx, args);
-            let ty::Adt(ty, args) = ty.kind() else {
-                unreachable!("expected first field of `MaybeUninit` to be an ADT")
-            };
-            assert!(
-                ty.is_manually_drop(),
-                "expected first field of `MaybeUninit` to be `ManuallyDrop`"
-            );
-            let fields = &ty.non_enum_variant().fields;
-            let ty = fields[FieldIdx::ZERO].ty(fx.tcx, args);
+            let ty = args.type_at(0);
             fx.clif_type(ty)
         }
         _ => fx.clif_type(ty),

@@ -1,7 +1,7 @@
 #![warn(clippy::obfuscated_if_else)]
 #![allow(
-    clippy::unnecessary_lazy_evaluations,
     clippy::unit_arg,
+    clippy::unnecessary_lazy_evaluations,
     clippy::unused_unit,
     clippy::unwrap_or_default
 )]
@@ -85,5 +85,11 @@ fn issue11141() {
 
     // Parentheses are not required for a deref followed by a cast
     let _ = *true.then_some(&42).unwrap_or(&17) as u8;
+    //~^ obfuscated_if_else
+}
+
+#[allow(clippy::useless_format)]
+fn issue16288() {
+    true.then(|| format!("this is a test")).unwrap_or_default();
     //~^ obfuscated_if_else
 }

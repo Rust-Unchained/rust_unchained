@@ -6,13 +6,11 @@ edition = "2024"
 [dependencies]
 # tidy-alphabetical-start
 rustc-hash = "2.0.0"
-
 rustc_abi = { path = "../rustc_abi", optional = true }
 rustc_apfloat = "0.2.0"
 rustc_arena = { path = "../rustc_arena", optional = true }
 rustc_data_structures = { path = "../rustc_data_structures", optional = true }
 rustc_errors = { path = "../rustc_errors", optional = true }
-rustc_fluent_macro = { path = "../rustc_fluent_macro", optional = true }
 rustc_hir = { path = "../rustc_hir", optional = true }
 rustc_index = { path = "../rustc_index", default-features = false }
 rustc_macros = { path = "../rustc_macros", optional = true }
@@ -24,17 +22,19 @@ tracing = "0.1"
 # tidy-alphabetical-end
 
 [dev-dependencies]
+# tidy-alphabetical-start
 tracing-subscriber = { version = "0.3.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
-tracing-tree = "0.3.0"
+tracing-tree = "0.4.1"
+# tidy-alphabetical-end
 
 [features]
+# tidy-alphabetical-start
 default = ["rustc"]
 rustc = [
     "dep:rustc_abi",
     "dep:rustc_arena",
     "dep:rustc_data_structures",
     "dep:rustc_errors",
-    "dep:rustc_fluent_macro",
     "dep:rustc_hir",
     "dep:rustc_macros",
     "dep:rustc_middle",
@@ -43,3 +43,4 @@ rustc = [
     "smallvec/may_dangle",
     "rustc_index/nightly",
 ]
+# tidy-alphabetical-end

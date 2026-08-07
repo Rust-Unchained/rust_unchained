@@ -3,11 +3,13 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::cell::{Cell, Ref, RefCell, RefMut, SyncUnsafeCell, UnsafeCell};
-use crate::char::{EscapeDebugExtArgs, MAX_LEN_UTF8};
-use crate::marker::PhantomData;
-use crate::num::fmt as numfmt;
+use crate::char::EscapeDebugExtArgs;
+use crate::hint::assert_unchecked;
+use crate::marker::{PhantomData, PointeeSized};
+use crate::num::imp::fmt as numfmt;
 use crate::ops::Deref;
-use crate::{iter, result, str};
+use crate::ptr::NonNull;
+use crate::{iter, mem, result, str};
 
 mod builders;
 #[cfg(not(no_fp_fmt_parse))]
@@ -15,6 +17,7 @@ mod float;
 #[cfg(no_fp_fmt_parse)]
 mod nofloat;
 mod num;
+mod num_buffer;
 mod rt;
 
 #[stable(feature = "fmt_flags_align", since = "1.28.0")]
@@ -33,9 +36,14 @@ pub enum Alignment {
     Center,
 }
 
+#[stable(feature = "int_format_into", since = "1.98.0")]
+pub use num_buffer::NumBuffer;
+#[unstable(feature = "fmt_internals", issue = "none")]
+pub use num_buffer::NumBufferTrait;
+
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub use self::builders::{DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple};
-#[unstable(feature = "debug_closure_helpers", issue = "117729")]
+#[stable(feature = "fmt_from_fn", since = "1.93.0")]
 pub use self::builders::{FromFn, from_fn};
 
 /// The type returned by formatter methods.
@@ -111,6 +119,7 @@ pub struct Error;
 /// [`std::io::Write`]: ../../std/io/trait.Write.html
 /// [flushable]: ../../std/io/trait.Write.html#tymethod.flush
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "FmtWrite"]
 pub trait Write {
     /// Writes a string slice into this writer, returning whether the write
     /// succeeded.
@@ -174,7 +183,7 @@ pub trait Write {
     /// ```
     #[stable(feature = "fmt_write_char", since = "1.1.0")]
     fn write_char(&mut self, c: char) -> Result {
-        self.write_str(c.encode_utf8(&mut [0; MAX_LEN_UTF8]))
+        self.write_str(c.encode_utf8(&mut [0; char::MAX_LEN_UTF8]))
     }
 
     /// Glue for usage of the [`write!`] macro with implementors of this trait.
@@ -283,7 +292,7 @@ pub struct FormattingOptions {
     /// ```text
     ///   31  30  29  28  27  26  25  24  23  22  21  20                              0
     /// ┌───┬───────┬───┬───┬───┬───┬───┬───┬───┬───┬──────────────────────────────────┐
-    /// │ 1 │ align │ p │ w │ X?│ x?│'0'│ # │ - │ + │               fill               │
+    /// │ 0 │ align │ p │ w │ X?│ x?│'0'│ # │ - │ + │               fill               │
     /// └───┴───────┴───┴───┴───┴───┴───┴───┴───┴───┴──────────────────────────────────┘
     ///   │     │     │   │  └─┬───────────────────┘ └─┬──────────────────────────────┘
     ///   │     │     │   │    │                       └─ The fill character (21 bits char).
@@ -294,12 +303,9 @@ pub struct FormattingOptions {
     ///   │     ├─ 1: Align right. (>)
     ///   │     ├─ 2: Align center. (^)
     ///   │     └─ 3: Alignment not set. (default)
-    ///   └─ Always set.
-    ///      This makes it possible to distinguish formatting flags from
-    ///      a &str size when stored in (the upper bits of) the same field.
-    ///      (fmt::Arguments will make use of this property in the future.)
+    ///   └─ Always zero.
     /// ```
-    // Note: This could use a special niche type with range 0x8000_0000..=0xfdd0ffff.
+    // Note: This could use a pattern type with range 0x0000_0000..=0x7dd0ffff.
     // It's unclear if that's useful, though.
     flags: u32,
     /// Width if width flag (bit 27) above is set. Otherwise, always 0.
@@ -323,13 +329,10 @@ mod flags {
     pub(super) const ALIGN_RIGHT: u32 = 1 << 29;
     pub(super) const ALIGN_CENTER: u32 = 2 << 29;
     pub(super) const ALIGN_UNKNOWN: u32 = 3 << 29;
-    pub(super) const ALWAYS_SET: u32 = 1 << 31;
 }
 
 impl FormattingOptions {
-    /// Construct a new `FormatterBuilder` with the supplied `Write` trait
-    /// object for output that is equivalent to the `{}` formatting
-    /// specifier:
+    /// Construct a new `FormattingOptions` representing the plain `{}` formatting specifier:
     ///
     /// - no flags,
     /// - filled with spaces,
@@ -339,23 +342,19 @@ impl FormattingOptions {
     /// - no [`DebugAsHex`] output mode.
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn new() -> Self {
-        Self {
-            flags: ' ' as u32 | flags::ALIGN_UNKNOWN | flags::ALWAYS_SET,
-            width: 0,
-            precision: 0,
-        }
+        Self { flags: ' ' as u32 | flags::ALIGN_UNKNOWN, width: 0, precision: 0 }
     }
 
     /// Sets or removes the sign (the `+` or the `-` flag).
     ///
     /// - `+`: This is intended for numeric types and indicates that the sign
-    /// should always be printed. By default only the negative sign of signed
-    /// values is printed, and the sign of positive or unsigned values is
-    /// omitted. This flag indicates that the correct sign (+ or -) should
-    /// always be printed.
+    ///   should always be printed. By default only the negative sign of signed
+    ///   values is printed, and the sign of positive or unsigned values is
+    ///   omitted. This flag indicates that the correct sign (+ or -) should
+    ///   always be printed.
     /// - `-`: Currently not used
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn sign(&mut self, sign: Option<Sign>) -> &mut Self {
+    pub const fn sign(&mut self, sign: Option<Sign>) -> &mut Self {
         let sign = match sign {
             None => 0,
             Some(Sign::Plus) => flags::SIGN_PLUS_FLAG,
@@ -368,7 +367,7 @@ impl FormattingOptions {
     ///
     /// This is used to indicate for integer formats that the padding to width should both be done with a 0 character as well as be sign-aware
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn sign_aware_zero_pad(&mut self, sign_aware_zero_pad: bool) -> &mut Self {
+    pub const fn sign_aware_zero_pad(&mut self, sign_aware_zero_pad: bool) -> &mut Self {
         if sign_aware_zero_pad {
             self.flags |= flags::SIGN_AWARE_ZERO_PAD_FLAG;
         } else {
@@ -382,10 +381,10 @@ impl FormattingOptions {
     /// used. The alternate forms are:
     /// - [`Debug`] : pretty-print the [`Debug`] formatting (adds linebreaks and indentation)
     /// - [`LowerHex`] as well as [`UpperHex`] - precedes the argument with a `0x`
-    /// - [`Octal`] - precedes the argument with a `0b`
-    /// - [`Binary`] - precedes the argument with a `0o`
+    /// - [`Octal`] - precedes the argument with a `0o`
+    /// - [`Binary`] - precedes the argument with a `0b`
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn alternate(&mut self, alternate: bool) -> &mut Self {
+    pub const fn alternate(&mut self, alternate: bool) -> &mut Self {
         if alternate {
             self.flags |= flags::ALTERNATE_FLAG;
         } else {
@@ -400,7 +399,7 @@ impl FormattingOptions {
     /// being formatted is smaller than width some extra characters will be
     /// printed around it.
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn fill(&mut self, fill: char) -> &mut Self {
+    pub const fn fill(&mut self, fill: char) -> &mut Self {
         self.flags = self.flags & (u32::MAX << 21) | fill as u32;
         self
     }
@@ -409,7 +408,7 @@ impl FormattingOptions {
     /// The alignment specifies how the value being formatted should be
     /// positioned if it is smaller than the width of the formatter.
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn align(&mut self, align: Option<Alignment>) -> &mut Self {
+    pub const fn align(&mut self, align: Option<Alignment>) -> &mut Self {
         let align: u32 = match align {
             Some(Alignment::Left) => flags::ALIGN_LEFT,
             Some(Alignment::Right) => flags::ALIGN_RIGHT,
@@ -426,7 +425,7 @@ impl FormattingOptions {
     /// the padding specified by [`FormattingOptions::fill`]/[`FormattingOptions::align`]
     /// will be used to take up the required space.
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn width(&mut self, width: Option<u16>) -> &mut Self {
+    pub const fn width(&mut self, width: Option<u16>) -> &mut Self {
         if let Some(width) = width {
             self.flags |= flags::WIDTH_FLAG;
             self.width = width;
@@ -439,14 +438,14 @@ impl FormattingOptions {
     /// Sets or removes the precision.
     ///
     /// - For non-numeric types, this can be considered a “maximum width”. If
-    /// the resulting string is longer than this width, then it is truncated
-    /// down to this many characters and that truncated value is emitted with
-    /// proper fill, alignment and width if those parameters are set.
+    ///   the resulting string is longer than this width, then it is truncated
+    ///   down to this many characters and that truncated value is emitted with
+    ///   proper fill, alignment and width if those parameters are set.
     /// - For integral types, this is ignored.
     /// - For floating-point types, this indicates how many digits after the
     /// decimal point should be printed.
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn precision(&mut self, precision: Option<u16>) -> &mut Self {
+    pub const fn precision(&mut self, precision: Option<u16>) -> &mut Self {
         if let Some(precision) = precision {
             self.flags |= flags::PRECISION_FLAG;
             self.precision = precision;
@@ -459,7 +458,7 @@ impl FormattingOptions {
     /// Specifies whether the [`Debug`] trait should use lower-/upper-case
     /// hexadecimal or normal integers
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn debug_as_hex(&mut self, debug_as_hex: Option<DebugAsHex>) -> &mut Self {
+    pub const fn debug_as_hex(&mut self, debug_as_hex: Option<DebugAsHex>) -> &mut Self {
         let debug_as_hex = match debug_as_hex {
             None => 0,
             Some(DebugAsHex::Lower) => flags::DEBUG_LOWER_HEX_FLAG,
@@ -517,7 +516,7 @@ impl FormattingOptions {
     pub const fn get_precision(&self) -> Option<u16> {
         if self.flags & flags::PRECISION_FLAG != 0 { Some(self.precision) } else { None }
     }
-    /// Returns the current precision.
+    /// Returns the current `x?` or `X?` flag.
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn get_debug_as_hex(&self) -> Option<DebugAsHex> {
         if self.flags & flags::DEBUG_LOWER_HEX_FLAG != 0 {
@@ -533,7 +532,7 @@ impl FormattingOptions {
     ///
     /// You may alternatively use [`Formatter::new()`].
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn create_formatter<'a>(self, write: &'a mut (dyn Write + 'a)) -> Formatter<'a> {
+    pub const fn create_formatter<'a>(self, write: &'a mut (dyn Write + 'a)) -> Formatter<'a> {
         Formatter { options: self, buf: write }
     }
 }
@@ -574,13 +573,13 @@ impl<'a> Formatter<'a> {
     ///
     /// You may alternatively use [`FormattingOptions::create_formatter()`].
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn new(write: &'a mut (dyn Write + 'a), options: FormattingOptions) -> Self {
+    pub const fn new(write: &'a mut (dyn Write + 'a), options: FormattingOptions) -> Self {
         Formatter { options, buf: write }
     }
 
     /// Creates a new formatter based on this one with given [`FormattingOptions`].
     #[unstable(feature = "formatting_options", issue = "118117")]
-    pub fn with_options<'b>(&'b mut self, options: FormattingOptions) -> Formatter<'b> {
+    pub const fn with_options<'b>(&'b mut self, options: FormattingOptions) -> Formatter<'b> {
         Formatter { options, buf: self.buf }
     }
 }
@@ -607,84 +606,222 @@ impl<'a> Formatter<'a> {
 /// ```
 ///
 /// [`format()`]: ../../std/fmt/fn.format.html
+//
+// Internal representation:
+//
+// fmt::Arguments is represented in one of two ways:
+//
+// 1) String literal representation (e.g. format_args!("hello"))
+//             ┌────────────────────────────────┐
+//   template: │           *const u8            │ ─▷ "hello"
+//             ├──────────────────────────────┬─┤
+//   args:     │             len              │1│ (lowest bit is 1; field contains `len << 1 | 1`)
+//             └──────────────────────────────┴─┘
+//   In this representation, there are no placeholders and `fmt::Arguments::as_str()` returns Some.
+//   The pointer points to the start of a static `str`. The length is given by `args as usize >> 1`.
+//   (The length of a `&str` is isize::MAX at most, so it always fits in a usize minus one bit.)
+//
+//   `fmt::Arguments::from_str()` constructs this representation from a `&'static str`.
+//
+// 2) Placeholders representation (e.g. format_args!("hello {name}\n"))
+//             ┌────────────────────────────────┐
+//   template: │           *const u8            │ ─▷ b"\x06hello \xC0\x01\n\x00"
+//             ├────────────────────────────────┤
+//   args:     │     &'a [Argument<'a>; _]     0│ (lower bit is 0 due to alignment of Argument type)
+//             └────────────────────────────────┘
+//   In this representation, the template is a byte sequence encoding both the literal string pieces
+//   and the placeholders (including their options/flags).
+//
+//   The `args` pointer points to an array of `fmt::Argument<'a>` values, of sufficient length to
+//   match the placeholders in the template.
+//
+//   `fmt::Arguments::new()` constructs this representation from a template byte slice and a slice
+//   of arguments. This function is unsafe, as the template is assumed to be valid and the args
+//   slice is assumed to have elements matching the template.
+//
+//   The template byte sequence is the concatenation of parts of the following types:
+//
+//   - Literal string piece:
+//         Pieces that must be formatted verbatim (e.g. "hello " and "\n" in "hello {name}\n")
+//         appear literally in the template byte sequence, prefixed by their length.
+//
+//         For pieces of up to 127 bytes, these are  represented as a single byte containing the
+//         length followed directly by the bytes of the string:
+//         ┌───┬────────────────────────────┐
+//         │len│    `len` bytes (utf-8)     │ (e.g. b"\x06hello ")
+//         └───┴────────────────────────────┘
+//
+//         For larger pieces up to u16::MAX bytes, these are  represented as a 0x80 followed by
+//         their length in 16-bit little endian, followed by the bytes of the string:
+//         ┌────┬─────────┬───────────────────────────┐
+//         │0x80│   len   │   `len` bytes (utf-8)     │ (e.g. b"\x80\x00\x01hello … ")
+//         └────┴─────────┴───────────────────────────┘
+//
+//         Longer pieces are split into multiple pieces of max u16::MAX bytes (at utf-8 boundaries).
+//
+//   - Placeholder:
+//         Placeholders (e.g. `{name}` in "hello {name}") are represented as a byte with the highest
+//         two bits set, followed by zero or more fields depending on the flags in the first byte:
+//         ┌──────────┬┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┬┄┄┄┄┄┄┄┄┄┄┄┬┄┄┄┄┄┄┄┄┄┄┄┬┄┄┄┄┄┄┄┄┄┄┄┐
+//         │0b11______│       flags       ┊   width   ┊ precision ┊ arg_index ┊ (e.g. b"\xC2\x05\0")
+//         └────││││││┴┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┴┄┄┄┄┄┄┄┄┄┄┄┴┄┄┄┄┄┄┄┄┄┄┄┴┄┄┄┄┄┄┄┄┄┄┄┘
+//              ││││││        32 bit          16 bit      16 bit      16 bit
+//              │││││└─ flags present
+//              ││││└─ width present
+//              │││└─ precision present
+//              ││└─ arg_index present
+//              │└─ width indirect
+//              └─ precision indirect
+//
+//         All fields other than the first byte are optional and only present when their
+//         corresponding flag is set in the first byte.
+//
+//         So, a fully default placeholder without any options is just a single byte:
+//         ┌──────────┐
+//         │0b11000000│ (b"\xC0")
+//         └──────────┘
+//
+//         The fields are stored as little endian.
+//
+//         The `flags` fields corresponds to the `flags` field of `FormattingOptions`.
+//         See doc comment of `FormattingOptions::flags` for details.
+//
+//         The `width` and `precision` fields correspond to their respective fields in
+//         `FormattingOptions`. However, if their "indirect" flag is set, the field contains the
+//         index in the `args` array where the dynamic width or precision is stored, rather than the
+//         value directly.
+//
+//         The `arg_index` field is the index into the `args` array for the argument to be
+//         formatted.
+//
+//         If omitted, the flags, width and precision of the default FormattingOptions::new() are
+//         used.
+//
+//         If the `arg_index` is omitted, the next argument in the `args` array is used (starting
+//         at 0).
+//
+//   - End:
+//         A single zero byte marks the end of the template:
+//         ┌───┐
+//         │ 0 │ ("\0")
+//         └───┘
+//
+//         (Note that a zero byte may also occur naturally as part of the string pieces or flags,
+//         width, precision and arg_index fields above. That is, the template byte sequence ends
+//         with a 0 byte, but isn't terminated by the first 0 byte.)
+//
 #[lang = "format_arguments"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Copy, Clone)]
 pub struct Arguments<'a> {
-    // Format string pieces to print.
-    pieces: &'a [&'static str],
-
-    // Placeholder specs, or `None` if all specs are default (as in "{}{}").
-    fmt: Option<&'a [rt::Placeholder]>,
-
-    // Dynamic arguments for interpolation, to be interleaved with string
-    // pieces. (Every argument is preceded by a string piece.)
-    args: &'a [rt::Argument<'a>],
+    template: NonNull<u8>,
+    args: NonNull<rt::Argument<'a>>,
 }
 
 /// Used by the format_args!() macro to create a fmt::Arguments object.
 #[doc(hidden)]
+#[rustc_diagnostic_item = "FmtArgumentsNew"]
 #[unstable(feature = "fmt_internals", issue = "none")]
 impl<'a> Arguments<'a> {
+    // SAFETY: The caller must ensure that the provided template and args encode a valid
+    // fmt::Arguments, as documented above.
     #[inline]
-    pub const fn new_const<const N: usize>(pieces: &'a [&'static str; N]) -> Self {
-        const { assert!(N <= 1) };
-        Arguments { pieces, fmt: None, args: &[] }
-    }
-
-    /// When using the format_args!() macro, this function is used to generate the
-    /// Arguments structure.
-    #[inline]
-    pub const fn new_v1<const P: usize, const A: usize>(
-        pieces: &'a [&'static str; P],
-        args: &'a [rt::Argument<'a>; A],
+    pub unsafe fn new<const N: usize, const M: usize>(
+        template: &'a [u8; N],
+        args: &'a [rt::Argument<'a>; M],
     ) -> Arguments<'a> {
-        const { assert!(P >= A && P <= A + 1, "invalid args") }
-        Arguments { pieces, fmt: None, args }
+        // SAFETY: Responsibility of the caller.
+        unsafe { Arguments { template: mem::transmute(template), args: mem::transmute(args) } }
     }
 
-    /// Specifies nonstandard formatting parameters.
-    ///
-    /// An `rt::UnsafeArg` is required because the following invariants must be held
-    /// in order for this function to be safe:
-    /// 1. The `pieces` slice must be at least as long as `fmt`.
-    /// 2. Every `rt::Placeholder::position` value within `fmt` must be a valid index of `args`.
-    /// 3. Every `rt::Count::Param` within `fmt` must contain a valid index of `args`.
+    // Same as `from_str`, but not const.
+    // Used by format_args!() expansion when arguments are inlined,
+    // e.g. format_args!("{}", 123), which is not allowed in const.
     #[inline]
-    pub const fn new_v1_formatted(
-        pieces: &'a [&'static str],
-        args: &'a [rt::Argument<'a>],
-        fmt: &'a [rt::Placeholder],
-        _unsafe_arg: rt::UnsafeArg,
-    ) -> Arguments<'a> {
-        Arguments { pieces, fmt: Some(fmt), args }
+    pub fn from_str_nonconst(s: &'static str) -> Arguments<'a> {
+        Arguments::from_str(s)
     }
+}
 
+#[doc(hidden)]
+#[unstable(feature = "fmt_internals", issue = "none")]
+impl<'a> Arguments<'a> {
     /// Estimates the length of the formatted text.
     ///
     /// This is intended to be used for setting initial `String` capacity
     /// when using `format!`. Note: this is neither the lower nor upper bound.
     #[inline]
     pub fn estimated_capacity(&self) -> usize {
-        let pieces_length: usize = self.pieces.iter().map(|x| x.len()).sum();
+        if let Some(s) = self.as_str() {
+            return s.len();
+        }
+        // Iterate over the template, counting the length of literal pieces.
+        let mut length = 0usize;
+        let mut starts_with_placeholder = false;
+        let mut template = self.template;
+        loop {
+            // SAFETY: We can assume the template is valid.
+            unsafe {
+                let n = template.read();
+                template = template.add(1);
+                if n == 0 {
+                    // End of template.
+                    break;
+                } else if n < 128 {
+                    // Short literal string piece.
+                    length += n as usize;
+                    template = template.add(n as usize);
+                } else if n == 128 {
+                    // Long literal string piece.
+                    let len = usize::from(u16::from_le_bytes(template.cast_array().read()));
+                    length += len;
+                    template = template.add(2 + len);
+                } else {
+                    assert_unchecked(n >= 0xC0);
+                    // Placeholder piece.
+                    if length == 0 {
+                        starts_with_placeholder = true;
+                    }
+                    // Skip remainder of placeholder:
+                    let skip = (n & 1 != 0) as usize * 4 // flags (32 bit)
+                        + (n & 2 != 0) as usize * 2  // width     (16 bit)
+                        + (n & 4 != 0) as usize * 2  // precision (16 bit)
+                        + (n & 8 != 0) as usize * 2; // arg_index (16 bit)
+                    template = template.add(skip as usize);
+                }
+            }
+        }
 
-        if self.args.is_empty() {
-            pieces_length
-        } else if !self.pieces.is_empty() && self.pieces[0].is_empty() && pieces_length < 16 {
-            // If the format string starts with an argument,
+        if starts_with_placeholder && length < 16 {
+            // If the format string starts with a placeholder,
             // don't preallocate anything, unless length
-            // of pieces is significant.
+            // of literal pieces is significant.
             0
         } else {
-            // There are some arguments, so any additional push
+            // There are some placeholders, so any additional push
             // will reallocate the string. To avoid that,
             // we're "pre-doubling" the capacity here.
-            pieces_length.checked_mul(2).unwrap_or(0)
+            length.wrapping_mul(2)
         }
     }
 }
 
 impl<'a> Arguments<'a> {
+    /// Create a `fmt::Arguments` object for a single static string.
+    ///
+    /// Formatting this `fmt::Arguments` will just produce the string as-is.
+    #[inline]
+    #[unstable(feature = "fmt_arguments_from_str", issue = "148905")]
+    pub const fn from_str(s: &'static str) -> Arguments<'a> {
+        // SAFETY: This is the "static str" representation of fmt::Arguments; see above.
+        unsafe {
+            Arguments {
+                template: mem::transmute(s.as_ptr()),
+                args: mem::transmute(s.len() << 1 | 1),
+            }
+        }
+    }
+
     /// Gets the formatted string, if it has no arguments to be formatted at runtime.
     ///
     /// This can be used to avoid allocations in some cases.
@@ -732,10 +869,22 @@ impl<'a> Arguments<'a> {
     #[must_use]
     #[inline]
     pub const fn as_str(&self) -> Option<&'static str> {
-        match (self.pieces, self.args) {
-            ([], []) => Some(""),
-            ([s], []) => Some(s),
-            _ => None,
+        // SAFETY: During const eval, `self.args` must have come from a usize,
+        // not a pointer, because that's the only way to create a fmt::Arguments in const.
+        // (I.e. only fmt::Arguments::from_str is const, fmt::Arguments::new is not.)
+        //
+        // Outside const eval, transmuting a pointer to a usize is fine.
+        let bits: usize = unsafe { mem::transmute(self.args) };
+        if bits & 1 == 1 {
+            // SAFETY: This fmt::Arguments stores a &'static str. See encoding documentation above.
+            Some(unsafe {
+                str::from_utf8_unchecked(crate::slice::from_raw_parts(
+                    self.template.as_ptr(),
+                    bits >> 1,
+                ))
+            })
+        } else {
+            None
         }
     }
 
@@ -885,21 +1034,23 @@ impl Display for Arguments<'_> {
 /// }";
 /// assert_eq!(format!("The origin is: {origin:#?}"), expected);
 /// ```
-
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented(
     on(
-        crate_local,
-        label = "`{Self}` cannot be formatted using `{{:?}}`",
-        note = "add `#[derive(Debug)]` to `{Self}` or manually `impl {Debug} for {Self}`"
+        all(crate_local, not(Self = "{union}")),
+        note = "add `#[derive(Debug)]` to `{Self}` or manually `impl {This} for {Self}`"
     ),
-    message = "`{Self}` doesn't implement `{Debug}`",
-    label = "`{Self}` cannot be formatted using `{{:?}}` because it doesn't implement `{Debug}`"
+    on(all(crate_local, Self = "{union}"), note = "manually `impl {This} for {Self}`"),
+    on(
+        from_desugaring = "FormatLiteral",
+        label = "`{Self}` cannot be formatted using `{{:?}}` because it doesn't implement `{This}`"
+    ),
+    message = "`{Self}` doesn't implement `{This}`"
 )]
 #[doc(alias = "{:?}")]
 #[rustc_diagnostic_item = "Debug"]
 #[rustc_trivial_field_reads]
-pub trait Debug {
+pub trait Debug: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     ///
     /// # Examples
@@ -963,6 +1114,20 @@ pub use macros::Debug;
 /// [tostring]: ../../std/string/trait.ToString.html
 /// [tostring_function]: ../../std/string/trait.ToString.html#tymethod.to_string
 ///
+/// # Completeness and parseability
+///
+/// `Display` for a type might not necessarily be a lossless or complete representation of the type.
+/// It may omit internal state, precision, or other information the type does not consider important
+/// for user-facing output, as determined by the type. As such, the output of `Display` might not be
+/// possible to parse, and even if it is, the result of parsing might not exactly match the original
+/// value.
+///
+/// However, if a type has a lossless `Display` implementation whose output is meant to be
+/// conveniently machine-parseable and not just meant for human consumption, then the type may wish
+/// to accept the same format in `FromStr`, and document that usage. Having both `Display` and
+/// `FromStr` implementations where the result of `Display` cannot be parsed with `FromStr` may
+/// surprise users.
+///
 /// # Internationalization
 ///
 /// Because a type can only have one `Display` implementation, it is often preferable
@@ -1004,19 +1169,22 @@ pub use macros::Debug;
 /// ```
 #[rustc_on_unimplemented(
     on(
-        any(_Self = "std::path::Path", _Self = "std::path::PathBuf"),
+        any(Self = "std::path::Path", Self = "std::path::PathBuf"),
         label = "`{Self}` cannot be formatted with the default formatter; call `.display()` on it",
         note = "call `.display()` or `.to_string_lossy()` to safely print paths, \
-                as they may contain non-Unicode data"
+                as they may contain non-Unicode data",
     ),
-    message = "`{Self}` doesn't implement `{Display}`",
-    label = "`{Self}` cannot be formatted with the default formatter",
-    note = "in format strings you may be able to use `{{:?}}` (or {{:#?}} for pretty-print) instead"
+    on(
+        from_desugaring = "FormatLiteral",
+        note = "in format strings you may be able to use `{{:?}}` (or {{:#?}} for pretty-print) instead",
+        label = "`{Self}` cannot be formatted with the default formatter",
+    ),
+    message = "`{Self}` doesn't implement `{This}`"
 )]
 #[doc(alias = "{}")]
 #[rustc_diagnostic_item = "Display"]
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait Display {
+pub trait Display: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     ///
     /// # Examples
@@ -1092,7 +1260,7 @@ pub trait Display {
 /// assert_eq!(format!("l as octal is: {l:#06o}"), "l as octal is: 0o0011");
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait Octal {
+pub trait Octal: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1151,7 +1319,7 @@ pub trait Octal {
 /// );
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait Binary {
+pub trait Binary: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1206,7 +1374,7 @@ pub trait Binary {
 /// assert_eq!(format!("l as hex is: {l:#010x}"), "l as hex is: 0x00000009");
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait LowerHex {
+pub trait LowerHex: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1261,7 +1429,7 @@ pub trait LowerHex {
 /// assert_eq!(format!("l as hex is: {l:#010X}"), "l as hex is: 0x7FFFFFFF");
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait UpperHex {
+pub trait UpperHex: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1320,7 +1488,7 @@ pub trait UpperHex {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "Pointer"]
-pub trait Pointer {
+pub trait Pointer: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1371,7 +1539,7 @@ pub trait Pointer {
 /// );
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait LowerExp {
+pub trait LowerExp: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1422,7 +1590,7 @@ pub trait LowerExp {
 /// );
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait UpperExp {
+pub trait UpperExp: PointeeSized {
     #[doc = include_str!("fmt_trait_method_doc.md")]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
@@ -1443,7 +1611,7 @@ pub trait UpperExp {
 ///
 /// let mut output = String::new();
 /// fmt::write(&mut output, format_args!("Hello {}!", "world"))
-///     .expect("Error occurred while trying to write in String");
+///     .expect("Writing to a `String` should not fail");
 /// assert_eq!(output, "Hello world!");
 /// ```
 ///
@@ -1454,92 +1622,119 @@ pub trait UpperExp {
 ///
 /// let mut output = String::new();
 /// write!(&mut output, "Hello {}!", "world")
-///     .expect("Error occurred while trying to write in String");
+///     .expect("Writing to a `String` should not fail");
 /// assert_eq!(output, "Hello world!");
 /// ```
 ///
 /// [`write!`]: crate::write!
 #[stable(feature = "rust1", since = "1.0.0")]
-pub fn write(output: &mut dyn Write, args: Arguments<'_>) -> Result {
-    let mut formatter = Formatter::new(output, FormattingOptions::new());
-    let mut idx = 0;
+pub fn write(output: &mut dyn Write, fmt: Arguments<'_>) -> Result {
+    if let Some(s) = fmt.as_str() {
+        return output.write_str(s);
+    }
 
-    match args.fmt {
-        None => {
-            // We can use default formatting parameters for all arguments.
-            for (i, arg) in args.args.iter().enumerate() {
-                // SAFETY: args.args and args.pieces come from the same Arguments,
-                // which guarantees the indexes are always within bounds.
-                let piece = unsafe { args.pieces.get_unchecked(i) };
-                if !piece.is_empty() {
-                    formatter.buf.write_str(*piece)?;
+    let mut template = fmt.template;
+    let args = fmt.args;
+
+    let mut arg_index = 0;
+
+    // See comment on `fmt::Arguments` for the details of how the template is encoded.
+
+    // This must match the encoding from `expand_format_args` in
+    // compiler/rustc_ast_lowering/src/format.rs.
+    loop {
+        // SAFETY: We can assume the template is valid.
+        let n = unsafe {
+            let n = template.read();
+            template = template.add(1);
+            n
+        };
+
+        if n == 0 {
+            // End of template.
+            return Ok(());
+        } else if n < 0x80 {
+            // Literal string piece of length `n`.
+
+            // SAFETY: We can assume the strings in the template are valid.
+            let s = unsafe {
+                let s = crate::str::from_raw_parts(template.as_ptr(), n as usize);
+                template = template.add(n as usize);
+                s
+            };
+            output.write_str(s)?;
+        } else if n == 0x80 {
+            // Literal string piece with a 16-bit length.
+
+            // SAFETY: We can assume the strings in the template are valid.
+            let s = unsafe {
+                let len = usize::from(u16::from_le_bytes(template.cast_array().read()));
+                template = template.add(2);
+                let s = crate::str::from_raw_parts(template.as_ptr(), len);
+                template = template.add(len);
+                s
+            };
+            output.write_str(s)?;
+        } else if n == 0xC0 {
+            // Placeholder for next argument with default options.
+            //
+            // Having this as a separate case improves performance for the common case.
+
+            // SAFETY: We can assume the template only refers to arguments that exist.
+            unsafe {
+                args.add(arg_index)
+                    .as_ref()
+                    .fmt(&mut Formatter::new(output, FormattingOptions::new()))?;
+            }
+            arg_index += 1;
+        } else {
+            // SAFETY: We can assume the template is valid.
+            unsafe { assert_unchecked(n > 0xC0) };
+
+            // Placeholder with custom options.
+
+            let mut opt = FormattingOptions::new();
+
+            // SAFETY: We can assume the template is valid.
+            unsafe {
+                if n & 1 != 0 {
+                    opt.flags = u32::from_le_bytes(template.cast_array().read());
+                    template = template.add(4);
                 }
-
-                // SAFETY: There are no formatting parameters and hence no
-                // count arguments.
+                if n & 2 != 0 {
+                    opt.width = u16::from_le_bytes(template.cast_array().read());
+                    template = template.add(2);
+                }
+                if n & 4 != 0 {
+                    opt.precision = u16::from_le_bytes(template.cast_array().read());
+                    template = template.add(2);
+                }
+                if n & 8 != 0 {
+                    arg_index = usize::from(u16::from_le_bytes(template.cast_array().read()));
+                    template = template.add(2);
+                }
+            }
+            if n & 16 != 0 {
+                // Dynamic width from a usize argument.
+                // SAFETY: We can assume the template only refers to arguments that exist.
                 unsafe {
-                    arg.fmt(&mut formatter)?;
+                    opt.width = args.add(opt.width as usize).as_ref().as_u16().unwrap_unchecked();
                 }
-                idx += 1;
             }
-        }
-        Some(fmt) => {
-            // Every spec has a corresponding argument that is preceded by
-            // a string piece.
-            for (i, arg) in fmt.iter().enumerate() {
-                // SAFETY: fmt and args.pieces come from the same Arguments,
-                // which guarantees the indexes are always within bounds.
-                let piece = unsafe { args.pieces.get_unchecked(i) };
-                if !piece.is_empty() {
-                    formatter.buf.write_str(*piece)?;
+            if n & 32 != 0 {
+                // Dynamic precision from a usize argument.
+                // SAFETY: We can assume the template only refers to arguments that exist.
+                unsafe {
+                    opt.precision =
+                        args.add(opt.precision as usize).as_ref().as_u16().unwrap_unchecked();
                 }
-                // SAFETY: arg and args.args come from the same Arguments,
-                // which guarantees the indexes are always within bounds.
-                unsafe { run(&mut formatter, arg, args.args) }?;
-                idx += 1;
             }
-        }
-    }
 
-    // There can be only one trailing string piece left.
-    if let Some(piece) = args.pieces.get(idx) {
-        formatter.buf.write_str(*piece)?;
-    }
-
-    Ok(())
-}
-
-unsafe fn run(fmt: &mut Formatter<'_>, arg: &rt::Placeholder, args: &[rt::Argument<'_>]) -> Result {
-    let (width, precision) =
-        // SAFETY: arg and args come from the same Arguments,
-        // which guarantees the indexes are always within bounds.
-        unsafe { (getcount(args, &arg.width), getcount(args, &arg.precision)) };
-
-    let options = FormattingOptions { flags: arg.flags, width, precision };
-
-    // Extract the correct argument
-    debug_assert!(arg.position < args.len());
-    // SAFETY: arg and args come from the same Arguments,
-    // which guarantees its index is always within bounds.
-    let value = unsafe { args.get_unchecked(arg.position) };
-
-    // Set all the formatting options.
-    fmt.options = options;
-
-    // Then actually do some printing
-    // SAFETY: this is a placeholder argument.
-    unsafe { value.fmt(fmt) }
-}
-
-unsafe fn getcount(args: &[rt::Argument<'_>], cnt: &rt::Count) -> u16 {
-    match *cnt {
-        rt::Count::Is(n) => n,
-        rt::Count::Implied => 0,
-        rt::Count::Param(i) => {
-            debug_assert!(i < args.len());
-            // SAFETY: cnt and args come from the same Arguments,
-            // which guarantees this index is always within bounds.
-            unsafe { args.get_unchecked(i).as_u16().unwrap_unchecked() }
+            // SAFETY: We can assume the template only refers to arguments that exist.
+            unsafe {
+                args.add(arg_index).as_ref().fmt(&mut Formatter::new(output, opt))?;
+            }
+            arg_index += 1;
         }
     }
 }
@@ -1812,7 +2007,13 @@ impl<'a> Formatter<'a> {
                 // SAFETY: Per the precondition.
                 unsafe { self.write_formatted_parts(&formatted) }
             } else {
-                let post_padding = self.padding(width - len as u16, Alignment::Right)?;
+                // Padding widths are capped at `u16`, so reaching this branch means
+                // the formatted output is also shorter than `u16::MAX`.
+                let len = match u16::try_from(len) {
+                    Ok(len) => len,
+                    Err(_) => unreachable!(),
+                };
+                let post_padding = self.padding(width - len, Alignment::Right)?;
                 // SAFETY: Per the precondition.
                 unsafe {
                     self.write_formatted_parts(&formatted)?;
@@ -2376,6 +2577,21 @@ impl<'a> Formatter<'a> {
         builder.finish()
     }
 
+    /// Shrinks `derive(Debug)` code, for faster compilation and smaller binaries.
+    /// For C-like enums with concatenated variant name strings.
+    #[doc(hidden)]
+    #[unstable(feature = "fmt_helpers_for_derive", issue = "none")]
+    pub fn debug_c_like_enum_write_str<'b>(
+        &'b mut self,
+        names: &str,
+        offset: &[usize],
+        discr: usize,
+    ) -> Result {
+        let start = offset[discr];
+        let end = offset[discr + 1];
+        self.write_str(&names[start..end])
+    }
+
     /// Creates a `DebugTuple` builder designed to assist with creation of
     /// `fmt::Debug` implementations for tuple structs.
     ///
@@ -2667,11 +2883,11 @@ macro_rules! fmt_refs {
     ($($tr:ident),*) => {
         $(
         #[stable(feature = "rust1", since = "1.0.0")]
-        impl<T: ?Sized + $tr> $tr for &T {
+        impl<T: PointeeSized + $tr> $tr for &T {
             fn fmt(&self, f: &mut Formatter<'_>) -> Result { $tr::fmt(&**self, f) }
         }
         #[stable(feature = "rust1", since = "1.0.0")]
-        impl<T: ?Sized + $tr> $tr for &mut T {
+        impl<T: PointeeSized + $tr> $tr for &mut T {
             fn fmt(&self, f: &mut Formatter<'_>) -> Result { $tr::fmt(&**self, f) }
         }
         )*
@@ -2740,7 +2956,7 @@ impl Debug for str {
             let mut chars = rest.chars();
             if let Some(c) = chars.next() {
                 let esc = c.escape_debug_ext(EscapeDebugExtArgs {
-                    escape_grapheme_extended: true,
+                    escape_grapheme_extender: true,
                     escape_single_quote: false,
                     escape_double_quote: true,
                 });
@@ -2772,7 +2988,7 @@ impl Debug for char {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.write_char('\'')?;
         let esc = self.escape_debug_ext(EscapeDebugExtArgs {
-            escape_grapheme_extended: true,
+            escape_grapheme_extender: true,
             escape_single_quote: true,
             escape_double_quote: false,
         });
@@ -2787,28 +3003,27 @@ impl Display for char {
         if f.options.flags & (flags::WIDTH_FLAG | flags::PRECISION_FLAG) == 0 {
             f.write_char(*self)
         } else {
-            f.pad(self.encode_utf8(&mut [0; MAX_LEN_UTF8]))
+            f.pad(self.encode_utf8(&mut [0; char::MAX_LEN_UTF8]))
         }
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Pointer for *const T {
+impl<T: PointeeSized> Pointer for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        if <<T as core::ptr::Pointee>::Metadata as core::unit::IsUnit>::is_unit() {
-            pointer_fmt_inner(self.expose_provenance(), f)
+        // Since the formatting will be identical for all pointer types, erase the pointee type and
+        // metadata type to reduce the amount of codegen work needed for each distinct type.
+        let ptr: *const T = *self;
+        let ptr_addr = ptr.expose_provenance();
+        if <<T as core::ptr::Pointee>::Metadata as core::unit::IsUnit>::IS_UNIT {
+            pointer_fmt_inner(ptr_addr, f)
         } else {
-            f.debug_struct("Pointer")
-                .field_with("addr", |f| pointer_fmt_inner(self.expose_provenance(), f))
-                .field("metadata", &core::ptr::metadata(*self))
-                .finish()
+            wide_pointer_fmt_inner(ptr_addr, &core::ptr::metadata(ptr), f)
         }
     }
 }
 
-/// Since the formatting will be identical for all pointer types, uses a
-/// non-monomorphized implementation for the actual formatting to reduce the
-/// amount of codegen work needed.
+/// Formats an address in `fmt::Pointer` style.
 ///
 /// This uses `ptr_addr: usize` and not `ptr: *const ()` to be able to use this for
 /// `fn(...) -> ...` without using [problematic] "Oxford Casts".
@@ -2837,22 +3052,30 @@ pub(crate) fn pointer_fmt_inner(ptr_addr: usize, f: &mut Formatter<'_>) -> Resul
     ret
 }
 
+/// Formats a wide pointer (address and type-erased metadata) in `fmt::Pointer` style.
+fn wide_pointer_fmt_inner(ptr_addr: usize, metadata: &dyn Debug, f: &mut Formatter<'_>) -> Result {
+    f.debug_struct("Pointer")
+        .field_with("addr", move |f| pointer_fmt_inner(ptr_addr, f))
+        .field("metadata", metadata)
+        .finish()
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Pointer for *mut T {
+impl<T: PointeeSized> Pointer for *mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(*self as *const T), f)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Pointer for &T {
+impl<T: PointeeSized> Pointer for &T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(*self as *const T), f)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Pointer for &mut T {
+impl<T: PointeeSized> Pointer for &mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(&**self as *const T), f)
     }
@@ -2861,13 +3084,13 @@ impl<T: ?Sized> Pointer for &mut T {
 // Implementation of Display/Debug for various core types
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Debug for *const T {
+impl<T: PointeeSized> Debug for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(self, f)
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Debug for *mut T {
+impl<T: PointeeSized> Debug for *mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(self, f)
     }
@@ -2883,7 +3106,7 @@ macro_rules! tuple {
         maybe_tuple_doc! {
             $($name)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($name:Debug),+> Debug for ($($name,)+) where last_type!($($name,)+): ?Sized {
+            impl<$($name:Debug),+> Debug for ($($name,)+) {
                 #[allow(non_snake_case, unused_assignments)]
                 fn fmt(&self, f: &mut Formatter<'_>) -> Result {
                     let mut builder = f.debug_tuple("");
@@ -2912,11 +3135,6 @@ macro_rules! maybe_tuple_doc {
         #[$meta]
         $item
     };
-}
-
-macro_rules! last_type {
-    ($a:ident,) => { $a };
-    ($a:ident, $($rest_a:ident,)+) => { last_type!($($rest_a,)+) };
 }
 
 tuple! { E, D, C, B, A, Z, Y, X, W, V, U, T, }

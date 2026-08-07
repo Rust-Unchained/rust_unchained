@@ -1,16 +1,18 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use rustc_codegen_ssa::CodegenResults;
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::{CompiledModules, CrateInfo};
 use rustc_data_structures::svh::Svh;
+use rustc_errors::timings::TimingSection;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_middle::dep_graph::DepGraph;
+use rustc_metadata::EncodedMetadata;
+use rustc_middle::dep_graph::{DepGraph, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::Session;
 use rustc_session::config::{self, OutputFilenames, OutputType};
+use rustc_session::{IncrCompSession, Session};
 
-use crate::errors::FailedWritingFile;
+use crate::diagnostics::FailedWritingFile;
 use crate::passes;
 
 pub struct Linker {
@@ -18,6 +20,8 @@ pub struct Linker {
     output_filenames: Arc<OutputFilenames>,
     // Only present when incr. comp. is enabled.
     crate_hash: Option<Svh>,
+    crate_info: CrateInfo,
+    metadata: EncodedMetadata,
     ongoing_codegen: Box<dyn Any>,
 }
 
@@ -26,31 +30,95 @@ impl Linker {
         tcx: TyCtxt<'_>,
         codegen_backend: &dyn CodegenBackend,
     ) -> Linker {
-        let ongoing_codegen = passes::start_codegen(codegen_backend, tcx);
+        let (ongoing_codegen, crate_info, metadata) = passes::start_codegen(codegen_backend, tcx);
 
         Linker {
             dep_graph: tcx.dep_graph.clone(),
             output_filenames: Arc::clone(tcx.output_filenames(())),
-            crate_hash: if tcx.needs_crate_hash() {
+            crate_hash: if tcx.sess.opts.incremental.is_some() {
                 Some(tcx.crate_hash(LOCAL_CRATE))
             } else {
                 None
             },
+            crate_info,
+            metadata,
             ongoing_codegen,
         }
     }
 
-    pub fn link(self, sess: &Session, codegen_backend: &dyn CodegenBackend) {
-        let (codegen_results, work_products) = sess.time("finish_ongoing_codegen", || {
-            codegen_backend.join_codegen(self.ongoing_codegen, sess, &self.output_filenames)
+    pub fn link(
+        self,
+        sess: &Session,
+        incr_comp_session: Option<IncrCompSession>,
+        codegen_backend: &dyn CodegenBackend,
+    ) {
+        let (compiled_modules, mut work_products) = sess.time("finish_ongoing_codegen", || {
+            match self.ongoing_codegen.downcast::<CompiledModules>() {
+                // This was a check only build
+                Ok(compiled_modules) => (*compiled_modules, WorkProductMap::default()),
+
+                Err(ongoing_codegen) => codegen_backend.join_codegen(
+                    ongoing_codegen,
+                    sess,
+                    incr_comp_session.as_ref(),
+                    &self.output_filenames,
+                    &self.crate_info,
+                ),
+            }
         });
 
-        sess.dcx().abort_if_errors();
+        if sess.codegen_units().as_usize() == 1 && sess.opts.unstable_opts.time_llvm_passes {
+            codegen_backend.print_pass_timings()
+        }
+
+        if sess.print_llvm_stats() {
+            codegen_backend.print_statistics()
+        }
+
+        if let Some(out_path) = sess.print_llvm_stats_json() {
+            let llvm_stats_json = codegen_backend.print_statistics_json();
+
+            if !llvm_stats_json.is_empty() {
+                if let Err(e) = std::fs::write(&out_path, llvm_stats_json) {
+                    sess.dcx().err(format!("failed to write stats to {}: {}", out_path, e));
+                }
+            } else {
+                sess.dcx().warn(format!(
+                    "requested to print LLVM statistics to JSON file {}, but the codegen backend \
+                    did not provide any statistics",
+                    out_path,
+                ));
+            }
+        }
+
+        sess.timings.end_section(sess.dcx(), TimingSection::Codegen);
+
+        if sess.opts.incremental.is_some()
+            && let Some(path) = self.metadata.path()
+        {
+            let (id, product) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
+                sess,
+                incr_comp_session.as_ref().unwrap(),
+                "metadata",
+                &[("rmeta", path)],
+                &[],
+            );
+            work_products.insert(id, product);
+        }
+
+        if let Some(guar) = sess.dcx().has_errors_or_delayed_bugs() {
+            guar.raise_fatal();
+        }
 
         let _timer = sess.timer("link");
 
         sess.time("serialize_work_products", || {
-            rustc_incremental::save_work_product_index(sess, &self.dep_graph, work_products)
+            rustc_incremental::save_work_product_index(
+                sess,
+                incr_comp_session.as_ref(),
+                &self.dep_graph,
+                work_products,
+            )
         });
 
         let prof = sess.prof.clone();
@@ -58,7 +126,7 @@ impl Linker {
 
         // Now that we won't touch anything in the incremental compilation directory
         // any more, we can finalize it (which involves renaming it)
-        rustc_incremental::finalize_session_directory(sess, self.crate_hash);
+        rustc_incremental::finalize_session_directory(sess, incr_comp_session, self.crate_hash);
 
         if !sess
             .opts
@@ -71,11 +139,13 @@ impl Linker {
 
         if sess.opts.unstable_opts.no_link {
             let rlink_file = self.output_filenames.with_extension(config::RLINK_EXT);
-            CodegenResults::serialize_rlink(
+            CompiledModules::serialize_rlink(
                 sess,
                 &rlink_file,
-                &codegen_results,
-                &*self.output_filenames,
+                &compiled_modules,
+                &self.crate_info,
+                &self.metadata,
+                &self.output_filenames,
             )
             .unwrap_or_else(|error| {
                 sess.dcx().emit_fatal(FailedWritingFile { path: &rlink_file, error })
@@ -84,6 +154,13 @@ impl Linker {
         }
 
         let _timer = sess.prof.verbose_generic_activity("link_crate");
-        codegen_backend.link(sess, codegen_results, &self.output_filenames)
+        let _timing = sess.timings.section_guard(sess.dcx(), TimingSection::Linking);
+        codegen_backend.link(
+            sess,
+            compiled_modules,
+            self.crate_info,
+            self.metadata,
+            &self.output_filenames,
+        )
     }
 }

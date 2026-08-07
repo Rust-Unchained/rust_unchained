@@ -2,35 +2,34 @@
 // compiled with multiple codegen units. (see #39160)
 
 //@ compile-flags:-g -Ccodegen-units=2
+//@ disable-gdb-pretty-printers
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===============================================================
 
-// gdb-command:run
+//@ gdb-command:run
 
-// gdb-command:print xxx
-// gdb-check:$1 = 12345
-// gdb-command:continue
+//@ gdb-command:print xxx
+//@ gdb-check:$1 = 12345
+//@ gdb-command:continue
 
-// gdb-command:print yyy
-// gdb-check:$2 = 67890
-// gdb-command:continue
+//@ gdb-command:print yyy
+//@ gdb-check:$2 = 67890
+//@ gdb-command:continue
 
 
 // === LLDB TESTS ==============================================================
 
-// lldb-command:run
+//@ lldb-command:run
 
-// lldb-command:v xxx
-// lldb-check:[...] 12345
-// lldb-command:continue
+//@ lldb-command:v xxx
+//@ lldb-check:[...] 12345
+//@ lldb-command:continue
 
-// lldb-command:v yyy
-// lldb-check:[...] 67890
-// lldb-command:continue
+//@ lldb-command:v yyy
+//@ lldb-check:[...] 67890
+//@ lldb-command:continue
 
-
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 mod a {
     pub fn foo(xxx: u32) {

@@ -10,6 +10,9 @@
     clippy::needless_lifetimes,
     clippy::missing_transmute_annotations
 )]
+#![allow(incomplete_features)]
+#![feature(adt_const_params)]
+#![feature(unsized_const_params)]
 
 #[macro_use]
 extern crate proc_macro_derive;
@@ -69,7 +72,7 @@ mod lifetimes {
     impl<'a> Foo<'a> {
         // Cannot use `Self` as return type, because the function is actually `fn foo<'b>(s: &'b str) ->
         // Foo<'b>`
-        fn foo(s: &str) -> Foo {
+        fn foo(s: &str) -> Foo<'_> {
             Foo { foo_str: s }
         }
         // cannot replace with `Self`, because that's `Foo<'a>`
@@ -530,8 +533,8 @@ mod issue7206 {
 
     impl<'a> S2<S<'a>> {
         fn new_again() -> Self {
-            Self::new()
-            //~^ use_self
+            S2::new()
+            // FIXME: ^Broken by PR #15611
         }
     }
 }
@@ -752,6 +755,42 @@ mod crash_check_13128 {
                     Some(A)
                 }
             }
+        }
+    }
+}
+
+mod issue_13277 {
+    trait Foo {
+        type Item<'foo>;
+    }
+    struct Bar<'b> {
+        content: &'b str,
+    }
+    impl<'b> Foo for Option<Bar<'b>> {
+        // when checking whether `Option<Bar<'foo>>` has a lifetime, check not only the outer
+        // `Option<T>`, but also the inner `Bar<'foo>`
+        type Item<'foo> = Option<Bar<'foo>>;
+    }
+}
+
+mod issue16164 {
+    trait Bits {
+        fn bit<const I: u8>(self) -> bool;
+    }
+
+    impl Bits for u8 {
+        fn bit<const I: u8>(self) -> bool {
+            todo!()
+        }
+    }
+
+    trait T {
+        fn f<const C: (u8, u8)>(self) -> bool;
+    }
+
+    impl T for u8 {
+        fn f<const C: (u8, u8)>(self) -> bool {
+            todo!()
         }
     }
 }

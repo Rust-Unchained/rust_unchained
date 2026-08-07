@@ -1,13 +1,7 @@
 // FIXME: Ideally these suggestions would be fixed via rustfix. Blocked by rust-lang/rust#53934
 //@no-rustfix
 #![warn(clippy::significant_drop_in_scrutinee)]
-#![allow(dead_code, unused_assignments)]
-#![allow(
-    clippy::match_single_binding,
-    clippy::single_match,
-    clippy::uninlined_format_args,
-    clippy::needless_lifetimes
-)]
+#![expect(clippy::match_single_binding, clippy::single_match)]
 
 use std::num::ParseIntError;
 use std::ops::Deref;
@@ -191,7 +185,7 @@ struct CounterWrapper<'a> {
 }
 
 impl<'a> CounterWrapper<'a> {
-    fn new(counter: &Counter) -> CounterWrapper {
+    fn new(counter: &Counter) -> CounterWrapper<'_> {
         counter.i.fetch_add(1, Ordering::Relaxed);
         CounterWrapper { counter }
     }
@@ -204,7 +198,7 @@ impl<'a> Drop for CounterWrapper<'a> {
 }
 
 impl Counter {
-    fn temp_increment(&self) -> Vec<CounterWrapper> {
+    fn temp_increment(&self) -> Vec<CounterWrapper<'_>> {
         vec![CounterWrapper::new(self), CounterWrapper::new(self)]
     }
 }
@@ -480,7 +474,7 @@ impl StateWithBoxedMutexGuard {
     fn new() -> StateWithBoxedMutexGuard {
         StateWithBoxedMutexGuard { u: Mutex::new(42) }
     }
-    fn lock(&self) -> Box<MutexGuard<u64>> {
+    fn lock(&self) -> Box<MutexGuard<'_, u64>> {
         Box::new(self.u.lock().unwrap())
     }
 }
@@ -507,7 +501,7 @@ impl StateStringWithBoxedMutexGuard {
             s: Mutex::new("A String".to_owned()),
         }
     }
-    fn lock(&self) -> Box<MutexGuard<String>> {
+    fn lock(&self) -> Box<MutexGuard<'_, String>> {
         Box::new(self.s.lock().unwrap())
     }
 }
@@ -686,11 +680,11 @@ struct Guard<'a, T>(MutexGuard<'a, T>);
 struct Ref<'a, T>(&'a T);
 
 impl<'a, T> Guard<'a, T> {
-    fn guard(&self) -> &MutexGuard<T> {
+    fn guard(&self) -> &MutexGuard<'_, T> {
         &self.0
     }
 
-    fn guard_ref(&self) -> Ref<MutexGuard<T>> {
+    fn guard_ref(&self) -> Ref<'_, MutexGuard<'_, T>> {
         Ref(&self.0)
     }
 

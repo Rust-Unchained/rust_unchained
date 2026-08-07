@@ -1,12 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::SpanRangeExt;
-use clippy_utils::ty::is_normalizable;
-use clippy_utils::{expr_or_init, match_def_path, path_def_id, paths, std_or_core};
+use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::source::SpanExt;
+use clippy_utils::{expr_or_init, std_or_core, sym};
 use rustc_ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, GenericArg, Mutability, QPath, Ty, TyKind};
 use rustc_lint::LateContext;
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 use super::MANUAL_DANGLING_PTR;
 
@@ -15,6 +15,8 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, from: &Expr<'_>, to: 
         let init_expr = expr_or_init(cx, from);
         if is_expr_const_aligned(cx, init_expr, ptr_ty.ty)
             && let Some(std_or_core) = std_or_core(cx)
+            && let pointee_ty = cx.typeck_results().node_type(ptr_ty.ty.hir_id)
+            && pointee_ty.is_sized(cx.tcx, cx.typing_env())
         {
             let sugg_fn = match ptr_ty.mutbl {
                 Mutability::Not => "ptr::dangling",
@@ -23,7 +25,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, from: &Expr<'_>, to: 
 
             let sugg = if let TyKind::Infer(()) = ptr_ty.ty.kind {
                 format!("{std_or_core}::{sugg_fn}()")
-            } else if let Some(mut_ty_snip) = ptr_ty.ty.span.get_source_text(cx) {
+            } else if let Some(mut_ty_snip) = ptr_ty.ty.span.get_text(cx) {
                 format!("{std_or_core}::{sugg_fn}::<{mut_ty_snip}>()")
             } else {
                 return;
@@ -47,15 +49,14 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, from: &Expr<'_>, to: 
 fn is_expr_const_aligned(cx: &LateContext<'_>, expr: &Expr<'_>, to: &Ty<'_>) -> bool {
     match expr.kind {
         ExprKind::Call(fun, _) => is_align_of_call(cx, fun, to),
-        ExprKind::Lit(lit) => is_literal_aligned(cx, lit, to),
+        ExprKind::Lit(lit) => is_literal_aligned(cx, &lit, to),
         _ => false,
     }
 }
 
 fn is_align_of_call(cx: &LateContext<'_>, fun: &Expr<'_>, to: &Ty<'_>) -> bool {
     if let ExprKind::Path(QPath::Resolved(_, path)) = fun.kind
-        && let Some(fun_id) = path_def_id(cx, fun)
-        && match_def_path(cx, fun_id, &paths::ALIGN_OF)
+        && fun.basic_res().is_diag_item(cx, sym::mem_align_of)
         && let Some(args) = path.segments.last().and_then(|seg| seg.args)
         && let [GenericArg::Type(generic_ty)] = args.args
     {
@@ -71,12 +72,10 @@ fn is_literal_aligned(cx: &LateContext<'_>, lit: &Spanned<LitKind>, to: &Ty<'_>)
         return false;
     }
     let to_mid_ty = cx.typeck_results().node_type(to.hir_id);
-    is_normalizable(cx, cx.param_env, to_mid_ty)
-        && cx
-            .tcx
-            .layout_of(cx.typing_env().as_query_input(to_mid_ty))
-            .is_ok_and(|layout| {
-                let align = u128::from(layout.align.abi.bytes());
-                u128::from(val) <= align
-            })
+    cx.tcx
+        .layout_of(cx.typing_env().as_query_input(to_mid_ty))
+        .is_ok_and(|layout| {
+            let align = u128::from(layout.align.bytes());
+            u128::from(val) <= align
+        })
 }

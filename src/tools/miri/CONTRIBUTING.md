@@ -3,28 +3,42 @@
 If you want to hack on Miri yourself, great!  Here are some resources you might
 find useful.
 
+## AI policy
+
+Before opening a PR or issue, please note our AI policy:
+
+* Using LLMs privately (any use where the output is not part of what you submit to Miri) is allowed.
+* Using LLMs to generate code, documentation, or text that you post in a PR or issue is disallowed, except:
+  - Machine translation is okay, but we recommend tools like https://www.deepl.com/ instead of general-purpose LLMs to reduce the chance of the meaning of the text being altered by the translation.
+  - For issues, it's okay to have a clearly separated LLM-generated section, but the rest of the issue without that section must be written and verified by you personally and must stand on its own.
+  - For PRs, if a Miri maintainer has previously agreed to mentor you, it's okay to submit LLM-generated code and have it reviewed by that maintainer. The PR needs to clearly indicate that it contains LLM-generated code and who the mentor is, and the PR description needs to be written and verified by you personally.
+
+If you have any doubts or questions, please come talk to us on [Zulip].
+
+[Zulip]: https://rust-lang.zulipchat.com/#narrow/channel/269128-miri
+
 ## Getting started
 
 Check out the issues on this GitHub repository for some ideas. In particular,
 look for the green `E-*` labels which mark issues that should be rather
 well-suited for onboarding. For more ideas or help with hacking on Miri, you can
-contact us on the [Rust Zulip]. See the [Rust website](https://www.rust-lang.org/governance/teams/compiler#team-miri)
+contact us on the [Rust Zulip][Zulip]. See the [Rust website](https://www.rust-lang.org/governance/teams/compiler#team-miri)
 for a list of Miri maintainers.
 
-[Rust Zulip]: https://rust-lang.zulipchat.com
-
-### Pull review process
+### PR review process
 
 When you get a review, please take care of the requested changes in new commits. Do not amend
 existing commits. Generally avoid force-pushing. The only time you should force push is when there
 is a conflict with the master branch (in that case you should rebase across master, not merge), and
 all the way at the end of the review process when the reviewer tells you that the PR is done and you
-should squash the commits. For the latter case, use `git rebase --keep-base ...` to squash without
-changing the base commit your PR branches off of. Use your own judgment and the reviewer's guidance
-to decide whether the PR should be squashed into a single commit or multiple logically separate
-commits. (All this is to work around the fact that Github is quite bad at dealing with force pushes
-and does not support `git range-diff`. Maybe one day Github will be good at git and then life can
-become easier.)
+should squash the commits. (All this is to work around the fact that Github is quite bad at
+dealing with force pushes and does not support `git range-diff`.)
+
+The recommended way to squash commits is to use `./miri squash`, which will make everything into a
+single commit. You will be asked for the commit message; please ensure it describes the entire PR.
+You can also use `git rebase` manually if you need more control (e.g. if there should be more than
+one commit at the end), but then please use `--keep-base` to ensure the PR remains based on the same
+upstream commit.
 
 Most PRs bounce back and forth between the reviewer and the author several times, so it is good to
 keep track of who is expected to take the next step. We are using the `S-waiting-for-review` and
@@ -63,6 +77,23 @@ process for such contributions:
 
 This process is largely informal, and its primary goal is to more clearly communicate expectations.
 Please get in touch with us if you have any questions!
+
+## Scope of Miri shims
+
+Miri has "shims" to implement functionality that is usually implemented in C libraries which are
+invoked from Rust code, such as opening files or spawning threads, as well as for
+CPU-vendor-provided SIMD intrinsics. However, the set of C functions that Rust code invokes this way
+is enormous, and for obvious reasons we have no intention of implementing every C API ever written
+in Miri.
+
+At the moment, the general guideline for "could this function have a shim in Miri" is: we will
+generally only add shims for functions that can be implemented in a portable way using just what is
+provided by the Rust standard library. The function should also be reasonably widely-used in Rust
+code to justify the review and maintenance effort (i.e. the easier the function is to implement, the
+lower the barrier). Other than that, we might make exceptions for certain cases if (a) there is a
+good case for why Miri should support those APIs, and (b) robust and widely-used portable libraries
+exist in the Rust ecosystem. We will generally not add shims to Miri that would require Miri to
+directly interact with platform-specific APIs (such as `libc` or `windows-sys`).
 
 ## Preparing the build environment
 
@@ -152,14 +183,25 @@ MIRI_LOG=rustc_mir::interpret=info,miri::stacked_borrows ./miri run tests/pass/v
 ```
 
 Note that you will only get `info`, `warn` or `error` messages if you use a prebuilt compiler.
-In order to get `debug` and `trace` level messages, you need to build miri with a locally built
-compiler that has `debug=true` set in `bootstrap.toml`.
+In order to get `debug` and `trace` level messages, you need to build miri with a [locally built
+compiler](#advanced-topic-building-miri-against-a-locally-compiled-rustc) that has `debug=true` set in `bootstrap.toml`.
 
 #### Debugging error messages
 
 You can set `MIRI_BACKTRACE=1` to get a backtrace of where an
 evaluation error was originally raised.
 
+#### Tracing
+
+You can generate a Chrome trace file from a Miri execution by passing `--features=tracing` during the
+build and then setting `MIRI_TRACING=1` when running Miri. This will generate a `.json` file that
+you can visualize in [Perfetto](https://ui.perfetto.dev/). For example:
+
+```sh
+MIRI_TRACING=1 ./miri run --features=tracing tests/pass/hello.rs
+```
+
+See [doc/tracing.md](./doc/tracing.md) for more information.
 
 ### UI testing
 
@@ -244,6 +286,12 @@ when installing the Miri toolchain. Alternatively, set the `RUSTUP_TOOLCHAIN` en
 
 [`etc/rust_analyzer_helix.toml`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_helix.toml
 
+### Zed
+
+Copy [`etc/rust_analyzer_zed.json`] to `.zed/settings.json` in the project root directory.
+
+[`etc/rust_analyzer_zed.json`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_zed.json
+
 ### Advanced configuration
 
 If you are building Miri with a locally built rustc, set
@@ -284,16 +332,43 @@ You can also directly run Miri on a Rust source file:
 ./x.py run miri --stage 1 --args src/tools/miri/tests/pass/hello.rs
 ```
 
+## Advanced topic: Building Miri against a locally compiled rustc
+
+Very rarely, it can be necessary to work with an out-of-tree Miri but build it against a rustc that
+was locally compiled. (Usually, you should instead work on the Miri that's in the Rust tree, as
+described in the previous subsection.)
+
+This requires a fully bootstrapped build:
+
+```sh
+# Build rustc, then build rustc with that rustc. This can take a while.
+./x build library --stage 3
+```
+
+You also need to set up a linked toolchain with rustup:
+
+```sh
+rustup toolchain link stage2 build/host/stage2
+```
+
+Then in the Miri folder, you can set this as the current toolchain and build against it:
+
+```sh
+rustup override set stage2
+# Prevent `./miri` from reseting the toolchain.
+export MIRI_AUTO_OPS=no
+```
+
 ## Advanced topic: Syncing with the rustc repo
 
-We use the [`josh` proxy](https://github.com/josh-project/josh) to transmit changes between the
+We use the [`josh-sync`](https://github.com/rust-lang/josh-sync) tool to transmit changes between the
 rustc and Miri repositories. You can install it as follows:
 
 ```sh
-cargo +stable install josh-proxy --git https://github.com/josh-project/josh --tag r24.10.04
+cargo install --locked --git https://github.com/rust-lang/josh-sync
 ```
 
-Josh will automatically be started and stopped by `./miri`.
+The commands below will automatically install and manage the [Josh](https://github.com/josh-project/josh) proxy that performs the actual work.
 
 ### Importing changes from the rustc repo
 
@@ -301,10 +376,12 @@ Josh will automatically be started and stopped by `./miri`.
 
 We assume we start on an up-to-date master branch in the Miri repo.
 
+1) First, create a branch for the pull, e.g. `git checkout -b rustup`
+2) Then run the following:
 ```sh
 # Fetch and merge rustc side of the history. Takes ca 5 min the first time.
 # This will also update the `rustc-version` file.
-./miri rustc-pull
+rustc-josh-sync pull
 # Update local toolchain and apply formatting.
 ./miri toolchain && ./miri fmt
 git commit -am "rustup"
@@ -317,12 +394,12 @@ needed.
 
 ### Exporting changes to the rustc repo
 
-We will use the josh proxy to push to your fork of rustc. Run the following in the Miri repo,
+We will use the `josh-sync` tool to push to your fork of rustc. Run the following in the Miri repo,
 assuming we are on an up-to-date master branch:
 
 ```sh
 # Push the Miri changes to your rustc fork (substitute your github handle for YOUR_NAME).
-./miri rustc-push YOUR_NAME miri
+rustc-josh-sync push miri YOUR_NAME
 ```
 
 This will create a new branch called `miri` in your fork, and the output should include a link that
@@ -332,7 +409,7 @@ you need to pull rustc changes into Miri first, and then re-do the rustc push.
 If this fails due to authentication problems, it can help to make josh push via ssh instead of
 https. Add the following to your `.gitconfig`:
 
-```toml
+```text
 [url "git@github.com:"]
     pushInsteadOf = https://github.com/
 ```
@@ -341,6 +418,7 @@ https. Add the following to your `.gitconfig`:
 
 The following environment variables are relevant to `./miri`:
 
+* `CARGO` sets the binary used to execute Cargo; if none is specified, defaults to `cargo`.
 * `MIRI_AUTO_OPS` indicates whether the automatic execution of rustfmt, clippy and toolchain setup
   (as controlled by the `./auto-*` files) should be skipped. If it is set to `no`, they are skipped.
   This is used to allow automated IDE actions to avoid the auto ops.

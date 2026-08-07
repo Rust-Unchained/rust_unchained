@@ -1,4 +1,5 @@
 use rustc_abi::ExternAbi;
+use rustc_ast::InlineAsmOptions;
 use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
 use rustc_middle::mir::*;
 use rustc_middle::query::{LocalCrate, Providers};
@@ -8,7 +9,7 @@ use rustc_session::lint::builtin::FFI_UNWIND_CALLS;
 use rustc_target::spec::PanicStrategy;
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 
 // Check if the body of this def_id can possibly leak a foreign unwind into Rust code.
 fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
@@ -46,6 +47,34 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
             continue;
         }
         let Some(terminator) = &block.terminator else { continue };
+
+        if let TerminatorKind::InlineAsm { options, .. } = &terminator.kind {
+            if options.contains(InlineAsmOptions::MAY_UNWIND) {
+                // We have detected an inline asm block that can possibly leak foreign unwind.
+                //
+                // Because the function body itself can unwind, we are not aborting this function call
+                // upon unwind, so this call can possibly leak foreign unwind into Rust code if the
+                // panic runtime linked is panic-abort.
+
+                let lint_root = body.source_scopes[terminator.source_info.scope]
+                    .local_data
+                    .as_ref()
+                    .unwrap_crate_local()
+                    .lint_root;
+                let span = terminator.source_info.span;
+
+                tcx.emit_node_span_lint(
+                    FFI_UNWIND_CALLS,
+                    lint_root,
+                    span,
+                    diagnostics::AsmUnwindCall { span },
+                );
+
+                tainted = true;
+            }
+            continue;
+        }
+
         let TerminatorKind::Call { func, .. } = &terminator.kind else { continue };
 
         let ty = func.ty(body, tcx);
@@ -90,7 +119,7 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
                 FFI_UNWIND_CALLS,
                 lint_root,
                 span,
-                errors::FfiUnwindCall { span, foreign },
+                diagnostics::FfiUnwindCall { span, foreign },
             );
 
             tainted = true;
@@ -101,12 +130,15 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
 }
 
 fn required_panic_strategy(tcx: TyCtxt<'_>, _: LocalCrate) -> Option<PanicStrategy> {
+    let local_strategy = tcx.sess.panic_strategy();
+
     if tcx.is_panic_runtime(LOCAL_CRATE) {
-        return Some(tcx.sess.panic_strategy());
+        return Some(local_strategy);
     }
 
-    if tcx.sess.panic_strategy() == PanicStrategy::Abort {
-        return Some(PanicStrategy::Abort);
+    match local_strategy {
+        PanicStrategy::Abort | PanicStrategy::ImmediateAbort => return Some(local_strategy),
+        _ => {}
     }
 
     for def_id in tcx.hir_body_owners() {

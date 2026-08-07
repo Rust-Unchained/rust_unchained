@@ -4,18 +4,14 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
-use shared_helpers::{
-    dylib_path, dylib_path_var, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
-    parse_value_from_args,
+use shim_utils::{
+    ArgFileCommand, collect_args, dylib_path, dylib_path_var, maybe_dump, parse_rustc_stage,
+    parse_rustc_verbose, parse_value_from_args,
 };
 
-#[path = "../utils/shared_helpers.rs"]
-mod shared_helpers;
-
 fn main() {
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let args = collect_args();
 
     let stage = parse_rustc_stage();
     let verbose = parse_rustc_verbose();
@@ -31,7 +27,7 @@ fn main() {
     let mut dylib_path = dylib_path();
     dylib_path.insert(0, PathBuf::from(libdir.clone()));
 
-    let mut cmd = Command::new(rustdoc);
+    let mut cmd = ArgFileCommand::new(rustdoc);
 
     if target.is_some() {
         // The stage0 compiler has a special sysroot distinct from what we
@@ -39,6 +35,12 @@ fn main() {
         // unless one is already set.
         if !args.iter().any(|arg| arg == "--sysroot") {
             cmd.arg("--sysroot").arg(&sysroot);
+        }
+    } else {
+        // Find any host flags that were passed by bootstrap.
+        // The flags are stored in a RUSTC_HOST_FLAGS variable, separated by spaces.
+        if let Ok(flags) = std::env::var("RUSTC_HOST_FLAGS") {
+            cmd.args(flags.split(' '));
         }
     }
 
@@ -56,11 +58,27 @@ fn main() {
     // Thus, if we are on stage 0, we explicitly set `--cfg=bootstrap`.
     // We also declare that the flag is expected, which we need to do to not
     // get warnings about it being unexpected.
-    if stage == "0" {
+    if stage == 0 {
         cmd.arg("--cfg=bootstrap");
     }
 
-    maybe_dump(format!("stage{stage}-rustdoc"), &cmd);
+    if let Some(crate_name) = parse_value_from_args(&args, "--crate-name") {
+        // Add rust logo and set html root for all rustc crates.
+        if crate_name.starts_with("rustc_") {
+            cmd.arg("-Ainternal_features")
+                .arg("-Zcrate-attr=doc(rust_logo)")
+                .arg("-Zcrate-attr=doc(html_root_url = \"https://doc.rust-lang.org/nightly/nightly-rustc/\")");
+
+            // rustc_proc_macro is another build of library/proc_macro which already enables this
+            // feature
+            if crate_name != "rustc_proc_macro" {
+                cmd.arg("-Zcrate-attr=feature(rustdoc_internals)");
+            }
+        }
+    }
+
+    let (mut cmd, arg_file) = cmd.build().unwrap();
+    maybe_dump(format!("stage{}-rustdoc", stage + 1), &cmd);
 
     if verbose > 1 {
         eprintln!(
@@ -73,7 +91,10 @@ fn main() {
         eprintln!("libdir: {libdir:?}");
     }
 
-    std::process::exit(match cmd.status() {
+    let status = cmd.status();
+    drop(arg_file);
+
+    std::process::exit(match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => panic!("\n\nfailed to run {cmd:?}: {e}\n\n"),
     })

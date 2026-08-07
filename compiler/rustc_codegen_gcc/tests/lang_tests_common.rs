@@ -2,11 +2,10 @@
 
 #![allow(clippy::uninlined_format_args)]
 
-use std::env::{self, current_dir};
+use std::env::current_dir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use boml::Toml;
 use lang_tester::LangTester;
 use tempfile::TempDir;
 
@@ -23,27 +22,6 @@ pub fn main_inner(profile: Profile) {
     let current_dir = current_dir().expect("current dir");
     let current_dir = current_dir.to_str().expect("current dir").to_string();
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    let gcc_path = std::fs::read_to_string(manifest_dir.join("config.toml"))
-        .ok()
-        .and_then(|v| {
-            let toml = Toml::parse(&v).expect("Failed to parse `config.toml`");
-            toml.get_string("gcc-path").map(PathBuf::from).ok()
-        })
-        .unwrap_or_else(|| {
-            // then we try to retrieve it from the `target` folder.
-            let commit = include_str!("../libgccjit.version").trim();
-            Path::new("build/libgccjit").join(commit)
-        });
-
-    let gcc_path = Path::new(&gcc_path)
-        .canonicalize()
-        .expect("failed to get absolute path of `gcc-path`")
-        .display()
-        .to_string();
-    env::set_var("LD_LIBRARY_PATH", gcc_path);
-
     fn rust_filter(path: &Path) -> bool {
         path.is_file() && path.extension().expect("extension").to_str().expect("to_str") == "rs"
     }
@@ -55,10 +33,10 @@ pub fn main_inner(profile: Profile) {
 
     #[cfg(not(feature = "master"))]
     fn filter(filename: &Path) -> bool {
-        if let Some(filename) = filename.to_str() {
-            if filename.ends_with("gep.rs") {
-                return false;
-            }
+        if let Some(filename) = filename.to_str()
+            && filename.ends_with("gep.rs")
+        {
+            return false;
         }
         rust_filter(filename)
     }
@@ -67,15 +45,14 @@ pub fn main_inner(profile: Profile) {
         .test_dir("tests/run")
         .test_path_filter(filter)
         .test_extract(|path| {
-            let lines = std::fs::read_to_string(path)
+            std::fs::read_to_string(path)
                 .expect("read file")
                 .lines()
                 .skip_while(|l| !l.starts_with("//"))
                 .take_while(|l| l.starts_with("//"))
                 .map(|l| &l[2..])
                 .collect::<Vec<_>>()
-                .join("\n");
-            lines
+                .join("\n")
         })
         .test_cmds(move |path| {
             // Test command 1: Compile `x.rs` into `tempdir/x`.
@@ -96,14 +73,14 @@ pub fn main_inner(profile: Profile) {
                 path.to_str().expect("to_str"),
             ]);
 
-            // TODO(antoyo): find a way to send this via a cli argument.
+            // FIXME(antoyo): find a way to send this via a cli argument.
             let test_target = std::env::var("CG_GCC_TEST_TARGET");
             if let Ok(ref target) = test_target {
                 compiler.args(["--target", target]);
                 let linker = format!("{}-gcc", target);
                 compiler.args(&[format!("-Clinker={}", linker)]);
                 let mut env_path = std::env::var("PATH").unwrap_or_default();
-                // TODO(antoyo): find a better way to add the PATH necessary locally.
+                // FIXME(antoyo): find a better way to add the PATH necessary locally.
                 env_path = format!("/opt/m68k-unknown-linux-gnu/bin:{}", env_path);
                 compiler.env("PATH", env_path);
             }
@@ -114,7 +91,19 @@ pub fn main_inner(profile: Profile) {
                 }
             }
             match profile {
-                Profile::Debug => {}
+                Profile::Debug => {
+                    if test_target.is_ok() {
+                        // m68k doesn't have lubsan for now
+                        compiler.args(["-C", "llvm-args=sanitize-undefined"]);
+                    } else {
+                        compiler.args([
+                            "-C",
+                            "llvm-args=sanitize-undefined",
+                            "-C",
+                            "link-args=-lubsan",
+                        ]);
+                    }
+                }
                 Profile::Release => {
                     compiler.args(["-C", "opt-level=3", "-C", "lto=no"]);
                 }

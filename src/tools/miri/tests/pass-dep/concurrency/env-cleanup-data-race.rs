@@ -1,4 +1,4 @@
-//@compile-flags: -Zmiri-disable-isolation -Zmiri-preemption-rate=0
+//@compile-flags: -Zmiri-disable-isolation -Zmiri-deterministic-concurrency
 //@ignore-target: windows # No libc env support on Windows
 
 use std::ffi::CStr;
@@ -8,7 +8,7 @@ fn main() {
     unsafe {
         thread::spawn(|| {
             // Access the environment in another thread without taking the env lock
-            let s = libc::getenv("MIRI_ENV_VAR_TEST\0".as_ptr().cast());
+            let s = libc::getenv(c"MIRI_ENV_VAR_TEST".as_ptr());
             if s.is_null() {
                 panic!("null");
             }

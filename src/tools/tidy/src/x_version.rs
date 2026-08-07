@@ -3,12 +3,18 @@ use std::process::{Command, Stdio};
 
 use semver::Version;
 
-pub fn check(root: &Path, cargo: &Path, bad: &mut bool) {
+use crate::diagnostics::{CheckId, TidyCtx};
+
+pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx.start_check(CheckId::new("x_version").path(root));
     let cargo_list = Command::new(cargo).args(["install", "--list"]).stdout(Stdio::piped()).spawn();
 
     let child = match cargo_list {
         Ok(child) => child,
-        Err(e) => return tidy_error!(bad, "failed to run `cargo`: {}", e),
+        Err(e) => {
+            check.error(format!("failed to run `cargo`: {e}"));
+            return;
+        }
     };
 
     let cargo_list = child.wait_with_output().unwrap();
@@ -25,12 +31,12 @@ pub fn check(root: &Path, cargo: &Path, bad: &mut bool) {
                 if let Some(version) = iter.next() {
                     // Check this is the rust-lang/rust x tool installation since it should be
                     // installed at a path containing `src/tools/x`.
-                    if let Some(path) = iter.next() {
-                        if path.contains(&"src/tools/x") {
-                            let version = version.strip_prefix("v").unwrap();
-                            installed = Some(Version::parse(version).unwrap());
-                            break;
-                        }
+                    if let Some(path) = iter.next()
+                        && path.contains("src/tools/x")
+                    {
+                        let version = version.strip_prefix("v").unwrap();
+                        installed = Some(Version::parse(version).unwrap());
+                        break;
                     };
                 }
             } else {
@@ -42,18 +48,15 @@ pub fn check(root: &Path, cargo: &Path, bad: &mut bool) {
 
         if let Some(expected) = get_x_wrapper_version(root, cargo) {
             if installed < expected {
-                return println!(
+                println!(
                     "Current version of x is {installed}, but the latest version is {expected}\nConsider updating to the newer version of x by running `cargo install --path src/tools/x`"
-                );
+                )
             }
         } else {
-            return tidy_error!(
-                bad,
-                "Unable to parse the latest version of `x` at `src/tools/x/Cargo.toml`"
-            );
+            check.error("Unable to parse the latest version of `x` at `src/tools/x/Cargo.toml`")
         }
     } else {
-        tidy_error!(bad, "failed to check version of `x`: {}", cargo_list.status)
+        check.error(format!("failed to check version of `x`: {}", cargo_list.status))
     }
 }
 

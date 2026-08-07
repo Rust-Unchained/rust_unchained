@@ -1,9 +1,8 @@
 #![feature(prelude_import)]
 #![no_std]
+extern crate std;
 #[prelude_import]
 use ::std::prelude::rust_2015::*;
-#[macro_use]
-extern crate std;
 // Test for issue 80832
 //
 //@ pretty-mode:expanded

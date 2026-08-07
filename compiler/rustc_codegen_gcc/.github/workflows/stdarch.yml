@@ -38,10 +38,10 @@ jobs:
     - name: Install packages
       run: sudo apt-get install ninja-build ripgrep
 
-    # TODO: remove when we have binutils version 2.43 in the repo.
+    # FIXME: remove when we have binutils version 2.43 in the repo.
     - name: Install more recent binutils
       run: |
-        echo "deb http://archive.ubuntu.com/ubuntu oracular main universe" | sudo tee /etc/apt/sources.list.d/oracular-copies.list
+        echo "deb http://archive.ubuntu.com/ubuntu plucky main universe" | sudo tee /etc/apt/sources.list.d/plucky-copies.list
         sudo apt-get update
         sudo apt-get install binutils
 
@@ -50,30 +50,25 @@ jobs:
       run: |
           mkdir intel-sde
           cd intel-sde
-          dir=sde-external-9.33.0-2024-01-07-lin
+          version=10.8.0-2026-03-15
+          url_path=915934
+          dir=sde-external-$version-lin
           file=$dir.tar.xz
-          wget https://downloadmirror.intel.com/813591/$file
+          wget https://downloadmirror.intel.com/$url_path/$file
           tar xvf $file
           sudo mkdir /usr/share/intel-sde
           sudo cp -r $dir/* /usr/share/intel-sde
           sudo ln -s /usr/share/intel-sde/sde /usr/bin/sde
           sudo ln -s /usr/share/intel-sde/sde64 /usr/bin/sde64
 
-    - name: Set env
+    - name: Set config
       run: |
-        echo "workspace="$GITHUB_WORKSPACE >> $GITHUB_ENV
         echo 'download-gccjit = true' > config.toml
 
     - name: Build
       run: |
         ./y.sh prepare --only-libcore
         ./y.sh build --sysroot --release --release-sysroot
-
-    - name: Set env (part 2)
-      run: |
-        # Set the `LD_LIBRARY_PATH` and `LIBRARY_PATH` env variables...
-        echo "LD_LIBRARY_PATH="$(./y.sh info | grep -v Using) >> $GITHUB_ENV
-        echo "LIBRARY_PATH="$(./y.sh info | grep -v Using) >> $GITHUB_ENV
 
     - name: Clean
       if: ${{ !matrix.cargo_runner }}
@@ -90,7 +85,7 @@ jobs:
       if: ${{ !matrix.cargo_runner }}
       run: |
         ./y.sh test --release --clean --release-sysroot --build-sysroot --mini-tests --std-tests --test-libcore
-        cargo test
+        ./y.sh test --cargo-tests
 
     - name: Run stdarch tests
       if: ${{ !matrix.cargo_runner }}
@@ -101,9 +96,8 @@ jobs:
       if: ${{ matrix.cargo_runner }}
       run: |
         # FIXME: these tests fail when the sysroot is compiled with LTO because of a missing symbol in proc-macro.
-        # TODO: remove --skip test_mm512_stream_ps when stdarch is updated in rustc.
-        # TODO: remove --skip test_tile_ when it's implemented.
-        STDARCH_TEST_EVERYTHING=1 CHANNEL=release CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="${{ matrix.cargo_runner }}" TARGET=x86_64-unknown-linux-gnu CG_RUSTFLAGS="-Ainternal_features --cfg stdarch_intel_sde" ./y.sh cargo test --manifest-path build/build_sysroot/sysroot_src/library/stdarch/Cargo.toml -- --skip rtm --skip tbm --skip sse4a --skip test_mm512_stream_ps --skip test_tile_
+        # FIXME: remove --skip test_tile_ when it's implemented.
+        STDARCH_TEST_SKIP_FUNCTION="xsave,xsaveopt,xsave64,xsaveopt64" STDARCH_TEST_EVERYTHING=1 CHANNEL=release CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="${{ matrix.cargo_runner }}" TARGET=x86_64-unknown-linux-gnu CG_RUSTFLAGS="-Ainternal_features" ./y.sh cargo test --manifest-path build/build_sysroot/sysroot_src/library/stdarch/Cargo.toml -- --skip rtm --skip tbm --skip sse4a --skip test_tile_
 
   # Summary job for the merge queue.
   # ALL THE PREVIOUS JOBS NEED TO BE ADDED TO THE `needs` SECTION OF THIS JOB!

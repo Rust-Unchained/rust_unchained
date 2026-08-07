@@ -1,23 +1,32 @@
-use chalk_ir::{AdtId, TyKind};
+use base_db::target::TargetData;
 use either::Either;
-use hir_def::db::DefDatabase;
-use project_model::{toolchain_info::QueryConfig, Sysroot};
+use hir_def::{
+    DefWithBodyId, HasModule,
+    expr_store::Body,
+    signatures::{
+        EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature, UnionSignature,
+    },
+};
+use project_model::{Sysroot, toolchain_info::QueryConfig};
 use rustc_hash::FxHashMap;
+use rustc_type_ir::inherent::GenericArgs as _;
 use syntax::ToSmolStr;
 use test_fixture::WithFixture;
 use triomphe::Arc;
 
 use crate::{
+    InferenceResult, ParamEnvAndCrate,
     db::HirDatabase,
     layout::{Layout, LayoutError},
+    next_solver::{DbInterner, GenericArgs},
+    setup_tracing,
     test_db::TestDB,
-    Interner, Substitution,
 };
 
 mod closure;
 
-fn current_machine_data_layout() -> String {
-    project_model::toolchain_info::target_data_layout::get(
+fn current_machine_target_data() -> TargetData {
+    project_model::toolchain_info::target_data::get(
         QueryConfig::Rustc(&Sysroot::empty(), &std::env::current_dir().unwrap()),
         None,
         &FxHashMap::default(),
@@ -29,7 +38,9 @@ fn eval_goal(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     minicore: &str,
 ) -> Result<Arc<Layout>, LayoutError> {
-    let target_data_layout = current_machine_data_layout();
+    let _tracing = setup_tracing();
+    let target_data = current_machine_target_data();
+    let target_data_layout = target_data.data_layout;
     let ra_fixture = format!(
         "//- target_data_layout: {target_data_layout}\n{minicore}//- /main.rs crate:test\n{ra_fixture}",
     );
@@ -38,27 +49,32 @@ fn eval_goal(
     let adt_or_type_alias_id = file_ids
         .into_iter()
         .find_map(|file_id| {
-            let module_id = db.module_for_file(file_id.file_id());
+            let module_id = db.module_for_file(file_id.file_id(&db));
             let def_map = module_id.def_map(&db);
-            let scope = &def_map[module_id.local_id].scope;
+            let scope = &def_map[module_id].scope;
             let adt_or_type_alias_id = scope.declarations().find_map(|x| match x {
                 hir_def::ModuleDefId::AdtId(x) => {
                     let name = match x {
-                        hir_def::AdtId::StructId(x) => {
-                            db.struct_data(x).name.display_no_db(file_id.edition()).to_smolstr()
-                        }
-                        hir_def::AdtId::UnionId(x) => {
-                            db.union_data(x).name.display_no_db(file_id.edition()).to_smolstr()
-                        }
-                        hir_def::AdtId::EnumId(x) => {
-                            db.enum_data(x).name.display_no_db(file_id.edition()).to_smolstr()
-                        }
+                        hir_def::AdtId::StructId(x) => StructSignature::of(&db, x)
+                            .name
+                            .display_no_db(file_id.edition(&db))
+                            .to_smolstr(),
+                        hir_def::AdtId::UnionId(x) => UnionSignature::of(&db, x)
+                            .name
+                            .display_no_db(file_id.edition(&db))
+                            .to_smolstr(),
+                        hir_def::AdtId::EnumId(x) => EnumSignature::of(&db, x)
+                            .name
+                            .display_no_db(file_id.edition(&db))
+                            .to_smolstr(),
                     };
                     (name == "Goal").then_some(Either::Left(x))
                 }
                 hir_def::ModuleDefId::TypeAliasId(x) => {
-                    let name =
-                        db.type_alias_data(x).name.display_no_db(file_id.edition()).to_smolstr();
+                    let name = TypeAliasSignature::of(&db, x)
+                        .name
+                        .display_no_db(file_id.edition(&db))
+                        .to_smolstr();
                     (name == "Goal").then_some(Either::Right(x))
                 }
                 _ => None,
@@ -66,21 +82,26 @@ fn eval_goal(
             Some(adt_or_type_alias_id)
         })
         .unwrap();
-    let goal_ty = match adt_or_type_alias_id {
-        Either::Left(adt_id) => {
-            TyKind::Adt(AdtId(adt_id), Substitution::empty(Interner)).intern(Interner)
-        }
-        Either::Right(ty_id) => {
-            db.ty(ty_id.into()).substitute(Interner, &Substitution::empty(Interner))
-        }
-    };
-    db.layout_of_ty(
-        goal_ty,
-        db.trait_environment(match adt_or_type_alias_id {
+    crate::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        let goal_ty = match adt_or_type_alias_id {
+            Either::Left(adt_id) => crate::next_solver::Ty::new_adt(
+                interner,
+                adt_id,
+                GenericArgs::identity_for_item(interner, adt_id.into()),
+            ),
+            Either::Right(ty_id) => db.ty(ty_id.into()).instantiate_identity().skip_norm_wip(),
+        };
+        let param_env = db.trait_environment(match adt_or_type_alias_id {
             Either::Left(adt) => hir_def::GenericDefId::AdtId(adt),
             Either::Right(ty) => hir_def::GenericDefId::TypeAliasId(ty),
-        }),
-    )
+        });
+        let krate = match adt_or_type_alias_id {
+            Either::Left(it) => it.krate(&db),
+            Either::Right(it) => it.krate(&db),
+        };
+        db.layout_of_ty(goal_ty.store(), ParamEnvAndCrate { param_env, krate }.store())
+    })
 }
 
 /// A version of `eval_goal` for types that can not be expressed in ADTs, like closures and `impl Trait`
@@ -88,35 +109,43 @@ fn eval_expr(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     minicore: &str,
 ) -> Result<Arc<Layout>, LayoutError> {
-    let target_data_layout = current_machine_data_layout();
+    let _tracing = setup_tracing();
+    let target_data = current_machine_target_data();
+    let target_data_layout = target_data.data_layout;
     let ra_fixture = format!(
         "//- target_data_layout: {target_data_layout}\n{minicore}//- /main.rs crate:test\nfn main(){{let goal = {{{ra_fixture}}};}}",
     );
 
     let (db, file_id) = TestDB::with_single_file(&ra_fixture);
-    let module_id = db.module_for_file(file_id.file_id());
-    let def_map = module_id.def_map(&db);
-    let scope = &def_map[module_id.local_id].scope;
-    let function_id = scope
-        .declarations()
-        .find_map(|x| match x {
-            hir_def::ModuleDefId::FunctionId(x) => {
-                let name = db.function_data(x).name.display_no_db(file_id.edition()).to_smolstr();
-                (name == "main").then_some(x)
-            }
-            _ => None,
-        })
-        .unwrap();
-    let hir_body = db.body(function_id.into());
-    let b = hir_body
-        .bindings
-        .iter()
-        .find(|x| x.1.name.display_no_db(file_id.edition()).to_smolstr() == "goal")
-        .unwrap()
-        .0;
-    let infer = db.infer(function_id.into());
-    let goal_ty = infer.type_of_binding[b].clone();
-    db.layout_of_ty(goal_ty, db.trait_environment(function_id.into()))
+    crate::attach_db(&db, || {
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let def_map = module_id.def_map(&db);
+        let scope = &def_map[module_id].scope;
+        let function_id = scope
+            .declarations()
+            .find_map(|x| match x {
+                hir_def::ModuleDefId::FunctionId(x) => {
+                    let name = FunctionSignature::of(&db, x)
+                        .name
+                        .display_no_db(file_id.edition(&db))
+                        .to_smolstr();
+                    (name == "main").then_some(x)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let hir_body = Body::of(&db, function_id.into());
+        let b = hir_body
+            .bindings()
+            .find(|x| x.1.name.display_no_db(file_id.edition(&db)).to_smolstr() == "goal")
+            .unwrap()
+            .0;
+        let infer = InferenceResult::of(&db, DefWithBodyId::from(function_id));
+        let goal_ty = infer.type_of_binding[b].clone();
+        let param_env = db.trait_environment(function_id.into());
+        let krate = function_id.krate(&db);
+        db.layout_of_ty(goal_ty, ParamEnvAndCrate { param_env, krate }.store())
+    })
 }
 
 #[track_caller]
@@ -128,7 +157,7 @@ fn check_size_and_align(
 ) {
     let l = eval_goal(ra_fixture, minicore).unwrap();
     assert_eq!(l.size.bytes(), size, "size mismatch");
-    assert_eq!(l.align.abi.bytes(), align, "align mismatch");
+    assert_eq!(l.align.bytes(), align, "align mismatch");
 }
 
 #[track_caller]
@@ -140,7 +169,7 @@ fn check_size_and_align_expr(
 ) {
     let l = eval_expr(ra_fixture, minicore).unwrap();
     assert_eq!(l.size.bytes(), size, "size mismatch");
-    assert_eq!(l.align.abi.bytes(), align, "align mismatch");
+    assert_eq!(l.align.bytes(), align, "align mismatch");
 }
 
 #[track_caller]
@@ -149,6 +178,7 @@ fn check_fail(#[rust_analyzer::rust_fixture] ra_fixture: &str, e: LayoutError) {
     assert_eq!(r, Err(e));
 }
 
+#[rust_analyzer::macro_style(braces)]
 macro_rules! size_and_align {
     (minicore: $($x:tt),*;$($t:tt)*) => {
         {
@@ -285,6 +315,18 @@ fn repr_packed() {
 }
 
 #[test]
+fn multiple_repr_attrs() {
+    size_and_align!(
+        #[repr(C)]
+        #[repr(packed)]
+        struct Goal {
+            id: i32,
+            u: u8,
+        }
+    )
+}
+
+#[test]
 fn generic() {
     size_and_align! {
         struct Pair<A, B>(A, B);
@@ -339,6 +381,11 @@ struct Goal(Foo<S>);
 
 #[test]
 fn simd_types() {
+    let size = 16;
+    #[cfg(not(target_arch = "s390x"))]
+    let align = 16;
+    #[cfg(target_arch = "s390x")]
+    let align = 8;
     check_size_and_align(
         r#"
             #[repr(simd)]
@@ -346,8 +393,8 @@ fn simd_types() {
             struct Goal(SimdType);
         "#,
         "",
-        16,
-        16,
+        size,
+        align,
     );
 }
 
@@ -394,6 +441,7 @@ fn return_position_impl_trait() {
             // but rustc actually runs this code.
             let pinned = pin!(inp);
             struct EmptyWaker;
+            #[expect(clippy::manual_noop_waker, reason = "we don't have access to std here")]
             impl Wake for EmptyWaker {
                 fn wake(self: Arc<Self>) {
                 }
@@ -469,12 +517,39 @@ fn tuple() {
 }
 
 #[test]
+fn tuple_ptr_with_dst_tail() {
+    size_and_align!(
+        struct Goal(*const ([u8],));
+    );
+    size_and_align!(
+        struct Goal(*const (u128, [u8]));
+    );
+}
+
+#[test]
 fn non_zero_and_non_null() {
     size_and_align! {
         minicore: non_zero, non_null, option;
         use core::{num::NonZeroU8, ptr::NonNull};
         struct Goal(Option<NonZeroU8>, Option<NonNull<i32>>);
     }
+    check_size_and_align(
+        r#"
+    const END: usize = 10;
+    struct Goal(core::pattern_type!(usize is 0..=END));
+        "#,
+        "//- minicore: pat\n",
+        8,
+        8,
+    );
+    check_size_and_align(
+        r#"
+pub struct Goal(core::pattern_type!(i32 is ..0 | 1..));
+    "#,
+        "//- minicore: pat\n",
+        4,
+        4,
+    );
 }
 
 #[test]
@@ -490,10 +565,7 @@ fn niche_optimization() {
 }
 
 #[test]
-fn const_eval() {
-    size_and_align! {
-        struct Goal([i32; 2 + 2]);
-    }
+fn const_eval_simple() {
     size_and_align! {
         const X: usize = 5;
         struct Goal([i32; X]);
@@ -504,6 +576,13 @@ fn const_eval() {
         }
         struct Ar<T>([T; foo::BAR]);
         struct Goal(Ar<Ar<i32>>);
+    }
+}
+
+#[test]
+fn const_eval_complex() {
+    size_and_align! {
+        struct Goal([i32; 2 + 2]);
     }
     size_and_align! {
         type Goal = [u8; 2 + 2];
@@ -529,6 +608,13 @@ fn enums_with_discriminants() {
     size_and_align! {
         enum Goal {
             A = 1, // This one is (perhaps surprisingly) zero sized.
+        }
+    }
+    size_and_align! {
+        #[allow(overflowing_literals, clippy::enum_clike_unportable_variant)]
+        enum Goal {
+            A = 0,
+            B = 0x8000_0000_0000_0001, // Wraps around to a negative discriminant.
         }
     }
 }

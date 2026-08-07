@@ -8,12 +8,11 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_span::{FileName, FileNameDisplayPreference, RealFileName, sym};
+use rustc_span::{FileName, RealFileName, RemapPathScopeComponents};
 use tracing::info;
 
-use super::highlight;
-use super::layout::{self, BufDisplay};
 use super::render::Context;
+use super::{highlight, layout};
 use crate::clean;
 use crate::clean::utils::has_doc_flag;
 use crate::docfs::PathError;
@@ -149,7 +148,10 @@ impl DocVisitor<'_> for SourceCollector<'_, '_> {
                         span,
                         format!(
                             "failed to render source code for `{filename}`: {e}",
-                            filename = filename.to_string_lossy(FileNameDisplayPreference::Local),
+                            filename = filename
+                                .path(RemapPathScopeComponents::DIAGNOSTICS)
+                                .to_string_lossy()
+                                .into_owned(),
                         ),
                     );
                     false
@@ -186,7 +188,7 @@ impl SourceCollector<'_, '_> {
         };
 
         // Remove the utf-8 BOM if any
-        let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+        let contents = contents.trim_prefix('\u{feff}');
 
         let shared = &self.cx.shared;
         // Create the intermediate directories
@@ -225,34 +227,34 @@ impl SourceCollector<'_, '_> {
         cur.push(&fname);
 
         let title = format!("{} - source", src_fname.to_string_lossy());
-        let desc = format!(
-            "Source of the Rust file `{}`.",
-            file.to_string_lossy(FileNameDisplayPreference::Remapped)
-        );
+        let desc = format!("Source of the Rust file `{}`.", p.to_string_lossy());
         let page = layout::Page {
             title: &title,
+            short_title: &src_fname.to_string_lossy(),
             css_class: "src",
             root_path: &root_path,
             static_root_path: shared.static_root_path.as_deref(),
             description: &desc,
             resource_suffix: &shared.resource_suffix,
-            rust_logo: has_doc_flag(self.cx.tcx(), LOCAL_CRATE.as_def_id(), sym::rust_logo),
+            rust_logo: has_doc_flag(self.cx.tcx(), LOCAL_CRATE.as_def_id(), |d| {
+                d.rust_logo.is_some()
+            }),
         };
         let source_context = SourceContext::Standalone { file_path };
         let v = layout::render(
             &shared.layout,
             &page,
             "",
-            BufDisplay(|buf: &mut String| {
+            fmt::from_fn(|f| {
                 print_src(
-                    buf,
+                    f,
                     contents,
                     file_span,
                     self.cx,
                     &root_path,
                     &highlight::DecorationInfo::default(),
                     &source_context,
-                );
+                )
             }),
             &shared.style_files,
         );
@@ -331,7 +333,7 @@ pub(crate) fn print_src(
     root_path: &str,
     decoration_info: &highlight::DecorationInfo,
     source_context: &SourceContext<'_>,
-) {
+) -> fmt::Result {
     let mut lines = s.lines().count();
     let line_info = if let SourceContext::Embedded(info) = source_context {
         highlight::LineInfo::new_scraped(lines as u32, info.offset as u32)
@@ -342,19 +344,30 @@ pub(crate) fn print_src(
         lines += line_info.start_line as usize;
     }
     let code = fmt::from_fn(move |fmt| {
-        let current_href = context
-            .href_from_span(clean::Span::new(file_span), false)
-            .expect("only local crates should have sources emitted");
+        // For scraped examples, use the URL from ScrapedInfo directly.
+        // For regular sources, derive it from the span.
+        let current_href = if let SourceContext::Embedded(info) = source_context {
+            info.url.to_string()
+        } else {
+            context
+                .href_from_span(clean::Span::new(file_span), false)
+                .expect("only local crates should have sources emitted")
+        };
         highlight::write_code(
             fmt,
             s,
-            Some(highlight::HrefContext { context, file_span, root_path, current_href }),
+            Some(highlight::HrefContext {
+                context,
+                file_span: file_span.into(),
+                root_path,
+                current_href,
+            }),
             Some(decoration_info),
             Some(line_info),
         );
         Ok(())
     });
-    let max_nb_digits = if lines > 0 { lines.ilog(10) + 1 } else { 1 };
+    let max_nb_digits = if lines > 0 { lines.ilog10() + 1 } else { 1 };
     match source_context {
         SourceContext::Standalone { file_path } => Source {
             code_html: code,
@@ -367,12 +380,10 @@ pub(crate) fn print_src(
             },
             max_nb_digits,
         }
-        .render_into(&mut writer)
-        .unwrap(),
+        .render_into(&mut writer),
         SourceContext::Embedded(info) => {
-            ScrapedSource { info, code_html: code, max_nb_digits }
-                .render_into(&mut writer)
-                .unwrap();
+            ScrapedSource { info, code_html: code, max_nb_digits }.render_into(&mut writer)
         }
-    };
+    }?;
+    Ok(())
 }

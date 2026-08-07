@@ -4,7 +4,7 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable, TypeV
 use rustc_span::Span;
 use tracing::debug;
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Parameter(pub u32);
 
 impl From<ty::ParamTy> for Parameter {
@@ -63,13 +63,19 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ParameterCollector {
     fn visit_ty(&mut self, t: Ty<'tcx>) {
         match *t.kind() {
             // Projections are not injective in general.
-            ty::Alias(ty::Projection | ty::Inherent | ty::Opaque, _)
-                if !self.include_nonconstraining =>
-            {
+            ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Opaque { .. },
+                    ..
+                },
+            ) if !self.include_nonconstraining => {
                 return;
             }
             // All free alias types should've been expanded beforehand.
-            ty::Alias(ty::Free, _) if !self.include_nonconstraining => {
+            ty::Alias(_, ty::AliasTy { kind: ty::Free { .. }, .. })
+                if !self.include_nonconstraining =>
+            {
                 bug!("unexpected free alias type")
             }
             ty::Param(param) => self.parameters.push(Parameter::from(param)),
@@ -87,7 +93,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ParameterCollector {
 
     fn visit_const(&mut self, c: ty::Const<'tcx>) {
         match c.kind() {
-            ty::ConstKind::Unevaluated(..) if !self.include_nonconstraining => {
+            ty::ConstKind::Alias(..) if !self.include_nonconstraining => {
                 // Constant expressions are not injective in general.
                 return;
             }
@@ -103,22 +109,22 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ParameterCollector {
 
 pub(crate) fn identify_constrained_generic_params<'tcx>(
     tcx: TyCtxt<'tcx>,
-    predicates: ty::GenericPredicates<'tcx>,
+    gen_clauses: ty::GenericClauses<'tcx>,
     impl_trait_ref: Option<ty::TraitRef<'tcx>>,
     input_parameters: &mut FxHashSet<Parameter>,
 ) {
-    let mut predicates = predicates.predicates.to_vec();
-    setup_constraining_predicates(tcx, &mut predicates, impl_trait_ref, input_parameters);
+    let mut clauses = gen_clauses.clauses.to_vec();
+    setup_constraining_clauses(tcx, &mut clauses, impl_trait_ref, input_parameters);
 }
 
-/// Order the predicates in `predicates` such that each parameter is
+/// Order the clauses in `clauses` such that each parameter is
 /// constrained before it is used, if that is possible, and add the
 /// parameters so constrained to `input_parameters`. For example,
 /// imagine the following impl:
 /// ```ignore (illustrative)
 /// impl<T: Debug, U: Iterator<Item = T>> Trait for U
 /// ```
-/// The impl's predicates are collected from left to right. Ignoring
+/// The impl's clauses are collected from left to right. Ignoring
 /// the implicit `Sized` bounds, these are
 ///   * `T: Debug`
 ///   * `U: Iterator`
@@ -129,9 +135,9 @@ pub(crate) fn identify_constrained_generic_params<'tcx>(
 /// variables and match them with the impl trait-ref, so we know that
 /// `$U = IntoIter<u32>`.
 ///
-/// However, in order to process the `$T: Debug` predicate, we must first
+/// However, in order to process the `$T: Debug` clause, we must first
 /// know the value of `$T` - which is only given by processing the
-/// projection. As we occasionally want to process predicates in a single
+/// projection. As we occasionally want to process clauses in a single
 /// pass, we want the projection to come first. In fact, as projections
 /// can (acyclically) depend on one another - see RFC447 for details - we
 /// need to topologically sort them.
@@ -155,9 +161,9 @@ pub(crate) fn identify_constrained_generic_params<'tcx>(
 /// which is determined by 1, which requires `U`, that is determined
 /// by 0. I should probably pick a less tangled example, but I can't
 /// think of any.
-pub(crate) fn setup_constraining_predicates<'tcx>(
+pub(crate) fn setup_constraining_clauses<'tcx>(
     tcx: TyCtxt<'tcx>,
-    predicates: &mut [(ty::Clause<'tcx>, Span)],
+    clauses: &mut [(ty::Clause<'tcx>, Span)],
     impl_trait_ref: Option<ty::TraitRef<'tcx>>,
     input_parameters: &mut FxHashSet<Parameter>,
 ) {
@@ -167,64 +173,60 @@ pub(crate) fn setup_constraining_predicates<'tcx>(
     // which is `O(nt)` where `t` is the depth of type-parameter constraints,
     // remembering that `t` should be less than 7 in practice.
     //
+    // FIXME(hkBst): the big-O bound above would be accurate for the number
+    // of calls to `parameters_for`, which itself is some O(complexity of type).
+    // That would make this potentially cubic instead of merely quadratic...
+    // ...unless we cache those `parameters_for` calls.
+    //
     // Basically, I iterate over all projections and swap every
     // "ready" projection to the start of the list, such that
     // all of the projections before `i` are topologically sorted
     // and constrain all the parameters in `input_parameters`.
     //
-    // In the example, `input_parameters` starts by containing `U` - which
-    // is constrained by the trait-ref - and so on the first pass we
+    // In the first example, `input_parameters` starts by containing `U`,
+    // which is constrained by the self type `U`. Then, on the first pass we
     // observe that `<U as Iterator>::Item = T` is a "ready" projection that
-    // constrains `T` and swap it to front. As it is the sole projection,
+    // constrains `T` and swap it to the front. As it is the sole projection,
     // no more swaps can take place afterwards, with the result being
     //   * <U as Iterator>::Item = T
     //   * T: Debug
     //   * U: Iterator
     debug!(
-        "setup_constraining_predicates: predicates={:?} \
-            impl_trait_ref={:?} input_parameters={:?}",
-        predicates, impl_trait_ref, input_parameters
+        "setup_constraining_clauses: clauses={:?} impl_trait_ref={:?} input_parameters={:?}",
+        clauses, impl_trait_ref, input_parameters
     );
     let mut i = 0;
     let mut changed = true;
     while changed {
         changed = false;
 
-        for j in i..predicates.len() {
+        for j in i..clauses.len() {
             // Note that we don't have to care about binders here,
             // as the impl trait ref never contains any late-bound regions.
-            if let ty::ClauseKind::Projection(projection) = predicates[j].0.kind().skip_binder() {
-                // Special case: watch out for some kind of sneaky attempt
-                // to project out an associated type defined by this very
-                // trait.
-                let unbound_trait_ref = projection.projection_term.trait_ref(tcx);
-                if Some(unbound_trait_ref) == impl_trait_ref {
-                    continue;
-                }
+            if let ty::ClauseKind::Projection(projection) = clauses[j].0.kind().skip_binder() &&
 
-                // A projection depends on its input types and determines its output
-                // type. For example, if we have
-                //     `<<T as Bar>::Baz as Iterator>::Output = <U as Iterator>::Output`
-                // Then the projection only applies if `T` is known, but it still
-                // does not determine `U`.
-                let inputs = parameters_for(tcx, projection.projection_term, true);
-                let relies_only_on_inputs = inputs.iter().all(|p| input_parameters.contains(p));
-                if !relies_only_on_inputs {
-                    continue;
-                }
+            // Special case: watch out for some kind of sneaky attempt to
+            // project out an associated type defined by this very trait.
+            !impl_trait_ref.is_some_and(|t| t == projection.projection_term.trait_ref(tcx)) &&
+
+            // A projection depends on its input types and determines its output
+            // type. For example, if we have
+            //     `<<T as Bar>::Baz as Iterator>::Output = <U as Iterator>::Output`
+            // then the projection only applies if `T` is known, but it still
+            // does not determine `U`.
+                parameters_for(tcx, projection.projection_term, true).iter().all(|p| input_parameters.contains(p))
+            {
                 input_parameters.extend(parameters_for(tcx, projection.term, false));
-            } else {
-                continue;
+
+                clauses.swap(i, j);
+                i += 1;
+                changed = true;
             }
-            // fancy control flow to bypass borrow checker
-            predicates.swap(i, j);
-            i += 1;
-            changed = true;
         }
         debug!(
-            "setup_constraining_predicates: predicates={:?} \
+            "setup_constraining_clauses: clauses={:?} \
                 i={} impl_trait_ref={:?} input_parameters={:?}",
-            predicates, i, impl_trait_ref, input_parameters
+            clauses, i, impl_trait_ref, input_parameters
         );
     }
 }

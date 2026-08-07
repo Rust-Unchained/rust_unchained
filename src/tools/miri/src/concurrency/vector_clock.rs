@@ -7,6 +7,7 @@ use rustc_span::{DUMMY_SP, Span, SpanData};
 use smallvec::SmallVec;
 
 use super::data_race::NaReadType;
+use crate::helpers::ToUsize;
 
 /// A vector clock index, this is associated with a thread id
 /// but in some cases one vector index may be shared with
@@ -40,19 +41,29 @@ impl From<u32> for VectorIdx {
     }
 }
 
-/// The size of the vector-clock to store inline
-/// clock vectors larger than this will be stored on the heap
+/// The size of the vector clock to store inline.
+/// Clock vectors larger than this will be stored on the heap.
 const SMALL_VECTOR: usize = 4;
 
 /// The time-stamps recorded in the data-race detector consist of both
 /// a 32-bit unsigned integer which is the actual timestamp, and a `Span`
 /// so that diagnostics can report what code was responsible for an operation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct VTimestamp {
     /// The lowest bit indicates read type, the rest is the time.
     /// `1` indicates a retag read, `0` a regular read.
     time_and_read_type: u32,
     pub span: Span,
+}
+
+impl Debug for VTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VTimestamp")
+            .field("time", &self.time())
+            .field("read_type", &self.read_type())
+            .field("span", &self.span)
+            .finish()
+    }
 }
 
 impl VTimestamp {
@@ -136,7 +147,7 @@ impl Ord for VTimestamp {
 pub struct VClock(SmallVec<[VTimestamp; SMALL_VECTOR]>);
 
 impl VClock {
-    /// Create a new vector-clock containing all zeros except
+    /// Create a new vector clock containing all zeros except
     /// for a value at the given index
     pub(super) fn new_with_index(index: VectorIdx, timestamp: VTimestamp) -> VClock {
         if timestamp.time() == 0 {
@@ -157,7 +168,7 @@ impl VClock {
 
     #[inline]
     pub(super) fn index_mut(&mut self, index: VectorIdx) -> &mut VTimestamp {
-        self.0.as_mut_slice().get_mut(index.to_u32() as usize).unwrap()
+        self.0.as_mut_slice().get_mut(index.to_u32().to_usize()).unwrap()
     }
 
     /// Get a mutable slice to the internal vector with minimum `min_len`
@@ -185,8 +196,8 @@ impl VClock {
         }
     }
 
-    // Join the two vector-clocks together, this
-    // sets each vector-element to the maximum value
+    // Join the two vector clocks together, this
+    // sets each vector element to the maximum value
     // of that element in either of the two source elements.
     pub fn join(&mut self, other: &Self) {
         let rhs_slice = other.as_slice();
@@ -420,7 +431,7 @@ impl Index<VectorIdx> for VClock {
 
     #[inline]
     fn index(&self, index: VectorIdx) -> &VTimestamp {
-        self.as_slice().get(index.to_u32() as usize).unwrap_or(&VTimestamp::ZERO)
+        self.as_slice().get(index.to_u32().to_usize()).unwrap_or(&VTimestamp::ZERO)
     }
 }
 

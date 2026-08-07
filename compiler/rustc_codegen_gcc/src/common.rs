@@ -1,16 +1,17 @@
-use gccjit::{LValue, RValue, ToRValue, Type};
-use rustc_abi as abi;
-use rustc_abi::HasDataLayout;
+use gccjit::{GlobalKind, LValue, RValue, ToRValue, Type};
 use rustc_abi::Primitive::Pointer;
+use rustc_abi::{self as abi, HasDataLayout};
 use rustc_codegen_ssa::traits::{
     BaseTypeCodegenMethods, ConstCodegenMethods, MiscCodegenMethods, StaticCodegenMethods,
 };
 use rustc_middle::mir::Mutability;
-use rustc_middle::mir::interpret::{ConstAllocation, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar};
 use rustc_middle::ty::layout::LayoutOf;
+use rustc_middle::ty::{Instance, SymbolName};
+use rustc_session::PointerAuthSchema;
 
 use crate::consts::const_alloc_to_gcc;
-use crate::context::CodegenCx;
+use crate::context::{CodegenCx, new_array_type};
 use crate::type_of::LayoutGccExt;
 
 impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
@@ -22,14 +23,18 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         bytes_in_context(self, bytes)
     }
 
+    pub fn const_u16(&self, i: u16) -> RValue<'gcc> {
+        self.const_uint(self.type_u16(), i as u64)
+    }
+
     fn global_string(&self, string: &str) -> LValue<'gcc> {
-        // TODO(antoyo): handle non-null-terminated strings.
+        // FIXME(antoyo): handle non-null-terminated strings.
         let string = self.context.new_string_literal(string);
         let sym = self.generate_local_symbol_name("str");
         let global = self.declare_private_global(&sym, self.val_ty(string));
         global.global_set_initializer_rvalue(string);
         global
-        // TODO(antoyo): set linkage.
+        // FIXME(antoyo): set linkage.
     }
 
     pub fn const_bitcast(&self, value: RValue<'gcc>, typ: Type<'gcc>) -> RValue<'gcc> {
@@ -43,15 +48,155 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         // SIMD builtins require a constant value.
         self.bitcast_if_needed(value, typ)
     }
+
+    pub(crate) fn alloc_to_backend(
+        &self,
+        global_alloc: GlobalAlloc<'tcx>,
+        need_symbol_name: bool,
+    ) -> Result<(RValue<'gcc>, Option<SymbolName<'tcx>>), u64> {
+        let alloc = match global_alloc {
+            GlobalAlloc::Function { instance, .. } => {
+                return Ok((
+                    self.get_fn_addr(instance, None),
+                    need_symbol_name.then(|| self.tcx.symbol_name(instance)),
+                ));
+            }
+            GlobalAlloc::Static(def_id) => {
+                assert!(self.tcx.is_static(def_id));
+                return Ok((
+                    self.get_static(def_id).get_address(None),
+                    need_symbol_name
+                        .then(|| self.tcx.symbol_name(Instance::mono(self.tcx, def_id))),
+                ));
+            }
+            GlobalAlloc::TypeId { .. } => {
+                // Drop the provenance, the offset contains the bytes of the hash, so
+                // just return 0 as base address.
+                return Err(0);
+            }
+
+            GlobalAlloc::Memory(alloc) => {
+                if alloc.inner().len() == 0 {
+                    // For ZSTs directly codegen an aligned pointer.
+                    // This avoids generating a zero-sized constant value and actually needing a
+                    // real address at runtime.
+                    return Err(alloc.inner().align.bytes());
+                }
+
+                alloc
+            }
+
+            GlobalAlloc::VTable(ty, dyn_ty) => {
+                self.tcx
+                    .global_alloc(self.tcx.vtable_allocation((
+                        ty,
+                        dyn_ty.principal().map(|principal| {
+                            self.tcx.instantiate_bound_regions_with_erased(principal)
+                        }),
+                    )))
+                    .unwrap_memory()
+            }
+        };
+
+        if need_symbol_name {
+            let name = self.generate_global_symbol_name();
+
+            let init = crate::consts::const_alloc_to_gcc_uncached(self, alloc);
+            let alloc = alloc.inner();
+            let typ = self.val_ty(init).get_aligned(alloc.align.bytes());
+
+            let global = self.declare_global_with_linkage(&name, typ, GlobalKind::Internal);
+
+            global.global_set_initializer_rvalue(init);
+            return Ok((global.get_address(None), Some(SymbolName::new(self.tcx, &name))));
+        }
+
+        let value = match alloc.inner().mutability {
+            Mutability::Mut => {
+                self.static_addr_of_mut(const_alloc_to_gcc(self, alloc), alloc.inner().align, None)
+            }
+            _ => self.static_addr_of(alloc, None),
+        };
+        if !self.sess().fewer_names() {
+            // FIXME(antoyo): set value name.
+        }
+
+        Ok((value, None))
+    }
 }
 
 pub fn bytes_in_context<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, bytes: &[u8]) -> RValue<'gcc> {
-    let context = &cx.context;
-    let byte_type = context.new_type::<u8>();
-    let typ = context.new_array_type(None, byte_type, bytes.len() as u64);
-    let elements: Vec<_> =
-        bytes.iter().map(|&byte| context.new_rvalue_from_int(byte_type, byte as i32)).collect();
-    context.new_array_constructor(None, typ, &elements)
+    // Instead of always using an array of bytes, use an array of larger integers of target endianness
+    // if possible. This reduces the amount of `rvalues` we use, which reduces memory usage significantly.
+    //
+    // FIXME(FractalFir): Consider using `global_set_initializer` instead. Before this is done, we need to confirm that
+    // `global_set_initializer` is more memory efficient than the current solution.
+    // `global_set_initializer` calls `global_set_initializer_rvalue` under the hood - does it generate an array of rvalues,
+    // or is it using a more efficient representation?
+    match bytes.len() % 8 {
+        0 => {
+            debug_assert_eq!(
+                bytes.len() % 8,
+                0,
+                "bytes length is not a multiple of 8, so bytes.as_chunks will have a remainder"
+            );
+            let context = &cx.context;
+            let byte_type = context.new_type::<u64>();
+            let typ = new_array_type(context, None, byte_type, bytes.len() as u64 / 8);
+            let elements: Vec<_> = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&arr| {
+                    context.new_rvalue_from_long(
+                        byte_type,
+                        // Since we are representing arbitrary byte runs as integers, we need to follow the target
+                        // endianness.
+                        match cx.sess().target.options.endian {
+                            rustc_abi::Endian::Little => u64::from_le_bytes(arr) as i64,
+                            rustc_abi::Endian::Big => u64::from_be_bytes(arr) as i64,
+                        },
+                    )
+                })
+                .collect();
+            context.new_array_constructor(None, typ, &elements)
+        }
+        4 => {
+            debug_assert_eq!(
+                bytes.len() % 4,
+                0,
+                "bytes length is not a multiple of 4, so bytes.as_chunks will have a remainder"
+            );
+            let context = &cx.context;
+            let byte_type = context.new_type::<u32>();
+            let typ = new_array_type(context, None, byte_type, bytes.len() as u64 / 4);
+            let elements: Vec<_> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&arr| {
+                    context.new_rvalue_from_int(
+                        byte_type,
+                        match cx.sess().target.options.endian {
+                            rustc_abi::Endian::Little => u32::from_le_bytes(arr) as i32,
+                            rustc_abi::Endian::Big => u32::from_be_bytes(arr) as i32,
+                        },
+                    )
+                })
+                .collect();
+            context.new_array_constructor(None, typ, &elements)
+        }
+        _ => {
+            let context = cx.context;
+            let byte_type = context.new_type::<u8>();
+            let typ = new_array_type(context, None, byte_type, bytes.len() as u64);
+            let elements: Vec<_> = bytes
+                .iter()
+                .map(|&byte| context.new_rvalue_from_int(byte_type, byte as i32))
+                .collect();
+            context.new_array_constructor(None, typ, &elements)
+        }
+    }
 }
 
 pub fn type_is_pointer(typ: Type<'_>) -> bool {
@@ -65,15 +210,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
 
     fn const_undef(&self, typ: Type<'gcc>) -> RValue<'gcc> {
         let local = self.current_func.borrow().expect("func").new_local(None, typ, "undefined");
-        if typ.is_struct().is_some() {
-            // NOTE: hack to workaround a limitation of the rustc API: see comment on
-            // CodegenCx.structs_as_pointer
-            let pointer = local.get_address(None);
-            self.structs_as_pointer.borrow_mut().insert(pointer);
-            pointer
-        } else {
-            local.to_rvalue()
-        }
+        local.to_rvalue()
     }
 
     fn const_poison(&self, typ: Type<'gcc>) -> RValue<'gcc> {
@@ -97,6 +234,10 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
         self.const_int(self.type_i32(), i as i64)
     }
 
+    fn const_i64(&self, i: i64) -> RValue<'gcc> {
+        self.const_int(self.type_i64(), i)
+    }
+
     fn const_int(&self, typ: Type<'gcc>, int: i64) -> RValue<'gcc> {
         self.gcc_int(typ, int)
     }
@@ -118,7 +259,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
     }
 
     fn const_usize(&self, i: u64) -> RValue<'gcc> {
-        let bit_size = self.data_layout().pointer_size.bits();
+        let bit_size = self.data_layout().pointer_size().bits();
         if bit_size < 64 {
             // make sure it doesn't overflow
             assert!(i < (1 << bit_size));
@@ -156,7 +297,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
 
     fn const_struct(&self, values: &[RValue<'gcc>], packed: bool) -> RValue<'gcc> {
         let fields: Vec<_> = values.iter().map(|value| value.get_type()).collect();
-        // TODO(antoyo): cache the type? It's anonymous, so probably not.
+        // FIXME(antoyo): cache the type? It's anonymous, so probably not.
         let typ = self.type_struct(&fields, packed);
         let struct_type = typ.is_struct().expect("struct type");
         self.context.new_struct_constructor(None, struct_type.as_type(), None, values)
@@ -168,78 +309,53 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
     }
 
     fn const_to_opt_uint(&self, _v: RValue<'gcc>) -> Option<u64> {
-        // TODO(antoyo)
+        // FIXME(antoyo)
         None
     }
 
     fn const_to_opt_u128(&self, _v: RValue<'gcc>, _sign_ext: bool) -> Option<u128> {
-        // TODO(antoyo)
+        // FIXME(antoyo)
         None
     }
 
-    fn scalar_to_backend(&self, cv: Scalar, layout: abi::Scalar, ty: Type<'gcc>) -> RValue<'gcc> {
+    fn scalar_to_backend_with_pac(
+        &self,
+        cv: Scalar,
+        layout: abi::Scalar,
+        ty: Type<'gcc>,
+        _schema: Option<&PointerAuthSchema>,
+    ) -> RValue<'gcc> {
         let bitsize = if layout.is_bool() { 1 } else { layout.size(self).bits() };
         match cv {
             Scalar::Int(int) => {
                 let data = int.to_bits(layout.size(self));
-
-                // FIXME(antoyo): there's some issues with using the u128 code that follows, so hard-code
-                // the paths for floating-point values.
-                if ty == self.float_type {
-                    return self
-                        .context
-                        .new_rvalue_from_double(ty, f32::from_bits(data as u32) as f64);
-                }
-                if ty == self.double_type {
-                    return self.context.new_rvalue_from_double(ty, f64::from_bits(data as u64));
-                }
-
                 let value = self.const_uint_big(self.type_ix(bitsize), data);
                 let bytesize = layout.size(self).bytes();
                 if bitsize > 1 && ty.is_integral() && bytesize as u32 == ty.get_size() {
                     // NOTE: since the intrinsic _xabort is called with a bitcast, which
                     // is non-const, but expects a constant, do a normal cast instead of a bitcast.
                     // FIXME(antoyo): fix bitcast to work in constant contexts.
-                    // TODO(antoyo): perhaps only use bitcast for pointers?
+                    // FIXME(antoyo): perhaps only use bitcast for pointers?
                     self.context.new_cast(None, value, ty)
                 } else {
-                    // TODO(bjorn3): assert size is correct
+                    // FIXME(bjorn3): assert size is correct
                     self.const_bitcast(value, ty)
                 }
             }
             Scalar::Ptr(ptr, _size) => {
-                let (prov, offset) = ptr.into_parts(); // we know the `offset` is relative
+                let (prov, offset) = ptr.prov_and_relative_offset();
                 let alloc_id = prov.alloc_id();
-                let base_addr = match self.tcx.global_alloc(alloc_id) {
-                    GlobalAlloc::Memory(alloc) => {
-                        let init = const_alloc_to_gcc(self, alloc);
-                        let alloc = alloc.inner();
-                        let value = match alloc.mutability {
-                            Mutability::Mut => self.static_addr_of_mut(init, alloc.align, None),
-                            _ => self.static_addr_of(init, alloc.align, None),
+                let base_addr = match self.alloc_to_backend(self.tcx.global_alloc(alloc_id), false)
+                {
+                    Ok((base_addr, _)) => base_addr,
+                    Err(base_addr) => {
+                        let val = base_addr.wrapping_add(offset.bytes());
+                        let val = self.const_usize(self.tcx.truncate_to_target_usize(val));
+                        return if matches!(layout.primitive(), Pointer(_)) {
+                            self.context.new_cast(None, val, ty)
+                        } else {
+                            self.const_bitcast(val, ty)
                         };
-                        if !self.sess().fewer_names() {
-                            // TODO(antoyo): set value name.
-                        }
-                        value
-                    }
-                    GlobalAlloc::Function { instance, .. } => self.get_fn_addr(instance),
-                    GlobalAlloc::VTable(ty, dyn_ty) => {
-                        let alloc = self
-                            .tcx
-                            .global_alloc(self.tcx.vtable_allocation((
-                                ty,
-                                dyn_ty.principal().map(|principal| {
-                                    self.tcx.instantiate_bound_regions_with_erased(principal)
-                                }),
-                            )))
-                            .unwrap_memory();
-                        let init = const_alloc_to_gcc(self, alloc);
-                        self.static_addr_of(init, alloc.inner().align, None)
-                    }
-                    GlobalAlloc::Static(def_id) => {
-                        assert!(self.tcx.is_static(def_id));
-                        self.get_static(def_id).get_address(None)
                     }
                 };
                 let ptr_type = base_addr.get_type();
@@ -254,10 +370,6 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                 }
             }
         }
-    }
-
-    fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
-        const_alloc_to_gcc(self, alloc)
     }
 
     fn const_ptr_byte_offset(&self, base_addr: Self::Value, offset: abi::Size) -> Self::Value {

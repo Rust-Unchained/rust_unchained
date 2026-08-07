@@ -13,8 +13,7 @@ mod tests;
 use crate::fmt;
 use crate::io::{self, ErrorKind};
 use crate::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use crate::sys::net as net_imp;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner, net as net_imp};
 use crate::time::Duration;
 
 /// A UDP socket.
@@ -120,7 +119,7 @@ impl UdpSocket {
     /// [`Ipv4Addr::UNSPECIFIED`] or [`Ipv6Addr::UNSPECIFIED`].
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-        super::each_addr(addr, net_imp::UdpSocket::bind).map(UdpSocket)
+        net_imp::UdpSocket::bind(addr).map(UdpSocket)
     }
 
     /// Receives a single datagram message on the socket. On success, returns the number
@@ -129,6 +128,10 @@ impl UdpSocket {
     /// The function must be called with valid byte array `buf` of sufficient size to
     /// hold the message bytes. If a message is too long to fit in the supplied buffer,
     /// excess bytes may be discarded.
+    ///
+    /// Refer to the platform-specific documentation on this function; it is considered
+    /// correct for its behavior to differ from [`UdpSocket::recv`] if the underlying system
+    /// call does so.
     ///
     /// # Examples
     ///
@@ -677,7 +680,7 @@ impl UdpSocket {
     /// on the platform.
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        super::each_addr(addr, |addr| self.0.connect(addr))
+        self.0.connect(addr)
     }
 
     /// Sends data on the socket to the remote address to which it is connected.
@@ -711,6 +714,10 @@ impl UdpSocket {
     ///
     /// [`UdpSocket::connect`] will connect this socket to a remote address. This
     /// method will fail if the socket is not connected.
+    ///
+    /// Refer to the platform-specific documentation on this function; it is considered
+    /// correct for its behavior to differ from [`UdpSocket::recv_from`] if the underlying
+    /// system call does so.
     ///
     /// # Examples
     ///
@@ -779,8 +786,8 @@ impl UdpSocket {
     /// and needs to be retried, an error with kind
     /// [`io::ErrorKind::WouldBlock`] is returned.
     ///
-    /// On Unix platforms, calling this method corresponds to calling `fcntl`
-    /// `FIONBIO`. On Windows calling this method corresponds to calling
+    /// On most Unix platforms, calling this method corresponds to calling `ioctl`
+    /// `FIONBIO`. On Windows, calling this method corresponds to calling
     /// `ioctlsocket` `FIONBIO`.
     ///
     /// # Examples

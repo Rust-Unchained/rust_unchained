@@ -1,16 +1,8 @@
 //! Test casts for alignment issues
 
-#![feature(rustc_private)]
 #![feature(core_intrinsics)]
 #![warn(clippy::cast_ptr_alignment)]
-#![allow(
-    clippy::no_effect,
-    clippy::unnecessary_operation,
-    clippy::cast_lossless,
-    clippy::borrow_as_ptr
-)]
-
-extern crate libc;
+#![expect(clippy::no_effect)]
 
 fn main() {
     /* These should be warned against */

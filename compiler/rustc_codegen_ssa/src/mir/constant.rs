@@ -5,7 +5,7 @@ use rustc_middle::ty::{self, Ty};
 use rustc_middle::{bug, mir, span_bug};
 
 use super::FunctionCx;
-use crate::errors;
+use crate::diagnostics;
 use crate::mir::operand::OperandRef;
 use crate::traits::*;
 
@@ -20,7 +20,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         OperandRef::from_const(bx, val, ty)
     }
 
-    pub fn eval_mir_constant(&self, constant: &mir::ConstOperand<'tcx>) -> mir::ConstValue<'tcx> {
+    pub fn eval_mir_constant(&self, constant: &mir::ConstOperand<'tcx>) -> mir::ConstValue {
         // `MirUsedCollector` visited all required_consts before codegen began, so if we got here
         // there can be no more constants that fail to evaluate.
         self.monomorphize(constant.const_)
@@ -38,8 +38,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         &self,
         constant: &mir::ConstOperand<'tcx>,
     ) -> Result<Result<ty::ValTree<'tcx>, Ty<'tcx>>, ErrorHandled> {
+        let tcx = self.cx.tcx();
         let uv = match self.monomorphize(constant.const_) {
-            mir::Const::Unevaluated(uv, _) => uv.shrink(),
+            mir::Const::Unevaluated(uv, _) => uv.shrink(tcx),
             mir::Const::Ty(_, c) => match c.kind() {
                 // A constant that came from a const generic but was then used as an argument to
                 // old-style simd_shuffle (passing as argument instead of as a generic param).
@@ -57,7 +58,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             other => span_bug!(constant.span, "{other:#?}"),
         };
         let uv = self.monomorphize(uv);
-        self.cx.tcx().const_eval_resolve_for_typeck(self.cx.typing_env(), uv, constant.span)
+        tcx.const_eval_resolve_for_typeck(self.cx.typing_env(), uv, constant.span)
     }
 
     /// process constant containing SIMD shuffle indices & constant vectors
@@ -77,28 +78,29 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             .flatten()
             .map(|val| {
                 // A SIMD type has a single field, which is an array.
-                let fields = val.unwrap_branch();
+                let fields = val.to_branch();
                 assert_eq!(fields.len(), 1);
-                let array = fields[0].unwrap_branch();
+                let array = fields[0].to_branch();
                 // Iterate over the array elements to obtain the values in the vector.
                 let values: Vec<_> = array
                     .iter()
                     .map(|field| {
-                        if let Some(prim) = field.try_to_scalar() {
-                            let layout = bx.layout_of(field_ty);
-                            let BackendRepr::Scalar(scalar) = layout.backend_repr else {
-                                bug!("from_const: invalid ByVal layout: {:#?}", layout);
-                            };
-                            bx.scalar_to_backend(prim, scalar, bx.immediate_backend_type(layout))
-                        } else {
+                        let Some(prim) = field.try_to_scalar() else {
                             bug!("field is not a scalar {:?}", field)
-                        }
+                        };
+                        let layout = bx.layout_of(field_ty);
+                        let BackendRepr::Scalar(scalar) = layout.backend_repr else {
+                            bug!("from_const: invalid ByVal layout: {:#?}", layout);
+                        };
+                        bx.scalar_to_backend(prim, scalar, bx.immediate_backend_type(layout))
                     })
                     .collect();
                 bx.const_vector(&values)
             })
             .unwrap_or_else(|| {
-                bx.tcx().dcx().emit_err(errors::ShuffleIndicesEvaluation { span: constant.span });
+                bx.tcx()
+                    .dcx()
+                    .emit_err(diagnostics::ShuffleIndicesEvaluation { span: constant.span });
                 // We've errored, so we don't have to produce working code.
                 let llty = bx.backend_type(bx.layout_of(ty));
                 bx.const_undef(llty)

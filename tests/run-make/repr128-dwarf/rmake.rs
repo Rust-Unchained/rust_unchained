@@ -1,3 +1,5 @@
+//@ ignore-cross-compile
+//@ ignore-wasm (`object` can't handle wasm object files)
 //@ ignore-windows
 // This test should be replaced with one in tests/debuginfo once GDB or LLDB support 128-bit enums.
 
@@ -11,25 +13,8 @@ use object::{Object, ObjectSection};
 use run_make_support::{gimli, object, rfs, rustc};
 
 fn main() {
-    // Before LLVM 20, 128-bit enums with variants didn't emit debuginfo correctly.
-    // This check can be removed once Rust no longer supports LLVM 18 and 19.
-    let llvm_version = rustc()
-        .verbose()
-        .arg("--version")
-        .run()
-        .stdout_utf8()
-        .lines()
-        .filter_map(|line| line.strip_prefix("LLVM version: "))
-        .map(|version| version.split(".").next().unwrap().parse::<u32>().unwrap())
-        .next()
-        .unwrap();
-    let is_old_llvm = llvm_version < 20;
-
     let output = PathBuf::from("repr128");
     let mut rustc = rustc();
-    if is_old_llvm {
-        rustc.cfg("old_llvm");
-    }
     rustc.input("main.rs").output(&output).arg("-Cdebuginfo=2").run();
     // Mach-O uses packed debug info
     let dsym_location = output
@@ -74,21 +59,17 @@ fn main() {
         let unit = dwarf.unit(header).unwrap();
         let mut cursor = unit.entries();
 
-        let get_name = |entry: &DebuggingInformationEntry<'_, '_, _>| {
+        let get_name = |entry: &DebuggingInformationEntry<_>| {
             let name = dwarf
-                .attr_string(
-                    &unit,
-                    entry.attr(gimli::constants::DW_AT_name).unwrap().unwrap().value(),
-                )
+                .attr_string(&unit, entry.attr(gimli::constants::DW_AT_name).unwrap().value())
                 .unwrap();
             name.to_string().unwrap().to_string()
         };
 
-        while let Some((_, entry)) = cursor.next_dfs().unwrap() {
+        while let Some(entry) = cursor.next_dfs().unwrap() {
             match entry.tag() {
-                gimli::constants::DW_TAG_variant if !is_old_llvm => {
-                    let Some(value) = entry.attr(gimli::constants::DW_AT_discr_value).unwrap()
-                    else {
+                gimli::constants::DW_TAG_variant => {
+                    let Some(value) = entry.attr(gimli::constants::DW_AT_discr_value) else {
                         // `std` enums might have variants without `DW_AT_discr_value`.
                         continue;
                     };
@@ -99,9 +80,11 @@ fn main() {
                     };
                     // The `DW_TAG_member` that is a child of `DW_TAG_variant` will contain the
                     // variant's name.
-                    let Some((1, child_entry)) = cursor.next_dfs().unwrap() else {
+                    let entry_depth = entry.depth;
+                    let Some(child_entry) = cursor.next_dfs().unwrap() else {
                         panic!("Missing child of DW_TAG_variant");
                     };
+                    assert_eq!(child_entry.depth, entry_depth + 1);
                     assert_eq!(child_entry.tag(), gimli::constants::DW_TAG_member);
                     let name = get_name(child_entry);
                     if let Some(expected) = variants_to_find.remove(name.as_str()) {
@@ -114,12 +97,7 @@ fn main() {
                 gimli::constants::DW_TAG_enumerator => {
                     let name = get_name(entry);
                     if let Some(expected) = enumerators_to_find.remove(name.as_str()) {
-                        match entry
-                            .attr(gimli::constants::DW_AT_const_value)
-                            .unwrap()
-                            .unwrap()
-                            .value()
-                        {
+                        match entry.attr(gimli::constants::DW_AT_const_value).unwrap().value() {
                             AttributeValue::Block(value) => {
                                 // This test uses LE byte order is used for consistent values across
                                 // architectures.
@@ -141,7 +119,7 @@ fn main() {
     if !enumerators_to_find.is_empty() {
         panic!("Didn't find debug enumerator entries for {enumerators_to_find:?}");
     }
-    if !is_old_llvm && !variants_to_find.is_empty() {
+    if !variants_to_find.is_empty() {
         panic!("Didn't find debug variant entries for {variants_to_find:?}");
     }
 }

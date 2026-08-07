@@ -5,18 +5,19 @@
 use hir::{HasSource, PathResolution};
 use ide_db::FxHashMap;
 use ide_db::{
-    defs::Definition, imports::insert_use::ast_to_remove_for_path_in_use_stmt,
-    search::FileReference,
+    defs::Definition, imports::insert_use::remove_use_tree_if_simple, search::FileReference,
 };
 use itertools::Itertools;
+use syntax::ast::syntax_factory::SyntaxFactory;
+use syntax::syntax_editor::SyntaxEditor;
 use syntax::{
-    ast::{self, make, HasGenericParams, HasName},
-    ted, AstNode, NodeOrToken, SyntaxNode,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T,
+    ast::{self, HasGenericParams, HasName},
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
-    AssistId, AssistKind,
 };
 
 use super::inline_call::split_refs_and_uses;
@@ -44,7 +45,7 @@ use super::inline_call::split_refs_and_uses;
 //     let _: i32 = 3;
 // }
 // ```
-pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let ast_alias = name.syntax().parent().and_then(ast::TypeAlias::cast)?;
 
@@ -59,7 +60,7 @@ pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>)
     // until this is ok
 
     acc.add(
-        AssistId("inline_type_alias_uses", AssistKind::RefactorInline),
+        AssistId::refactor_inline("inline_type_alias_uses"),
         "Inline type alias into all uses",
         name.syntax().text_range(),
         |builder| {
@@ -67,37 +68,39 @@ pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>)
             let mut definition_deleted = false;
 
             let mut inline_refs_for_file = |file_id, refs: Vec<FileReference>| {
-                builder.edit_file(file_id);
+                let source = ctx.sema.parse(file_id);
+                let editor = builder.make_editor(source.syntax());
 
-                let (path_types, path_type_uses) =
-                    split_refs_and_uses(builder, refs, |path_type| {
-                        path_type.syntax().ancestors().nth(3).and_then(ast::PathType::cast)
-                    });
-
+                let (path_types, path_type_uses) = split_refs_and_uses(refs, |path_type| {
+                    path_type.syntax().ancestors().nth(3).and_then(ast::PathType::cast)
+                });
                 path_type_uses
                     .iter()
-                    .flat_map(ast_to_remove_for_path_in_use_stmt)
-                    .for_each(|x| builder.delete(x.syntax().text_range()));
+                    .for_each(|use_tree| remove_use_tree_if_simple(use_tree, &editor));
+
                 for (target, replacement) in path_types.into_iter().filter_map(|path_type| {
-                    let replacement = inline(&ast_alias, &path_type)?.to_text(&concrete_type);
-                    let target = path_type.syntax().text_range();
+                    let replacement =
+                        inline(&ast_alias, &path_type)?.replace_generic(&concrete_type);
+                    let target = path_type.syntax().clone();
                     Some((target, replacement))
                 }) {
-                    builder.replace(target, replacement);
+                    editor.replace(target, replacement);
                 }
 
-                if file_id == ctx.file_id() {
-                    builder.delete(ast_alias.syntax().text_range());
+                if file_id.file_id(ctx.db()) == ctx.vfs_file_id() {
+                    editor.delete(ast_alias.syntax());
                     definition_deleted = true;
                 }
+                builder.add_file_edits(file_id.file_id(ctx.db()), editor);
             };
 
             for (file_id, refs) in usages.into_iter() {
-                inline_refs_for_file(file_id.file_id(), refs);
+                inline_refs_for_file(file_id, refs);
             }
             if !definition_deleted {
-                builder.edit_file(ctx.file_id());
-                builder.delete(ast_alias.syntax().text_range());
+                let editor = builder.make_editor(ast_alias.syntax());
+                editor.delete(ast_alias.syntax());
+                builder.add_file_edits(ctx.vfs_file_id(), editor)
             }
         },
     )
@@ -122,7 +125,7 @@ pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>)
 //     let a: Vec<u32>;
 // }
 // ```
-pub(crate) fn inline_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn inline_type_alias(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let alias_instance = ctx.find_node_at_offset::<ast::PathType>()?;
     let concrete_type;
     let replacement;
@@ -132,7 +135,20 @@ pub(crate) fn inline_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
                 PathResolution::SelfType(imp) => {
                     concrete_type = imp.source(ctx.db())?.value.self_ty()?;
                 }
-                // FIXME: should also work in ADT definitions
+                PathResolution::Def(hir::ModuleDef::Adt(adt)) => {
+                    let make = SyntaxFactory::without_mappings();
+                    let src = adt.source(ctx.db())?.value;
+                    let name = src.name()?;
+                    let generic_params = src.generic_param_list();
+                    let name_ref = make.name_ref(name.text());
+                    let segment = match generic_params {
+                        Some(params) => {
+                            make.path_segment_generics(name_ref, params.to_generic_args(&make))
+                        }
+                        None => make.path_segment(name_ref),
+                    };
+                    concrete_type = make.ty_path_from_segments([segment], false);
+                }
                 _ => return None,
             }
 
@@ -145,23 +161,26 @@ pub(crate) fn inline_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         }
     }
 
-    let target = alias_instance.syntax().text_range();
-
     acc.add(
-        AssistId("inline_type_alias", AssistKind::RefactorInline),
+        AssistId::refactor_inline("inline_type_alias"),
         "Inline type alias",
-        target,
-        |builder| builder.replace(target, replacement.to_text(&concrete_type)),
+        alias_instance.syntax().text_range(),
+        |builder| {
+            let editor = builder.make_editor(alias_instance.syntax());
+            let replace = replacement.replace_generic(&concrete_type);
+            editor.replace(alias_instance.syntax(), replace);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
+        },
     )
 }
 
 impl Replacement {
-    fn to_text(&self, concrete_type: &ast::Type) -> String {
+    fn replace_generic(&self, concrete_type: &ast::Type) -> SyntaxNode {
         match self {
             Replacement::Generic { lifetime_map, const_and_type_map } => {
                 create_replacement(lifetime_map, const_and_type_map, concrete_type)
             }
-            Replacement::Plain => concrete_type.to_string(),
+            Replacement::Plain => concrete_type.syntax().clone(),
         }
     }
 }
@@ -198,8 +217,8 @@ impl LifetimeMap {
         alias_generics: &ast::GenericParamList,
     ) -> Option<Self> {
         let mut inner = FxHashMap::default();
-
-        let wildcard_lifetime = make::lifetime("'_");
+        let make = SyntaxFactory::without_mappings();
+        let wildcard_lifetime = make.lifetime("'_");
         let lifetimes = alias_generics
             .lifetime_params()
             .filter_map(|lp| lp.lifetime())
@@ -281,70 +300,132 @@ impl ConstAndTypeMap {
 ///          ^ alias generic params
 ///    let a: A<100>;
 ///            ^ instance generic args
-///    ```
 ///
 ///    generic['a] = '_ due to omission
 ///    generic[N] = 100 due to the instance arg
 ///    generic[T] = u64 due to the default param
+///    ```
 ///
 /// 2. Copy the concrete type and substitute in each found mapping:
 ///
+///    ```ignore
 ///    &'_ [u64; 100]
+///    ```
 ///
 /// 3. Remove wildcard lifetimes entirely:
 ///
+///    ```ignore
 ///    &[u64; 100]
+///    ```
 fn create_replacement(
     lifetime_map: &LifetimeMap,
     const_and_type_map: &ConstAndTypeMap,
     concrete_type: &ast::Type,
-) -> String {
-    let updated_concrete_type = concrete_type.clone_for_update();
-    let mut replacements = Vec::new();
-    let mut removals = Vec::new();
+) -> SyntaxNode {
+    let (editor, updated_concrete_type) = SyntaxEditor::new(concrete_type.syntax().clone());
+    let make = editor.make();
+    let mut replacements: Vec<(SyntaxNode, SyntaxNode)> = Vec::new();
+    let mut removals: Vec<NodeOrToken<SyntaxNode, _>> = Vec::new();
 
-    for syntax in updated_concrete_type.syntax().descendants() {
-        let syntax_string = syntax.to_string();
-        let syntax_str = syntax_string.as_str();
-
+    for syntax in updated_concrete_type.descendants() {
         if let Some(old_lifetime) = ast::Lifetime::cast(syntax.clone()) {
             if let Some(new_lifetime) = lifetime_map.0.get(&old_lifetime.to_string()) {
                 if new_lifetime.text() == "'_" {
-                    removals.push(NodeOrToken::Node(syntax.clone()));
+                    // Check if this lifetime is inside a LifetimeArg (in angle brackets)
+                    if let Some(lifetime_arg) =
+                        old_lifetime.syntax().parent().and_then(ast::LifetimeArg::cast)
+                    {
+                        // Remove LifetimeArg and associated comma/whitespace
+                        let lifetime_arg_syntax = lifetime_arg.syntax();
+                        removals.push(NodeOrToken::Node(lifetime_arg_syntax.clone()));
 
-                    if let Some(ws) = syntax.next_sibling_or_token() {
-                        removals.push(ws.clone());
+                        // Remove comma and whitespace (look forward then backward)
+                        let comma_and_ws: Vec<_> = lifetime_arg_syntax
+                            .siblings_with_tokens(syntax::Direction::Next)
+                            .skip(1)
+                            .take_while(|it| it.as_token().is_some())
+                            .take_while_inclusive(|it| it.kind() == T![,])
+                            .collect();
+
+                        if comma_and_ws.iter().any(|it| it.kind() == T![,]) {
+                            removals.extend(comma_and_ws);
+                        } else {
+                            // No comma after, try before
+                            let comma_and_ws: Vec<_> = lifetime_arg_syntax
+                                .siblings_with_tokens(syntax::Direction::Prev)
+                                .skip(1)
+                                .take_while(|it| it.as_token().is_some())
+                                .take_while_inclusive(|it| it.kind() == T![,])
+                                .collect();
+                            removals.extend(comma_and_ws);
+                        }
+                        continue;
                     }
-
+                    removals.push(NodeOrToken::Node(syntax.clone()));
+                    if let Some(ws) = syntax.next_sibling_or_token()
+                        && ws.kind() == SyntaxKind::WHITESPACE
+                    {
+                        removals.push(ws);
+                    }
                     continue;
                 }
 
-                replacements.push((syntax.clone(), new_lifetime.syntax().clone_for_update()));
+                replacements.push((syntax.clone(), new_lifetime.syntax().clone()));
             }
-        } else if let Some(replacement_syntax) = const_and_type_map.0.get(syntax_str) {
+        } else if let Some(name_ref) = ast::NameRef::cast(syntax.clone()) {
+            let Some(replacement_syntax) = const_and_type_map.0.get(&name_ref.to_string()) else {
+                continue;
+            };
             let new_string = replacement_syntax.to_string();
             let new = if new_string == "_" {
-                make::wildcard_pat().syntax().clone_for_update()
+                make.wildcard_pat().syntax().clone()
             } else {
-                replacement_syntax.clone_for_update()
+                replacement_syntax.clone()
             };
 
             replacements.push((syntax.clone(), new));
         }
     }
 
+    // Deduplicate removals to avoid intersecting changes
+    removals.sort_by_key(|n| n.text_range().start());
+    removals.dedup();
+
+    // Remove GenericArgList entirely if all its args are being removed (avoids empty angle brackets)
+    let generic_arg_lists_to_check: Vec<_> =
+        updated_concrete_type.descendants().filter_map(ast::GenericArgList::cast).collect();
+
+    for generic_arg_list in generic_arg_lists_to_check {
+        let will_be_empty = generic_arg_list.generic_args().all(|arg| match arg {
+            ast::GenericArg::LifetimeArg(lt_arg) => removals.iter().any(|removal| {
+                if let NodeOrToken::Node(node) = removal { node == lt_arg.syntax() } else { false }
+            }),
+            _ => false,
+        });
+
+        if will_be_empty && generic_arg_list.generic_args().next().is_some() {
+            removals.retain(|removal| {
+                if let NodeOrToken::Node(node) = removal {
+                    !node.ancestors().any(|anc| anc == *generic_arg_list.syntax())
+                } else {
+                    true
+                }
+            });
+            removals.push(NodeOrToken::Node(generic_arg_list.syntax().clone()));
+        }
+    }
+
     for (old, new) in replacements {
-        ted::replace(old, new);
+        editor.replace(old, new);
     }
 
     for syntax in removals {
-        ted::remove(syntax);
+        editor.delete(syntax);
     }
-
-    updated_concrete_type.to_string()
+    editor.finish().new_root().clone()
 }
 
-fn get_type_alias(ctx: &AssistContext<'_>, path: &ast::PathType) -> Option<ast::TypeAlias> {
+fn get_type_alias(ctx: &AssistContext<'_, '_>, path: &ast::PathType) -> Option<ast::TypeAlias> {
     let resolved_path = ctx.sema.resolve_path(&path.path()?)?;
 
     // We need the generics in the correct order to be able to map any provided
@@ -928,6 +1009,110 @@ trait Tr {
         );
     }
 
+    #[test]
+    fn inline_self_type_in_adt_definition() {
+        check_assist(
+            inline_type_alias,
+            r#"
+enum Foo {
+    A(i32),
+    B(Box<Self$0>),
+}
+"#,
+            r#"
+enum Foo {
+    A(i32),
+    B(Box<Foo>),
+}
+"#,
+        );
+        check_assist(
+            inline_type_alias,
+            r#"
+struct Foo {
+    a: Box<Self$0>,
+}
+"#,
+            r#"
+struct Foo {
+    a: Box<Foo>,
+}
+"#,
+        );
+        check_assist(
+            inline_type_alias,
+            r#"
+struct Foo<T> {
+    a: T,
+    b: Box<Self$0>,
+}
+"#,
+            r#"
+struct Foo<T> {
+    a: T,
+    b: Box<Foo<T>>,
+}
+"#,
+        );
+        check_assist(
+            inline_type_alias,
+            r#"
+union Foo {
+    a: u32,
+    b: std::mem::ManuallyDrop<Box<Self$0>>,
+}
+"#,
+            r#"
+union Foo {
+    a: u32,
+    b: std::mem::ManuallyDrop<Box<Foo>>,
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn inline_types_with_lifetime() {
+        check_assist(
+            inline_type_alias_uses,
+            r#"
+struct A<'a, 'b>(pub &'a mut &'b mut ());
+
+type $0T<'a, 'b> = A<'a, 'b>;
+
+fn foo(_: T) {}
+"#,
+            r#"
+struct A<'a, 'b>(pub &'a mut &'b mut ());
+
+
+
+fn foo(_: A) {}
+"#,
+        );
+    }
+
+    #[test]
+    fn mixed_lifetime_and_type_args() {
+        check_assist(
+            inline_type_alias,
+            r#"
+type Foo<'a, T> = Bar<'a, T>;
+struct Bar<'a, T>(&'a T);
+fn main() {
+    let a: $0Foo<u32>;
+}
+"#,
+            r#"
+type Foo<'a, T> = Bar<'a, T>;
+struct Bar<'a, T>(&'a T);
+fn main() {
+    let a: Bar<u32>;
+}
+"#,
+        );
+    }
+
     mod inline_type_alias_uses {
         use crate::{handlers::inline_type_alias::inline_type_alias_uses, tests::check_assist};
 
@@ -981,7 +1166,6 @@ fn f() -> Vec<&str> {
 }
 
 //- /foo.rs
-
 fn foo() {
     let _: Vec<i8> = Vec::new();
 }
@@ -1010,7 +1194,6 @@ mod foo;
 
 
 //- /foo.rs
-
 fn foo() {
     let _: i32 = 0;
 }

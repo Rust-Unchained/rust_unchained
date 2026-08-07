@@ -1,39 +1,63 @@
-//! System bindings for the wasm/web platform
+//! System bindings for the WASI platforms.
 //!
 //! This module contains the facade (aka platform-specific) implementations of
-//! OS level functionality for wasm.
-//!
-//! This is all super highly experimental and not actually intended for
-//! wide/production use yet, it's still all in the experimental category. This
-//! will likely change over time.
-//!
-//! Currently all functions here are basically stubs that immediately return
-//! errors. The hope is that with a portability lint we can turn actually just
-//! remove all this and just omit parts of the standard library if we're
-//! compiling for wasm. That way it's a compile time error for something that's
-//! guaranteed to be a runtime error!
+//! OS level functionality for WASI. Currently this includes both WASIp1 and
+//! WASIp2.
 
-#[allow(unused)]
-#[path = "../wasm/atomics/futex.rs"]
-pub mod futex;
+use crate::io;
 
-pub mod os;
-#[path = "../unsupported/pipe.rs"]
-pub mod pipe;
-pub mod thread;
+pub mod conf;
+pub mod stack_overflow;
+#[path = "../unix/time.rs"]
 pub mod time;
+
+#[cfg(not(target_env = "p1"))]
+mod cabi_realloc;
 
 #[path = "../unsupported/common.rs"]
 #[deny(unsafe_op_in_unsafe_fn)]
-#[allow(unused)]
+#[expect(dead_code)]
 mod common;
+pub use common::{cleanup, init, unsupported};
 
-pub use common::*;
+pub fn abort_internal() -> ! {
+    unsafe { libc::abort() }
+}
 
-mod helpers;
+#[inline]
+#[cfg(target_env = "p1")]
+pub(crate) fn err2io(err: wasip1::Errno) -> crate::io::Error {
+    crate::io::Error::from_raw_os_error(err.raw().into())
+}
 
-// The following exports are listed individually to work around Rust's glob
-// import conflict rules. If we glob export `helpers` and `common` together,
-// then the compiler complains about conflicts.
+#[doc(hidden)]
+pub trait IsMinusOne {
+    fn is_minus_one(&self) -> bool;
+}
 
-pub(crate) use helpers::{abort_internal, decode_error_kind, err2io, is_interrupted};
+macro_rules! impl_is_minus_one {
+    ($($t:ident)*) => ($(impl IsMinusOne for $t {
+        fn is_minus_one(&self) -> bool {
+            *self == -1
+        }
+    })*)
+}
+
+impl_is_minus_one! { i8 i16 i32 i64 isize }
+
+pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+    if t.is_minus_one() { Err(io::Error::last_os_error()) } else { Ok(t) }
+}
+
+pub fn cvt_r<T, F>(mut f: F) -> io::Result<T>
+where
+    T: IsMinusOne,
+    F: FnMut() -> T,
+{
+    loop {
+        match cvt(f()) {
+            Err(ref e) if e.is_interrupted() => {}
+            other => return other,
+        }
+    }
+}

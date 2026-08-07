@@ -7,7 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::ops::Range;
-use std::{cmp, ptr, slice, str};
+use std::{cmp, ptr, slice};
 
 // The arenas start with PAGE-sized chunks, and then each new chunk is twice as
 // big as its predecessor, up until we reach HUGE_PAGE-sized chunks, whereupon
@@ -58,16 +58,16 @@ impl Arena {
         // Also ensure that this chunk can fit `additional`.
         new_cap = cmp::max(additional, new_cap);
 
-        let mut chunk = Box::new_uninit_slice(new_cap);
+        let chunk = chunks.push_mut(Box::new_uninit_slice(new_cap));
         let Range { start, end } = chunk.as_mut_ptr_range();
         self.start.set(start);
         self.end.set(end);
-        chunks.push(chunk);
     }
 
     /// Allocates a byte slice with specified size from the current memory
     /// chunk. Returns `None` if there is no free space left to satisfy the
     /// request.
+    #[allow(clippy::mut_from_ref)]
     fn alloc_raw_without_grow(&self, bytes: usize) -> Option<&mut [MaybeUninit<u8>]> {
         let start = self.start.get().addr();
         let old_end = self.end.get();
@@ -89,14 +89,13 @@ impl Arena {
             return &mut [];
         }
 
-        loop {
-            if let Some(a) = self.alloc_raw_without_grow(bytes) {
-                break a;
-            }
-            // No free space left. Allocate a new chunk to satisfy the request.
-            // On failure the grow will panic or abort.
-            self.grow(bytes);
+        if let Some(a) = self.alloc_raw_without_grow(bytes) {
+            return a;
         }
+        // No free space left. Allocate a new chunk to satisfy the request.
+        // On failure the grow will panic or abort.
+        self.grow(bytes);
+        self.alloc_raw_without_grow(bytes).unwrap()
     }
 
     #[allow(clippy::mut_from_ref)] // arena allocator

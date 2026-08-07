@@ -1,46 +1,19 @@
 use std::ops::ControlFlow;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::path_to_local_id;
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::{Descend, Visitable, for_each_expr};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::hir_id::ItemLocalId;
 use rustc_hir::{
-    Block, Body, BodyOwnerKind, Expr, ExprKind, HirId, LetExpr, LocalSource, Node, Pat, PatKind, QPath, UnOp,
+    Block, Body, BodyOwnerKind, Expr, ExprKind, HirId, ItemLocalId, LetExpr, LocalSource, Node,
+    Pat, PatKind, QPath, UnOp,
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::{Span, Symbol};
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for bindings that shadow other bindings already in
-    /// scope, while just changing reference level or mutability.
-    ///
-    /// ### Why restrict this?
-    /// To require that what are formally distinct variables be given distinct names.
-    ///
-    /// See also `shadow_reuse` and `shadow_unrelated` for other restrictions on shadowing.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// # let x = 1;
-    /// let x = &x;
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # let x = 1;
-    /// let y = &x; // use different variable name
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub SHADOW_SAME,
-    restriction,
-    "rebinding a name to itself, e.g., `let mut x = &mut x`"
-}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -68,6 +41,33 @@ declare_clippy_lint! {
     pub SHADOW_REUSE,
     restriction,
     "rebinding a name to an expression that reuses the original value, e.g., `let x = x + 1`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for bindings that shadow other bindings already in
+    /// scope, while just changing reference level or mutability.
+    ///
+    /// ### Why restrict this?
+    /// To require that what are formally distinct variables be given distinct names.
+    ///
+    /// See also `shadow_reuse` and `shadow_unrelated` for other restrictions on shadowing.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let x = 1;
+    /// let x = &x;
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # let x = 1;
+    /// let y = &x; // use different variable name
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub SHADOW_SAME,
+    restriction,
+    "rebinding a name to itself, e.g., `let mut x = &mut x`"
 }
 
 declare_clippy_lint! {
@@ -106,12 +106,12 @@ declare_clippy_lint! {
     "rebinding a name without even using the original value"
 }
 
+impl_lint_pass!(Shadow => [SHADOW_REUSE, SHADOW_SAME, SHADOW_UNRELATED]);
+
 #[derive(Default)]
 pub(crate) struct Shadow {
     bindings: Vec<(FxHashMap<Symbol, Vec<ItemLocalId>>, LocalDefId)>,
 }
-
-impl_lint_pass!(Shadow => [SHADOW_SAME, SHADOW_REUSE, SHADOW_UNRELATED]);
 
 impl<'tcx> LateLintPass<'tcx> for Shadow {
     fn check_pat(&mut self, cx: &LateContext<'tcx>, pat: &'tcx Pat<'_>) {
@@ -133,7 +133,7 @@ impl<'tcx> LateLintPass<'tcx> for Shadow {
             .tcx
             .hir_parent_iter(pat.hir_id)
             .find(|(_, node)| !matches!(node, Node::Pat(_) | Node::PatField(_)))
-            && let LocalSource::AssignDesugar(_) = let_stmt.source
+            && let LocalSource::AssignDesugar = let_stmt.source
         {
             return;
         }
@@ -179,7 +179,7 @@ impl<'tcx> LateLintPass<'tcx> for Shadow {
 }
 
 fn is_shadow(cx: &LateContext<'_>, owner: LocalDefId, first: ItemLocalId, second: ItemLocalId) -> bool {
-    let scope_tree = cx.tcx.region_scope_tree(owner.to_def_id());
+    let scope_tree = cx.tcx.region_scope_tree(owner);
     if let Some(first_scope) = scope_tree.var_scope(first)
         && let Some(second_scope) = scope_tree.var_scope(second)
     {
@@ -199,10 +199,10 @@ pub fn is_local_used_except<'tcx>(
     id: HirId,
     except: Option<HirId>,
 ) -> bool {
-    for_each_expr(cx, visitable, |e| {
+    for_each_expr(cx.tcx, visitable, |e| {
         if except.is_some_and(|it| it == e.hir_id) {
             ControlFlow::Continue(Descend::No)
-        } else if path_to_local_id(e, id) {
+        } else if e.res_local_id() == Some(id) {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(Descend::Yes)

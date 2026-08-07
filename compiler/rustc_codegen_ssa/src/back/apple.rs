@@ -3,49 +3,49 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use itertools::Itertools;
+use rustc_errors::msg;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
 use rustc_session::Session;
-use rustc_target::spec::Target;
 pub(super) use rustc_target::spec::apple::OSVersion;
+use rustc_target::spec::{Arch, Env, Os, Target};
 use tracing::debug;
 
-use crate::errors::{XcrunError, XcrunSdkPathWarning};
-use crate::fluent_generated as fluent;
+use crate::diagnostics::{XcrunError, XcrunSdkPathWarning};
 
 #[cfg(test)]
 mod tests;
 
 /// The canonical name of the desired SDK for a given target.
 pub(super) fn sdk_name(target: &Target) -> &'static str {
-    match (&*target.os, &*target.abi) {
-        ("macos", "") => "MacOSX",
-        ("ios", "") => "iPhoneOS",
-        ("ios", "sim") => "iPhoneSimulator",
+    match (&target.os, &target.env) {
+        (Os::MacOs, Env::Unspecified) => "MacOSX",
+        (Os::IOs, Env::Unspecified) => "iPhoneOS",
+        (Os::IOs, Env::Sim) => "iPhoneSimulator",
         // Mac Catalyst uses the macOS SDK
-        ("ios", "macabi") => "MacOSX",
-        ("tvos", "") => "AppleTVOS",
-        ("tvos", "sim") => "AppleTVSimulator",
-        ("visionos", "") => "XROS",
-        ("visionos", "sim") => "XRSimulator",
-        ("watchos", "") => "WatchOS",
-        ("watchos", "sim") => "WatchSimulator",
+        (Os::IOs, Env::MacAbi) => "MacOSX",
+        (Os::TvOs, Env::Unspecified) => "AppleTVOS",
+        (Os::TvOs, Env::Sim) => "AppleTVSimulator",
+        (Os::VisionOs, Env::Unspecified) => "XROS",
+        (Os::VisionOs, Env::Sim) => "XRSimulator",
+        (Os::WatchOs, Env::Unspecified) => "WatchOS",
+        (Os::WatchOs, Env::Sim) => "WatchSimulator",
         (os, abi) => unreachable!("invalid os '{os}' / abi '{abi}' combination for Apple target"),
     }
 }
 
 pub(super) fn macho_platform(target: &Target) -> u32 {
-    match (&*target.os, &*target.abi) {
-        ("macos", _) => object::macho::PLATFORM_MACOS,
-        ("ios", "macabi") => object::macho::PLATFORM_MACCATALYST,
-        ("ios", "sim") => object::macho::PLATFORM_IOSSIMULATOR,
-        ("ios", _) => object::macho::PLATFORM_IOS,
-        ("watchos", "sim") => object::macho::PLATFORM_WATCHOSSIMULATOR,
-        ("watchos", _) => object::macho::PLATFORM_WATCHOS,
-        ("tvos", "sim") => object::macho::PLATFORM_TVOSSIMULATOR,
-        ("tvos", _) => object::macho::PLATFORM_TVOS,
-        ("visionos", "sim") => object::macho::PLATFORM_XROSSIMULATOR,
-        ("visionos", _) => object::macho::PLATFORM_XROS,
-        _ => unreachable!("tried to get Mach-O platform for non-Apple target"),
+    match (&target.os, &target.env) {
+        (Os::MacOs, _) => object::macho::PLATFORM_MACOS,
+        (Os::IOs, Env::MacAbi) => object::macho::PLATFORM_MACCATALYST,
+        (Os::IOs, Env::Sim) => object::macho::PLATFORM_IOSSIMULATOR,
+        (Os::IOs, _) => object::macho::PLATFORM_IOS,
+        (Os::WatchOs, Env::Sim) => object::macho::PLATFORM_WATCHOSSIMULATOR,
+        (Os::WatchOs, _) => object::macho::PLATFORM_WATCHOS,
+        (Os::TvOs, Env::Sim) => object::macho::PLATFORM_TVOSSIMULATOR,
+        (Os::TvOs, _) => object::macho::PLATFORM_TVOS,
+        (Os::VisionOs, Env::Sim) => object::macho::PLATFORM_XROSSIMULATOR,
+        (Os::VisionOs, _) => object::macho::PLATFORM_XROS,
+        (os, env) => unreachable!("invalid os '{os}' / env '{env}' combination for Apple target"),
     }
 }
 
@@ -95,7 +95,7 @@ pub(super) fn add_data_and_relocation(
         pointer_width => unimplemented!("unsupported Apple pointer width {pointer_width:?}"),
     };
 
-    if target.arch == "x86_64" {
+    if target.arch == Arch::X86_64 {
         // Force alignment for the entire section to be 16 on x86_64.
         file.section_mut(section).append_data(&[], 16);
     } else {
@@ -111,7 +111,7 @@ pub(super) fn add_data_and_relocation(
             r_pcrel: false,
             r_length: 3,
         }
-    } else if target.arch == "arm" {
+    } else if target.arch == Arch::Arm {
         // FIXME(madsmtm): Remove once `object` supports 32-bit ARM relocations:
         // https://github.com/gimli-rs/object/pull/757
         object::write::RelocationFlags::MachO {
@@ -160,7 +160,11 @@ pub(super) fn add_version_to_llvm_target(
 pub(super) fn get_sdk_root(sess: &Session) -> Option<PathBuf> {
     let sdk_name = sdk_name(&sess.target);
 
-    match xcrun_show_sdk_path(sdk_name, sess.verbose_internals()) {
+    // Attempt to invoke `xcrun` to find the SDK.
+    //
+    // Note that when cross-compiling from e.g. Linux, the `xcrun` binary may sometimes be provided
+    // as a shim by a cross-compilation helper tool. It usually isn't, but we still try nonetheless.
+    match xcrun_show_sdk_path(sdk_name, false) {
         Ok((path, stderr)) => {
             // Emit extra stderr, such as if `-verbose` was passed, or if `xcrun` emitted a warning.
             if !stderr.is_empty() {
@@ -169,19 +173,31 @@ pub(super) fn get_sdk_root(sess: &Session) -> Option<PathBuf> {
             Some(path)
         }
         Err(err) => {
-            let mut diag = sess.dcx().create_err(err);
+            // Failure to find the SDK is not a hard error, since the user might have specified it
+            // in a manner unknown to us (moreso if cross-compiling):
+            // - A compiler driver like `zig cc` which links using an internally bundled SDK.
+            // - Extra linker arguments (`-Clink-arg=-syslibroot`).
+            // - A custom linker or custom compiler driver.
+            //
+            // Though we still warn, since such cases are uncommon, and it is very hard to debug if
+            // you do not know the details.
+            //
+            // FIXME(madsmtm): Make this a lint, to allow deny warnings to work.
+            // (Or fix <https://github.com/rust-lang/rust/issues/21204>).
+            let mut diag = sess.dcx().create_warn(err);
+            diag.note(msg!("the SDK is needed by the linker to know where to find symbols in system libraries and for embedding the SDK version in the final object file"));
 
             // Recognize common error cases, and give more Rust-specific error messages for those.
             if let Some(developer_dir) = xcode_select_developer_dir() {
                 diag.arg("developer_dir", &developer_dir);
-                diag.note(fluent::codegen_ssa_xcrun_found_developer_dir);
+                diag.note(msg!("found active developer directory at \"{$developer_dir}\""));
                 if developer_dir.as_os_str().to_string_lossy().contains("CommandLineTools") {
                     if sdk_name != "MacOSX" {
-                        diag.help(fluent::codegen_ssa_xcrun_command_line_tools_insufficient);
+                        diag.help(msg!("when compiling for iOS, tvOS, visionOS or watchOS, you need a full installation of Xcode"));
                     }
                 }
             } else {
-                diag.help(fluent::codegen_ssa_xcrun_no_developer_dir);
+                diag.help(msg!("pass the path of an Xcode installation via the DEVELOPER_DIR environment variable, or an SDK with the SDKROOT environment variable"));
             }
 
             diag.emit();
@@ -209,6 +225,8 @@ fn xcrun_show_sdk_path(
     sdk_name: &'static str,
     verbose: bool,
 ) -> Result<(PathBuf, String), XcrunError> {
+    // Intentionally invoke the `xcrun` in PATH, since e.g. nixpkgs provide an `xcrun` shim, so we
+    // don't want to require `/usr/bin/xcrun`.
     let mut cmd = Command::new("xcrun");
     if verbose {
         cmd.arg("--verbose");
@@ -280,7 +298,7 @@ fn stdout_to_path(mut stdout: Vec<u8>) -> PathBuf {
     }
     #[cfg(unix)]
     let path = <OsString as std::os::unix::ffi::OsStringExt>::from_vec(stdout);
-    #[cfg(not(unix))] // Unimportant, this is only used on macOS
-    let path = OsString::from(String::from_utf8(stdout).unwrap());
+    #[cfg(not(unix))] // Not so important, this is mostly used on macOS
+    let path = OsString::from(String::from_utf8(stdout).expect("stdout must be UTF-8"));
     PathBuf::from(path)
 }

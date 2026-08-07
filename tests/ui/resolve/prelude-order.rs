@@ -1,5 +1,6 @@
 //@ proc-macro:macro_helpers.rs
 //@ compile-flags: --crate-type=lib
+//@ ignore-backends: gcc
 
 /* There are 5 preludes and 3 namespaces. Test the order in which they are resolved.
  * See https://doc.rust-lang.org/nightly/reference/names/preludes.html.
@@ -58,7 +59,7 @@ extern crate macro_helpers as _;
 /* lang and libs implicitly in scope */
 
 // tool/extern -> extern
-#[type_ns::inner] //~ ERROR could not find `inner` in `type_ns`
+#[type_ns::inner] //~ ERROR cannot find `inner` in `type_ns`
 fn t1() {}
 
 // tool/lang -> tool
@@ -70,7 +71,7 @@ fn t2() {}
 fn t3() {}
 
 // extern/lang -> extern
-#[usize::inner] //~ ERROR could not find `inner` in `usize`
+#[usize::inner] //~ ERROR cannot find `inner` in `usize`
 fn e1() {} // NOTE: testing with `-> usize` isn't valid, crates aren't considered in that scope
            // (unless they have generic arguments, for some reason.)
 

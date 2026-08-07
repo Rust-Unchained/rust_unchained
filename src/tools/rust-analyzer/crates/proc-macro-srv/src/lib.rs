@@ -7,42 +7,52 @@
 //!
 //! * We use `tt` for proc-macro `TokenStream` server, it is easier to manipulate and interact with
 //!   RA than `proc-macro2` token stream.
-//! * By **copying** the whole rustc `lib_proc_macro` code, we are able to build this with `stable`
-//!   rustc rather than `unstable`. (Although in general ABI compatibility is still an issue)…
 
-#![cfg(any(feature = "sysroot-abi", rust_analyzer))]
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)]
-#![allow(unreachable_pub, internal_features, clippy::disallowed_types, clippy::print_stderr)]
-#![deny(deprecated_safe)]
+#![cfg(feature = "in-rust-tree")]
+#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)]
+#![expect(internal_features, clippy::disallowed_types, clippy::print_stderr)]
+#![allow(unused_features, unused_crate_dependencies)]
+#![deny(deprecated_safe, clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(test, expect(unreachable_pub))]
 
-extern crate proc_macro;
-#[cfg(feature = "in-rust-tree")]
+extern crate rustc_codegen_ssa;
 extern crate rustc_driver as _;
-
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_lexer as rustc_lexer;
-#[cfg(feature = "in-rust-tree")]
+extern crate rustc_interface;
 extern crate rustc_lexer;
+extern crate rustc_metadata;
+extern crate rustc_proc_macro;
+extern crate rustc_session;
+extern crate rustc_span;
+extern crate rustc_target;
 
+mod bridge;
 mod dylib;
-mod proc_macros;
 mod server_impl;
+mod token_stream;
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     ffi::OsString,
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     thread,
 };
 
 use paths::{Utf8Path, Utf8PathBuf};
-use span::{Span, TokenId};
+use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
+use temp_dir::TempDir;
 
-use crate::server_impl::TokenStream;
+pub use crate::server_impl::token_id::SpanId;
+
+pub use rustc_proc_macro::Delimiter;
+pub use span;
+
+pub use crate::bridge::*;
+pub use crate::server_impl::literal_from_str;
+pub use crate::token_stream::{TokenStream, TokenStreamIter, literal_to_string};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ProcMacroKind {
@@ -56,32 +66,93 @@ pub const RUSTC_VERSION_STRING: &str = env!("RUSTC_VERSION");
 pub struct ProcMacroSrv<'env> {
     expanders: Mutex<HashMap<Utf8PathBuf, Arc<dylib::Expander>>>,
     env: &'env EnvSnapshot,
+    temp_dir: TempDir,
 }
 
 impl<'env> ProcMacroSrv<'env> {
     pub fn new(env: &'env EnvSnapshot) -> Self {
-        Self { expanders: Default::default(), env }
+        Self {
+            expanders: Default::default(),
+            env,
+            temp_dir: TempDir::with_prefix("proc-macro-srv").unwrap(),
+        }
     }
+
+    pub fn join_spans(&self, first: Span, second: Span) -> Option<Span> {
+        first.join(second, |_, _| {
+            // FIXME: Once we can talk back to the client, implement a "long join" request for anchors
+            // that differ in [AstId]s as joining those spans requires resolving the AstIds.
+            None
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum ProcMacroClientError {
+    Cancelled { reason: String },
+    Io(std::io::Error),
+    Protocol(String),
+    Eof,
+}
+
+#[derive(Debug)]
+pub enum ProcMacroPanicMarker {
+    Cancelled { reason: String },
+    Internal { reason: String },
+}
+
+pub type ProcMacroClientHandle<'a> = &'a mut (dyn ProcMacroClientInterface + Sync + Send);
+
+pub trait ProcMacroClientInterface {
+    fn file(&mut self, file_id: span::FileId) -> String;
+    fn source_text(&mut self, span: Span) -> Option<String>;
+    fn local_file(&mut self, file_id: span::FileId) -> Option<String>;
+    /// Line and column are 1-based.
+    fn line_column(&mut self, span: Span) -> Option<(u32, u32)>;
+
+    fn byte_range(&mut self, span: Span) -> Range<usize>;
+    fn span_source(&mut self, span: Span) -> Span;
+    fn span_parent(&mut self, span: Span) -> Option<Span>;
+    fn span_join(&mut self, first: Span, second: Span) -> Option<Span>;
 }
 
 const EXPANDER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+pub enum ExpandError {
+    Panic(PanicMessage),
+    Cancelled { reason: Option<String> },
+    Internal { reason: Option<String> },
+}
+
+impl ExpandError {
+    pub fn into_string(self) -> Option<String> {
+        match self {
+            ExpandError::Panic(panic_message) => panic_message.into_string(),
+            ExpandError::Cancelled { reason } => reason,
+            ExpandError::Internal { reason } => reason,
+        }
+    }
+}
+
 impl ProcMacroSrv<'_> {
-    pub fn expand<S: ProcMacroSrvSpan>(
+    pub fn expand<'a, S: ProcMacroSrvSpan + 'a>(
         &self,
         lib: impl AsRef<Utf8Path>,
-        env: Vec<(String, String)>,
+        env: &[(String, String)],
         current_dir: Option<impl AsRef<Path>>,
-        macro_name: String,
-        macro_body: tt::TopSubtree<S>,
-        attribute: Option<tt::TopSubtree<S>>,
+        macro_name: &str,
+        macro_body: token_stream::TokenStream<S>,
+        attribute: Option<token_stream::TokenStream<S>>,
         def_site: S,
         call_site: S,
         mixed_site: S,
-    ) -> Result<Vec<tt::TokenTree<S>>, String> {
+        tracked_env: &'a mut TrackedEnv,
+        callback: Option<ProcMacroClientHandle<'a>>,
+    ) -> Result<token_stream::TokenStream<S>, ExpandError> {
         let snapped_env = self.env;
-        let expander =
-            self.expander(lib.as_ref()).map_err(|err| format!("failed to load macro: {err}"))?;
+        let expander = self.expander(lib.as_ref()).map_err(|err| ExpandError::Internal {
+            reason: Some(format!("failed to load macro: {err}")),
+        })?;
 
         let prev_env = EnvChange::apply(snapped_env, env, current_dir.as_ref().map(<_>::as_ref));
 
@@ -90,27 +161,35 @@ impl ProcMacroSrv<'_> {
         let result = thread::scope(|s| {
             let thread = thread::Builder::new()
                 .stack_size(EXPANDER_STACK_SIZE)
-                .name(macro_name.clone())
+                .name(macro_name.to_owned())
                 .spawn_scoped(s, move || {
-                    expander
-                        .expand(
-                            &macro_name,
-                            server_impl::TopSubtree(macro_body.0.into_vec()),
-                            attribute.map(|it| server_impl::TopSubtree(it.0.into_vec())),
-                            def_site,
-                            call_site,
-                            mixed_site,
-                        )
-                        .map(|tt| tt.0)
+                    expander.expand(
+                        macro_name,
+                        macro_body,
+                        attribute,
+                        def_site,
+                        call_site,
+                        mixed_site,
+                        tracked_env,
+                        callback,
+                    )
                 });
-            let res = match thread {
-                Ok(handle) => handle.join(),
-                Err(e) => return Err(e.to_string()),
-            };
+            match thread.unwrap().join() {
+                Ok(res) => res.map_err(ExpandError::Panic),
+                Err(payload) => {
+                    if let Some(marker) = payload.downcast_ref::<ProcMacroPanicMarker>() {
+                        return match marker {
+                            ProcMacroPanicMarker::Cancelled { reason } => {
+                                Err(ExpandError::Cancelled { reason: Some(reason.clone()) })
+                            }
+                            ProcMacroPanicMarker::Internal { reason } => {
+                                Err(ExpandError::Internal { reason: Some(reason.clone()) })
+                            }
+                        };
+                    }
 
-            match res {
-                Ok(res) => res,
-                Err(e) => std::panic::resume_unwind(e),
+                    std::panic::resume_unwind(payload)
+                }
             }
         });
         prev_env.rollback();
@@ -123,12 +202,12 @@ impl ProcMacroSrv<'_> {
         dylib_path: &Utf8Path,
     ) -> Result<Vec<(String, ProcMacroKind)>, String> {
         let expander = self.expander(dylib_path)?;
-        Ok(expander.list_macros())
+        Ok(expander.list_macros().map(|(k, v)| (k.to_owned(), v)).collect())
     }
 
     fn expander(&self, path: &Utf8Path) -> Result<Arc<dylib::Expander>, String> {
         let expander = || {
-            let expander = dylib::Expander::new(path)
+            let expander = dylib::Expander::new(&self.temp_dir, path)
                 .map_err(|err| format!("Cannot create expander for {path}: {err}",));
             expander.map(Arc::new)
         };
@@ -153,30 +232,60 @@ impl ProcMacroSrv<'_> {
     }
 }
 
-pub trait ProcMacroSrvSpan: Copy + Send {
-    type Server: proc_macro::bridge::server::Server<TokenStream = TokenStream<Self>>;
-    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server;
+#[derive(Default)]
+pub struct TrackedEnv {
+    pub env_vars: HashMap<Box<str>, Option<Box<str>>>,
+    pub paths: HashSet<Box<str>>,
 }
 
-impl ProcMacroSrvSpan for TokenId {
-    type Server = server_impl::token_id::TokenIdServer;
+pub trait ProcMacroSrvSpan: Copy + Send + Sync {
+    type Server<'a>: rustc_proc_macro::bridge::server::Server<
+            TokenStream = crate::token_stream::TokenStream<Self>,
+        >;
+    fn make_server<'a>(
+        call_site: Self,
+        def_site: Self,
+        mixed_site: Self,
+        tracked_env: &'a mut TrackedEnv,
+        callback: Option<ProcMacroClientHandle<'a>>,
+    ) -> Self::Server<'a>;
+}
 
-    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server {
-        Self::Server { call_site, def_site, mixed_site }
+impl ProcMacroSrvSpan for SpanId {
+    type Server<'a> = server_impl::token_id::SpanIdServer<'a>;
+
+    fn make_server<'a>(
+        call_site: Self,
+        def_site: Self,
+        mixed_site: Self,
+        _: &'a mut TrackedEnv,
+        callback: Option<ProcMacroClientHandle<'a>>,
+    ) -> Self::Server<'a> {
+        Self::Server { call_site, def_site, mixed_site, callback }
     }
 }
+
 impl ProcMacroSrvSpan for Span {
-    type Server = server_impl::rust_analyzer_span::RaSpanServer;
-    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server {
+    type Server<'a> = server_impl::rust_analyzer_span::RaSpanServer<'a>;
+    fn make_server<'a>(
+        call_site: Self,
+        def_site: Self,
+        mixed_site: Self,
+        tracked_env: &'a mut TrackedEnv,
+        callback: Option<ProcMacroClientHandle<'a>>,
+    ) -> Self::Server<'a> {
         Self::Server {
             call_site,
             def_site,
             mixed_site,
-            tracked_env_vars: Default::default(),
-            tracked_paths: Default::default(),
+            callback,
+            tracked_env,
+            fixup_id: FIXUP_ERASED_FILE_AST_ID_MARKER,
         }
     }
 }
+
+#[derive(Debug, Clone)]
 pub struct PanicMessage {
     message: Option<String>,
 }
@@ -200,7 +309,7 @@ impl Default for EnvSnapshot {
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvChange<'snap> {
-    changed_vars: Vec<String>,
+    changed_vars: Vec<&'snap str>,
     prev_working_dir: Option<PathBuf>,
     snap: &'snap EnvSnapshot,
     _guard: std::sync::MutexGuard<'snap, ()>,
@@ -209,7 +318,7 @@ struct EnvChange<'snap> {
 impl<'snap> EnvChange<'snap> {
     fn apply(
         snap: &'snap EnvSnapshot,
-        new_vars: Vec<(String, String)>,
+        new_vars: &'snap [(String, String)],
         current_dir: Option<&Path>,
     ) -> EnvChange<'snap> {
         let guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -218,7 +327,7 @@ impl<'snap> EnvChange<'snap> {
                 let prev_working_dir = std::env::current_dir().ok();
                 if let Err(err) = std::env::set_current_dir(dir) {
                     eprintln!(
-                        "Failed to set the current working dir to {}. Error: {err:?}",
+                        "Failed to change the current working dir to {}. Error: {err:?}",
                         dir.display()
                     )
                 }
@@ -229,11 +338,11 @@ impl<'snap> EnvChange<'snap> {
         EnvChange {
             snap,
             changed_vars: new_vars
-                .into_iter()
+                .iter()
                 .map(|(k, v)| {
                     // SAFETY: We have acquired the environment lock
-                    unsafe { env::set_var(&k, v) };
-                    k
+                    unsafe { env::set_var(k, v) };
+                    &**k
                 })
                 .collect(),
             prev_working_dir,
@@ -256,14 +365,14 @@ impl Drop for EnvChange<'_> {
             }
         }
 
-        if let Some(dir) = &self.prev_working_dir {
-            if let Err(err) = std::env::set_current_dir(dir) {
-                eprintln!(
-                    "Failed to set the current working dir to {}. Error: {:?}",
-                    dir.display(),
-                    err
-                )
-            }
+        if let Some(dir) = &self.prev_working_dir
+            && let Err(err) = std::env::set_current_dir(dir)
+        {
+            eprintln!(
+                "Failed to change the current working dir back to {}. Error: {:?}",
+                dir.display(),
+                err
+            )
         }
     }
 }

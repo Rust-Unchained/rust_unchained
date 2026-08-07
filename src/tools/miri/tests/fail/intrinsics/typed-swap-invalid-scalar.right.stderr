@@ -1,18 +1,16 @@
-error: Undefined Behavior: constructing invalid value: encountered 0x03, but expected a boolean
+error: Undefined Behavior: constructing invalid value of type bool: encountered 0x03, but expected a boolean
   --> tests/fail/intrinsics/typed-swap-invalid-scalar.rs:LL:CC
    |
 LL |         typed_swap_nonoverlapping(a, b);
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ constructing invalid value: encountered 0x03, but expected a boolean
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
    |
    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
-   = note: BACKTRACE:
-   = note: inside `invalid_scalar` at tests/fail/intrinsics/typed-swap-invalid-scalar.rs:LL:CC
-note: inside `main`
-  --> tests/fail/intrinsics/typed-swap-invalid-scalar.rs:LL:CC
-   |
-LL |     invalid_scalar();
-   |     ^^^^^^^^^^^^^^^^
+   = note: stack backtrace:
+           0: invalid_scalar
+               at tests/fail/intrinsics/typed-swap-invalid-scalar.rs:LL:CC
+           1: main
+               at tests/fail/intrinsics/typed-swap-invalid-scalar.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

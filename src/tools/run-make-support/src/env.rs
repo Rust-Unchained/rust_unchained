@@ -18,11 +18,28 @@ pub fn env_var_os(name: &str) -> OsString {
     }
 }
 
-/// Check if `NO_DEBUG_ASSERTIONS` is set (usually this may be set in CI jobs).
+/// Check if staged `rustc`-under-test was built with debug assertions.
 #[track_caller]
 #[must_use]
-pub fn no_debug_assertions() -> bool {
-    std::env::var_os("NO_DEBUG_ASSERTIONS").is_some()
+pub fn rustc_debug_assertions_enabled() -> bool {
+    // Note: we assume this env var is set when the test recipe is being executed.
+    std::env::var_os("__RUSTC_DEBUG_ASSERTIONS_ENABLED").is_some()
+}
+
+/// Check if staged `std`-under-test was built with debug assertions.
+#[track_caller]
+#[must_use]
+pub fn std_debug_assertions_enabled() -> bool {
+    // Note: we assume this env var is set when the test recipe is being executed.
+    std::env::var_os("__STD_DEBUG_ASSERTIONS_ENABLED").is_some()
+}
+
+/// Check if staged `std`-under-test was built with remapping of it's sources.
+#[track_caller]
+#[must_use]
+pub fn std_remap_debuginfo_enabled() -> bool {
+    // Note: we assume this env var is set when the test recipe is being executed.
+    std::env::var_os("__STD_REMAP_DEBUGINFO_ENABLED").is_some()
 }
 
 /// A wrapper around [`std::env::set_current_dir`] which includes the directory
@@ -31,4 +48,18 @@ pub fn no_debug_assertions() -> bool {
 pub fn set_current_dir<P: AsRef<std::path::Path>>(dir: P) {
     std::env::set_current_dir(dir.as_ref())
         .expect(&format!("could not set current directory to \"{}\"", dir.as_ref().display()));
+}
+
+/// Number of parallel jobs bootstrap was configured with.
+///
+/// This may fallback to [`std::thread::available_parallelism`] when no explicit jobs count has been
+/// configured. Refer to bootstrap's jobs fallback logic.
+#[track_caller]
+pub fn jobs() -> u32 {
+    std::env::var_os("__BOOTSTRAP_JOBS")
+        .expect("`__BOOTSTRAP_JOBS` must be set by `compiletest`")
+        .to_str()
+        .expect("`__BOOTSTRAP_JOBS` must be a valid string")
+        .parse::<u32>()
+        .expect("`__BOOTSTRAP_JOBS` must be a valid `u32`")
 }

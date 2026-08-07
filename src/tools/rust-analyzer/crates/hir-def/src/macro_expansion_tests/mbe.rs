@@ -35,9 +35,9 @@ macro_rules! f {
     };
 }
 
-struct#0:1@58..64#4# MyTraitMap2#0:2@31..42#2# {#0:1@72..73#4#
-    map#0:1@86..89#4#:#0:1@89..90#4# #0:1@89..90#4#::#0:1@91..93#4#std#0:1@93..96#4#::#0:1@96..98#4#collections#0:1@98..109#4#::#0:1@109..111#4#HashSet#0:1@111..118#4#<#0:1@118..119#4#(#0:1@119..120#4#)#0:1@120..121#4#>#0:1@121..122#4#,#0:1@122..123#4#
-}#0:1@132..133#4#
+struct#0:MacroRules[BE8F, 0]@58..64#15360# MyTraitMap2#0:MacroCall[BE8F, 0]@31..42#ROOT2024# {#0:MacroRules[BE8F, 0]@72..73#15360#
+    map#0:MacroRules[BE8F, 0]@86..89#15360#:#0:MacroRules[BE8F, 0]@89..90#15360# #0:MacroRules[BE8F, 0]@89..90#15360#::#0:MacroRules[BE8F, 0]@91..93#15360#std#0:MacroRules[BE8F, 0]@93..96#15360#::#0:MacroRules[BE8F, 0]@96..98#15360#collections#0:MacroRules[BE8F, 0]@98..109#15360#::#0:MacroRules[BE8F, 0]@109..111#15360#HashSet#0:MacroRules[BE8F, 0]@111..118#15360#<#0:MacroRules[BE8F, 0]@118..119#15360#(#0:MacroRules[BE8F, 0]@119..120#15360#)#0:MacroRules[BE8F, 0]@120..121#15360#>#0:MacroRules[BE8F, 0]@121..122#15360#,#0:MacroRules[BE8F, 0]@122..123#15360#
+}#0:MacroRules[BE8F, 0]@132..133#15360#
 "#]],
     );
 }
@@ -75,12 +75,12 @@ macro_rules! f {
     };
 }
 
-fn#0:2@30..32#2# main#0:2@33..37#2#(#0:2@37..38#2#)#0:2@38..39#2# {#0:2@40..41#2#
-    1#0:2@50..51#2#;#0:2@51..52#2#
-    1.0#0:2@61..64#2#;#0:2@64..65#2#
-    (#0:2@74..75#2#(#0:2@75..76#2#1#0:2@76..77#2#,#0:2@77..78#2# )#0:2@78..79#2#,#0:2@79..80#2# )#0:2@80..81#2#.#0:2@81..82#2#0#0:2@82..85#2#.#0:2@82..85#2#0#0:2@82..85#2#;#0:2@85..86#2#
-    let#0:2@95..98#2# x#0:2@99..100#2# =#0:2@101..102#2# 1#0:2@103..104#2#;#0:2@104..105#2#
-}#0:2@110..111#2#
+fn#0:MacroCall[BE8F, 0]@30..32#ROOT2024# main#0:MacroCall[BE8F, 0]@33..37#ROOT2024#(#0:MacroCall[BE8F, 0]@37..38#ROOT2024#)#0:MacroCall[BE8F, 0]@38..39#ROOT2024# {#0:MacroCall[BE8F, 0]@40..41#ROOT2024#
+    1#0:MacroCall[BE8F, 0]@50..51#ROOT2024#;#0:MacroCall[BE8F, 0]@51..52#ROOT2024#
+    1.0#0:MacroCall[BE8F, 0]@61..64#ROOT2024#;#0:MacroCall[BE8F, 0]@64..65#ROOT2024#
+    (#0:MacroCall[BE8F, 0]@74..75#ROOT2024#(#0:MacroCall[BE8F, 0]@75..76#ROOT2024#1#0:MacroCall[BE8F, 0]@76..77#ROOT2024#,#0:MacroCall[BE8F, 0]@77..78#ROOT2024# )#0:MacroCall[BE8F, 0]@78..79#ROOT2024#,#0:MacroCall[BE8F, 0]@79..80#ROOT2024# )#0:MacroCall[BE8F, 0]@80..81#ROOT2024#.#0:MacroCall[BE8F, 0]@81..82#ROOT2024#0#0:MacroCall[BE8F, 0]@82..85#ROOT2024#.#0:MacroCall[BE8F, 0]@82..85#ROOT2024#0#0:MacroCall[BE8F, 0]@82..85#ROOT2024#;#0:MacroCall[BE8F, 0]@85..86#ROOT2024#
+    let#0:MacroCall[BE8F, 0]@95..98#ROOT2024# x#0:MacroCall[BE8F, 0]@99..100#ROOT2024# =#0:MacroCall[BE8F, 0]@101..102#ROOT2024# 1#0:MacroCall[BE8F, 0]@103..104#ROOT2024#;#0:MacroCall[BE8F, 0]@104..105#ROOT2024#
+}#0:MacroCall[BE8F, 0]@110..111#ROOT2024#
 
 
 "#]],
@@ -171,7 +171,7 @@ fn main(foo: ()) {
     }
 
     fn main(foo: ()) {
-        /* error: unresolved macro unresolved */"helloworld!"#0:3@236..321#2#;
+        /* error: unresolved macro unresolved */"helloworld!"#0:Fn[15AE, 0]@236..321#ROOT2024#;
     }
 }
 
@@ -197,7 +197,7 @@ macro_rules! mk_struct {
 #[macro_use]
 mod foo;
 
-struct#1:1@59..65#4# Foo#0:2@32..35#2#(#1:1@70..71#4#u32#0:2@41..44#2#)#1:1@74..75#4#;#1:1@75..76#4#
+struct#1:MacroRules[DB0C, 0]@59..65#15360# Foo#0:MacroCall[DB0C, 0]@32..35#ROOT2024#(#1:MacroRules[DB0C, 0]@70..71#15360#u32#0:MacroCall[DB0C, 0]@41..44#ROOT2024#)#1:MacroRules[DB0C, 0]@74..75#15360#;#1:MacroRules[DB0C, 0]@75..76#15360#
 "#]],
     );
 }
@@ -300,21 +300,21 @@ fn match_by_first_token_literally() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (= $i:ident) => ( fn $i() {} );
     (+ $i:ident) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { = bar }
 m! { + Baz }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (= $i:ident) => ( fn $i() {} );
     (+ $i:ident) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -326,21 +326,21 @@ fn match_by_last_token_literally() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     ($i:ident =) => ( fn $i() {} );
     ($i:ident +) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { bar = }
 m! { Baz + }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     ($i:ident =) => ( fn $i() {} );
     ($i:ident +) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -352,21 +352,21 @@ fn match_by_ident() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (spam $i:ident) => ( fn $i() {} );
     (eggs $i:ident) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { spam bar }
 m! { eggs Baz }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (spam $i:ident) => ( fn $i() {} );
     (eggs $i:ident) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -378,12 +378,12 @@ fn match_by_separator_token() {
     check(
         r#"
 macro_rules! m {
-    ($($i:ident),*) => ($(mod $i {} )*);
+    ($($i:ident),*) => ($(enum $i {} )*);
     ($($i:ident)#*) => ($(fn $i() {} )*);
     ($i:ident ,# $ j:ident) => ( struct $i; struct $ j; )
 }
 
-m! { foo, bar }
+m! { Baz, Qux }
 
 m! { foo# bar }
 
@@ -391,13 +391,13 @@ m! { Foo,# Bar }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($($i:ident),*) => ($(mod $i {} )*);
+    ($($i:ident),*) => ($(enum $i {} )*);
     ($($i:ident)#*) => ($(fn $i() {} )*);
     ($i:ident ,# $ j:ident) => ( struct $i; struct $ j; )
 }
 
-mod foo {}
-mod bar {}
+enum Baz {}
+enum Qux {}
 
 fn foo() {}
 fn bar() {}
@@ -423,10 +423,10 @@ m! { foo, bar }
 macro_rules! m {
     ($($i:ident),*) => ( impl Bar { $(fn $i() {})* } );
 }
-impl#\4# Bar#\4# {#\4#
-    fn#\4# foo#\2#(#\4#)#\4# {#\4#}#\4#
-    fn#\4# bar#\2#(#\4#)#\4# {#\4#}#\4#
-}#\4#
+impl#\15360# Bar#\15360# {#\15360#
+    fn#\15360# foo#\ROOT2024#(#\15360#)#\15360# {#\15360#}#\15360#
+    fn#\15360# bar#\ROOT2024#(#\15360#)#\15360# {#\15360#}#\15360#
+}#\15360#
 "#]],
     );
 }
@@ -1114,11 +1114,11 @@ fn test_single_item() {
     check(
         r#"
 macro_rules! m { ($i:item) => ( $i ) }
-m! { mod c {} }
+m! { struct C {} }
 "#,
         expect![[r#"
 macro_rules! m { ($i:item) => ( $i ) }
-mod c {}
+struct C {}
 "#]],
     )
 }
@@ -1144,6 +1144,7 @@ m! {
     type T = u8;
 }
 "#,
+        // The modules are counted twice, once because of the module and once because of the macro call.
         expect![[r#"
 macro_rules! m { ($($i:item)*) => ($($i )*) }
 extern crate a;
@@ -1161,7 +1162,9 @@ trait J {}
 fn h() {}
 extern {}
 type T = u8;
-"#]],
+
+mod b;
+mod c {}"#]],
     );
 }
 
@@ -1195,7 +1198,7 @@ m! { hello::world }
 macro_rules! m {
     ($m:meta) => ( #[$m] fn bar() {} )
 }
-#[cfg(target_os = "windows")] fn bar() {}
+#[cfg (target_os = "windows")] fn bar() {}
 #[hello::world] fn bar() {}
 "#]],
     );
@@ -1408,7 +1411,7 @@ ok!();
 macro_rules! m2 {
     ($($a:expr => $b:ident)* _ => $c:expr) => { ok!(); }
 }
-ok!();
+/* error: unexpected token in input */ok!();
 "#]],
     );
 }
@@ -1959,23 +1962,103 @@ fn f() {
 }
 
 #[test]
-fn test_edition_handling_in() {
+fn semicolon_does_not_glue() {
     check(
         r#"
-//- /main.rs crate:main deps:old edition:2021
+macro_rules! bug {
+    ($id: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*; $norm: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*;; $print: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*; $norm: expr; $print: expr) => {
+        true
+    };
+}
 fn f() {
-    old::parse_try_old!(try!{});
+    let _ = bug!(a;;;test);
 }
-//- /old.rs crate:old edition:2015
-#[macro_export]
-macro_rules! parse_try_old {
-    ($it:expr) => {};
-}
- "#,
+    "#,
         expect![[r#"
+macro_rules! bug {
+    ($id: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*; $norm: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*;; $print: expr) => {
+        true
+    };
+    ($id: expr; $($attr: ident),*; $norm: expr; $print: expr) => {
+        true
+    };
+}
 fn f() {
+    let _ = true;
+}
+    "#]],
+    );
+}
+
+#[test]
+fn lifetime_repeat() {
+    check(
+        r#"
+macro_rules! m {
+    ($($x:expr)'a*) => (stringify!($($x)'b*));
+}
+fn f() {
+    let _ = m!(0 'a 1 'a 2);
+}
+    "#,
+        expect![[r#"
+macro_rules! m {
+    ($($x:expr)'a*) => (stringify!($($x)'b*));
+}
+fn f() {
+    let _ = stringify!(0 'b 1 'b 2);
+}
+    "#]],
+    );
+}
+
+#[test]
+fn per_token_edition() {
+    check(
+        r#"
+//- /foo.rs crate:foo edition:2024
+#[macro_export]
+macro_rules! m {
+    ($e:expr) => {};
+}
+//- /bar.rs crate:bar deps:foo edition:2021
+fn gen() -> usize {
+    0
+}
+
+fn foo() {
+    foo::m!(gen());
+}
+    "#,
+        expect![[r#"
+fn gen() -> usize {
+    0
+}
+
+fn foo() {
     ;
 }
-"#]],
+    "#]],
     );
 }

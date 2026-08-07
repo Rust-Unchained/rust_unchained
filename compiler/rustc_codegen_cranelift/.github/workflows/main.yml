@@ -19,24 +19,34 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  todo_check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Check todo
+      run: ./y.sh check-todo
+
   rustfmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Avoid installing rustc-dev
       run: |
-        sed -i 's/components.*/components = ["rustfmt"]/' rust-toolchain
+        sed -i 's/components.*/components = ["rustfmt"]/' rust-toolchain.toml
         rustfmt -v
 
     - name: Rustfmt
       run: |
         cargo fmt --check
-        rustfmt --check build_system/main.rs
-        rustfmt --check example/*
-        rustfmt --check scripts/*.rs
+        rustfmt --check --edition 2024 build_system/main.rs
+        rustfmt --check --edition 2024 example/*
+        rustfmt --check --edition 2024 scripts/*.rs
 
 
   test:
@@ -56,7 +66,7 @@ jobs:
           - os: ubuntu-24.04-arm
             env:
               TARGET_TRIPLE: aarch64-unknown-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             env:
               TARGET_TRIPLE: x86_64-apple-darwin
           - os: macos-latest
@@ -78,17 +88,17 @@ jobs:
               TARGET_TRIPLE: x86_64-pc-windows-gnu
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: CPU features
       if: matrix.os == 'ubuntu-latest'
       run: cat /proc/cpuinfo
 
     - name: Cache cargo target dir
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: build/cg_clif
-        key: ${{ runner.os }}-${{ matrix.env.TARGET_TRIPLE }}-cargo-build-target-${{ hashFiles('rust-toolchain', '**/Cargo.lock') }}
+        key: ${{ runner.os }}-${{ matrix.env.TARGET_TRIPLE }}-cargo-build-target-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
     - name: Set MinGW as the default toolchain
       if: matrix.os == 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
@@ -109,7 +119,8 @@ jobs:
     - name: Test
       env:
         TARGET_TRIPLE: ${{ matrix.env.TARGET_TRIPLE }}
-      run: ./y.sh test
+      # Skip `graviola` on Windows, too slow
+      run: ./y.sh test ${{ runner.os == 'Windows' && '--skip-test test.graviola' || '' }}
 
     - name: Install LLVM standard library
       run: rustup target add ${{ matrix.env.TARGET_TRIPLE }}
@@ -118,7 +129,8 @@ jobs:
     - name: Test with LLVM sysroot
       env:
         TARGET_TRIPLE: ${{ matrix.env.TARGET_TRIPLE }}
-      run: ./y.sh test --sysroot llvm --no-unstable-features
+      # Skip `graviola` on Windows, too slow
+      run: ./y.sh test --sysroot llvm --no-unstable-features ${{ runner.os == 'Windows' && '--skip-test test.graviola' || '' }}
 
 
   # This job doesn't use cg_clif in any way. It checks that all cg_clif tests work with cg_llvm too.
@@ -127,7 +139,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: CPU features
       run: cat /proc/cpuinfo
@@ -149,16 +161,16 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: CPU features
       run: cat /proc/cpuinfo
 
     - name: Cache cargo target dir
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: build/cg_clif
-        key: ${{ runner.os }}-x86_64-unknown-linux-gnu-cargo-build-target-${{ hashFiles('rust-toolchain', '**/Cargo.lock') }}
+        key: ${{ runner.os }}-x86_64-unknown-linux-gnu-cargo-build-target-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
     - name: Install hyperfine
       run: |
@@ -187,7 +199,7 @@ jobs:
           - os: ubuntu-24.04-arm
             env:
               TARGET_TRIPLE: aarch64-unknown-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             env:
               TARGET_TRIPLE: x86_64-apple-darwin
           - os: macos-latest
@@ -201,13 +213,13 @@ jobs:
               TARGET_TRIPLE: x86_64-pc-windows-gnu
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Cache cargo target dir
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: build/cg_clif
-        key: ${{ runner.os }}-${{ matrix.env.TARGET_TRIPLE }}-dist-cargo-build-target-${{ hashFiles('rust-toolchain', '**/Cargo.lock') }}
+        key: ${{ runner.os }}-${{ matrix.env.TARGET_TRIPLE }}-dist-cargo-build-target-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
     - name: Set MinGW as the default toolchain
       if: matrix.os == 'windows-latest' && matrix.env.TARGET_TRIPLE == 'x86_64-pc-windows-gnu'
@@ -223,7 +235,7 @@ jobs:
       run: tar cvfJ cg_clif.tar.xz dist
 
     - name: Upload prebuilt cg_clif
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: cg_clif-${{ matrix.env.TARGET_TRIPLE }}
         path: cg_clif.tar.xz
@@ -231,8 +243,8 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ github.ref == 'refs/heads/master' }}
-    needs: [rustfmt, test, bench, dist]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: [todo_check, rustfmt, test, bench, dist]
 
     permissions:
       contents: write # for creating the dev tag and release
@@ -242,10 +254,10 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
 

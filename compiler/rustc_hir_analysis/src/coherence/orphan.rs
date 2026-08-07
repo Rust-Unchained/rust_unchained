@@ -7,6 +7,7 @@ use rustc_infer::infer::{DefineOpaqueTypes, InferCtxt, TyCtxtInferExt};
 use rustc_lint_defs::builtin::UNCOVERED_PARAM_IN_PROJECTION;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode,
+    Unnormalized,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::{DefId, LocalDefId};
@@ -15,14 +16,14 @@ use rustc_trait_selection::traits::{
 };
 use tracing::{debug, instrument};
 
-use crate::errors;
+use crate::diagnostics;
 
 #[instrument(level = "debug", skip(tcx))]
 pub(crate) fn orphan_check_impl(
     tcx: TyCtxt<'_>,
     impl_def_id: LocalDefId,
 ) -> Result<(), ErrorGuaranteed> {
-    let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().instantiate_identity();
+    let trait_ref = tcx.impl_trait_ref(impl_def_id).instantiate_identity().skip_norm_wip();
     trait_ref.error_reported()?;
 
     match orphan_check(tcx, impl_def_id, OrphanCheckMode::Proper) {
@@ -30,7 +31,21 @@ pub(crate) fn orphan_check_impl(
         Err(err) => match orphan_check(tcx, impl_def_id, OrphanCheckMode::Compat) {
             Ok(()) => match err {
                 OrphanCheckErr::UncoveredTyParams(uncovered_ty_params) => {
-                    lint_uncovered_ty_params(tcx, uncovered_ty_params, impl_def_id)
+                    let hir_id = tcx.local_def_id_to_hir_id(impl_def_id);
+
+                    for param_def_id in uncovered_ty_params.uncovered {
+                        let ident = tcx.item_ident(param_def_id);
+
+                        tcx.emit_node_span_lint(
+                            UNCOVERED_PARAM_IN_PROJECTION,
+                            hir_id,
+                            ident.span,
+                            diagnostics::UncoveredTyParam {
+                                param: ident,
+                                local_ty: uncovered_ty_params.local_ty,
+                            },
+                        );
+                    }
                 }
                 OrphanCheckErr::NonLocalInputType(_) => {
                     bug!("orphanck: shouldn't've gotten non-local input tys in compat mode")
@@ -87,7 +102,13 @@ pub(crate) fn orphan_check_impl(
     );
 
     if tcx.trait_is_auto(trait_def_id) {
-        let self_ty = trait_ref.self_ty();
+        // Expand free alias types (e.g. lazy type aliases) so that the checks below operate
+        // on the type the alias resolves to rather than the alias itself. Otherwise an impl
+        // whose self type is an alias expanding to an otherwise valid nominal type would be
+        // wrongly rejected, e.g. `unsafe impl Sync for Alias {}` where `type Alias = Local;`.
+        // Expansion also reveals genuinely problematic self types (trait objects, opaque
+        // types, type parameters), so those keep being rejected. See issue #157756.
+        let self_ty = tcx.expand_free_alias_tys(trait_ref.self_ty());
 
         // If the impl is in the same crate as the auto-trait, almost anything
         // goes.
@@ -184,20 +205,20 @@ pub(crate) fn orphan_check_impl(
                 NonlocalImpl::DisallowOther,
             ),
 
-            ty::Alias(kind, _) => {
+            ty::Alias(_, ty::AliasTy { kind, .. }) => {
                 let problematic_kind = match kind {
                     // trait Id { type This: ?Sized; }
                     // impl<T: ?Sized> Id for T {
                     //     type This = T;
                     // }
                     // impl<T: ?Sized> AutoTrait for <T as Id>::This {}
-                    ty::Projection => "associated type",
+                    ty::Projection { .. } => "associated type",
                     // type Foo = (impl Sized, bool)
                     // impl AutoTrait for Foo {}
-                    ty::Free => "type alias",
+                    ty::Free { .. } => "type alias",
                     // type Opaque = impl Trait;
                     // impl AutoTrait for Opaque {}
-                    ty::Opaque => "opaque type",
+                    ty::Opaque { .. } => "opaque type",
                     // ```
                     // struct S<T>(T);
                     // impl<T: ?Sized> S<T> {
@@ -206,17 +227,13 @@ pub(crate) fn orphan_check_impl(
                     // impl<T: ?Sized> AutoTrait for S<T>::This {}
                     // ```
                     // FIXME(inherent_associated_types): The example code above currently leads to a cycle
-                    ty::Inherent => "associated type",
+                    ty::Inherent { .. } => "associated type",
                 };
                 (LocalImpl::Disallow { problematic_kind }, NonlocalImpl::DisallowOther)
             }
 
-            ty::Pat(..) => (
-                LocalImpl::Disallow { problematic_kind: "pattern type" },
-                NonlocalImpl::DisallowOther,
-            ),
-
             ty::Bool
+            | ty::Pat(..)
             | ty::Char
             | ty::Int(..)
             | ty::Uint(..)
@@ -226,13 +243,13 @@ pub(crate) fn orphan_check_impl(
             | ty::Slice(..)
             | ty::RawPtr(..)
             | ty::Ref(..)
-            | ty::FnDef(..)
             | ty::FnPtr(..)
             | ty::Never
             | ty::Tuple(..)
             | ty::UnsafeBinder(_) => (LocalImpl::Allow, NonlocalImpl::DisallowOther),
 
-            ty::Closure(..)
+            ty::FnDef(..)
+            | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
@@ -250,7 +267,7 @@ pub(crate) fn orphan_check_impl(
             match local_impl {
                 LocalImpl::Allow => {}
                 LocalImpl::Disallow { problematic_kind } => {
-                    return Err(tcx.dcx().emit_err(errors::TraitsWithDefaultImpl {
+                    return Err(tcx.dcx().emit_err(diagnostics::TraitsWithDefaultImpl {
                         span: tcx.def_span(impl_def_id),
                         traits: tcx.def_path_str(trait_def_id),
                         problematic_kind,
@@ -262,13 +279,13 @@ pub(crate) fn orphan_check_impl(
             match nonlocal_impl {
                 NonlocalImpl::Allow => {}
                 NonlocalImpl::DisallowBecauseNonlocal => {
-                    return Err(tcx.dcx().emit_err(errors::CrossCrateTraitsDefined {
+                    return Err(tcx.dcx().emit_err(diagnostics::CrossCrateTraitsDefined {
                         span: tcx.def_span(impl_def_id),
                         traits: tcx.def_path_str(trait_def_id),
                     }));
                 }
                 NonlocalImpl::DisallowOther => {
-                    return Err(tcx.dcx().emit_err(errors::CrossCrateTraits {
+                    return Err(tcx.dcx().emit_err(diagnostics::CrossCrateTraits {
                         span: tcx.def_span(impl_def_id),
                         traits: tcx.def_path_str(trait_def_id),
                         self_ty,
@@ -297,7 +314,7 @@ fn orphan_check<'tcx>(
 ) -> Result<(), OrphanCheckErr<TyCtxt<'tcx>, FxIndexSet<DefId>>> {
     // We only accept this routine to be invoked on implementations
     // of a trait, not inherent implementations.
-    let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+    let trait_ref = tcx.impl_trait_ref(impl_def_id);
     debug!(trait_ref = ?trait_ref.skip_binder());
 
     // If the *trait* is local to the crate, ok.
@@ -307,32 +324,22 @@ fn orphan_check<'tcx>(
     }
 
     // (1)  Instantiate all generic params with fresh inference vars.
-    let infcx = tcx.infer_ctxt().build(TypingMode::Coherence);
+    let infcx =
+        tcx.infer_ctxt().enable_next_solver_overflow_fcw(false).build(TypingMode::Coherence);
     let cause = traits::ObligationCause::dummy();
     let args = infcx.fresh_args_for_item(cause.span, impl_def_id.to_def_id());
-    let trait_ref = trait_ref.instantiate(tcx, args);
+    let trait_ref = trait_ref.instantiate(tcx, args).skip_norm_wip();
 
     let lazily_normalize_ty = |user_ty: Ty<'tcx>| {
         let ty::Alias(..) = user_ty.kind() else { return Ok(user_ty) };
 
         let ocx = traits::ObligationCtxt::new(&infcx);
-        let ty = ocx.normalize(&cause, ty::ParamEnv::empty(), user_ty);
+        let ty = ocx.normalize(&cause, ty::ParamEnv::empty(), Unnormalized::new_wip(user_ty));
         let ty = infcx.resolve_vars_if_possible(ty);
-        let errors = ocx.select_where_possible();
+        let errors = ocx.try_evaluate_obligations();
         if !errors.is_empty() {
             return Ok(user_ty);
         }
-
-        let ty = if infcx.next_trait_solver() {
-            ocx.structurally_normalize_ty(
-                &cause,
-                ty::ParamEnv::empty(),
-                infcx.resolve_vars_if_possible(ty),
-            )
-            .unwrap_or(ty)
-        } else {
-            ty
-        };
 
         Ok::<_, !>(ty)
     };
@@ -389,15 +396,15 @@ fn emit_orphan_check_error<'tcx>(
         traits::OrphanCheckErr::NonLocalInputType(tys) => {
             let item = tcx.hir_expect_item(impl_def_id);
             let impl_ = item.expect_impl();
-            let hir_trait_ref = impl_.of_trait.as_ref().unwrap();
+            let of_trait = impl_.of_trait.unwrap();
 
             let span = tcx.def_span(impl_def_id);
             let mut diag = tcx.dcx().create_err(match trait_ref.self_ty().kind() {
-                ty::Adt(..) => errors::OnlyCurrentTraits::Outside { span, note: () },
+                ty::Adt(..) => diagnostics::OnlyCurrentTraits::Outside { span, note: () },
                 _ if trait_ref.self_ty().is_primitive() => {
-                    errors::OnlyCurrentTraits::Primitive { span, note: () }
+                    diagnostics::OnlyCurrentTraits::Primitive { span, note: () }
                 }
-                _ => errors::OnlyCurrentTraits::Arbitrary { span, note: () },
+                _ => diagnostics::OnlyCurrentTraits::Arbitrary { span, note: () },
             });
 
             for &(mut ty, is_target_ty) in &tys {
@@ -406,10 +413,10 @@ fn emit_orphan_check_error<'tcx>(
                     impl_.self_ty.span
                 } else {
                     // Point at `C<B>` in `impl<A, B> for C<B> in D<A>`
-                    hir_trait_ref.path.span
+                    of_trait.trait_ref.path.span
                 };
 
-                ty = tcx.erase_regions(ty);
+                ty = tcx.erase_and_anonymize_regions(ty);
 
                 let is_foreign =
                     !trait_ref.def_id.is_local() && matches!(is_target_ty, IsFirstInputType::No);
@@ -417,9 +424,9 @@ fn emit_orphan_check_error<'tcx>(
                 match *ty.kind() {
                     ty::Slice(_) => {
                         if is_foreign {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsForeign { span });
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsForeign { span });
                         } else {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsName {
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsName {
                                 span,
                                 name: "slices",
                             });
@@ -427,9 +434,9 @@ fn emit_orphan_check_error<'tcx>(
                     }
                     ty::Array(..) => {
                         if is_foreign {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsForeign { span });
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsForeign { span });
                         } else {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsName {
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsName {
                                 span,
                                 name: "arrays",
                             });
@@ -437,36 +444,39 @@ fn emit_orphan_check_error<'tcx>(
                     }
                     ty::Tuple(..) => {
                         if is_foreign {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsForeign { span });
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsForeign { span });
                         } else {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsName {
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsName {
                                 span,
                                 name: "tuples",
                             });
                         }
                     }
-                    ty::Alias(ty::Opaque, ..) => {
-                        diag.subdiagnostic(errors::OnlyCurrentTraitsOpaque { span });
+                    ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
+                        diag.subdiagnostic(diagnostics::OnlyCurrentTraitsOpaque { span });
                     }
                     ty::RawPtr(ptr_ty, mutbl) => {
                         if !trait_ref.self_ty().has_param() {
-                            diag.subdiagnostic(errors::OnlyCurrentTraitsPointerSugg {
+                            diag.subdiagnostic(diagnostics::OnlyCurrentTraitsPointerSugg {
                                 wrapper_span: impl_.self_ty.span,
                                 struct_span: item.span.shrink_to_lo(),
                                 mut_key: mutbl.prefix_str(),
                                 ptr_ty,
                             });
                         }
-                        diag.subdiagnostic(errors::OnlyCurrentTraitsPointer { span, pointer: ty });
+                        diag.subdiagnostic(diagnostics::OnlyCurrentTraitsPointer {
+                            span,
+                            pointer: ty,
+                        });
                     }
                     ty::Adt(adt_def, _) => {
-                        diag.subdiagnostic(errors::OnlyCurrentTraitsAdt {
+                        diag.subdiagnostic(diagnostics::OnlyCurrentTraitsAdt {
                             span,
                             name: tcx.def_path_str(adt_def.did()),
                         });
                     }
                     _ => {
-                        diag.subdiagnostic(errors::OnlyCurrentTraitsTy { span, ty });
+                        diag.subdiagnostic(diagnostics::OnlyCurrentTraitsTy { span, ty });
                     }
                 }
             }
@@ -474,51 +484,15 @@ fn emit_orphan_check_error<'tcx>(
             diag.emit()
         }
         traits::OrphanCheckErr::UncoveredTyParams(UncoveredTyParams { uncovered, local_ty }) => {
-            let mut reported = None;
+            let mut guar = None;
             for param_def_id in uncovered {
-                let name = tcx.item_ident(param_def_id);
-                let span = name.span;
-
-                reported.get_or_insert(match local_ty {
-                    Some(local_type) => tcx.dcx().emit_err(errors::TyParamFirstLocal {
-                        span,
-                        note: (),
-                        param: name,
-                        local_type,
-                    }),
-                    None => tcx.dcx().emit_err(errors::TyParamSome { span, note: (), param: name }),
-                });
+                guar.get_or_insert(tcx.dcx().emit_err(diagnostics::UncoveredTyParam {
+                    param: tcx.item_ident(param_def_id),
+                    local_ty,
+                }));
             }
-            reported.unwrap() // FIXME(fmease): This is very likely reachable.
+            guar.unwrap()
         }
-    }
-}
-
-fn lint_uncovered_ty_params<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    UncoveredTyParams { uncovered, local_ty }: UncoveredTyParams<TyCtxt<'tcx>, FxIndexSet<DefId>>,
-    impl_def_id: LocalDefId,
-) {
-    let hir_id = tcx.local_def_id_to_hir_id(impl_def_id);
-
-    for param_def_id in uncovered {
-        let span = tcx.def_ident_span(param_def_id).unwrap();
-        let name = tcx.item_ident(param_def_id);
-
-        match local_ty {
-            Some(local_type) => tcx.emit_node_span_lint(
-                UNCOVERED_PARAM_IN_PROJECTION,
-                hir_id,
-                span,
-                errors::TyParamFirstLocalLint { span, note: (), param: name, local_type },
-            ),
-            None => tcx.emit_node_span_lint(
-                UNCOVERED_PARAM_IN_PROJECTION,
-                hir_id,
-                span,
-                errors::TyParamSomeLint { span, note: (), param: name },
-            ),
-        };
     }
 }
 

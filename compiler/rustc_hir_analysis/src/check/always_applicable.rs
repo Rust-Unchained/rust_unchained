@@ -11,11 +11,13 @@ use rustc_infer::infer::{RegionResolutionError, TyCtxtInferExt};
 use rustc_infer::traits::{ObligationCause, ObligationCauseCode};
 use rustc_middle::span_bug;
 use rustc_middle::ty::util::CheckRegions;
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypingMode};
+use rustc_middle::ty::{self, GenericArgsRef, RegionExt, Ty, TyCtxt, TypeVisitableExt, TypingMode};
+use rustc_span::sym;
 use rustc_trait_selection::regions::InferCtxtRegionExt;
 use rustc_trait_selection::traits::{self, ObligationCtxt};
 
-use crate::errors;
+use crate::check::missing_items_must_implement_one_of_err;
+use crate::diagnostics;
 use crate::hir::def_id::{DefId, LocalDefId};
 
 /// This function confirms that the `Drop` implementation identified by
@@ -41,20 +43,20 @@ pub(crate) fn check_drop_impl(
     match tcx.impl_polarity(drop_impl_did) {
         ty::ImplPolarity::Positive => {}
         ty::ImplPolarity::Negative => {
-            return Err(tcx.dcx().emit_err(errors::DropImplPolarity::Negative {
+            return Err(tcx.dcx().emit_err(diagnostics::DropImplPolarity::Negative {
                 span: tcx.def_span(drop_impl_did),
             }));
         }
         ty::ImplPolarity::Reservation => {
-            return Err(tcx.dcx().emit_err(errors::DropImplPolarity::Reservation {
+            return Err(tcx.dcx().emit_err(diagnostics::DropImplPolarity::Reservation {
                 span: tcx.def_span(drop_impl_did),
             }));
         }
     }
 
-    tcx.ensure_ok().orphan_check_impl(drop_impl_did)?;
+    tcx.ensure_result().orphan_check_impl(drop_impl_did)?;
 
-    let self_ty = tcx.type_of(drop_impl_did).instantiate_identity();
+    let self_ty = tcx.type_of(drop_impl_did).instantiate_identity().skip_norm_wip();
 
     match self_ty.kind() {
         ty::Adt(adt_def, adt_to_impl_args) => {
@@ -65,12 +67,18 @@ pub(crate) fn check_drop_impl(
                 adt_to_impl_args,
             )?;
 
+            ensure_all_fields_are_const_destruct(tcx, drop_impl_did, adt_def.did())?;
+
             ensure_impl_predicates_are_implied_by_item_defn(
                 tcx,
                 drop_impl_did,
                 adt_def.did(),
                 adt_to_impl_args,
-            )
+            )?;
+
+            check_drop_xor_pin_drop(tcx, adt_def.did(), drop_impl_did)?;
+
+            Ok(())
         }
         _ => {
             span_bug!(tcx.def_span(drop_impl_did), "incoherent impl of Drop");
@@ -96,7 +104,7 @@ pub(crate) fn check_negative_auto_trait_impl<'tcx>(
         tcx.dcx().span_delayed_bug(tcx.def_span(impl_def_id), "default impl cannot be negative");
     }
 
-    tcx.ensure_ok().orphan_check_impl(impl_def_id)?;
+    tcx.ensure_result().orphan_check_impl(impl_def_id)?;
 
     match impl_trait_ref.self_ty().kind() {
         ty::Adt(adt_def, adt_to_impl_args) => {
@@ -148,8 +156,7 @@ fn ensure_impl_params_and_item_params_correspond<'tcx>(
         ty::ImplPolarity::Positive | ty::ImplPolarity::Reservation => "",
         ty::ImplPolarity::Negative => "!",
     };
-    let trait_name = tcx
-        .item_name(tcx.trait_id_of_impl(impl_def_id.to_def_id()).expect("expected impl of trait"));
+    let trait_name = tcx.item_name(tcx.impl_trait_id(impl_def_id.to_def_id()));
     let mut err = struct_span_code_err!(
         tcx.dcx(),
         impl_span,
@@ -174,6 +181,75 @@ fn ensure_impl_params_and_item_params_correspond<'tcx>(
     Err(err.emit())
 }
 
+fn ensure_all_fields_are_const_destruct<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    impl_def_id: LocalDefId,
+    adt_def_id: DefId,
+) -> Result<(), ErrorGuaranteed> {
+    if !tcx.is_conditionally_const(impl_def_id) {
+        return Ok(());
+    }
+    let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
+
+    let impl_span = tcx.def_span(impl_def_id.to_def_id());
+    let env = ty::EarlyBinder::bind(tcx, tcx.param_env(impl_def_id))
+        .instantiate_identity()
+        .skip_norm_wip();
+    let args = ty::GenericArgs::identity_for_item(tcx, impl_def_id);
+    let destruct_trait = tcx.lang_items().destruct_trait().unwrap();
+    for field in tcx.adt_def(adt_def_id).all_fields() {
+        let field_ty = field.ty(tcx, args).skip_norm_wip();
+        let cause = traits::ObligationCause::new(
+            tcx.def_span(field.did),
+            impl_def_id,
+            ObligationCauseCode::Misc,
+        );
+        ocx.register_obligation(traits::Obligation::new(
+            tcx,
+            cause,
+            env,
+            ty::ClauseKind::HostEffect(ty::HostEffectPredicate {
+                trait_ref: ty::TraitRef::new(tcx, destruct_trait, [field_ty]),
+                constness: ty::BoundConstness::Maybe,
+            }),
+        ));
+    }
+    ocx.evaluate_obligations_error_on_ambiguity()
+        .into_iter()
+        .map(|error| {
+            let ty::ClauseKind::HostEffect(eff) =
+                error.root_obligation.predicate.expect_clause().kind().no_bound_vars().unwrap()
+            else {
+                unreachable!()
+            };
+            let field_ty = eff.trait_ref.self_ty();
+            let mut diag = struct_span_code_err!(
+                tcx.dcx(),
+                error.root_obligation.cause.span,
+                E0367,
+                "`{field_ty}` does not implement `[const] Destruct`",
+            )
+            .with_span_note(impl_span, "required for this `Drop` impl");
+            if field_ty.has_param()
+                && let Some(generics) = tcx.hir_node_by_def_id(impl_def_id).generics()
+            {
+                let destruct_def_id = tcx.lang_items().destruct_trait();
+                ty::suggest_constraining_type_param(
+                    tcx,
+                    generics,
+                    &mut diag,
+                    &field_ty.to_string(),
+                    "[const] Destruct",
+                    destruct_def_id,
+                    None,
+                );
+            }
+            Err(diag.emit())
+        })
+        .collect()
+}
+
 /// Confirms that all predicates defined on the `Drop` impl (`drop_impl_def_id`) are able to be
 /// proven from within `adt_def_id`'s environment. I.e. all the predicates on the impl are
 /// implied by the ADT being well formed.
@@ -187,8 +263,7 @@ fn ensure_impl_predicates_are_implied_by_item_defn<'tcx>(
     let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
 
     let impl_span = tcx.def_span(impl_def_id.to_def_id());
-    let trait_name = tcx
-        .item_name(tcx.trait_id_of_impl(impl_def_id.to_def_id()).expect("expected impl of trait"));
+    let trait_name = tcx.item_name(tcx.impl_trait_id(impl_def_id.to_def_id()));
     let polarity = match tcx.impl_polarity(impl_def_id) {
         ty::ImplPolarity::Positive | ty::ImplPolarity::Reservation => "",
         ty::ImplPolarity::Negative => "!",
@@ -208,17 +283,18 @@ fn ensure_impl_predicates_are_implied_by_item_defn<'tcx>(
     // reference the params from the ADT instead of from the impl which is bad UX. To resolve
     // this we "rename" the ADT's params to be the impl's params which should not affect behaviour.
     let impl_adt_ty = Ty::new_adt(tcx, tcx.adt_def(adt_def_id), adt_to_impl_args);
-    let adt_env =
-        ty::EarlyBinder::bind(tcx.param_env(adt_def_id)).instantiate(tcx, adt_to_impl_args);
+    let adt_env = ty::EarlyBinder::bind_unchecked(tcx.param_env(adt_def_id))
+        .instantiate(tcx, adt_to_impl_args)
+        .skip_norm_wip();
 
     let fresh_impl_args = infcx.fresh_args_for_item(impl_span, impl_def_id.to_def_id());
     let fresh_adt_ty =
-        tcx.impl_trait_ref(impl_def_id).unwrap().instantiate(tcx, fresh_impl_args).self_ty();
+        tcx.impl_trait_ref(impl_def_id).instantiate(tcx, fresh_impl_args).skip_norm_wip().self_ty();
 
     ocx.eq(&ObligationCause::dummy_with_span(impl_span), adt_env, fresh_adt_ty, impl_adt_ty)
         .expect("equating fully generic trait ref should never fail");
 
-    for (clause, span) in tcx.predicates_of(impl_def_id).instantiate(tcx, fresh_impl_args) {
+    for (clause, span) in tcx.clauses_of(impl_def_id).instantiate(tcx, fresh_impl_args) {
         let normalize_cause = traits::ObligationCause::misc(span, impl_def_id);
         let pred = ocx.normalize(&normalize_cause, adt_env, clause);
         let cause = traits::ObligationCause::new(
@@ -235,7 +311,7 @@ fn ensure_impl_predicates_are_implied_by_item_defn<'tcx>(
     // They can probably get removed with better treatment of the new `DropImpl`
     // obligation cause code, and perhaps some custom logic in `report_region_errors`.
 
-    let errors = ocx.select_all_or_error();
+    let errors = ocx.evaluate_obligations_error_on_ambiguity();
     if !errors.is_empty() {
         let mut guar = None;
         let mut root_predicates = FxHashSet::default();
@@ -292,5 +368,71 @@ fn ensure_impl_predicates_are_implied_by_item_defn<'tcx>(
         return Err(guar.unwrap());
     }
 
+    Ok(())
+}
+
+/// This function checks at least and at most one of `Drop::drop` and `Drop::pin_drop` is implemented.
+/// It also checks that `Drop::pin_drop` must be implemented if `#[pin_v2]` is present on the type.
+fn check_drop_xor_pin_drop<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def_id: DefId,
+    drop_impl_did: LocalDefId,
+) -> Result<(), ErrorGuaranteed> {
+    let mut drop_span = None;
+    let mut pin_drop_span = None;
+    for item in tcx.associated_items(drop_impl_did).in_definition_order() {
+        match item.kind {
+            ty::AssocKind::Fn { name: sym::drop, .. } => {
+                drop_span = Some(tcx.def_span(item.def_id))
+            }
+            ty::AssocKind::Fn { name: sym::pin_drop, .. } => {
+                pin_drop_span = Some(tcx.def_span(item.def_id))
+            }
+            _ => {}
+        }
+    }
+
+    match (drop_span, pin_drop_span) {
+        (None, None) => {
+            if tcx.features().pin_ergonomics() {
+                return Err(missing_items_must_implement_one_of_err(
+                    tcx,
+                    drop_impl_did,
+                    [sym::drop, sym::pin_drop].into_iter(),
+                    None,
+                ));
+            } else {
+                return Err(tcx
+                    .dcx()
+                    .span_delayed_bug(tcx.def_span(drop_impl_did), "missing `Drop::drop`"));
+            }
+        }
+        (Some(span), None) => {
+            if tcx.adt_def(adt_def_id).is_pin_project() {
+                let pin_v2_span = rustc_hir::find_attr!(tcx, adt_def_id, PinV2(attr) => *attr);
+                let adt_name = tcx.item_name(adt_def_id);
+                return Err(tcx.dcx().emit_err(crate::diagnostics::PinV2WithoutPinDrop {
+                    span,
+                    pin_v2_span,
+                    adt_name,
+                }));
+            }
+        }
+        (None, Some(span)) => {
+            if !tcx.features().pin_ergonomics() {
+                return Err(tcx.dcx().span_delayed_bug(
+                    span,
+                    "`Drop::pin_drop` should be guarded by the library feature gate",
+                ));
+            }
+        }
+        (Some(drop_span), Some(pin_drop_span)) => {
+            return Err(tcx.dcx().emit_err(crate::diagnostics::ConflictImplDropAndPinDrop {
+                span: tcx.def_span(drop_impl_did),
+                drop_span,
+                pin_drop_span,
+            }));
+        }
+    }
     Ok(())
 }

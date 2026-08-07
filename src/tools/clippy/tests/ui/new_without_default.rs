@@ -1,11 +1,5 @@
-#![allow(
-    dead_code,
-    clippy::missing_safety_doc,
-    clippy::extra_unused_lifetimes,
-    clippy::extra_unused_type_parameters,
-    clippy::needless_lifetimes
-)]
 #![warn(clippy::new_without_default)]
+#![expect(clippy::extra_unused_lifetimes, clippy::missing_safety_doc)]
 
 pub struct Foo;
 
@@ -263,5 +257,121 @@ where
     pub fn new() -> Self {
         //~^ new_without_default
         Self { _kv: None }
+    }
+}
+
+// From issue #14552, but with `#[cfg]`s that are actually `true` in the uitest context
+
+pub struct NewWithCfg;
+impl NewWithCfg {
+    #[cfg(not(test))]
+    pub fn new() -> Self {
+        //~^ new_without_default
+        unimplemented!()
+    }
+}
+
+pub struct NewWith2Cfgs;
+impl NewWith2Cfgs {
+    #[cfg(not(test))]
+    #[cfg(panic = "unwind")]
+    pub fn new() -> Self {
+        //~^ new_without_default
+        unimplemented!()
+    }
+}
+
+pub struct NewWithExtraneous;
+impl NewWithExtraneous {
+    #[inline]
+    pub fn new() -> Self {
+        //~^ new_without_default
+        unimplemented!()
+    }
+}
+
+pub struct NewWithCfgAndExtraneous;
+impl NewWithCfgAndExtraneous {
+    #[cfg(not(test))]
+    #[inline]
+    pub fn new() -> Self {
+        //~^ new_without_default
+        unimplemented!()
+    }
+}
+
+mod issue15778 {
+    pub struct Foo(Vec<i32>);
+
+    impl Foo {
+        pub fn new() -> Self {
+            Self(Vec::new())
+        }
+    }
+
+    impl<'a> IntoIterator for &'a Foo {
+        type Item = &'a i32;
+
+        type IntoIter = std::slice::Iter<'a, i32>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.as_slice().iter()
+        }
+    }
+}
+
+pub mod issue16255 {
+    use std::fmt::Display;
+    use std::marker::PhantomData;
+
+    pub struct Foo<T> {
+        marker: PhantomData<T>,
+    }
+
+    impl<T> Foo<T>
+    where
+        T: Display,
+    {
+        pub fn new() -> Self
+        //~^ new_without_default
+        where
+            T: Clone,
+        {
+            Self { marker: PhantomData }
+        }
+    }
+
+    pub struct Bar<T> {
+        marker: PhantomData<T>,
+    }
+
+    impl<T> Bar<T> {
+        pub fn new() -> Self
+        //~^ new_without_default
+        where
+            T: Clone,
+        {
+            Self { marker: PhantomData }
+        }
+    }
+}
+
+pub mod issue17361 {
+    //! This test ensures that attributes applied to the impl block
+    //! containing `fn new()` do not get mistakenly applied to the
+    //! newly generated `Default` trait impl. This has been the
+    //! case because the `Default` trait impl was inserted right
+    //! before the existing impl block, but after the attributes.
+
+    #![deny(clippy::unwrap_used, reason = "check that expect below stays put")]
+
+    pub struct S;
+
+    #[expect(clippy::unwrap_used, reason = "without it, new() fails to compile")]
+    impl S {
+        pub fn new() -> S {
+            //~^ new_without_default
+            std::hint::black_box(Some(S)).unwrap()
+        }
     }
 }

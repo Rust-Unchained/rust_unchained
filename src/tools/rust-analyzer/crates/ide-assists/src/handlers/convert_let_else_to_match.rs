@@ -1,10 +1,10 @@
-use hir::Semantics;
-use ide_db::RootDatabase;
-use syntax::ast::RangeItem;
-use syntax::ast::{edit::AstNodeEdit, AstNode, HasName, LetStmt, Name, Pat};
 use syntax::T;
+use syntax::ast::RangeItem;
+use syntax::ast::edit::AstNodeEdit;
+use syntax::ast::{self, AstNode, HasName, LetStmt, Pat};
+use syntax::syntax_editor::SyntaxEditor;
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: convert_let_else_to_match
 //
@@ -24,160 +24,216 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     };
 // }
 // ```
-pub(crate) fn convert_let_else_to_match(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    // should focus on else token to trigger
+pub(crate) fn convert_let_else_to_match(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
+    let (editor, _) = SyntaxEditor::new(ctx.source_file().syntax().clone());
+    // Should focus on the `else` token to trigger
     let let_stmt = ctx
         .find_token_syntax_at_offset(T![else])
         .and_then(|it| it.parent()?.parent())
         .or_else(|| ctx.find_token_syntax_at_offset(T![let])?.parent())?;
     let let_stmt = LetStmt::cast(let_stmt)?;
-    let let_else_block = let_stmt.let_else()?.block_expr()?;
-    let let_init = let_stmt.initializer()?;
+    let else_block = let_stmt.let_else()?.block_expr()?;
+    let else_expr = if else_block.statements().next().is_none()
+        && let Some(tail_expr) = else_block.tail_expr()
+    {
+        tail_expr.reset_indent()
+    } else {
+        else_block.reset_indent().into()
+    };
+    let init = let_stmt.initializer()?;
+    // Ignore let stmt with type annotation
     if let_stmt.ty().is_some() {
-        // don't support let with type annotation
         return None;
     }
     let pat = let_stmt.pat()?;
-    let mut binders = Vec::new();
-    binders_in_pat(&mut binders, &pat, &ctx.sema)?;
-
-    let target = let_stmt.syntax().text_range();
-    acc.add(
-        AssistId("convert_let_else_to_match", AssistKind::RefactorRewrite),
-        "Convert let-else to let and match",
-        target,
-        |edit| {
-            let indent_level = let_stmt.indent_level().0 as usize;
-            let indent = "    ".repeat(indent_level);
-            let indent1 = "    ".repeat(indent_level + 1);
-
-            let binders_str = binders_to_str(&binders, false);
-            let binders_str_mut = binders_to_str(&binders, true);
-
-            let init_expr = let_init.syntax().text();
-            let mut pat_no_mut = pat.syntax().text().to_string();
-            // remove the mut from the pattern
-            for (b, ismut) in binders.iter() {
-                if *ismut {
-                    pat_no_mut = pat_no_mut.replace(&format!("mut {b}"), &b.to_string());
-                }
-            }
-
-            let only_expr = let_else_block.statements().next().is_none();
-            let branch2 = match &let_else_block.tail_expr() {
-                Some(tail) if only_expr => format!("{tail},"),
-                _ => let_else_block.syntax().text().to_string(),
-            };
-            let replace = if binders.is_empty() {
-                format!(
-                    "match {init_expr} {{
-{indent1}{pat_no_mut} => {binders_str}
-{indent1}_ => {branch2}
-{indent}}}"
-                )
+    let mut idents = Vec::default();
+    let pat_without_mut = remove_mut_and_collect_idents(&editor, &pat, &mut idents)?;
+    let bindings = idents
+        .into_iter()
+        .filter_map(|ref pat| {
+            // Identifiers which resolve to constants are not bindings
+            if ctx.sema.resolve_bind_pat_to_const(pat).is_none() {
+                Some((pat.name()?, pat.ref_token().is_none() && pat.mut_token().is_some()))
             } else {
-                format!(
-                    "let {binders_str_mut} = match {init_expr} {{
-{indent1}{pat_no_mut} => {binders_str},
-{indent1}_ => {branch2}
-{indent}}};"
-                )
-            };
-            edit.replace(target, replace);
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    acc.add(
+        AssistId::refactor_rewrite("convert_let_else_to_match"),
+        if bindings.is_empty() {
+            "Convert let-else to match"
+        } else {
+            "Convert let-else to let and match"
+        },
+        let_stmt.syntax().text_range(),
+        |builder| {
+            let make = editor.make();
+            let binding_paths = bindings
+                .iter()
+                .map(|(name, _)| make.expr_path(make.ident_path(&name.to_string())))
+                .collect::<Vec<_>>();
+
+            let binding_arm = make.match_arm(
+                pat_without_mut,
+                None,
+                // There are three possible cases:
+                //
+                // - No bindings: `None => {}`
+                // - Single binding: `Some(it) => it`
+                // - Multiple bindings: `Foo::Bar { a, b, .. } => (a, b)`
+                match binding_paths.len() {
+                    0 => make.expr_empty_block().into(),
+
+                    1 => binding_paths[0].clone(),
+                    _ => make.expr_tuple(binding_paths).into(),
+                },
+            );
+            let else_arm = make.match_arm(make.wildcard_pat().into(), None, else_expr);
+            let arms = [binding_arm, else_arm].map(|arm| arm.indent(1.into()));
+            let match_ = make.expr_match(init, make.match_arm_list(arms));
+            let match_ = match_.indent(let_stmt.indent_level());
+
+            if bindings.is_empty() {
+                editor.replace(let_stmt.syntax(), match_.syntax());
+            } else {
+                let ident_pats = bindings
+                    .into_iter()
+                    .map(|(name, is_mut)| make.ident_pat(false, is_mut, name).into())
+                    .collect::<Vec<Pat>>();
+                let new_let_stmt = make.let_stmt(
+                    if ident_pats.len() == 1 {
+                        ident_pats[0].clone()
+                    } else {
+                        make.tuple_pat(ident_pats).into()
+                    },
+                    None,
+                    Some(match_.into()),
+                );
+                editor.replace(let_stmt.syntax(), new_let_stmt.syntax());
+            }
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
-/// Gets a list of binders in a pattern, and whether they are mut.
-fn binders_in_pat(
-    acc: &mut Vec<(Name, bool)>,
-    pat: &Pat,
-    sem: &Semantics<'_, RootDatabase>,
-) -> Option<()> {
-    use Pat::*;
-    match pat {
-        IdentPat(p) => {
-            let ident = p.name()?;
-            let ismut = p.ref_token().is_none() && p.mut_token().is_some();
-            // check for const reference
-            if sem.resolve_bind_pat_to_const(p).is_none() {
-                acc.push((ident, ismut));
-            }
-            if let Some(inner) = p.pat() {
-                binders_in_pat(acc, &inner, sem)?;
-            }
-            Some(())
+fn remove_mut_and_collect_idents(
+    editor: &SyntaxEditor,
+    pat: &ast::Pat,
+    acc: &mut Vec<ast::IdentPat>,
+) -> Option<ast::Pat> {
+    let make = editor.make();
+    Some(match pat {
+        ast::Pat::IdentPat(p) => {
+            acc.push(p.clone());
+            let non_mut_pat = make.ident_pat(
+                p.ref_token().is_some(),
+                p.ref_token().is_some() && p.mut_token().is_some(),
+                p.name()?,
+            );
+            let non_mut_pat = if let Some(inner) = p.pat() {
+                non_mut_pat.set_pat(remove_mut_and_collect_idents(editor, &inner, acc), editor)
+            } else {
+                non_mut_pat
+            };
+            non_mut_pat.into()
         }
-        BoxPat(p) => p.pat().and_then(|p| binders_in_pat(acc, &p, sem)),
-        RestPat(_) | LiteralPat(_) | PathPat(_) | WildcardPat(_) | ConstBlockPat(_) => Some(()),
-        OrPat(p) => {
-            for p in p.pats() {
-                binders_in_pat(acc, &p, sem)?;
-            }
-            Some(())
+        ast::Pat::BoxPat(p) => {
+            let pat = remove_mut_and_collect_idents(editor, &p.pat()?, acc)?;
+            make.box_pat(pat).into()
         }
-        ParenPat(p) => p.pat().and_then(|p| binders_in_pat(acc, &p, sem)),
-        RangePat(p) => {
-            if let Some(st) = p.start() {
-                binders_in_pat(acc, &st, sem)?
-            }
-            if let Some(ed) = p.end() {
-                binders_in_pat(acc, &ed, sem)?
-            }
-            Some(())
+        ast::Pat::DerefPat(p) => {
+            let pat = remove_mut_and_collect_idents(editor, &p.pat()?, acc)?;
+            make.deref_pat(pat)
         }
-        RecordPat(p) => {
-            for f in p.record_pat_field_list()?.fields() {
-                let pat = f.pat()?;
-                binders_in_pat(acc, &pat, sem)?;
-            }
-            Some(())
+        ast::Pat::OrPat(p) => {
+            let pats = p
+                .pats()
+                .map(|pat| remove_mut_and_collect_idents(editor, &pat, acc))
+                .collect::<Option<Vec<_>>>()?;
+            make.or_pat(pats, p.leading_pipe().is_some()).into()
         }
-        RefPat(p) => p.pat().and_then(|p| binders_in_pat(acc, &p, sem)),
-        SlicePat(p) => {
-            for p in p.pats() {
-                binders_in_pat(acc, &p, sem)?;
-            }
-            Some(())
+        ast::Pat::ParenPat(p) => {
+            let pat = remove_mut_and_collect_idents(editor, &p.pat()?, acc)?;
+            make.paren_pat(pat).into()
         }
-        TuplePat(p) => {
-            for p in p.fields() {
-                binders_in_pat(acc, &p, sem)?;
-            }
-            Some(())
+        ast::Pat::RangePat(p) => {
+            let start = if let Some(start) = p.start() {
+                Some(remove_mut_and_collect_idents(editor, &start, acc)?)
+            } else {
+                None
+            };
+            let end = if let Some(end) = p.end() {
+                Some(remove_mut_and_collect_idents(editor, &end, acc)?)
+            } else {
+                None
+            };
+            make.range_pat(start, end).into()
         }
-        TupleStructPat(p) => {
-            for p in p.fields() {
-                binders_in_pat(acc, &p, sem)?;
-            }
-            Some(())
+        ast::Pat::RecordPat(p) => {
+            let fields = p
+                .record_pat_field_list()?
+                .fields()
+                .map(|field| {
+                    remove_mut_and_collect_idents(editor, &field.pat()?, acc).map(|pat| {
+                        if let Some(name_ref) = field.name_ref() {
+                            make.record_pat_field(name_ref, pat)
+                        } else {
+                            make.record_pat_field_shorthand(pat)
+                        }
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            make.record_pat_with_fields(
+                p.path()?,
+                make.record_pat_field_list(fields, p.record_pat_field_list()?.rest_pat()),
+            )
+            .into()
         }
+        ast::Pat::RefPat(p) => {
+            let inner = p.pat()?;
+            if let ast::Pat::IdentPat(ident) = inner {
+                acc.push(ident);
+                p.clone().into()
+            } else {
+                let pat = remove_mut_and_collect_idents(editor, &inner, acc)?;
+                make.ref_pat(pat).into()
+            }
+        }
+        ast::Pat::SlicePat(p) => {
+            let pats = p
+                .pats()
+                .map(|pat| remove_mut_and_collect_idents(editor, &pat, acc))
+                .collect::<Option<Vec<_>>>()?;
+            make.slice_pat(pats).into()
+        }
+        ast::Pat::TuplePat(p) => {
+            let pats = p
+                .fields()
+                .map(|field| remove_mut_and_collect_idents(editor, &field, acc))
+                .collect::<Option<Vec<_>>>()?;
+            make.tuple_pat(pats).into()
+        }
+        ast::Pat::TupleStructPat(p) => {
+            let fields = p
+                .fields()
+                .map(|field| remove_mut_and_collect_idents(editor, &field, acc))
+                .collect::<Option<Vec<_>>>()?;
+            make.tuple_struct_pat(p.path()?, fields).into()
+        }
+        ast::Pat::RestPat(_)
+        | ast::Pat::LiteralPat(_)
+        | ast::Pat::PathPat(_)
+        | ast::Pat::WildcardPat(_)
+        | ast::Pat::NotNull(_)
+        | ast::Pat::ConstBlockPat(_) => pat.clone(),
         // don't support macro pat yet
-        MacroPat(_) => None,
-    }
-}
-
-fn binders_to_str(binders: &[(Name, bool)], addmut: bool) -> String {
-    let vars = binders
-        .iter()
-        .map(
-            |(ident, ismut)| {
-                if *ismut && addmut {
-                    format!("mut {ident}")
-                } else {
-                    ident.to_string()
-                }
-            },
-        )
-        .collect::<Vec<_>>()
-        .join(", ");
-    if binders.is_empty() {
-        String::from("{}")
-    } else if binders.len() == 1 {
-        vars
-    } else {
-        format!("({vars})")
-    }
+        ast::Pat::MacroPat(_) => return None,
+    })
 }
 
 #[cfg(test)]
@@ -248,6 +304,81 @@ fn main() {
         _ => continue,
     };
 }",
+        );
+    }
+
+    #[test]
+    fn convert_let_else_to_match_with_empty_else_block() {
+        check_assist(
+            convert_let_else_to_match,
+            r"
+fn main() {
+    let Ok(x) = f() else$0 {};
+}",
+            r"
+fn main() {
+    let x = match f() {
+        Ok(x) => x,
+        _ => {}
+    };
+}",
+        );
+    }
+
+    #[test]
+    fn convert_let_else_to_match_with_some_indent() {
+        check_assist(
+            convert_let_else_to_match,
+            r#"
+mod indent {
+    fn main() {
+        let Ok(x) = f() else$0 {
+            log();
+            unreachable!(
+                "..."
+            );
+        };
+    }
+}"#,
+            r#"
+mod indent {
+    fn main() {
+        let x = match f() {
+            Ok(x) => x,
+            _ => {
+                log();
+                unreachable!(
+                    "..."
+                );
+            }
+        };
+    }
+}"#,
+        );
+
+        check_assist(
+            convert_let_else_to_match,
+            r#"
+mod indent {
+    fn main() {
+        let Ok(x) = f() else$0 {
+            unreachable!(
+                "..."
+            )
+        };
+    }
+}"#,
+            r#"
+mod indent {
+    fn main() {
+        let x = match f() {
+            Ok(x) => x,
+            _ => unreachable!(
+                "..."
+            ),
+        };
+    }
+}"#,
         );
     }
 

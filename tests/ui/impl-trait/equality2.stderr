@@ -1,15 +1,5 @@
-warning: the feature `specialization` is incomplete and may not be safe to use and/or cause compiler crashes
-  --> $DIR/equality2.rs:1:12
-   |
-LL | #![feature(specialization)]
-   |            ^^^^^^^^^^^^^^
-   |
-   = note: see issue #31844 <https://github.com/rust-lang/rust/issues/31844> for more information
-   = help: consider using `min_specialization` instead, which is more stable and complete
-   = note: `#[warn(incomplete_features)]` on by default
-
 error[E0308]: mismatched types
-  --> $DIR/equality2.rs:25:18
+  --> $DIR/equality2.rs:27:18
    |
 LL | fn hide<T: Foo>(x: T) -> impl Foo {
    |                          -------- the found opaque type
@@ -23,7 +13,7 @@ LL |     let _: u32 = hide(0_u32);
            found opaque type `impl Foo`
 
 error[E0308]: mismatched types
-  --> $DIR/equality2.rs:31:18
+  --> $DIR/equality2.rs:33:18
    |
 LL | fn hide<T: Foo>(x: T) -> impl Foo {
    |                          -------- the found opaque type
@@ -41,7 +31,7 @@ LL | fn hide<T: Foo>(x: T) -> impl Foo<T = i32> {
    |                                  +++++++++
 
 error[E0308]: mismatched types
-  --> $DIR/equality2.rs:38:10
+  --> $DIR/equality2.rs:40:10
    |
 LL | fn hide<T: Foo>(x: T) -> impl Foo {
    |                          --------
@@ -57,7 +47,7 @@ LL |     x = (x.1,
    = note: distinct uses of `impl Trait` result in different opaque types
 
 error[E0308]: mismatched types
-  --> $DIR/equality2.rs:41:10
+  --> $DIR/equality2.rs:43:10
    |
 LL | fn hide<T: Foo>(x: T) -> impl Foo {
    |                          --------
@@ -72,6 +62,6 @@ LL |          x.0);
               found opaque type `impl Foo` (`u32`)
    = note: distinct uses of `impl Trait` result in different opaque types
 
-error: aborting due to 4 previous errors; 1 warning emitted
+error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0308`.

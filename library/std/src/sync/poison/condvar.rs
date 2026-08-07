@@ -1,72 +1,8 @@
 use crate::fmt;
+use crate::sync::WaitTimeoutResult;
 use crate::sync::poison::{self, LockResult, MutexGuard, PoisonError, mutex};
 use crate::sys::sync as sys;
 use crate::time::{Duration, Instant};
-
-/// A type indicating whether a timed wait on a condition variable returned
-/// due to a time out or not.
-///
-/// It is returned by the [`wait_timeout`] method.
-///
-/// [`wait_timeout`]: Condvar::wait_timeout
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-#[stable(feature = "wait_timeout", since = "1.5.0")]
-pub struct WaitTimeoutResult(bool);
-
-// FIXME(sync_nonpoison): `WaitTimeoutResult` is actually poisoning-agnostic, it seems.
-// Should we take advantage of this fact?
-impl WaitTimeoutResult {
-    /// Returns `true` if the wait was known to have timed out.
-    ///
-    /// # Examples
-    ///
-    /// This example spawns a thread which will sleep 20 milliseconds before
-    /// updating a boolean value and then notifying the condvar.
-    ///
-    /// The main thread will wait with a 10 millisecond timeout on the condvar
-    /// and will leave the loop upon timeout.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Condvar, Mutex};
-    /// use std::thread;
-    /// use std::time::Duration;
-    ///
-    /// let pair = Arc::new((Mutex::new(false), Condvar::new()));
-    /// let pair2 = Arc::clone(&pair);
-    ///
-    /// # let handle =
-    /// thread::spawn(move || {
-    ///     let (lock, cvar) = &*pair2;
-    ///
-    ///     // Let's wait 20 milliseconds before notifying the condvar.
-    ///     thread::sleep(Duration::from_millis(20));
-    ///
-    ///     let mut started = lock.lock().unwrap();
-    ///     // We update the boolean value.
-    ///     *started = true;
-    ///     cvar.notify_one();
-    /// });
-    ///
-    /// // Wait for the thread to start up.
-    /// let (lock, cvar) = &*pair;
-    /// loop {
-    ///     // Let's put a timeout on the condvar's wait.
-    ///     let result = cvar.wait_timeout(lock.lock().unwrap(), Duration::from_millis(10)).unwrap();
-    ///     // 10 milliseconds have passed.
-    ///     if result.1.timed_out() {
-    ///         // timed out now and we can leave.
-    ///         break
-    ///     }
-    /// }
-    /// # // Prevent leaks for Miri.
-    /// # let _ = handle.join();
-    /// ```
-    #[must_use]
-    #[stable(feature = "wait_timeout", since = "1.5.0")]
-    pub fn timed_out(&self) -> bool {
-        self.0
-    }
-}
 
 /// A Condition Variable
 ///
@@ -185,6 +121,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
         let poisoned = unsafe {
             let lock = mutex::guard_lock(&guard);
@@ -241,6 +178,7 @@ impl Condvar {
     /// let _guard = cvar.wait_while(lock.lock().unwrap(), |pending| { *pending }).unwrap();
     /// ```
     #[stable(feature = "wait_until", since = "1.42.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait_while<'a, T, F>(
         &self,
         mut guard: MutexGuard<'a, T>,
@@ -309,6 +247,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     #[deprecated(since = "1.6.0", note = "replaced by `std::sync::Condvar::wait_timeout`")]
     pub fn wait_timeout_ms<'a, T>(
         &self,
@@ -333,11 +272,10 @@ impl Condvar {
     /// the system time. This function is susceptible to spurious wakeups.
     /// Condition variables normally have a boolean predicate associated with
     /// them, and the predicate must always be checked each time this function
-    /// returns to protect against spurious wakeups. Additionally, it is
-    /// typically desirable for the timeout to not exceed some duration in
-    /// spite of spurious wakes, thus the sleep-duration is decremented by the
-    /// amount slept. Alternatively, use the `wait_timeout_while` method
-    /// to wait with a timeout while a predicate is true.
+    /// returns to protect against spurious wakeups. Furthermore, since the timeout
+    /// is given relative to the moment this function is called, it needs to be adjusted
+    /// when this function is called in a loop. The [`wait_timeout_while`] method
+    /// lets you wait with a timeout while a predicate is true, taking care of all these concerns.
     ///
     /// The returned [`WaitTimeoutResult`] value indicates if the timeout is
     /// known to have elapsed.
@@ -381,6 +319,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "wait_timeout", since = "1.5.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait_timeout<'a, T>(
         &self,
         guard: MutexGuard<'a, T>,
@@ -447,6 +386,7 @@ impl Condvar {
     /// // access the locked mutex via result.0
     /// ```
     #[stable(feature = "wait_timeout_until", since = "1.42.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait_timeout_while<'a, T, F>(
         &self,
         mut guard: MutexGuard<'a, T>,
@@ -507,6 +447,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn notify_one(&self) {
         self.inner.notify_one()
     }
@@ -547,6 +488,7 @@ impl Condvar {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn notify_all(&self) {
         self.inner.notify_all()
     }

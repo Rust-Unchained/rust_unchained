@@ -2,15 +2,17 @@ use crate::question_mark::{QUESTION_MARK, QuestionMark};
 use clippy_config::types::MatchLintBehaviour;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::IfLetOrMatch;
+use clippy_utils::res::{MaybeDef, MaybeQPath};
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::{is_lint_allowed, is_never_expr, msrvs, pat_and_expr_can_be_question_mark, peel_blocks};
+use clippy_utils::{is_lint_allowed, is_never_expr, is_wild, msrvs, pat_and_expr_can_be_question_mark, peel_blocks};
 use rustc_ast::BindingMode;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, ExprKind, MatchSource, Pat, PatExpr, PatExprKind, PatKind, QPath, Stmt, StmtKind};
+use rustc_hir::def::{CtorOf, DefKind, Res};
+use rustc_hir::{
+    Arm, BlockCheckMode, Expr, ExprKind, MatchSource, Pat, PatExpr, PatExprKind, PatKind, QPath, Stmt, StmtKind,
+};
 use rustc_lint::{LateContext, LintContext};
-
 use rustc_span::Span;
 use rustc_span::symbol::{Symbol, sym};
 use std::slice;
@@ -47,7 +49,7 @@ declare_clippy_lint! {
 }
 
 impl<'tcx> QuestionMark {
-    pub(crate) fn check_manual_let_else(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'tcx>) {
+    pub(crate) fn check_manual_let_else(&self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'tcx>) {
         if let StmtKind::Let(local) = stmt.kind
             && let Some(init) = local.init
             && local.els.is_none()
@@ -91,14 +93,15 @@ impl<'tcx> QuestionMark {
                     let Some((idx, diverging_arm)) = diverging_arm_opt else {
                         return;
                     };
+
+                    let pat_arm = &arms[1 - idx];
                     // If the non-diverging arm is the first one, its pattern can be reused in a let/else statement.
                     // However, if it arrives in second position, its pattern may cover some cases already covered
                     // by the diverging one.
-                    // TODO: accept the non-diverging arm as a second position if patterns are disjointed.
-                    if idx == 0 {
+                    if idx == 0 && !is_arms_disjointed(cx, diverging_arm, pat_arm) {
                         return;
                     }
-                    let pat_arm = &arms[1 - idx];
+
                     let Some(ident_map) = expr_simple_identity_map(local.pat, pat_arm.pat, pat_arm.body) else {
                         return;
                     };
@@ -108,6 +111,49 @@ impl<'tcx> QuestionMark {
             }
         }
     }
+}
+
+/// Checks if the patterns of the arms are disjointed. Currently, we only support patterns of simple
+/// enum variants without nested patterns or bindings.
+///
+/// TODO: Support more complex patterns.
+fn is_arms_disjointed(cx: &LateContext<'_>, arm1: &Arm<'_>, arm2: &Arm<'_>) -> bool {
+    if arm1.guard.is_some() || arm2.guard.is_some() {
+        return false;
+    }
+
+    if !is_enum_variant(cx, arm1.pat) || !is_enum_variant(cx, arm2.pat) {
+        return false;
+    }
+
+    true
+}
+
+/// Returns `true` if the given pattern is a variant of an enum.
+pub fn is_enum_variant(cx: &LateContext<'_>, pat: &Pat<'_>) -> bool {
+    let path = match pat.kind {
+        PatKind::Struct(ref qpath, fields, _)
+            if fields
+                .iter()
+                .all(|field| is_wild(field.pat) || matches!(field.pat.kind, PatKind::Binding(..))) =>
+        {
+            (qpath, pat.hir_id)
+        },
+        PatKind::TupleStruct(ref qpath, pats, _)
+            if pats
+                .iter()
+                .all(|pat| is_wild(pat) || matches!(pat.kind, PatKind::Binding(..))) =>
+        {
+            (qpath, pat.hir_id)
+        },
+        PatKind::Expr(e) if let Some((qpath, id)) = e.opt_qpath() => (qpath, id),
+        _ => return false,
+    };
+    let res = path.res(cx);
+    matches!(
+        res,
+        Res::Def(DefKind::Variant, ..) | Res::Def(DefKind::Ctor(CtorOf::Variant, _), _)
+    )
 }
 
 fn emit_manual_let_else(
@@ -133,13 +179,22 @@ fn emit_manual_let_else(
             let (sn_expr, _) = snippet_with_context(cx, expr.span, span.ctxt(), "", &mut app);
             let (sn_else, else_is_mac_call) = snippet_with_context(cx, else_body.span, span.ctxt(), "", &mut app);
 
-            let else_bl = if matches!(else_body.kind, ExprKind::Block(..)) && !else_is_mac_call {
+            let else_bl = if let ExprKind::Block(block, None) = else_body.kind
+                && matches!(block.rules, BlockCheckMode::DefaultBlock)
+                && !else_is_mac_call
+            {
                 sn_else.into_owned()
             } else {
                 format!("{{ {sn_else} }}")
             };
             let sn_bl = replace_in_pattern(cx, span, ident_map, pat, &mut app, true);
-            let sugg = format!("let {sn_bl} = {sn_expr} else {else_bl};");
+            let sugg = if sn_expr.ends_with('}') {
+                // let-else statement expressions are not allowed to end with `}`
+                // https://rust-lang.github.io/rfcs/3137-let-else.html#let-pattern--if--else--else-
+                format!("let {sn_bl} = ({sn_expr}) else {else_bl};")
+            } else {
+                format!("let {sn_bl} = {sn_expr} else {else_bl};")
+            };
             diag.span_suggestion(span, "consider writing", sugg, app);
         },
     );
@@ -185,17 +240,36 @@ fn replace_in_pattern(
         }
 
         match pat.kind {
-            PatKind::Binding(_ann, _id, binding_name, opt_subpt) => {
-                let Some((pat_to_put, binding_mode)) = ident_map.get(&binding_name.name) else {
-                    break 'a;
-                };
-                let sn_pfx = binding_mode.prefix_str();
-                let (sn_ptp, _) = snippet_with_context(cx, pat_to_put.span, span.ctxt(), "", app);
-                if let Some(subpt) = opt_subpt {
-                    let subpt = replace_in_pattern(cx, span, ident_map, subpt, app, false);
-                    return format!("{sn_pfx}{sn_ptp} @ {subpt}");
+            PatKind::Binding(ann, _id, binding_name, opt_subpt) => {
+                match (ident_map.get(&binding_name.name), opt_subpt) {
+                    (Some((pat_to_put, binding_mode)), opt_subpt) => {
+                        let sn_pfx = binding_mode.prefix_str();
+                        let (sn_ptp, _) = snippet_with_context(cx, pat_to_put.span, span.ctxt(), "", app);
+                        if let Some(subpt) = opt_subpt {
+                            let subpt = replace_in_pattern(cx, span, ident_map, subpt, app, false);
+                            return format!("{sn_pfx}{sn_ptp} @ {subpt}");
+                        }
+                        return format!("{sn_pfx}{sn_ptp}");
+                    },
+                    (None, Some(subpt)) => {
+                        let subpt = replace_in_pattern(cx, span, ident_map, subpt, app, false);
+                        // scanning for a value that matches is not sensitive to order
+                        #[expect(rustc::potential_query_instability)]
+                        if ident_map.values().any(|(other_pat, _)| {
+                            if let PatKind::Binding(_, _, other_name, _) = other_pat.kind {
+                                other_name == binding_name
+                            } else {
+                                false
+                            }
+                        }) {
+                            // this name is shadowed, and, therefore, not usable
+                            return subpt;
+                        }
+                        let binding_pfx = ann.prefix_str();
+                        return format!("{binding_pfx}{binding_name} @ {subpt}");
+                    },
+                    (None, None) => break 'a,
                 }
-                return format!("{sn_pfx}{sn_ptp}");
             },
             PatKind::Or(pats) => {
                 let patterns = pats
@@ -208,7 +282,7 @@ fn replace_in_pattern(
                 }
                 return or_pat;
             },
-            PatKind::Struct(path, fields, has_dot_dot) => {
+            PatKind::Struct(path, fields, dot_dot) => {
                 let fields = fields
                     .iter()
                     .map(|fld| {
@@ -232,7 +306,7 @@ fn replace_in_pattern(
                     .collect::<Vec<_>>();
                 let fields_string = fields.join(", ");
 
-                let dot_dot_str = if has_dot_dot { " .." } else { "" };
+                let dot_dot_str = if dot_dot.is_some() { ", .." } else { "" };
                 let (sn_pth, _) = snippet_with_context(cx, path.span(), span.ctxt(), "", app);
                 return format!("{sn_pth} {{ {fields_string}{dot_dot_str} }}");
             },
@@ -305,7 +379,7 @@ fn pat_allowed_for_else(cx: &LateContext<'_>, pat: &'_ Pat<'_>, check_types: boo
         }
         let ty = typeck_results.pat_ty(pat);
         // Option and Result are allowed, everything else isn't.
-        if !(is_type_diagnostic_item(cx, ty, sym::Option) || is_type_diagnostic_item(cx, ty, sym::Result)) {
+        if !matches!(ty.opt_diag_name(cx), Some(sym::Option | sym::Result)) {
             has_disallowed = true;
         }
     });

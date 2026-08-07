@@ -13,6 +13,7 @@ fn main() {
     //~^ tuple_array_conversions
     let x = &[1, 2];
     let x = (x[0], x[1]);
+    //~^ tuple_array_conversions
 
     let t1: &[(u32, u32)] = &[(1, 2), (3, 4)];
     let v1: Vec<[u32; 2]> = t1.iter().map(|&(a, b)| [a, b]).collect();
@@ -115,4 +116,28 @@ fn msrv_juust_right() {
     //~^ tuple_array_conversions
     let x = &[1, 2];
     let x = (x[0], x[1]);
+    //~^ tuple_array_conversions
+}
+
+fn issue16192() {
+    fn do_something(tuple: (u32, u32)) {}
+    fn produce_array() -> [u32; 2] {
+        [1, 2]
+    }
+
+    let [a, b] = produce_array();
+    for tuple in [(a, b), (b, a)] {
+        do_something(tuple);
+    }
+
+    let [a, b] = produce_array();
+    let x = b;
+    do_something((a, b));
+
+    let [a, b] = produce_array();
+    do_something((b, a));
+
+    let [a, b] = produce_array();
+    do_something((a, b));
+    //~^ tuple_array_conversions
 }

@@ -17,17 +17,17 @@ use clap::Parser;
 use jobs::JobDatabase;
 use serde_yaml::Value;
 
-use crate::analysis::{output_largest_duration_changes, output_test_diffs};
+use crate::analysis::{output_largest_job_duration_changes, output_test_diffs};
 use crate::cpu_usage::load_cpu_usage;
 use crate::datadog::upload_datadog_metric;
 use crate::github::JobInfoResolver;
 use crate::jobs::RunType;
 use crate::metrics::{JobMetrics, download_auto_job_metrics, download_job_metrics, load_metrics};
 use crate::test_dashboard::generate_test_dashboard;
-use crate::utils::{load_env_var, output_details};
+use crate::utils::{init_submodule_if_needed, load_env_var, output_details};
 
 const CI_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
-const DOCKER_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker");
+pub const DOCKER_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker");
 const JOBS_YML_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../github-actions/jobs.yml");
 
 struct GitHubContext {
@@ -41,12 +41,13 @@ impl GitHubContext {
         match (self.event_name.as_str(), self.branch_ref.as_str()) {
             ("pull_request", _) => Some(RunType::PullRequest),
             ("push", "refs/heads/try-perf") => Some(RunType::TryJob { job_patterns: None }),
-            ("push", "refs/heads/try" | "refs/heads/automation/bors/try") => {
+            ("push", "refs/heads/automation/bors/try") => {
                 let patterns = self.get_try_job_patterns();
                 let patterns = if !patterns.is_empty() { Some(patterns) } else { None };
                 Some(RunType::TryJob { job_patterns: patterns })
             }
-            ("push", "refs/heads/auto") => Some(RunType::AutoJob),
+            ("push", "refs/heads/automation/bors/auto") => Some(RunType::AutoJob),
+            ("push", "refs/heads/main") => Some(RunType::MainJob),
             _ => None,
         }
     }
@@ -119,6 +120,8 @@ fn run_workflow_locally(db: JobDatabase, job_type: JobType, name: String) -> any
         };
         (key.clone(), value)
     }));
+
+    init_submodule_if_needed("src/llvm-project/")?;
 
     let mut cmd = Command::new(Path::new(DOCKER_DIRECTORY).join("run.sh"));
     cmd.arg(job.image());
@@ -202,7 +205,7 @@ And then open `test-dashboard/index.html` in your browser to see an overview of 
         );
     });
 
-    output_largest_duration_changes(&metrics, &mut job_info_resolver);
+    output_largest_job_duration_changes(&metrics, &mut job_info_resolver);
 
     Ok(())
 }

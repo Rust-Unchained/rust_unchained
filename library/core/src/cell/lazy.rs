@@ -1,6 +1,6 @@
 use super::UnsafeCell;
 use crate::hint::unreachable_unchecked;
-use crate::ops::Deref;
+use crate::ops::{Deref, DerefMut};
 use crate::{fmt, mem};
 
 enum State<T, F> {
@@ -14,6 +14,22 @@ enum State<T, F> {
 /// For a thread-safe version of this struct, see [`std::sync::LazyLock`].
 ///
 /// [`std::sync::LazyLock`]: ../../std/sync/struct.LazyLock.html
+///
+/// # Poisoning
+///
+/// If the initialization closure passed to [`LazyCell::new`] panics, the cell will be poisoned.
+/// Once the cell is poisoned, any threads that attempt to access this cell (via a dereference
+/// or via an explicit call to [`force()`]) will panic.
+///
+/// This concept is similar to that of poisoning in the [`std::sync::poison`] module. A key
+/// difference, however, is that poisoning in `LazyCell` is _unrecoverable_. All future accesses of
+/// the cell from other threads will panic, whereas a type in [`std::sync::poison`] like
+/// [`std::sync::poison::Mutex`] allows recovery via [`PoisonError::into_inner()`].
+///
+/// [`force()`]: LazyCell::force
+/// [`std::sync::poison`]: ../../std/sync/poison/index.html
+/// [`std::sync::poison::Mutex`]: ../../std/sync/poison/struct.Mutex.html
+/// [`PoisonError::into_inner()`]: ../../std/sync/poison/struct.PoisonError.html#method.into_inner
 ///
 /// # Examples
 ///
@@ -64,6 +80,10 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     ///
     /// Returns `Ok(value)` if `Lazy` is initialized and `Err(f)` otherwise.
     ///
+    /// # Panics
+    ///
+    /// Panics if the cell is poisoned.
+    ///
     /// # Examples
     ///
     /// ```
@@ -93,6 +113,15 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     ///
     /// This is equivalent to the `Deref` impl, but is explicit.
     ///
+    /// # Panics
+    ///
+    /// If the initialization closure panics (the one that is passed to the [`new()`] method), the
+    /// panic is propagated to the caller, and the cell becomes poisoned. This will cause all future
+    /// accesses of the cell (via [`force()`] or a dereference) to panic.
+    ///
+    /// [`new()`]: LazyCell::new
+    /// [`force()`]: LazyCell::force
+    ///
     /// # Examples
     ///
     /// ```
@@ -105,6 +134,7 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn force(this: &LazyCell<T, F>) -> &T {
         // SAFETY:
         // This invalidates any mutable references to the data. The resulting
@@ -123,10 +153,18 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     /// Forces the evaluation of this lazy value and returns a mutable reference to
     /// the result.
     ///
+    /// # Panics
+    ///
+    /// If the initialization closure panics (the one that is passed to the [`new()`] method), the
+    /// panic is propagated to the caller, and the cell becomes poisoned. This will cause all future
+    /// accesses of the cell (via [`force()`] or a dereference) to panic.
+    ///
+    /// [`new()`]: LazyCell::new
+    /// [`force()`]: LazyCell::force
+    ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
     /// use std::cell::LazyCell;
     ///
     /// let mut lazy = LazyCell::new(|| 92);
@@ -137,7 +175,7 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn force_mut(this: &mut LazyCell<T, F>) -> &mut T {
         #[cold]
         /// # Safety
@@ -219,13 +257,12 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
 }
 
 impl<T, F> LazyCell<T, F> {
-    /// Returns a mutable reference to the value if initialized, or `None` if not.
+    /// Returns a mutable reference to the value if initialized. Otherwise (if uninitialized or
+    /// poisoned), returns `None`.
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::cell::LazyCell;
     ///
     /// let mut lazy = LazyCell::new(|| 92);
@@ -236,7 +273,7 @@ impl<T, F> LazyCell<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn get_mut(this: &mut LazyCell<T, F>) -> Option<&mut T> {
         let state = this.state.get_mut();
         match state {
@@ -245,13 +282,12 @@ impl<T, F> LazyCell<T, F> {
         }
     }
 
-    /// Returns a reference to the value if initialized, or `None` if not.
+    /// Returns a reference to the value if initialized. Otherwise (if uninitialized or poisoned),
+    /// returns `None`.
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::cell::LazyCell;
     ///
     /// let lazy = LazyCell::new(|| 92);
@@ -261,7 +297,7 @@ impl<T, F> LazyCell<T, F> {
     /// assert_eq!(LazyCell::get(&lazy), Some(&92));
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn get(this: &LazyCell<T, F>) -> Option<&T> {
         // SAFETY:
         // This is sound for the same reason as in `force`: once the state is
@@ -278,14 +314,40 @@ impl<T, F> LazyCell<T, F> {
 #[stable(feature = "lazy_cell", since = "1.80.0")]
 impl<T, F: FnOnce() -> T> Deref for LazyCell<T, F> {
     type Target = T;
+
+    /// # Panics
+    ///
+    /// If the initialization closure panics (the one that is passed to the [`new()`] method), the
+    /// panic is propagated to the caller, and the cell becomes poisoned. This will cause all future
+    /// accesses of the cell (via [`force()`] or a dereference) to panic.
+    ///
+    /// [`new()`]: LazyCell::new
+    /// [`force()`]: LazyCell::force
     #[inline]
     fn deref(&self) -> &T {
         LazyCell::force(self)
     }
 }
 
+#[stable(feature = "lazy_deref_mut", since = "1.89.0")]
+impl<T, F: FnOnce() -> T> DerefMut for LazyCell<T, F> {
+    /// # Panics
+    ///
+    /// If the initialization closure panics (the one that is passed to the [`new()`] method), the
+    /// panic is propagated to the caller, and the cell becomes poisoned. This will cause all future
+    /// accesses of the cell (via [`force()`] or a dereference) to panic.
+    ///
+    /// [`new()`]: LazyCell::new
+    /// [`force()`]: LazyCell::force
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        LazyCell::force_mut(self)
+    }
+}
+
 #[stable(feature = "lazy_cell", since = "1.80.0")]
-impl<T: Default> Default for LazyCell<T> {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl<T: Default> Default for LazyCell<T> {
     /// Creates a new lazy value using `Default` as the initializing function.
     #[inline]
     fn default() -> LazyCell<T> {
@@ -302,6 +364,16 @@ impl<T: fmt::Debug, F> fmt::Debug for LazyCell<T, F> {
             None => d.field(&format_args!("<uninit>")),
         };
         d.finish()
+    }
+}
+
+#[stable(feature = "from_wrapper_impls", since = "1.96.0")]
+impl<T, F> From<T> for LazyCell<T, F> {
+    /// Constructs a `LazyCell` that starts already initialized
+    /// with the provided value.
+    #[inline]
+    fn from(value: T) -> Self {
+        Self { state: UnsafeCell::new(State::Init(value)) }
     }
 }
 

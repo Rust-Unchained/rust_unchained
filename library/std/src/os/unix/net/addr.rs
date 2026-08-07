@@ -1,9 +1,9 @@
+use crate::bstr::ByteStr;
 use crate::ffi::OsStr;
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use crate::os::net::linux_ext;
 use crate::os::unix::ffi::OsStrExt;
 use crate::path::Path;
-use crate::sealed::Sealed;
 use crate::sys::cvt;
 use crate::{fmt, io, mem, ptr};
 
@@ -53,7 +53,15 @@ pub(super) fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::s
     let mut len = SUN_PATH_OFFSET + bytes.len();
     match bytes.get(0) {
         Some(&0) | None => {}
-        Some(_) => len += 1,
+        Some(_) => {
+            // on QNX7.1 and QNX8 the `len` value returned by the SUN_LEN
+            // macro in its libc does not include the null byte in the count so
+            // don't add it here to match what a C program passes to bind(2) and
+            // similar functions
+            if cfg!(not(any(target_os = "qnx", target_env = "nto71"))) {
+                len += 1
+            }
+        }
     }
     Ok((addr, len as libc::socklen_t))
 }
@@ -61,14 +69,15 @@ pub(super) fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::s
 enum AddressKind<'a> {
     Unnamed,
     Pathname(&'a Path),
-    Abstract(&'a [u8]),
+    Abstract(&'a ByteStr),
 }
 
 /// An address associated with a Unix socket.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(target_family = "unix", doc = "```")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
 /// use std::os::unix::net::UnixListener;
 ///
 /// let socket = match UnixListener::bind("/tmp/sock") {
@@ -137,7 +146,8 @@ impl SocketAddr {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::SocketAddr;
     /// use std::path::Path;
     ///
@@ -150,7 +160,8 @@ impl SocketAddr {
     ///
     /// Creating a `SocketAddr` with a NULL byte results in an error.
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::SocketAddr;
     ///
     /// assert!(SocketAddr::from_pathname("/path/with/\0/bytes").is_err());
@@ -169,7 +180,8 @@ impl SocketAddr {
     ///
     /// A named address:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixListener;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -182,7 +194,8 @@ impl SocketAddr {
     ///
     /// An unnamed address:
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -204,7 +217,8 @@ impl SocketAddr {
     ///
     /// With a pathname:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixListener;
     /// use std::path::Path;
     ///
@@ -218,7 +232,8 @@ impl SocketAddr {
     ///
     /// Without a pathname:
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -240,30 +255,33 @@ impl SocketAddr {
 
         // macOS seems to return a len of 16 and a zeroed sun_path for unnamed addresses
         if len == 0
-            || (cfg!(not(any(target_os = "linux", target_os = "android")))
+            || (cfg!(not(any(target_os = "linux", target_os = "android", target_os = "cygwin")))
                 && self.addr.sun_path[0] == 0)
         {
             AddressKind::Unnamed
         } else if self.addr.sun_path[0] == 0 {
-            AddressKind::Abstract(&path[1..len])
+            AddressKind::Abstract(ByteStr::from_bytes(&path[1..len]))
         } else {
-            AddressKind::Pathname(OsStr::from_bytes(&path[..len - 1]).as_ref())
+            // the value returned by getsockname(2) and similar on QNX7.1 and
+            // QNX8 does not count the NUL byte terminator of the path string,
+            // which matches the behavior of the SUN_LEN macro in libc, but
+            // other OSes do count the NUL byte so adjust accordingly
+            let end =
+                if cfg!(any(target_os = "qnx", target_env = "nto71")) { len } else { len - 1 };
+            AddressKind::Pathname(OsStr::from_bytes(&path[..end]).as_ref())
         }
     }
 }
 
-#[stable(feature = "unix_socket_abstract", since = "1.70.0")]
-impl Sealed for SocketAddr {}
-
-#[doc(cfg(any(target_os = "android", target_os = "linux")))]
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[doc(cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin")))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
 impl linux_ext::addr::SocketAddrExt for SocketAddr {
     fn as_abstract_name(&self) -> Option<&[u8]> {
-        if let AddressKind::Abstract(name) = self.address() { Some(name) } else { None }
+        if let AddressKind::Abstract(name) = self.address() { Some(name.as_bytes()) } else { None }
     }
 
-    fn from_abstract_name<N>(name: N) -> crate::io::Result<Self>
+    fn from_abstract_name<N>(name: N) -> io::Result<Self>
     where
         N: AsRef<[u8]>,
     {
@@ -295,7 +313,7 @@ impl fmt::Debug for SocketAddr {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.address() {
             AddressKind::Unnamed => write!(fmt, "(unnamed)"),
-            AddressKind::Abstract(name) => write!(fmt, "\"{}\" (abstract)", name.escape_ascii()),
+            AddressKind::Abstract(name) => write!(fmt, "{name:?} (abstract)"),
             AddressKind::Pathname(path) => write!(fmt, "{path:?} (pathname)"),
         }
     }

@@ -13,8 +13,8 @@ struct Foo<'lt, T, const C: usize> where $0 {}
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            st Foo<…> Foo<'_, {unknown}, _>
+            md module::
+            st Foo<…>        Foo<'lt, T, C>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -22,6 +22,10 @@ struct Foo<'lt, T, const C: usize> where $0 {}
             un Union                  Union
             bt u32                      u32
             kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
             kw self::
         "#]],
     );
@@ -35,7 +39,7 @@ struct Foo<'lt, T, const C: usize> where T: $0 {}
 "#,
         expect![[r#"
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             tt Trait
             kw crate::
             kw self::
@@ -53,7 +57,7 @@ struct Foo<'lt, T, const C: usize> where 'lt: $0 {}
 "#,
         expect![[r#"
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             tt Trait
             kw crate::
             kw self::
@@ -69,7 +73,7 @@ struct Foo<'lt, T, const C: usize> where for<'a> T: $0 {}
 "#,
         expect![[r#"
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             tt Trait
             kw crate::
             kw self::
@@ -86,8 +90,8 @@ struct Foo<'lt, T, const C: usize> where for<'a> $0 {}
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            st Foo<…> Foo<'_, {unknown}, _>
+            md module::
+            st Foo<…>        Foo<'lt, T, C>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -95,6 +99,10 @@ struct Foo<'lt, T, const C: usize> where for<'a> $0 {}
             un Union                  Union
             bt u32                      u32
             kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
             kw self::
         "#]],
     );
@@ -111,7 +119,7 @@ impl Record {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             sp Self                  Record
             st Record                Record
             st Tuple                  Tuple
@@ -120,6 +128,10 @@ impl Record {
             un Union                  Union
             bt u32                      u32
             kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
             kw self::
         "#]],
     );
@@ -137,7 +149,7 @@ struct Foo<T> where T: $0 {}
 pub trait Trait {}
 "#,
         expect![[r#"
-            md std
+            md std::
             kw crate::
             kw self::
         "#]],
@@ -157,7 +169,7 @@ struct Foo<T> where T: $0 {}
 pub trait Trait {}
 "#,
         expect![[r#"
-            md std
+            md std::
             tt Trait
             kw crate::
             kw self::

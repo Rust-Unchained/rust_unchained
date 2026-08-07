@@ -4,7 +4,7 @@ use crate::collections::HashMap;
 #[test]
 fn no_lookup_host_duplicates() {
     let mut addrs = HashMap::new();
-    let lh = match LookupHost::try_from(("localhost", 0)) {
+    let lh = match lookup_host("localhost", 0) {
         Ok(lh) => lh,
         Err(e) => panic!("couldn't resolve `localhost`: {e}"),
     };
@@ -16,4 +16,15 @@ fn no_lookup_host_duplicates() {
         vec![],
         "There should be no duplicate localhost entries"
     );
+}
+
+// #115325: on Apple, `send` rejects a length > `c_int::MAX` with `EINVAL`, so
+// the clamp must not regress to the unbounded `wrlen_t::MAX`.
+#[test]
+fn max_send_len_within_platform_limit() {
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(MAX_SEND_LEN, c_int::MAX as usize);
+    } else {
+        assert_eq!(MAX_SEND_LEN, <wrlen_t>::MAX as usize);
+    }
 }

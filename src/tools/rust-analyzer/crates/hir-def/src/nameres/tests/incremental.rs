@@ -1,25 +1,128 @@
-use base_db::SourceDatabaseFileInputExt as _;
+use base_db::{
+    CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
+    DependencyBuilder, Env, SourceDatabase, all_crates,
+};
+use expect_test::{Expect, expect};
+use intern::Symbol;
+use span::Edition;
 use test_fixture::WithFixture;
+use triomphe::Arc;
 
-use crate::{db::DefDatabase, nameres::tests::TestDB, AdtId, ModuleDefId};
+use crate::{
+    file_item_tree,
+    nameres::{crate_def_map, tests::TestDB},
+};
 
-fn check_def_map_is_not_recomputed(ra_fixture_initial: &str, ra_fixture_change: &str) {
+fn check_def_map_is_not_recomputed(
+    #[rust_analyzer::rust_fixture] ra_fixture_initial: &str,
+    #[rust_analyzer::rust_fixture] ra_fixture_change: &str,
+    expecta: Expect,
+    expectb: Expect,
+) {
     let (mut db, pos) = TestDB::with_position(ra_fixture_initial);
     let krate = db.fetch_test_crate();
-    {
-        let events = db.log_executed(|| {
-            db.crate_def_map(krate);
-        });
-        assert!(format!("{events:?}").contains("crate_def_map"), "{events:#?}")
+    execute_assert_events(
+        &db,
+        || {
+            crate_def_map(&db, krate);
+        },
+        &[],
+        expecta,
+    );
+    db.set_file_text(pos.file_id.file_id(&db), ra_fixture_change);
+
+    execute_assert_events(
+        &db,
+        || {
+            crate_def_map(&db, krate);
+        },
+        &[("crate_local_def_map", 0)],
+        expectb,
+    );
+}
+
+#[test]
+fn crate_metadata_changes_should_not_invalidate_unrelated_def_maps() {
+    let (mut db, files) = TestDB::with_many_files(
+        r#"
+//- /a.rs crate:a
+pub fn foo() {}
+
+//- /b.rs crate:b
+pub struct Bar;
+
+//- /c.rs crate:c deps:b
+pub const BAZ: u32 = 0;
+    "#,
+    );
+
+    for &krate in all_crates(&db).iter() {
+        crate_def_map(&db, krate);
     }
-    db.set_file_text(pos.file_id.file_id(), ra_fixture_change);
+
+    let all_crates_before = all_crates(&db);
 
     {
-        let events = db.log_executed(|| {
-            db.crate_def_map(krate);
-        });
-        assert!(!format!("{events:?}").contains("crate_def_map"), "{events:#?}")
+        // Add dependencies: c -> b, b -> a.
+        let mut new_crate_graph = CrateGraphBuilder::default();
+
+        let mut add_crate = |crate_name, root_file_idx: usize| {
+            new_crate_graph.add_crate_root(
+                files[root_file_idx].file_id(&db),
+                Edition::CURRENT,
+                Some(CrateDisplayName::from_canonical_name(crate_name)),
+                None,
+                Default::default(),
+                None,
+                Env::default(),
+                CrateOrigin::Local { repo: None, name: Some(Symbol::intern(crate_name)) },
+                Vec::new(),
+                false,
+                Arc::new(
+                    // FIXME: This is less than ideal
+                    TryFrom::try_from(
+                        &*std::env::current_dir().unwrap().as_path().to_string_lossy(),
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(CrateWorkspaceData { target: Err("".into()), toolchain: None }),
+            )
+        };
+        let a = add_crate("a", 0);
+        let b = add_crate("b", 1);
+        let c = add_crate("c", 2);
+        new_crate_graph
+            .add_dep(c, DependencyBuilder::new(CrateName::new("b").unwrap(), b))
+            .unwrap();
+        new_crate_graph
+            .add_dep(b, DependencyBuilder::new(CrateName::new("a").unwrap(), a))
+            .unwrap();
+        new_crate_graph.set_in_db(&mut db);
     }
+
+    let all_crates_after = all_crates(&db);
+    assert!(
+        std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
+        "the all_crates list should not have been invalidated"
+    );
+    execute_assert_events(
+        &db,
+        || {
+            for &krate in all_crates(&db).iter() {
+                crate_def_map(&db, krate);
+            }
+        },
+        // `c` gets invalidated as its dependency `b` changed
+        // `b` gets invalidated due to its new dependency edge to `a`
+        &[("crate_local_def_map", 2)],
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "crate_local_def_map",
+            ]
+        "#]],
+    );
 }
 
 #[test]
@@ -59,6 +162,33 @@ fn foo() -> i32 { 92 }
 #[cfg(never)]
 fn no() {}
 ",
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "EnumVariants::of_",
+            ]
+        "#]],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+                "EnumVariants::of_",
+            ]
+        "#]],
     );
 }
 
@@ -90,6 +220,41 @@ m!(Y);
 
 pub struct S {}
 ",
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "AstId < ast :: Macro >::decl_macro_expander_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+            ]
+        "#]],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+                "MacroCallId::macro_arg_",
+                "MacroCallId::parse_macro_expansion_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+            ]
+        "#]],
     );
 }
 
@@ -113,6 +278,49 @@ fn f() {}
 #[proc_macros::identity]
 fn f() { foo }
 ",
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "crate_local_def_map",
+                "ProcMacros::get_for_crate_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::macro_arg_",
+                "proc_macro_span",
+            ]
+        "#]],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+                "MacroCallId::macro_arg_",
+                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::parse_macro_expansion_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+            ]
+        "#]],
     );
 }
 
@@ -194,6 +402,60 @@ m2!(X);
 #[derive(proc_macros::DeriveIdentity)]
 pub struct S {}
 ",
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "crate_local_def_map",
+                "ProcMacros::get_for_crate_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "AstId < ast :: Macro >::decl_macro_expander_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+                "AstId < ast :: Macro >::decl_macro_expander_",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::macro_arg_",
+                "proc_macro_span",
+            ]
+        "#]],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+                "MacroCallId::macro_arg_",
+                "AstId < ast :: Macro >::decl_macro_expander_",
+                "MacroCallId::macro_arg_",
+                "MacroCallId::macro_arg_",
+            ]
+        "#]],
     );
 }
 
@@ -248,19 +510,47 @@ m!(Z);
 "#,
     );
     let krate = db.test_crate();
-    {
-        let events = db.log_executed(|| {
-            let crate_def_map = db.crate_def_map(krate);
-            let (_, module_data) = crate_def_map.modules.iter().last().unwrap();
+    execute_assert_events(
+        &db,
+        || {
+            let crate_def_map = crate_def_map(&db, krate);
+            let module_data = &crate_def_map
+                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
             assert_eq!(module_data.scope.resolutions().count(), 4);
-        });
-        let n_recalculated_item_trees =
-            events.iter().filter(|it| it.contains("item_tree(")).count();
-        assert_eq!(n_recalculated_item_trees, 6);
-        let n_reparsed_macros =
-            events.iter().filter(|it| it.contains("parse_macro_expansion(")).count();
-        assert_eq!(n_reparsed_macros, 3);
-    }
+        },
+        &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
+        expect![[r#"
+            [
+                "crate_local_def_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "AstId < ast :: Macro >::decl_macro_expander_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+                "MacroId::definition_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "MacroCallId::parse_macro_expansion_",
+                "MacroCallId::macro_arg_",
+            ]
+        "#]],
+    );
 
     let new_text = r#"
 m!(X);
@@ -268,29 +558,34 @@ fn quux() { 92 }
 m!(Y);
 m!(Z);
 "#;
-    db.set_file_text(pos.file_id.file_id(), new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
-    {
-        let events = db.log_executed(|| {
-            let crate_def_map = db.crate_def_map(krate);
-            let (_, module_data) = crate_def_map.modules.iter().last().unwrap();
+    execute_assert_events(
+        &db,
+        || {
+            let crate_def_map = crate_def_map(&db, krate);
+            let module_data = &crate_def_map
+                [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
             assert_eq!(module_data.scope.resolutions().count(), 4);
-        });
-        let n_recalculated_item_trees = events.iter().filter(|it| it.contains("item_tree")).count();
-        assert_eq!(n_recalculated_item_trees, 1);
-        let n_reparsed_macros =
-            events.iter().filter(|it| it.contains("parse_macro_expansion(")).count();
-        assert_eq!(n_reparsed_macros, 0);
-    }
+        },
+        &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+                "MacroCallId::macro_arg_",
+                "MacroCallId::macro_arg_",
+                "MacroCallId::macro_arg_",
+            ]
+        "#]],
+    );
 }
 
 #[test]
 fn item_tree_prevents_reparsing() {
-    // The `ItemTree` is used by both name resolution and the various queries in `adt.rs` and
-    // `data.rs`. After computing the `ItemTree` and deleting the parse tree, we should be able to
-    // run those other queries without triggering a reparse.
-
-    let (db, pos) = TestDB::with_position(
+    let (mut db, pos) = TestDB::with_position(
         r#"
 pub struct S;
 pub union U {}
@@ -305,52 +600,54 @@ pub static ST: u8 = 0;
 pub type Ty = ();
 "#,
     );
-    let krate = db.test_crate();
-    {
-        let events = db.log_executed(|| {
-            db.file_item_tree(pos.file_id.into());
-        });
-        let n_calculated_item_trees = events.iter().filter(|it| it.contains("item_tree(")).count();
-        assert_eq!(n_calculated_item_trees, 1);
-        let n_parsed_files = events.iter().filter(|it| it.contains("parse(")).count();
-        assert_eq!(n_parsed_files, 1);
+
+    execute_assert_events(
+        &db,
+        || {
+            file_item_tree(&db, pos.file_id.into(), db.test_crate());
+        },
+        &[("file_item_tree_query", 1), ("parse", 1)],
+        expect![[r#"
+            [
+                "file_item_tree_query",
+                "HirFileId::ast_id_map_",
+                "EditionedFileId::parse_",
+                "real_span_map",
+            ]
+        "#]],
+    );
+
+    let file_id = pos.file_id.file_id(&db);
+    let file_text = db.file_text(file_id).text(&db);
+    db.set_file_text(file_id, &format!("{file_text}\n"));
+
+    execute_assert_events(
+        &db,
+        || {
+            file_item_tree(&db, pos.file_id.into(), db.test_crate());
+        },
+        &[("file_item_tree_query", 1), ("parse", 1)],
+        expect![[r#"
+            [
+                "EditionedFileId::parse_",
+                "HirFileId::ast_id_map_",
+                "file_item_tree_query",
+                "real_span_map",
+            ]
+        "#]],
+    );
+}
+
+fn execute_assert_events(
+    db: &TestDB,
+    f: impl FnOnce(),
+    required: &[(&str, usize)],
+    expect: Expect,
+) {
+    let events = db.log_executed(f);
+    for (event, count) in required {
+        let n = events.iter().filter(|it| it.contains(event)).count();
+        assert_eq!(n, *count, "Expected {event} to be executed {count} times, but only got {n}");
     }
-
-    // Delete the parse tree.
-    base_db::ParseQuery.in_db(&db).purge();
-
-    {
-        let events = db.log_executed(|| {
-            let crate_def_map = db.crate_def_map(krate);
-            let (_, module_data) = crate_def_map.modules.iter().last().unwrap();
-            assert_eq!(module_data.scope.resolutions().count(), 8);
-            assert_eq!(module_data.scope.impls().count(), 1);
-
-            for imp in module_data.scope.impls() {
-                db.impl_data(imp);
-            }
-
-            for (_, res) in module_data.scope.resolutions() {
-                match res.values.map(|it| it.def).or(res.types.map(|it| it.def)).unwrap() {
-                    ModuleDefId::FunctionId(f) => _ = db.function_data(f),
-                    ModuleDefId::AdtId(adt) => match adt {
-                        AdtId::StructId(it) => _ = db.struct_data(it),
-                        AdtId::UnionId(it) => _ = db.union_data(it),
-                        AdtId::EnumId(it) => _ = db.enum_data(it),
-                    },
-                    ModuleDefId::ConstId(it) => _ = db.const_data(it),
-                    ModuleDefId::StaticId(it) => _ = db.static_data(it),
-                    ModuleDefId::TraitId(it) => _ = db.trait_data(it),
-                    ModuleDefId::TraitAliasId(it) => _ = db.trait_alias_data(it),
-                    ModuleDefId::TypeAliasId(it) => _ = db.type_alias_data(it),
-                    ModuleDefId::EnumVariantId(_)
-                    | ModuleDefId::ModuleId(_)
-                    | ModuleDefId::MacroId(_)
-                    | ModuleDefId::BuiltinType(_) => unreachable!(),
-                }
-            }
-        });
-        let n_reparsed_files = events.iter().filter(|it| it.contains("parse(")).count();
-        assert_eq!(n_reparsed_files, 0);
-    }
+    expect.assert_debug_eq(&events);
 }

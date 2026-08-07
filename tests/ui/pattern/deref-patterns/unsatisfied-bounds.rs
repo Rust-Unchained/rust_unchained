@@ -1,5 +1,4 @@
 #![feature(deref_patterns)]
-#![allow(incomplete_features)]
 
 struct MyPointer;
 
@@ -15,7 +14,7 @@ fn main() {
     // FIXME(deref_patterns): there should be a special diagnostic for missing `DerefPure`.
     match MyPointer {
         () => {}
-        //~^ the trait bound `MyPointer: DerefPure` is not satisfied
+        //~^ ERROR the trait bound `MyPointer: DerefPure` is not satisfied
         _ => {}
     }
 }

@@ -2,12 +2,16 @@
 
 use core::time::Duration;
 
-use crate::concurrency::sync::FutexRef;
+use rustc_abi::FieldIdx;
+
+use crate::concurrency::sync::{FutexRef, SyncObj};
 use crate::*;
 
 pub struct FreeBsdFutex {
     futex: FutexRef,
 }
+
+impl SyncObj for FreeBsdFutex {}
 
 /// Extended variant of the `timespec` struct.
 pub struct UmtxTime {
@@ -89,7 +93,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // extended variant, `struct _umtx_time`, as the `uaddr2` argument of _umtx_op().
                     // They are distinguished by the `uaddr` value, which must be equal
                     // to the size of the structure pointed to by `uaddr2`, casted to uintptr_t.
-                    let timeout = if this.ptr_is_null(uaddr2)? {
+                    let deadline = if this.ptr_is_null(uaddr2)? {
                         // no timeout parameter
                         None
                     } else {
@@ -97,33 +101,29 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             // `uaddr2` points to a `struct _umtx_time`.
                             let umtx_time_place = this.ptr_to_mplace(uaddr2, umtx_time_layout);
 
-                            let umtx_time = match this.read_umtx_time(&umtx_time_place)? {
-                                Some(ut) => ut,
-                                None => {
-                                    return this
-                                        .set_last_error_and_return(LibcError("EINVAL"), dest);
-                                }
+                            let Some(umtx_time) = this.read_umtx_time(&umtx_time_place)? else {
+                                return this.set_errno_and_return_neg1(LibcError("EINVAL"), dest);
                             };
 
-                            let anchor = if umtx_time.abs_time {
-                                TimeoutAnchor::Absolute
+                            let style = if umtx_time.abs_time {
+                                TimeoutStyle::Absolute
                             } else {
-                                TimeoutAnchor::Relative
+                                TimeoutStyle::Relative
                             };
 
-                            Some((umtx_time.timeout_clock, anchor, umtx_time.timeout))
+                            Some(this.machine.timeout(
+                                umtx_time.timeout_clock,
+                                style,
+                                umtx_time.timeout,
+                            ))
                         } else if uaddr == timespec_layout.size.bytes() {
                             // RealTime clock can't be used in isolation mode.
                             this.check_no_isolation("`_umtx_op` with `timespec` timeout")?;
 
                             // `uaddr2` points to a `struct timespec`.
                             let timespec = this.ptr_to_mplace(uaddr2, timespec_layout);
-                            let duration = match this.read_timespec(&timespec)? {
-                                Some(duration) => duration,
-                                None => {
-                                    return this
-                                        .set_last_error_and_return(LibcError("EINVAL"), dest);
-                                }
+                            let Some(duration) = this.read_timespec(&timespec)? else {
+                                return this.set_errno_and_return_neg1(LibcError("EINVAL"), dest);
                             };
 
                             // FreeBSD does not seem to document which clock is used when the timeout
@@ -131,9 +131,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             // code (umtx_copyin_umtx_time() in kern_umtx.c), it seems to default to CLOCK_REALTIME,
                             // so that's what we also do.
                             // Discussion in golang: https://github.com/golang/go/issues/17168#issuecomment-250235271
-                            Some((TimeoutClock::RealTime, TimeoutAnchor::Relative, duration))
+                            Some(this.machine.timeout(
+                                TimeoutClock::RealTime,
+                                TimeoutStyle::Relative,
+                                duration,
+                            ))
                         } else {
-                            return this.set_last_error_and_return(LibcError("EINVAL"), dest);
+                            return this.set_errno_and_return_neg1(LibcError("EINVAL"), dest);
                         }
                     };
 
@@ -141,7 +145,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.futex_wait(
                         futex_ref,
                         u32::MAX, // we set the bitset to include all bits
-                        timeout,
+                        deadline,
                         callback!(
                             @capture<'tcx> {
                                 dest: MPlaceTy<'tcx>,
@@ -154,7 +158,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                     ecx.write_int(0, &dest)
                                 }
                                 UnblockKind::TimedOut => {
-                                    ecx.set_last_error_and_return(LibcError("ETIMEDOUT"), &dest)
+                                    ecx.set_errno_and_return_neg1(LibcError("ETIMEDOUT"), &dest)
                                 }
                             }
                         ),
@@ -173,12 +177,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let Some(futex_ref) =
                     this.get_sync_or_init(obj, |_| FreeBsdFutex { futex: Default::default() })
                 else {
-                    // From Linux implemenation:
+                    // From Linux implementation:
                     // No AllocId, or no live allocation at that AllocId.
                     // Return an error code. (That seems nicer than silently doing something non-intuitive.)
                     // This means that if an address gets reused by a new allocation,
                     // we'll use an independent futex queue for this... that seems acceptable.
-                    return this.set_last_error_and_return(LibcError("EFAULT"), dest);
+                    return this.set_errno_and_return_neg1(LibcError("EFAULT"), dest);
                 };
                 let futex_ref = futex_ref.futex.clone();
 
@@ -214,38 +218,32 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Only flag allowed is UMTX_ABSTIME.
         let abs_time = this.eval_libc_u32("UMTX_ABSTIME");
 
-        let timespec_place = this.project_field(ut, 0)?;
+        let timespec_place = this.project_field(ut, FieldIdx::from_u32(0))?;
         // Inner `timespec` must still be valid.
-        let duration = match this.read_timespec(&timespec_place)? {
-            Some(dur) => dur,
-            None => return interp_ok(None),
+        let Some(duration) = this.read_timespec(&timespec_place)? else { return interp_ok(None) };
+
+        let flags_place = this.project_field(ut, FieldIdx::from_u32(1))?;
+        let mut flags = this.read_scalar(&flags_place)?.to_u32()?;
+
+        let abs_time_flag = if flags & abs_time != 0 {
+            flags &= !abs_time;
+            true
+        } else {
+            false
         };
+        if flags != 0 {
+            throw_unsup_format!("unsupported `_umtx_time` flags: {:#x}", flags);
+        }
 
-        let flags_place = this.project_field(ut, 1)?;
-        let flags = this.read_scalar(&flags_place)?.to_u32()?;
-        let abs_time_flag = flags == abs_time;
-
-        let clock_id_place = this.project_field(ut, 2)?;
-        let clock_id = this.read_scalar(&clock_id_place)?.to_i32()?;
-        let timeout_clock = this.translate_umtx_time_clock_id(clock_id)?;
+        let clock_id_place = this.project_field(ut, FieldIdx::from_u32(2))?;
+        let clock_id = this.read_scalar(&clock_id_place)?;
+        let Some(timeout_clock) = this.parse_clockid(clock_id) else {
+            throw_unsup_format!("unsupported clock")
+        };
+        if timeout_clock == TimeoutClock::RealTime {
+            this.check_no_isolation("`_umtx_op` with `CLOCK_REALTIME`")?;
+        }
 
         interp_ok(Some(UmtxTime { timeout: duration, abs_time: abs_time_flag, timeout_clock }))
-    }
-
-    /// Translate raw FreeBSD clockid to a Miri TimeoutClock.
-    /// FIXME: share this code with the pthread and clock_gettime shims.
-    fn translate_umtx_time_clock_id(&mut self, raw_id: i32) -> InterpResult<'tcx, TimeoutClock> {
-        let this = self.eval_context_mut();
-
-        let timeout = if raw_id == this.eval_libc_i32("CLOCK_REALTIME") {
-            // RealTime clock can't be used in isolation mode.
-            this.check_no_isolation("`_umtx_op` with `CLOCK_REALTIME` timeout")?;
-            TimeoutClock::RealTime
-        } else if raw_id == this.eval_libc_i32("CLOCK_MONOTONIC") {
-            TimeoutClock::Monotonic
-        } else {
-            throw_unsup_format!("unsupported clock id {raw_id}");
-        };
-        interp_ok(timeout)
     }
 }

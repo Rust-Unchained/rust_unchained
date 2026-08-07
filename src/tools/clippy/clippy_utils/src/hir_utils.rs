@@ -1,28 +1,34 @@
 use crate::consts::ConstEvalCtxt;
 use crate::macros::macro_backtrace;
-use crate::source::{SpanRange, SpanRangeExt, walk_span_to_context};
-use crate::tokenize_with_text;
+use crate::source::{SpanExt, SpanRange, walk_span_to_context};
+use crate::{sym, tokenize_with_text};
+use core::mem;
+use rustc_ast::ast;
 use rustc_ast::ast::InlineAsmTemplatePiece;
-use rustc_data_structures::fx::FxHasher;
+use rustc_data_structures::fx::{FxHasher, FxIndexMap};
 use rustc_hir::MatchSource::TryDesugar;
 use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::DefId;
 use rustc_hir::{
-    AssocItemConstraint, BinOpKind, BindingMode, Block, BodyId, Closure, ConstArg, ConstArgKind, Expr, ExprField,
-    ExprKind, FnRetTy, GenericArg, GenericArgs, HirId, HirIdMap, InlineAsmOperand, LetExpr, Lifetime, LifetimeKind,
-    Pat, PatExpr, PatExprKind, PatField, PatKind, Path, PathSegment, PrimTy, QPath, Stmt, StmtKind, StructTailExpr,
-    TraitBoundModifiers, Ty, TyKind, TyPat, TyPatKind,
+    AssocItemConstraint, BinOpKind, BindingMode, Block, BodyId, ByRef, Closure, ConstArg, ConstArgKind, ConstItemRhs,
+    Expr, ExprField, ExprKind, FnDecl, FnRetTy, FnSig, GenericArg, GenericArgs, GenericBound, GenericBounds,
+    GenericParam, GenericParamKind, GenericParamSource, Generics, HirId, HirIdMap, InlineAsmOperand, ItemId, ItemKind,
+    LetExpr, Lifetime, LifetimeKind, LifetimeParamKind, Node, ParamName, Pat, PatExpr, PatExprKind, PatField, PatKind,
+    Path, PathSegment, PreciseCapturingArgKind, PrimTy, QPath, Stmt, StmtKind, StructTailExpr, TraitBoundModifiers, Ty,
+    TyFieldPath, TyKind, TyPat, TyPatKind, UseKind, WherePredicate, WherePredicateKind,
 };
-use rustc_lexer::{TokenKind, tokenize};
+use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 use rustc_lint::LateContext;
 use rustc_middle::ty::TypeckResults;
-use rustc_span::{BytePos, ExpnKind, MacroKind, Symbol, SyntaxContext, sym};
+use rustc_span::{BytePos, ExpnKind, MacroKind, Symbol, SyntaxContext};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::slice;
 
 /// Callback that is called when two expressions are not equal in the sense of `SpanlessEq`, but
 /// other conditions would make them equal.
-type SpanlessEqCallback<'a> = dyn FnMut(&Expr<'_>, &Expr<'_>) -> bool + 'a;
+type SpanlessEqCallback<'a, 'tcx> =
+    dyn FnMut(&TypeckResults<'tcx>, &Expr<'_>, &TypeckResults<'tcx>, &Expr<'_>) -> bool + 'a;
 
 /// Determines how paths are hashed and compared for equality.
 #[derive(Copy, Clone, Debug, Default)]
@@ -55,7 +61,7 @@ pub struct SpanlessEq<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     maybe_typeck_results: Option<(&'tcx TypeckResults<'tcx>, &'tcx TypeckResults<'tcx>)>,
     allow_side_effects: bool,
-    expr_fallback: Option<Box<SpanlessEqCallback<'a>>>,
+    expr_fallback: Option<Box<SpanlessEqCallback<'a, 'tcx>>>,
     path_check: PathCheck,
 }
 
@@ -63,7 +69,7 @@ impl<'a, 'tcx> SpanlessEq<'a, 'tcx> {
     pub fn new(cx: &'a LateContext<'tcx>) -> Self {
         Self {
             cx,
-            maybe_typeck_results: cx.maybe_typeck_results().map(|x| (x, x)),
+            maybe_typeck_results: cx.typeck_results.map(|x| (x, x)),
             allow_side_effects: true,
             expr_fallback: None,
             path_check: PathCheck::default(),
@@ -90,7 +96,10 @@ impl<'a, 'tcx> SpanlessEq<'a, 'tcx> {
     }
 
     #[must_use]
-    pub fn expr_fallback(self, expr_fallback: impl FnMut(&Expr<'_>, &Expr<'_>) -> bool + 'a) -> Self {
+    pub fn expr_fallback(
+        self,
+        expr_fallback: impl FnMut(&TypeckResults<'tcx>, &Expr<'_>, &TypeckResults<'tcx>, &Expr<'_>) -> bool + 'a,
+    ) -> Self {
         Self {
             expr_fallback: Some(Box::new(expr_fallback)),
             ..self
@@ -99,54 +108,77 @@ impl<'a, 'tcx> SpanlessEq<'a, 'tcx> {
 
     /// Use this method to wrap comparisons that may involve inter-expression context.
     /// See `self.locals`.
-    pub fn inter_expr(&mut self) -> HirEqInterExpr<'_, 'a, 'tcx> {
+    pub fn inter_expr(&mut self, ctxt: SyntaxContext) -> HirEqInterExpr<'_, 'a, 'tcx> {
         HirEqInterExpr {
             inner: self,
-            left_ctxt: SyntaxContext::root(),
-            right_ctxt: SyntaxContext::root(),
+            eval_ctxt: ctxt,
+            prev_left_ctxt: ctxt,
+            prev_right_ctxt: ctxt,
             locals: HirIdMap::default(),
+            local_items: FxIndexMap::default(),
         }
     }
 
-    pub fn eq_block(&mut self, left: &Block<'_>, right: &Block<'_>) -> bool {
-        self.inter_expr().eq_block(left, right)
+    pub fn eq_block(&mut self, ctxt: SyntaxContext, left: &Block<'_>, right: &Block<'_>) -> bool {
+        self.inter_expr(ctxt).eq_block(left, right)
     }
 
-    pub fn eq_expr(&mut self, left: &Expr<'_>, right: &Expr<'_>) -> bool {
-        self.inter_expr().eq_expr(left, right)
+    pub fn eq_expr(&mut self, ctxt: SyntaxContext, left: &Expr<'_>, right: &Expr<'_>) -> bool {
+        self.inter_expr(ctxt).eq_expr(left, right)
     }
 
-    pub fn eq_path(&mut self, left: &Path<'_>, right: &Path<'_>) -> bool {
-        self.inter_expr().eq_path(left, right)
+    pub fn eq_path(&mut self, ctxt: SyntaxContext, left: &Path<'_>, right: &Path<'_>) -> bool {
+        self.inter_expr(ctxt).eq_path(left, right)
     }
 
-    pub fn eq_path_segment(&mut self, left: &PathSegment<'_>, right: &PathSegment<'_>) -> bool {
-        self.inter_expr().eq_path_segment(left, right)
+    pub fn eq_path_segment(&mut self, ctxt: SyntaxContext, left: &PathSegment<'_>, right: &PathSegment<'_>) -> bool {
+        self.inter_expr(ctxt).eq_path_segment(left, right)
     }
 
-    pub fn eq_path_segments(&mut self, left: &[PathSegment<'_>], right: &[PathSegment<'_>]) -> bool {
-        self.inter_expr().eq_path_segments(left, right)
+    pub fn eq_path_segments(
+        &mut self,
+        ctxt: SyntaxContext,
+        left: &[PathSegment<'_>],
+        right: &[PathSegment<'_>],
+    ) -> bool {
+        self.inter_expr(ctxt).eq_path_segments(left, right)
     }
 
     pub fn eq_modifiers(left: TraitBoundModifiers, right: TraitBoundModifiers) -> bool {
-        std::mem::discriminant(&left.constness) == std::mem::discriminant(&right.constness)
-            && std::mem::discriminant(&left.polarity) == std::mem::discriminant(&right.polarity)
+        mem::discriminant(&left.constness) == mem::discriminant(&right.constness)
+            && mem::discriminant(&left.polarity) == mem::discriminant(&right.polarity)
     }
 }
 
 pub struct HirEqInterExpr<'a, 'b, 'tcx> {
     inner: &'a mut SpanlessEq<'b, 'tcx>,
-    left_ctxt: SyntaxContext,
-    right_ctxt: SyntaxContext,
+
+    /// The root context to view each side from.
+    eval_ctxt: SyntaxContext,
+
+    // Optimization to avoid rechecking the context of desugarings.
+    prev_left_ctxt: SyntaxContext,
+    prev_right_ctxt: SyntaxContext,
 
     // When binding are declared, the binding ID in the left expression is mapped to the one on the
     // right. For example, when comparing `{ let x = 1; x + 2 }` and `{ let y = 1; y + 2 }`,
     // these blocks are considered equal since `x` is mapped to `y`.
     pub locals: HirIdMap<HirId>,
+    pub local_items: FxIndexMap<DefId, DefId>,
 }
 
 impl HirEqInterExpr<'_, '_, '_> {
+    pub fn set_eval_ctxt(&mut self, ctxt: SyntaxContext) {
+        self.eval_ctxt = ctxt;
+        self.prev_left_ctxt = ctxt;
+        self.prev_right_ctxt = ctxt;
+    }
+
     pub fn eq_stmt(&mut self, left: &Stmt<'_>, right: &Stmt<'_>) -> bool {
+        if self.check_ctxt(left.span.ctxt(), right.span.ctxt()) == Some(false) {
+            return false;
+        }
+
         match (&left.kind, &right.kind) {
             (StmtKind::Let(l), StmtKind::Let(r)) => {
                 // This additional check ensures that the type of the locals are equivalent even if the init
@@ -167,6 +199,186 @@ impl HirEqInterExpr<'_, '_, '_> {
                     && self.eq_pat(l.pat, r.pat)
             },
             (StmtKind::Expr(l), StmtKind::Expr(r)) | (StmtKind::Semi(l), StmtKind::Semi(r)) => self.eq_expr(l, r),
+            (StmtKind::Item(l), StmtKind::Item(r)) => self.eq_item(*l, *r),
+            _ => false,
+        }
+    }
+
+    pub fn eq_item(&mut self, l: ItemId, r: ItemId) -> bool {
+        let left = self.inner.cx.tcx.hir_item(l);
+        let right = self.inner.cx.tcx.hir_item(r);
+        let eq = match (left.kind, right.kind) {
+            (
+                ItemKind::Const(l_ident, l_generics, l_ty, ConstItemRhs::Body(l_body)),
+                ItemKind::Const(r_ident, r_generics, r_ty, ConstItemRhs::Body(r_body)),
+            ) => {
+                l_ident.name == r_ident.name
+                    && self.eq_generics(l_generics, r_generics)
+                    && self.eq_ty(l_ty, r_ty)
+                    && self.eq_body(l_body, r_body)
+            },
+            (ItemKind::Static(l_mut, l_ident, l_ty, l_body), ItemKind::Static(r_mut, r_ident, r_ty, r_body)) => {
+                l_mut == r_mut && l_ident.name == r_ident.name && self.eq_ty(l_ty, r_ty) && self.eq_body(l_body, r_body)
+            },
+            (
+                ItemKind::Fn {
+                    sig: l_sig,
+                    ident: l_ident,
+                    generics: l_generics,
+                    body: l_body,
+                    has_body: l_has_body,
+                },
+                ItemKind::Fn {
+                    sig: r_sig,
+                    ident: r_ident,
+                    generics: r_generics,
+                    body: r_body,
+                    has_body: r_has_body,
+                },
+            ) => {
+                l_ident.name == r_ident.name
+                    && (l_has_body == r_has_body)
+                    && self.eq_fn_sig(&l_sig, &r_sig)
+                    && self.eq_generics(l_generics, r_generics)
+                    && self.eq_body(l_body, r_body)
+            },
+            (ItemKind::TyAlias(l_ident, l_generics, l_ty), ItemKind::TyAlias(r_ident, r_generics, r_ty)) => {
+                l_ident.name == r_ident.name && self.eq_generics(l_generics, r_generics) && self.eq_ty(l_ty, r_ty)
+            },
+            (ItemKind::Use(l_path, l_kind), ItemKind::Use(r_path, r_kind)) => {
+                self.eq_path_segments(l_path.segments, r_path.segments)
+                    && match (l_kind, r_kind) {
+                        (UseKind::Single(l_ident), UseKind::Single(r_ident)) => l_ident.name == r_ident.name,
+                        (UseKind::Glob, UseKind::Glob) | (UseKind::ListStem, UseKind::ListStem) => true,
+                        _ => false,
+                    }
+            },
+            (ItemKind::Mod(l_ident, l_mod), ItemKind::Mod(r_ident, r_mod)) => {
+                l_ident.name == r_ident.name && over(l_mod.item_ids, r_mod.item_ids, |l, r| self.eq_item(*l, *r))
+            },
+            _ => false,
+        };
+        if eq {
+            self.local_items.insert(l.owner_id.to_def_id(), r.owner_id.to_def_id());
+        }
+        eq
+    }
+
+    fn eq_fn_sig(&mut self, left: &FnSig<'_>, right: &FnSig<'_>) -> bool {
+        left.header.safety == right.header.safety
+            && left.header.constness == right.header.constness
+            && left.header.asyncness == right.header.asyncness
+            && left.header.abi == right.header.abi
+            && self.eq_fn_decl(left.decl, right.decl)
+    }
+
+    fn eq_fn_decl(&mut self, left: &FnDecl<'_>, right: &FnDecl<'_>) -> bool {
+        over(left.inputs, right.inputs, |l, r| self.eq_ty(l, r))
+            && (match (left.output, right.output) {
+                (FnRetTy::DefaultReturn(_), FnRetTy::DefaultReturn(_)) => true,
+                (FnRetTy::Return(l_ty), FnRetTy::Return(r_ty)) => self.eq_ty(l_ty, r_ty),
+                _ => false,
+            })
+            && left.c_variadic() == right.c_variadic()
+            && left.implicit_self() == right.implicit_self()
+            && left.lifetime_elision_allowed() == right.lifetime_elision_allowed()
+    }
+
+    fn eq_generics(&mut self, left: &Generics<'_>, right: &Generics<'_>) -> bool {
+        self.eq_generics_param(left.params, right.params)
+            && self.eq_generics_predicate(left.predicates, right.predicates)
+    }
+
+    fn eq_generics_predicate(&mut self, left: &[WherePredicate<'_>], right: &[WherePredicate<'_>]) -> bool {
+        over(left, right, |l, r| match (l.kind, r.kind) {
+            (WherePredicateKind::BoundPredicate(l_bound), WherePredicateKind::BoundPredicate(r_bound)) => {
+                l_bound.origin == r_bound.origin
+                    && self.eq_ty(l_bound.bounded_ty, r_bound.bounded_ty)
+                    && self.eq_generics_param(l_bound.bound_generic_params, r_bound.bound_generic_params)
+                    && self.eq_generics_bound(l_bound.bounds, r_bound.bounds)
+            },
+            (WherePredicateKind::RegionPredicate(l_region), WherePredicateKind::RegionPredicate(r_region)) => {
+                Self::eq_lifetime(l_region.lifetime, r_region.lifetime)
+                    && self.eq_generics_bound(l_region.bounds, r_region.bounds)
+            },
+            _ => false,
+        })
+    }
+
+    fn eq_generics_bound(&mut self, left: GenericBounds<'_>, right: GenericBounds<'_>) -> bool {
+        over(left, right, |l, r| match (l, r) {
+            (GenericBound::Trait(l_trait), GenericBound::Trait(r_trait)) => {
+                l_trait.modifiers == r_trait.modifiers
+                    && self.eq_path(l_trait.trait_ref.path, r_trait.trait_ref.path)
+                    && self.eq_generics_param(l_trait.bound_generic_params, r_trait.bound_generic_params)
+            },
+            (GenericBound::Outlives(l_lifetime), GenericBound::Outlives(r_lifetime)) => {
+                Self::eq_lifetime(l_lifetime, r_lifetime)
+            },
+            (GenericBound::Use(l_capture, _), GenericBound::Use(r_capture, _)) => {
+                over(l_capture, r_capture, |l, r| match (l, r) {
+                    (PreciseCapturingArgKind::Lifetime(l_lifetime), PreciseCapturingArgKind::Lifetime(r_lifetime)) => {
+                        Self::eq_lifetime(l_lifetime, r_lifetime)
+                    },
+                    (PreciseCapturingArgKind::Param(l_param), PreciseCapturingArgKind::Param(r_param)) => {
+                        l_param.ident == r_param.ident && l_param.res == r_param.res
+                    },
+                    _ => false,
+                })
+            },
+            _ => false,
+        })
+    }
+
+    fn eq_generics_param(&mut self, left: &[GenericParam<'_>], right: &[GenericParam<'_>]) -> bool {
+        over(left, right, |l, r| {
+            (match (l.name, r.name) {
+                (ParamName::Plain(l_ident), ParamName::Plain(r_ident))
+                | (ParamName::Error(l_ident), ParamName::Error(r_ident)) => l_ident.name == r_ident.name,
+                (ParamName::Fresh, ParamName::Fresh) => true,
+                _ => false,
+            }) && l.pure_wrt_drop == r.pure_wrt_drop
+                && self.eq_generics_param_kind(&l.kind, &r.kind)
+                && (matches!(
+                    (l.source, r.source),
+                    (GenericParamSource::Generics, GenericParamSource::Generics)
+                        | (GenericParamSource::Binder, GenericParamSource::Binder)
+                ))
+        })
+    }
+
+    fn eq_generics_param_kind(&mut self, left: &GenericParamKind<'_>, right: &GenericParamKind<'_>) -> bool {
+        match (left, right) {
+            (GenericParamKind::Lifetime { kind: l_kind }, GenericParamKind::Lifetime { kind: r_kind }) => {
+                match (l_kind, r_kind) {
+                    (LifetimeParamKind::Explicit, LifetimeParamKind::Explicit)
+                    | (LifetimeParamKind::Error, LifetimeParamKind::Error) => true,
+                    (LifetimeParamKind::Elided(l_lifetime_kind), LifetimeParamKind::Elided(r_lifetime_kind)) => {
+                        l_lifetime_kind == r_lifetime_kind
+                    },
+                    _ => false,
+                }
+            },
+            (
+                GenericParamKind::Type {
+                    default: l_default,
+                    synthetic: l_synthetic,
+                },
+                GenericParamKind::Type {
+                    default: r_default,
+                    synthetic: r_synthetic,
+                },
+            ) => both(*l_default, *r_default, |l, r| self.eq_ty(l, r)) && l_synthetic == r_synthetic,
+            (
+                GenericParamKind::Const {
+                    ty: l_ty,
+                    default: l_default,
+                },
+                GenericParamKind::Const {
+                    ty: r_ty,
+                    default: r_default,
+                },
+            ) => self.eq_ty(l_ty, r_ty) && both(*l_default, *r_default, |l, r| self.eq_const_arg(l, r)),
             _ => false,
         }
     }
@@ -179,15 +391,16 @@ impl HirEqInterExpr<'_, '_, '_> {
         }
         let lspan = left.span.data();
         let rspan = right.span.data();
-        if lspan.ctxt != SyntaxContext::root() && rspan.ctxt != SyntaxContext::root() {
-            // Don't try to check in between statements inside macros.
-            return over(left.stmts, right.stmts, |left, right| self.eq_stmt(left, right))
-                && both(left.expr.as_ref(), right.expr.as_ref(), |left, right| {
-                    self.eq_expr(left, right)
-                });
-        }
-        if lspan.ctxt != rspan.ctxt {
-            return false;
+        match self.check_ctxt(lspan.ctxt, rspan.ctxt) {
+            Some(false) => return false,
+            None if self.eval_ctxt.is_root() => {},
+            _ => {
+                // Don't try to check in between statements inside macros.
+                return over(left.stmts, right.stmts, |left, right| self.eq_stmt(left, right))
+                    && both(left.expr.as_ref(), right.expr.as_ref(), |left, right| {
+                        self.eq_expr(left, right)
+                    });
+            },
         }
 
         let mut lstart = lspan.lo;
@@ -257,7 +470,7 @@ impl HirEqInterExpr<'_, '_, '_> {
         })
     }
 
-    fn should_ignore(&mut self, expr: &Expr<'_>) -> bool {
+    fn should_ignore(&self, expr: &Expr<'_>) -> bool {
         macro_backtrace(expr.span).last().is_some_and(|macro_call| {
             matches!(
                 self.inner.cx.tcx.get_diagnostic_name(macro_call.def_id),
@@ -282,24 +495,28 @@ impl HirEqInterExpr<'_, '_, '_> {
 
     #[expect(clippy::too_many_lines)]
     pub fn eq_expr(&mut self, left: &Expr<'_>, right: &Expr<'_>) -> bool {
-        if !self.check_ctxt(left.span.ctxt(), right.span.ctxt()) {
-            return false;
-        }
-
-        if let Some((typeck_lhs, typeck_rhs)) = self.inner.maybe_typeck_results
-            && typeck_lhs.expr_ty(left) == typeck_rhs.expr_ty(right)
-            && let (Some(l), Some(r)) = (
-                ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.typing_env(), typeck_lhs).eval_simple(left),
-                ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.typing_env(), typeck_rhs).eval_simple(right),
-            )
-            && l == r
-        {
-            return true;
+        match self.check_ctxt(left.span.ctxt(), right.span.ctxt()) {
+            None => {
+                if let Some((typeck_lhs, typeck_rhs)) = self.inner.maybe_typeck_results
+                    && typeck_lhs.expr_ty(left) == typeck_rhs.expr_ty(right)
+                    && let (Some(l), Some(r)) = (
+                        ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.typing_env(), typeck_lhs)
+                            .eval_local(left, self.eval_ctxt),
+                        ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.typing_env(), typeck_rhs)
+                            .eval_local(right, self.eval_ctxt),
+                    )
+                    && l == r
+                {
+                    return true;
+                }
+            },
+            Some(false) => return false,
+            Some(true) => {},
         }
 
         let is_eq = match (
-            reduce_exprkind(self.inner.cx, &left.kind),
-            reduce_exprkind(self.inner.cx, &right.kind),
+            reduce_exprkind(self.inner.cx, self.eval_ctxt, &left.kind),
+            reduce_exprkind(self.inner.cx, self.eval_ctxt, &right.kind),
         ) {
             (ExprKind::AddrOf(lb, l_mut, le), ExprKind::AddrOf(rb, r_mut, re)) => {
                 lb == rb && l_mut == r_mut && self.eq_expr(le, re)
@@ -314,7 +531,7 @@ impl HirEqInterExpr<'_, '_, '_> {
             (ExprKind::Block(l, _), ExprKind::Block(r, _)) => self.eq_block(l, r),
             (ExprKind::Binary(l_op, ll, lr), ExprKind::Binary(r_op, rl, rr)) => {
                 l_op.node == r_op.node && self.eq_expr(ll, rl) && self.eq_expr(lr, rr)
-                    || swap_binop(l_op.node, ll, lr).is_some_and(|(l_op, ll, lr)| {
+                    || self.swap_binop(l_op.node, ll, lr).is_some_and(|(l_op, ll, lr)| {
                         l_op == r_op.node && self.eq_expr(ll, rl) && self.eq_expr(lr, rr)
                     })
             },
@@ -347,7 +564,12 @@ impl HirEqInterExpr<'_, '_, '_> {
                     && both(l.ty.as_ref(), r.ty.as_ref(), |l, r| self.eq_ty(l, r))
                     && self.eq_expr(l.init, r.init)
             },
-            (ExprKind::Lit(l), ExprKind::Lit(r)) => l.node == r.node,
+            (ExprKind::Lit(l), ExprKind::Lit(r)) => {
+                if self.check_ctxt(l.span.ctxt(), r.span.ctxt()) == Some(false) {
+                    return false;
+                }
+                l.node == r.node
+            },
             (ExprKind::Loop(lb, ll, lls, _), ExprKind::Loop(rb, rl, rls, _)) => {
                 lls == rls && self.eq_block(lb, rb)
                     && both(ll.as_ref(), rl.as_ref(), |l, r| l.ident.name == r.ident.name)
@@ -448,7 +670,15 @@ impl HirEqInterExpr<'_, '_, '_> {
             ) => false,
         };
         (is_eq && (!self.should_ignore(left) || !self.should_ignore(right)))
-            || self.inner.expr_fallback.as_mut().is_some_and(|f| f(left, right))
+            || self
+                .inner
+                .maybe_typeck_results
+                .is_some_and(|(left_typeck_results, right_typeck_results)| {
+                    self.inner
+                        .expr_fallback
+                        .as_mut()
+                        .is_some_and(|f| f(left_typeck_results, left, right_typeck_results, right))
+                })
     }
 
     fn eq_exprs(&mut self, left: &[Expr<'_>], right: &[Expr<'_>]) -> bool {
@@ -470,15 +700,62 @@ impl HirEqInterExpr<'_, '_, '_> {
     }
 
     fn eq_const_arg(&mut self, left: &ConstArg<'_>, right: &ConstArg<'_>) -> bool {
+        if self.check_ctxt(left.span.ctxt(), right.span.ctxt()) == Some(false) {
+            return false;
+        }
+
         match (&left.kind, &right.kind) {
+            (ConstArgKind::Tup(l_t), ConstArgKind::Tup(r_t)) => {
+                l_t.len() == r_t.len() && l_t.iter().zip(*r_t).all(|(l_c, r_c)| self.eq_const_arg(l_c, r_c))
+            },
             (ConstArgKind::Path(l_p), ConstArgKind::Path(r_p)) => self.eq_qpath(l_p, r_p),
             (ConstArgKind::Anon(l_an), ConstArgKind::Anon(r_an)) => self.eq_body(l_an.body, r_an.body),
             (ConstArgKind::Infer(..), ConstArgKind::Infer(..)) => true,
+            (ConstArgKind::Struct(path_a, inits_a), ConstArgKind::Struct(path_b, inits_b)) => {
+                self.eq_qpath(path_a, path_b)
+                    && inits_a
+                        .iter()
+                        .zip(*inits_b)
+                        .all(|(init_a, init_b)| self.eq_const_arg(init_a.expr, init_b.expr))
+            },
+            (ConstArgKind::TupleCall(path_a, args_a), ConstArgKind::TupleCall(path_b, args_b)) => {
+                self.eq_qpath(path_a, path_b)
+                    && args_a
+                        .iter()
+                        .zip(*args_b)
+                        .all(|(arg_a, arg_b)| self.eq_const_arg(arg_a, arg_b))
+            },
+            (
+                ConstArgKind::Literal {
+                    lit: kind_l,
+                    negated: negated_l,
+                },
+                ConstArgKind::Literal {
+                    lit: kind_r,
+                    negated: negated_r,
+                },
+            ) => kind_l == kind_r && negated_l == negated_r,
+            (ConstArgKind::Array(l_arr), ConstArgKind::Array(r_arr)) => {
+                l_arr.elems.len() == r_arr.elems.len()
+                    && l_arr
+                        .elems
+                        .iter()
+                        .zip(r_arr.elems.iter())
+                        .all(|(l_elem, r_elem)| self.eq_const_arg(l_elem, r_elem))
+            },
             // Use explicit match for now since ConstArg is undergoing flux.
-            (ConstArgKind::Path(..), ConstArgKind::Anon(..))
-            | (ConstArgKind::Anon(..), ConstArgKind::Path(..))
-            | (ConstArgKind::Infer(..), _)
-            | (_, ConstArgKind::Infer(..)) => false,
+            (
+                ConstArgKind::Path(..)
+                | ConstArgKind::Tup(..)
+                | ConstArgKind::Anon(..)
+                | ConstArgKind::TupleCall(..)
+                | ConstArgKind::Infer(..)
+                | ConstArgKind::Struct(..)
+                | ConstArgKind::Literal { .. }
+                | ConstArgKind::Array(..)
+                | ConstArgKind::Error(..),
+                _,
+            ) => false,
         }
     }
 
@@ -503,9 +780,8 @@ impl HirEqInterExpr<'_, '_, '_> {
                     negated: right_neg,
                 },
             ) => left_neg == right_neg && left.node == right.node,
-            (PatExprKind::ConstBlock(left), PatExprKind::ConstBlock(right)) => self.eq_body(left.body, right.body),
             (PatExprKind::Path(left), PatExprKind::Path(right)) => self.eq_qpath(left, right),
-            (PatExprKind::Lit { .. } | PatExprKind::ConstBlock(..) | PatExprKind::Path(..), _) => false,
+            (PatExprKind::Lit { .. } | PatExprKind::Path(..), _) => false,
         }
     }
 
@@ -533,7 +809,7 @@ impl HirEqInterExpr<'_, '_, '_> {
                     && both(le.as_ref(), re.as_ref(), |a, b| self.eq_pat_expr(a, b))
                     && (li == ri)
             },
-            (PatKind::Ref(le, lm), PatKind::Ref(re, rm)) => lm == rm && self.eq_pat(le, re),
+            (PatKind::Ref(le, lp, lm), PatKind::Ref(re, rp, rm)) => lp == rp && lm == rm && self.eq_pat(le, re),
             (PatKind::Slice(ls, li, le), PatKind::Slice(rs, ri, re)) => {
                 over(ls, rs, |l, r| self.eq_pat(l, r))
                     && over(le, re, |l, r| self.eq_pat(l, r))
@@ -552,7 +828,6 @@ impl HirEqInterExpr<'_, '_, '_> {
             (QPath::TypeRelative(lty, lseg), QPath::TypeRelative(rty, rseg)) => {
                 self.eq_ty(lty, rty) && self.eq_path_segment(lseg, rseg)
             },
-            (QPath::LangItem(llang_item, ..), QPath::LangItem(rlang_item, ..)) => llang_item == rlang_item,
             _ => false,
         }
     }
@@ -561,6 +836,17 @@ impl HirEqInterExpr<'_, '_, '_> {
         match (left.res, right.res) {
             (Res::Local(l), Res::Local(r)) => l == r || self.locals.get(&l) == Some(&r),
             (Res::Local(_), _) | (_, Res::Local(_)) => false,
+            (Res::Def(l_kind, l), Res::Def(r_kind, r))
+                if l_kind == r_kind
+                    && let DefKind::Const { .. }
+                    | DefKind::Static { .. }
+                    | DefKind::Fn
+                    | DefKind::TyAlias
+                    | DefKind::Use
+                    | DefKind::Mod = l_kind =>
+            {
+                (l == r || self.local_items.get(&l) == Some(&r)) && self.eq_path_segments(left.segments, right.segments)
+            },
             _ => self.eq_path_segments(left.segments, right.segments),
         }
     }
@@ -633,51 +919,115 @@ impl HirEqInterExpr<'_, '_, '_> {
                 || both_some_and(left.ct(), right.ct(), |l, r| self.eq_const_arg(l, r)))
     }
 
-    fn check_ctxt(&mut self, left: SyntaxContext, right: SyntaxContext) -> bool {
-        if self.left_ctxt == left && self.right_ctxt == right {
-            return true;
-        } else if self.left_ctxt == left || self.right_ctxt == right {
-            // Only one context has changed. This can only happen if the two nodes are written differently.
-            return false;
-        } else if left != SyntaxContext::root() {
+    /// Checks whether either operand is within a macro context, and if so, whether the macro calls
+    /// are equal.
+    fn check_ctxt(&mut self, left: SyntaxContext, right: SyntaxContext) -> Option<bool> {
+        let prev_left = mem::replace(&mut self.prev_left_ctxt, left);
+        let prev_right = mem::replace(&mut self.prev_right_ctxt, right);
+
+        if left == self.eval_ctxt && right == self.eval_ctxt {
+            None
+        } else if left == prev_left && right == prev_right {
+            // Same as the previous context, no need to recheck anything
+            Some(true)
+        } else if left == prev_left
+            || right == prev_right
+            || left == self.eval_ctxt
+            || right == self.eval_ctxt
+            || left.is_root()
+            || right.is_root()
+        {
+            // Either only one context changed, or at least one context is a parent of the
+            // evaluation context.
+            // Unfortunately we can't get a span of a metavariable so we have to treat the
+            // second case as unequal.
+            Some(false)
+        } else {
+            // Walk each context in lockstep up to the evaluation context checking that each
+            // expansion has the same kind.
             let mut left_data = left.outer_expn_data();
             let mut right_data = right.outer_expn_data();
             loop {
                 use TokenKind::{BlockComment, LineComment, Whitespace};
-                if left_data.macro_def_id != right_data.macro_def_id
-                    || (matches!(
-                        left_data.kind,
-                        ExpnKind::Macro(MacroKind::Bang, name)
-                        if name == sym::cfg || name == sym::option_env
-                    ) && !eq_span_tokens(self.inner.cx, left_data.call_site, right_data.call_site, |t| {
-                        !matches!(t, Whitespace | LineComment { .. } | BlockComment { .. })
-                    }))
+                if left_data.macro_def_id != right_data.macro_def_id || left_data.kind != right_data.kind {
+                    return Some(false);
+                }
+                let left = left_data.call_site.ctxt();
+                let right = right_data.call_site.ctxt();
+                if left == self.eval_ctxt && right == self.eval_ctxt {
+                    // Finally if the outermost expansion is a macro call, check if the
+                    // tokens are the same.
+                    if let ExpnKind::Macro(MacroKind::Bang, _) = left_data.kind {
+                        return Some(eq_span_tokens(
+                            self.inner.cx,
+                            left_data.call_site,
+                            right_data.call_site,
+                            |t| !matches!(t, Whitespace | LineComment { .. } | BlockComment { .. }),
+                        ));
+                    }
+                    return Some(true);
+                }
+                if left == prev_left && right == prev_right {
+                    return Some(true);
+                }
+                if left == prev_left
+                    || right == prev_right
+                    || left == self.eval_ctxt
+                    || right == self.eval_ctxt
+                    || left.is_root()
+                    || right.is_root()
                 {
-                    // Either a different chain of macro calls, or different arguments to the `cfg` macro.
-                    return false;
+                    // Either there's a different number of expansions, or at least one context is
+                    // a parent of the evaluation context.
+                    return Some(false);
                 }
-                let left_ctxt = left_data.call_site.ctxt();
-                let right_ctxt = right_data.call_site.ctxt();
-                if left_ctxt == SyntaxContext::root() && right_ctxt == SyntaxContext::root() {
-                    break;
-                }
-                if left_ctxt == SyntaxContext::root() || right_ctxt == SyntaxContext::root() {
-                    // Different lengths for the expansion stack. This can only happen if nodes are written differently,
-                    // or shouldn't be compared to start with.
-                    return false;
-                }
-                left_data = left_ctxt.outer_expn_data();
-                right_data = right_ctxt.outer_expn_data();
+                left_data = left.outer_expn_data();
+                right_data = right.outer_expn_data();
             }
         }
-        self.left_ctxt = left;
-        self.right_ctxt = right;
-        true
+    }
+
+    fn swap_binop<'a>(
+        &self,
+        binop: BinOpKind,
+        lhs: &'a Expr<'a>,
+        rhs: &'a Expr<'a>,
+    ) -> Option<(BinOpKind, &'a Expr<'a>, &'a Expr<'a>)> {
+        match binop {
+            // `==` and `!=`, are commutative
+            BinOpKind::Eq | BinOpKind::Ne => Some((binop, rhs, lhs)),
+            // Comparisons can be reversed
+            BinOpKind::Lt => Some((BinOpKind::Gt, rhs, lhs)),
+            BinOpKind::Le => Some((BinOpKind::Ge, rhs, lhs)),
+            BinOpKind::Ge => Some((BinOpKind::Le, rhs, lhs)),
+            BinOpKind::Gt => Some((BinOpKind::Lt, rhs, lhs)),
+            // Non-commutative operators
+            BinOpKind::Shl | BinOpKind::Shr | BinOpKind::Rem | BinOpKind::Sub | BinOpKind::Div => None,
+            // We know that those operators are commutative for primitive types,
+            // and we don't assume anything for other types
+            BinOpKind::Mul
+            | BinOpKind::Add
+            | BinOpKind::And
+            | BinOpKind::Or
+            | BinOpKind::BitAnd
+            | BinOpKind::BitXor
+            | BinOpKind::BitOr => self.inner.maybe_typeck_results.and_then(|(typeck_lhs, _)| {
+                typeck_lhs
+                    .expr_ty_adjusted(lhs)
+                    .peel_refs()
+                    .is_primitive()
+                    .then_some((binop, rhs, lhs))
+            }),
+        }
     }
 }
 
 /// Some simple reductions like `{ return }` => `return`
-fn reduce_exprkind<'hir>(cx: &LateContext<'_>, kind: &'hir ExprKind<'hir>) -> &'hir ExprKind<'hir> {
+fn reduce_exprkind<'hir>(
+    cx: &LateContext<'_>,
+    eval_ctxt: SyntaxContext,
+    kind: &'hir ExprKind<'hir>,
+) -> &'hir ExprKind<'hir> {
     if let ExprKind::Block(block, _) = kind {
         match (block.stmts, block.expr) {
             // From an `if let` expression without an `else` block. The arm for the implicit wild pattern is an empty
@@ -685,17 +1035,20 @@ fn reduce_exprkind<'hir>(cx: &LateContext<'_>, kind: &'hir ExprKind<'hir>) -> &'
             ([], None) if block.span.is_empty() => &ExprKind::Tup(&[]),
             // `{}` => `()`
             ([], None)
-                if block.span.check_source_text(cx, |src| {
-                    tokenize(src)
-                        .map(|t| t.kind)
-                        .filter(|t| {
-                            !matches!(
-                                t,
-                                TokenKind::LineComment { .. } | TokenKind::BlockComment { .. } | TokenKind::Whitespace
-                            )
-                        })
-                        .eq([TokenKind::OpenBrace, TokenKind::CloseBrace].iter().copied())
-                }) =>
+                if block.span.ctxt() != eval_ctxt
+                    || block.span.check_text(cx, |src| {
+                        tokenize(src, FrontmatterAllowed::No)
+                            .map(|t| t.kind)
+                            .filter(|t| {
+                                !matches!(
+                                    t,
+                                    TokenKind::LineComment { .. }
+                                        | TokenKind::BlockComment { .. }
+                                        | TokenKind::Whitespace
+                                )
+                            })
+                            .eq([TokenKind::OpenBrace, TokenKind::CloseBrace].iter().copied())
+                    }) =>
             {
                 &ExprKind::Tup(&[])
             },
@@ -719,30 +1072,6 @@ fn reduce_exprkind<'hir>(cx: &LateContext<'_>, kind: &'hir ExprKind<'hir>) -> &'
     }
 }
 
-fn swap_binop<'a>(
-    binop: BinOpKind,
-    lhs: &'a Expr<'a>,
-    rhs: &'a Expr<'a>,
-) -> Option<(BinOpKind, &'a Expr<'a>, &'a Expr<'a>)> {
-    match binop {
-        BinOpKind::Add | BinOpKind::Eq | BinOpKind::Ne | BinOpKind::BitAnd | BinOpKind::BitXor | BinOpKind::BitOr => {
-            Some((binop, rhs, lhs))
-        },
-        BinOpKind::Lt => Some((BinOpKind::Gt, rhs, lhs)),
-        BinOpKind::Le => Some((BinOpKind::Ge, rhs, lhs)),
-        BinOpKind::Ge => Some((BinOpKind::Le, rhs, lhs)),
-        BinOpKind::Gt => Some((BinOpKind::Lt, rhs, lhs)),
-        BinOpKind::Mul // Not always commutative, e.g. with matrices. See issue #5698
-        | BinOpKind::Shl
-        | BinOpKind::Shr
-        | BinOpKind::Rem
-        | BinOpKind::Sub
-        | BinOpKind::Div
-        | BinOpKind::And
-        | BinOpKind::Or => None,
-    }
-}
-
 /// Checks if the two `Option`s are both `None` or some equal values as per
 /// `eq_fn`.
 pub fn both<X>(l: Option<&X>, r: Option<&X>, mut eq_fn: impl FnMut(&X, &X) -> bool) -> bool {
@@ -756,7 +1085,7 @@ pub fn both_some_and<X, Y>(l: Option<X>, r: Option<Y>, mut pred: impl FnMut(X, Y
 }
 
 /// Checks if two slices are equal as per `eq_fn`.
-pub fn over<X>(left: &[X], right: &[X], mut eq_fn: impl FnMut(&X, &X) -> bool) -> bool {
+pub fn over<X, Y>(left: &[X], right: &[Y], mut eq_fn: impl FnMut(&X, &Y) -> bool) -> bool {
     left.len() == right.len() && left.iter().zip(right).all(|(x, y)| eq_fn(x, y))
 }
 
@@ -770,8 +1099,13 @@ pub fn count_eq<X: Sized>(
 }
 
 /// Checks if two expressions evaluate to the same value, and don't contain any side effects.
-pub fn eq_expr_value(cx: &LateContext<'_>, left: &Expr<'_>, right: &Expr<'_>) -> bool {
-    SpanlessEq::new(cx).deny_side_effects().eq_expr(left, right)
+///
+/// The context argument is the context used to view the two expressions. e.g. when comparing the
+/// two arguments in `f(m!(1), m!(2))` the context of the call expression should be used. This is
+/// needed to handle the case where two macros expand to the same thing, but the arguments are
+/// different.
+pub fn eq_expr_value(cx: &LateContext<'_>, ctxt: SyntaxContext, left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    SpanlessEq::new(cx).deny_side_effects().eq_expr(ctxt, left, right)
 }
 
 /// Returns the segments of a path that might have generic parameters.
@@ -779,7 +1113,7 @@ pub fn eq_expr_value(cx: &LateContext<'_>, left: &Expr<'_>, right: &Expr<'_>) ->
 /// item, in which case it is the last two
 fn generic_path_segments<'tcx>(segments: &'tcx [PathSegment<'tcx>]) -> Option<&'tcx [PathSegment<'tcx>]> {
     match segments.last()?.res {
-        Res::Def(DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy, _) => {
+        Res::Def(DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy, _) => {
             // <Ty as module::Trait<T>>::assoc::<U>
             //        ^^^^^^^^^^^^^^^^   ^^^^^^^^^^ segments: [module, Trait<T>, assoc<U>]
             Some(&segments[segments.len().checked_sub(2)?..])
@@ -806,7 +1140,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
     pub fn new(cx: &'a LateContext<'tcx>) -> Self {
         Self {
             cx,
-            maybe_typeck_results: cx.maybe_typeck_results(),
+            maybe_typeck_results: cx.typeck_results,
             s: FxHasher::default(),
             path_check: PathCheck::default(),
         }
@@ -835,13 +1169,13 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             self.hash_expr(e);
         }
 
-        std::mem::discriminant(&b.rules).hash(&mut self.s);
+        mem::discriminant(&b.rules).hash(&mut self.s);
     }
 
     #[expect(clippy::too_many_lines)]
     pub fn hash_expr(&mut self, e: &Expr<'_>) {
         let simple_const = self.maybe_typeck_results.and_then(|typeck_results| {
-            ConstEvalCtxt::with_env(self.cx.tcx, self.cx.typing_env(), typeck_results).eval_simple(e)
+            ConstEvalCtxt::with_env(self.cx.tcx, self.cx.typing_env(), typeck_results).eval_local(e, e.span.ctxt())
         });
 
         // const hashing may result in the same hash as some unrelated node, so add a sort of
@@ -851,11 +1185,11 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             return;
         }
 
-        std::mem::discriminant(&e.kind).hash(&mut self.s);
+        mem::discriminant(&e.kind).hash(&mut self.s);
 
         match &e.kind {
             ExprKind::AddrOf(kind, m, e) => {
-                std::mem::discriminant(kind).hash(&mut self.s);
+                mem::discriminant(kind).hash(&mut self.s);
                 m.hash(&mut self.s);
                 self.hash_expr(e);
             },
@@ -872,7 +1206,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 self.hash_expr(r);
             },
             ExprKind::AssignOp(o, l, r) => {
-                std::mem::discriminant(&o.node).hash(&mut self.s);
+                mem::discriminant(&o.node).hash(&mut self.s);
                 self.hash_expr(l);
                 self.hash_expr(r);
             },
@@ -883,7 +1217,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 self.hash_block(b);
             },
             ExprKind::Binary(op, l, r) => {
-                std::mem::discriminant(&op.node).hash(&mut self.s);
+                mem::discriminant(&op.node).hash(&mut self.s);
                 self.hash_expr(l);
                 self.hash_expr(r);
             },
@@ -906,7 +1240,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             ExprKind::Closure(Closure {
                 capture_clause, body, ..
             }) => {
-                std::mem::discriminant(capture_clause).hash(&mut self.s);
+                mem::discriminant(capture_clause).hash(&mut self.s);
                 // closures inherit TypeckResults
                 self.hash_expr(self.cx.tcx.hir_body(*body).value);
             },
@@ -1004,8 +1338,8 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                     self.hash_expr(e);
                 }
             },
-            ExprKind::Match(e, arms, s) => {
-                self.hash_expr(e);
+            ExprKind::Match(scrutinee, arms, _) => {
+                self.hash_expr(scrutinee);
 
                 for arm in *arms {
                     self.hash_pat(arm.pat);
@@ -1014,8 +1348,6 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                     }
                     self.hash_expr(arm.body);
                 }
-
-                s.hash(&mut self.s);
             },
             ExprKind::MethodCall(path, receiver, args, _fn_span) => {
                 self.hash_name(path.ident.name);
@@ -1058,12 +1390,12 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             ExprKind::Use(expr, _) => {
                 self.hash_expr(expr);
             },
-            ExprKind::Unary(lop, le) => {
-                std::mem::discriminant(lop).hash(&mut self.s);
+            ExprKind::Unary(l_op, le) => {
+                mem::discriminant(l_op).hash(&mut self.s);
                 self.hash_expr(le);
             },
             ExprKind::UnsafeBinderCast(kind, expr, ty) => {
-                std::mem::discriminant(kind).hash(&mut self.s);
+                mem::discriminant(kind).hash(&mut self.s);
                 self.hash_expr(expr);
                 if let Some(ty) = ty {
                     self.hash_ty(ty);
@@ -1091,48 +1423,48 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             QPath::TypeRelative(_, path) => {
                 self.hash_name(path.ident.name);
             },
-            QPath::LangItem(lang_item, ..) => {
-                std::mem::discriminant(lang_item).hash(&mut self.s);
-            },
         }
         // self.maybe_typeck_results.unwrap().qpath_res(p, id).hash(&mut self.s);
     }
 
     pub fn hash_pat_expr(&mut self, lit: &PatExpr<'_>) {
-        std::mem::discriminant(&lit.kind).hash(&mut self.s);
+        mem::discriminant(&lit.kind).hash(&mut self.s);
         match &lit.kind {
             PatExprKind::Lit { lit, negated } => {
                 lit.node.hash(&mut self.s);
                 negated.hash(&mut self.s);
             },
-            PatExprKind::ConstBlock(c) => self.hash_body(c.body),
             PatExprKind::Path(qpath) => self.hash_qpath(qpath),
         }
     }
 
     pub fn hash_ty_pat(&mut self, pat: &TyPat<'_>) {
-        std::mem::discriminant(&pat.kind).hash(&mut self.s);
+        mem::discriminant(&pat.kind).hash(&mut self.s);
         match pat.kind {
             TyPatKind::Range(s, e) => {
                 self.hash_const_arg(s);
                 self.hash_const_arg(e);
             },
             TyPatKind::Or(variants) => {
-                for variant in variants.iter() {
-                    self.hash_ty_pat(variant)
+                for variant in variants {
+                    self.hash_ty_pat(variant);
                 }
             },
-            TyPatKind::Err(_) => {},
+            TyPatKind::NotNull | TyPatKind::Err(_) => {},
         }
     }
 
     pub fn hash_pat(&mut self, pat: &Pat<'_>) {
-        std::mem::discriminant(&pat.kind).hash(&mut self.s);
+        mem::discriminant(&pat.kind).hash(&mut self.s);
         match &pat.kind {
             PatKind::Missing => unreachable!(),
             PatKind::Binding(BindingMode(by_ref, mutability), _, _, pat) => {
-                std::mem::discriminant(by_ref).hash(&mut self.s);
-                std::mem::discriminant(mutability).hash(&mut self.s);
+                mem::discriminant(by_ref).hash(&mut self.s);
+                if let ByRef::Yes(pi, mu) = by_ref {
+                    mem::discriminant(pi).hash(&mut self.s);
+                    mem::discriminant(mu).hash(&mut self.s);
+                }
+                mem::discriminant(mutability).hash(&mut self.s);
                 if let Some(pat) = pat {
                     self.hash_pat(pat);
                 }
@@ -1151,11 +1483,12 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 if let Some(e) = e {
                     self.hash_pat_expr(e);
                 }
-                std::mem::discriminant(i).hash(&mut self.s);
+                mem::discriminant(i).hash(&mut self.s);
             },
-            PatKind::Ref(pat, mu) => {
+            PatKind::Ref(pat, pi, mu) => {
                 self.hash_pat(pat);
-                std::mem::discriminant(mu).hash(&mut self.s);
+                mem::discriminant(pi).hash(&mut self.s);
+                mem::discriminant(mu).hash(&mut self.s);
             },
             PatKind::Guard(pat, guard) => {
                 self.hash_pat(pat);
@@ -1224,12 +1557,12 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
 
     pub fn hash_modifiers(&mut self, modifiers: TraitBoundModifiers) {
         let TraitBoundModifiers { constness, polarity } = modifiers;
-        std::mem::discriminant(&polarity).hash(&mut self.s);
-        std::mem::discriminant(&constness).hash(&mut self.s);
+        mem::discriminant(&polarity).hash(&mut self.s);
+        mem::discriminant(&constness).hash(&mut self.s);
     }
 
     pub fn hash_stmt(&mut self, b: &Stmt<'_>) {
-        std::mem::discriminant(&b.kind).hash(&mut self.s);
+        mem::discriminant(&b.kind).hash(&mut self.s);
 
         match &b.kind {
             StmtKind::Let(local) => {
@@ -1250,14 +1583,14 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
 
     pub fn hash_lifetime(&mut self, lifetime: &Lifetime) {
         lifetime.ident.name.hash(&mut self.s);
-        std::mem::discriminant(&lifetime.kind).hash(&mut self.s);
+        mem::discriminant(&lifetime.kind).hash(&mut self.s);
         if let LifetimeKind::Param(param_id) = lifetime.kind {
             param_id.hash(&mut self.s);
         }
     }
 
     pub fn hash_ty(&mut self, ty: &Ty<'_>) {
-        std::mem::discriminant(&ty.kind).hash(&mut self.s);
+        mem::discriminant(&ty.kind).hash(&mut self.s);
         self.hash_tykind(&ty.kind);
     }
 
@@ -1274,6 +1607,13 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 self.hash_ty(ty);
                 self.hash_ty_pat(pat);
             },
+            TyKind::FieldOf(base, TyFieldPath { variant, field }) => {
+                self.hash_ty(base);
+                if let Some(variant) = variant {
+                    self.hash_name(variant.name);
+                }
+                self.hash_name(field.name);
+            },
             TyKind::Ptr(mut_ty) => {
                 self.hash_ty(mut_ty.ty);
                 mut_ty.mutbl.hash(&mut self.s);
@@ -1283,20 +1623,20 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 self.hash_ty(mut_ty.ty);
                 mut_ty.mutbl.hash(&mut self.s);
             },
-            TyKind::BareFn(bfn) => {
-                bfn.safety.hash(&mut self.s);
-                bfn.abi.hash(&mut self.s);
-                for arg in bfn.decl.inputs {
+            TyKind::FnPtr(fn_ptr) => {
+                fn_ptr.safety.hash(&mut self.s);
+                fn_ptr.abi.hash(&mut self.s);
+                for arg in fn_ptr.decl.inputs {
                     self.hash_ty(arg);
                 }
-                std::mem::discriminant(&bfn.decl.output).hash(&mut self.s);
-                match bfn.decl.output {
+                mem::discriminant(&fn_ptr.decl.output).hash(&mut self.s);
+                match fn_ptr.decl.output {
                     FnRetTy::DefaultReturn(_) => {},
                     FnRetTy::Return(ty) => {
                         self.hash_ty(ty);
                     },
                 }
-                bfn.decl.c_variadic.hash(&mut self.s);
+                fn_ptr.decl.c_variadic().hash(&mut self.s);
             },
             TyKind::Tup(ty_list) => {
                 for ty in *ty_list {
@@ -1307,11 +1647,12 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             TyKind::TraitObject(_, lifetime) => {
                 self.hash_lifetime(lifetime);
             },
-            TyKind::Typeof(anon_const) => {
-                self.hash_body(anon_const.body);
-            },
             TyKind::UnsafeBinder(binder) => {
                 self.hash_ty(binder.inner_ty);
+            },
+            TyKind::View(ty, _) => {
+                self.hash_ty(ty);
+                // FIXME(scrabsha): probably hash the fields as well?
             },
             TyKind::Err(_)
             | TyKind::Infer(())
@@ -1331,9 +1672,35 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
 
     fn hash_const_arg(&mut self, const_arg: &ConstArg<'_>) {
         match &const_arg.kind {
+            ConstArgKind::Tup(tup) => {
+                for arg in *tup {
+                    self.hash_const_arg(arg);
+                }
+            },
             ConstArgKind::Path(path) => self.hash_qpath(path),
             ConstArgKind::Anon(anon) => self.hash_body(anon.body),
-            ConstArgKind::Infer(..) => {},
+            ConstArgKind::Struct(path, inits) => {
+                self.hash_qpath(path);
+                for init in *inits {
+                    self.hash_const_arg(init.expr);
+                }
+            },
+            ConstArgKind::TupleCall(path, args) => {
+                self.hash_qpath(path);
+                for arg in *args {
+                    self.hash_const_arg(arg);
+                }
+            },
+            ConstArgKind::Array(array_expr) => {
+                for elem in array_expr.elems {
+                    self.hash_const_arg(elem);
+                }
+            },
+            ConstArgKind::Infer(..) | ConstArgKind::Error(..) => {},
+            ConstArgKind::Literal { lit, negated } => {
+                lit.hash(&mut self.s);
+                negated.hash(&mut self.s);
+            },
         }
     }
 
@@ -1393,4 +1760,71 @@ fn eq_span_tokens(
         }
     }
     f(cx, left.into_range(), right.into_range(), pred)
+}
+
+/// Returns true if the expression contains ambiguous literals (unsuffixed float or int literals)
+/// that could be interpreted as either f32/f64 or i32/i64 depending on context.
+pub fn has_ambiguous_literal_in_expr(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Path(ref qpath) => {
+            if let Res::Local(hir_id) = cx.qpath_res(qpath, expr.hir_id)
+                && let Node::LetStmt(local) = cx.tcx.parent_hir_node(hir_id)
+                && local.ty.is_none()
+                && let Some(init) = local.init
+            {
+                return has_ambiguous_literal_in_expr(cx, init);
+            }
+            false
+        },
+        ExprKind::Lit(lit) => matches!(
+            lit.node,
+            ast::LitKind::Float(_, ast::LitFloatType::Unsuffixed) | ast::LitKind::Int(_, ast::LitIntType::Unsuffixed)
+        ),
+
+        ExprKind::Array(exprs) | ExprKind::Tup(exprs) => exprs.iter().any(|e| has_ambiguous_literal_in_expr(cx, e)),
+
+        ExprKind::Assign(lhs, rhs, _) | ExprKind::AssignOp(_, lhs, rhs) | ExprKind::Binary(_, lhs, rhs) => {
+            has_ambiguous_literal_in_expr(cx, lhs) || has_ambiguous_literal_in_expr(cx, rhs)
+        },
+
+        ExprKind::Unary(_, e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::Type(e, _)
+        | ExprKind::DropTemps(e)
+        | ExprKind::AddrOf(_, _, e)
+        | ExprKind::Field(e, _)
+        | ExprKind::Index(e, _, _)
+        | ExprKind::Yield(e, _) => has_ambiguous_literal_in_expr(cx, e),
+
+        ExprKind::MethodCall(_, receiver, args, _) | ExprKind::Call(receiver, args) => {
+            has_ambiguous_literal_in_expr(cx, receiver) || args.iter().any(|e| has_ambiguous_literal_in_expr(cx, e))
+        },
+
+        ExprKind::Closure(Closure { body, .. }) => {
+            let body = cx.tcx.hir_body(*body);
+            let closure_expr = crate::peel_blocks(body.value);
+            has_ambiguous_literal_in_expr(cx, closure_expr)
+        },
+
+        ExprKind::Block(blk, _) => blk.expr.as_ref().is_some_and(|e| has_ambiguous_literal_in_expr(cx, e)),
+
+        ExprKind::If(cond, then_expr, else_expr) => {
+            has_ambiguous_literal_in_expr(cx, cond)
+                || has_ambiguous_literal_in_expr(cx, then_expr)
+                || else_expr.as_ref().is_some_and(|e| has_ambiguous_literal_in_expr(cx, e))
+        },
+
+        ExprKind::Match(scrutinee, arms, _) => {
+            has_ambiguous_literal_in_expr(cx, scrutinee)
+                || arms.iter().any(|arm| has_ambiguous_literal_in_expr(cx, arm.body))
+        },
+
+        ExprKind::Loop(body, ..) => body.expr.is_some_and(|e| has_ambiguous_literal_in_expr(cx, e)),
+
+        ExprKind::Ret(opt_expr) | ExprKind::Break(_, opt_expr) => {
+            opt_expr.as_ref().is_some_and(|e| has_ambiguous_literal_in_expr(cx, e))
+        },
+
+        _ => false,
+    }
 }

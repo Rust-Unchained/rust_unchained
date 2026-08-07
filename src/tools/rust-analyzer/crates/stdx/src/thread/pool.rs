@@ -8,16 +8,18 @@
 //! the threading utilities in [`crate::thread`].
 
 use std::{
+    marker::PhantomData,
     panic::{self, UnwindSafe},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
 use crossbeam_channel::{Receiver, Sender};
+use crossbeam_utils::sync::WaitGroup;
 
-use super::{Builder, JoinHandle, ThreadIntent};
+use crate::thread::{Builder, JoinHandle, ThreadIntent};
 
 pub struct Pool {
     // `_handles` is never read: the field is present
@@ -38,18 +40,19 @@ struct Job {
 }
 
 impl Pool {
-    pub fn new(threads: usize) -> Pool {
-        const STACK_SIZE: usize = 8 * 1024 * 1024;
+    /// # Panics
+    ///
+    /// Panics if job panics
+    #[must_use]
+    pub fn new(threads: usize) -> Self {
         const INITIAL_INTENT: ThreadIntent = ThreadIntent::Worker;
 
         let (job_sender, job_receiver) = crossbeam_channel::unbounded();
         let extant_tasks = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            let handle = Builder::new(INITIAL_INTENT)
-                .stack_size(STACK_SIZE)
-                .name("Worker".into())
+        for idx in 0..threads {
+            let handle = Builder::new(INITIAL_INTENT, format!("Worker{idx}",))
                 .allow_leak(true)
                 .spawn({
                     let extant_tasks = Arc::clone(&extant_tasks);
@@ -61,9 +64,8 @@ impl Pool {
                                 job.requested_intent.apply_to_current_thread();
                                 current_intent = job.requested_intent;
                             }
-                            extant_tasks.fetch_add(1, Ordering::SeqCst);
                             // discard the panic, we should've logged the backtrace already
-                            _ = panic::catch_unwind(job.f);
+                            drop(panic::catch_unwind(job.f));
                             extant_tasks.fetch_sub(1, Ordering::SeqCst);
                         }
                     }
@@ -73,7 +75,7 @@ impl Pool {
             handles.push(handle);
         }
 
-        Pool { _handles: handles.into_boxed_slice(), extant_tasks, job_sender }
+        Self { _handles: handles.into_boxed_slice(), extant_tasks, job_sender }
     }
 
     pub fn spawn<F>(&self, intent: ThreadIntent, f: F)
@@ -84,14 +86,66 @@ impl Pool {
             if cfg!(debug_assertions) {
                 intent.assert_is_used_on_current_thread();
             }
-            f()
+            f();
         });
 
         let job = Job { requested_intent: intent, f };
+        self.extant_tasks.fetch_add(1, Ordering::SeqCst);
         self.job_sender.send(job).unwrap();
     }
 
+    pub fn scoped<'pool, 'scope, F, R>(&'pool self, f: F) -> R
+    where
+        F: FnOnce(&Scope<'pool, 'scope>) -> R,
+    {
+        let wg = WaitGroup::new();
+        let scope = Scope { pool: self, wg, _marker: PhantomData };
+        let r = f(&scope);
+        scope.wg.wait();
+        r
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         self.extant_tasks.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub struct Scope<'pool, 'scope> {
+    pool: &'pool Pool,
+    wg: WaitGroup,
+    _marker: PhantomData<fn(&'scope ()) -> &'scope ()>,
+}
+
+impl<'scope> Scope<'_, 'scope> {
+    pub fn spawn<F>(&self, intent: ThreadIntent, f: F)
+    where
+        F: 'scope + FnOnce() + Send + UnwindSafe,
+    {
+        let wg = self.wg.clone();
+        let f = Box::new(move || {
+            if cfg!(debug_assertions) {
+                intent.assert_is_used_on_current_thread();
+            }
+            f();
+            drop(wg);
+        });
+
+        let job = Job {
+            requested_intent: intent,
+            f: unsafe {
+                std::mem::transmute::<
+                    Box<dyn 'scope + FnOnce() + Send + UnwindSafe>,
+                    Box<dyn 'static + FnOnce() + Send + UnwindSafe>,
+                >(f)
+            },
+        };
+        self.pool.extant_tasks.fetch_add(1, Ordering::SeqCst);
+        self.pool.job_sender.send(job).unwrap();
     }
 }

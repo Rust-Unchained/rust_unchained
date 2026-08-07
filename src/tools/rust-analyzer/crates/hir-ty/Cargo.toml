@@ -10,49 +10,54 @@ license.workspace = true
 rust-version.workspace = true
 
 [lib]
+doctest = false
 
 [dependencies]
-cov-mark = "2.0.0-pre.1"
+cov-mark = "2.0.0"
 itertools.workspace = true
 arrayvec.workspace = true
-bitflags.workspace = true
 smallvec.workspace = true
-ena = "0.14.0"
+ena = "0.14.3"
+serde.workspace = true
+serde_derive.workspace = true
 either.workspace = true
-oorandom = "11.1.3"
-tracing.workspace = true
+oorandom = "11.1.5"
+tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
-scoped-tls = "1.0.0"
-chalk-solve.workspace = true
-chalk-ir.workspace = true
-chalk-recursive.workspace = true
-chalk-derive.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
-nohash-hasher.workspace = true
-typed-arena = "2.0.1"
+typed-arena = "2.0.2"
 indexmap.workspace = true
-rustc_apfloat = "0.2.0"
+rustc_apfloat = "0.2.3"
+salsa.workspace = true
+petgraph.workspace = true
+bitflags.workspace = true
 
 ra-ap-rustc_abi.workspace = true
 ra-ap-rustc_index.workspace = true
 ra-ap-rustc_pattern_analysis.workspace = true
+ra-ap-rustc_ast_ir.workspace = true
+ra-ap-rustc_type_ir.workspace = true
+ra-ap-rustc_next_trait_solver.workspace = true
 
+# These moved to dev deps if `setup_tracing` was a macro and dependents also
+# included these
+tracing-subscriber.workspace = true
+tracing-tree.workspace = true
 
 # local deps
 stdx.workspace = true
+macros.workspace = true
 intern.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
+thin-vec = "0.2.16"
 
 [dev-dependencies]
-expect-test = "1.4.0"
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-tree.workspace = true
+expect-test = "1.5.1"
 project-model.workspace = true
 
 # local deps

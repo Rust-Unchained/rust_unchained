@@ -1,8 +1,7 @@
-use super::sealed::Sealed;
-use crate::simd::{LaneCount, Simd, SimdCast, SimdElement, SupportedLaneCount, cmp::SimdOrd};
+use crate::simd::{Simd, SimdCast, SimdElement, cmp::SimdOrd};
 
 /// Operations on SIMD vectors of unsigned integers.
-pub trait SimdUint: Copy + Sealed {
+pub impl(self) trait SimdUint: Copy {
     /// Scalar type contained by this SIMD vector type.
     type Scalar;
 
@@ -55,6 +54,7 @@ pub trait SimdUint: Copy + Sealed {
     /// let sat = x.saturating_sub(max);
     /// assert_eq!(unsat, Simd::from_array([3, 2, 1, 0]));
     /// assert_eq!(sat, Simd::splat(0));
+    /// ```
     fn saturating_sub(self, second: Self) -> Self;
 
     /// Lanewise absolute difference.
@@ -123,15 +123,7 @@ pub trait SimdUint: Copy + Sealed {
 macro_rules! impl_trait {
     { $($ty:ident ($signed:ident)),* } => {
         $(
-        impl<const N: usize> Sealed for Simd<$ty, N>
-        where
-            LaneCount<N>: SupportedLaneCount,
-        {
-        }
-
         impl<const N: usize> SimdUint for Simd<$ty, N>
-        where
-            LaneCount<N>: SupportedLaneCount,
         {
             type Scalar = $ty;
             type Cast<T: SimdElement> = Simd<T, N>;

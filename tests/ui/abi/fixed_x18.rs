@@ -1,5 +1,5 @@
 // This tests that -Zfixed-x18 causes a compilation failure on targets other than aarch64.
-// Behavior on aarch64 is tested by tests/codegen/fixed-x18.rs.
+// Behavior on aarch64 is tested by tests/codegen-llvm/fixed-x18.rs.
 //
 //@ revisions: x64 i686 arm riscv32 riscv64
 //@ dont-check-compiler-stderr
@@ -15,12 +15,17 @@
 //@ [riscv32] compile-flags: --target=riscv32i-unknown-none-elf --crate-type=rlib
 //@ [riscv64] needs-llvm-components: riscv
 //@ [riscv64] compile-flags: --target=riscv64gc-unknown-none-elf --crate-type=rlib
+//@ ignore-backends: gcc
 
 #![crate_type = "lib"]
 #![feature(no_core, lang_items)]
 #![no_core]
 
+#[lang = "pointee_sized"]
+trait PointeeSized {}
+#[lang = "meta_sized"]
+trait MetaSized: PointeeSized {}
 #[lang = "sized"]
-trait Sized {}
+trait Sized: MetaSized {}
 
 //~? ERROR the `-Zfixed-x18` flag is not supported on the `

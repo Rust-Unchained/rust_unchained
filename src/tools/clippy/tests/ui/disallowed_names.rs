@@ -1,13 +1,9 @@
-#![allow(
-    dead_code,
-    clippy::needless_if,
-    clippy::similar_names,
-    clippy::single_match,
-    clippy::toplevel_ref_arg,
-    unused_mut,
-    unused_variables
-)]
+//@aux-build:proc_macros.rs
+#![expect(clippy::single_match, clippy::toplevel_ref_arg)]
 #![warn(clippy::disallowed_names)]
+
+extern crate proc_macros;
+use proc_macros::{external, with_span};
 
 fn test(foo: ()) {}
 //~^ disallowed_names
@@ -64,6 +60,17 @@ fn issue_1647_ref_mut() {
 
     if let Some(ref mut quux) = Some(42) {}
     //~^ disallowed_names
+}
+
+pub fn issue_14958_proc_macro() {
+    // does not lint macro-generated code
+    external! {
+        let foo = 0;
+    }
+    with_span! {
+        span
+        let foo = 0;
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,6 @@
 // they're used in `inner_async4` for some reasons... This test ensures that no
 // only `v` is marked as not used mutably in `inner_async4`.
 
-#![allow(clippy::redundant_closure_call)]
 #![warn(clippy::needless_pass_by_ref_mut)]
 
 async fn inner_async3(x: &mut i32, y: &mut u32) {
@@ -24,3 +23,9 @@ async fn inner_async4(u: &mut i32, v: &mut u32) {
 }
 
 fn main() {}
+
+//~v needless_pass_by_ref_mut
+fn issue16267<'a>(msg: &str, slice: &'a mut [i32]) -> &'a [i32] {
+    println!("{msg}");
+    &slice[0..5]
+}

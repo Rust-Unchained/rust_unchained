@@ -1,13 +1,13 @@
 use hir::{AsAssocItem, Semantics};
 use ide_db::{
-    defs::{Definition, NameClass, NameRefClass},
     RootDatabase,
+    defs::{Definition, NameClass, NameRefClass},
 };
-use syntax::{ast, match_ast, AstNode, SyntaxKind::*, T};
+use syntax::{AstNode, SyntaxKind::*, T, ast, match_ast};
 
 use crate::{
-    goto_definition::goto_definition, navigation_target::TryToNav, FilePosition, NavigationTarget,
-    RangeInfo,
+    FilePosition, GotoDefinitionConfig, NavigationTarget, RangeInfo,
+    goto_definition::goto_definition, navigation_target::TryToNav,
 };
 
 // Feature: Go to Declaration
@@ -21,6 +21,7 @@ use crate::{
 pub(crate) fn goto_declaration(
     db: &RootDatabase,
     position @ FilePosition { file_id, offset }: FilePosition,
+    config: &GotoDefinitionConfig<'_>,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
@@ -29,48 +30,48 @@ pub(crate) fn goto_declaration(
         .find(|it| matches!(it.kind(), IDENT | T![self] | T![super] | T![crate] | T![Self]))?;
     let range = original_token.text_range();
     let info: Vec<NavigationTarget> = sema
-        .descend_into_macros_no_opaque(original_token)
+        .descend_into_macros_no_opaque(original_token, false)
         .iter()
         .filter_map(|token| {
-            let parent = token.parent()?;
+            let parent = token.value.parent()?;
             let def = match_ast! {
                 match parent {
                     ast::NameRef(name_ref) => match NameRefClass::classify(&sema, &name_ref)? {
                         NameRefClass::Definition(it, _) => Some(it),
                         NameRefClass::FieldShorthand { field_ref, .. } =>
-                            return field_ref.try_to_nav(db),
+                            return field_ref.try_to_nav(&sema),
                         NameRefClass::ExternCrateShorthand { decl, .. } =>
-                            return decl.try_to_nav(db),
+                            return decl.try_to_nav(&sema),
                     },
                     ast::Name(name) => match NameClass::classify(&sema, &name)? {
                         NameClass::Definition(it) | NameClass::ConstReference(it) => Some(it),
                         NameClass::PatFieldShorthand { field_ref, .. } =>
-                            return field_ref.try_to_nav(db),
+                            return field_ref.try_to_nav(&sema),
                     },
                     _ => None
                 }
             };
             let assoc = match def? {
                 Definition::Module(module) => {
-                    return Some(NavigationTarget::from_module_to_decl(db, module))
+                    return Some(NavigationTarget::from_module_to_decl(db, module));
                 }
                 Definition::Const(c) => c.as_assoc_item(db),
                 Definition::TypeAlias(ta) => ta.as_assoc_item(db),
                 Definition::Function(f) => f.as_assoc_item(db),
-                Definition::ExternCrateDecl(it) => return it.try_to_nav(db),
+                Definition::ExternCrateDecl(it) => return it.try_to_nav(&sema),
                 _ => None,
             }?;
 
             let trait_ = assoc.implemented_trait(db)?;
             let name = Some(assoc.name(db)?);
             let item = trait_.items(db).into_iter().find(|it| it.name(db) == name)?;
-            item.try_to_nav(db)
+            item.try_to_nav(&sema)
         })
         .flatten()
         .collect();
 
     if info.is_empty() {
-        goto_definition(db, position)
+        goto_definition(db, position, config)
     } else {
         Some(RangeInfo::new(range, info))
     }
@@ -78,15 +79,18 @@ pub(crate) fn goto_declaration(
 
 #[cfg(test)]
 mod tests {
-    use ide_db::FileRange;
+    use ide_db::{FileRange, ra_fixture::RaFixtureConfig};
     use itertools::Itertools;
 
-    use crate::fixture;
+    use crate::{GotoDefinitionConfig, fixture};
+
+    const TEST_CONFIG: GotoDefinitionConfig<'_> =
+        GotoDefinitionConfig { ra_fixture: RaFixtureConfig::default() };
 
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let (analysis, position, expected) = fixture::annotations(ra_fixture);
         let navs = analysis
-            .goto_declaration(position)
+            .goto_declaration(position, &TEST_CONFIG)
             .unwrap()
             .expect("no declaration or definition found")
             .info;

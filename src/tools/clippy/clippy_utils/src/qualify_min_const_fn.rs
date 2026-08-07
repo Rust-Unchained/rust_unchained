@@ -5,20 +5,20 @@
 
 use crate::msrvs::{self, Msrv};
 use hir::LangItem;
-use rustc_attr_parsing::{RustcVersion, StableSince};
 use rustc_const_eval::check_consts::ConstCx;
-use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
+use rustc_hir::attrs::RustcVersion;
+use rustc_hir::{self as hir, HirId, StableSince};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::Obligation;
 use rustc_lint::LateContext;
 use rustc_middle::mir::{
-    Body, CastKind, NonDivergingIntrinsic, NullOp, Operand, Place, ProjectionElem, Rvalue, Statement, StatementKind,
-    Terminator, TerminatorKind,
+    Body, CastKind, NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue, Statement, StatementKind,
+    Terminator, TerminatorKind, UnOp,
 };
 use rustc_middle::traits::{BuiltinImplSource, ImplSource, ObligationCause};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{self, GenericArgKind, TraitRef, Ty, TyCtxt};
+use rustc_middle::ty::{self, GenericArgKind, Instance, TraitRef, Ty, TyCtxt};
 use rustc_span::Span;
 use rustc_span::symbol::sym;
 use rustc_trait_selection::traits::{ObligationCtxt, SelectionContext};
@@ -32,10 +32,30 @@ pub fn is_min_const_fn<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, msrv: Ms
     for local in &body.local_decls {
         check_ty(cx, local.ty, local.source_info.span, msrv)?;
     }
+    if !msrv.meets(cx, msrvs::CONST_FN_TRAIT_BOUND)
+        && let Some(sized_did) = cx.tcx.lang_items().sized_trait()
+        && let Some(meta_sized_did) = cx.tcx.lang_items().meta_sized_trait()
+        && cx.tcx.param_env(def_id).caller_bounds().iter().any(|bound| {
+            bound.as_trait_clause().is_some_and(|clause| {
+                let did = clause.def_id();
+                did != sized_did && did != meta_sized_did
+            })
+        })
+    {
+        return Err((
+            body.span,
+            "non-`Sized` trait clause before `const_fn_trait_bound` is stabilized".into(),
+        ));
+    }
     // impl trait is gone in MIR, so check the return type manually
     check_ty(
         cx,
-        cx.tcx.fn_sig(def_id).instantiate_identity().output().skip_binder(),
+        cx.tcx
+            .fn_sig(def_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .output()
+            .skip_binder(),
         body.local_decls.iter().next().unwrap().source_info.span,
         msrv,
     )?;
@@ -55,7 +75,7 @@ pub fn is_min_const_fn<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, msrv: Ms
 
 fn check_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, span: Span, msrv: Msrv) -> McfResult {
     for arg in ty.walk() {
-        let ty = match arg.unpack() {
+        let ty = match arg.kind() {
             GenericArgKind::Type(ty) => ty,
 
             // No constraints on lifetimes or constants, except potentially
@@ -67,11 +87,17 @@ fn check_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, span: Span, msrv: Msrv) 
             ty::Ref(_, _, hir::Mutability::Mut) if !msrv.meets(cx, msrvs::CONST_MUT_REFS) => {
                 return Err((span, "mutable references in const fn are unstable".into()));
             },
-            ty::Alias(ty::Opaque, ..) => return Err((span, "`impl Trait` in const fn is unstable".into())),
+            ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Opaque { .. },
+                    ..
+                },
+            ) => return Err((span, "`impl Trait` in const fn is unstable".into())),
             ty::FnPtr(..) => {
                 return Err((span, "function pointers in const fn are unstable".into()));
             },
-            ty::Dynamic(preds, _, _) => {
+            ty::Dynamic(preds, _) => {
                 for pred in *preds {
                     match pred.skip_binder() {
                         ty::ExistentialPredicate::AutoTrait(_) | ty::ExistentialPredicate::Projection(_) => {
@@ -111,13 +137,15 @@ fn check_rvalue<'tcx>(
 ) -> McfResult {
     match rvalue {
         Rvalue::ThreadLocalRef(_) => Err((span, "cannot access thread local storage in const fn".into())),
-        Rvalue::Len(place) | Rvalue::Discriminant(place) | Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-            check_place(cx, *place, span, body, msrv)
-        },
-        Rvalue::CopyForDeref(place) => check_place(cx, *place, span, body, msrv),
+        Rvalue::Discriminant(place)
+        | Rvalue::Ref(_, _, place)
+        | Rvalue::Reborrow(_, _, place)
+        | Rvalue::RawPtr(_, place)
+        | Rvalue::CopyForDeref(place) => check_place(cx, *place, span, body, msrv),
         Rvalue::Repeat(operand, _)
-        | Rvalue::Use(operand)
+        | Rvalue::Use(operand, _)
         | Rvalue::WrapUnsafeBinder(operand, _)
+        | Rvalue::UnaryOp(UnOp::PtrMetadata, operand)
         | Rvalue::Cast(
             CastKind::PointerWithExposedProvenance
             | CastKind::IntToInt
@@ -126,7 +154,8 @@ fn check_rvalue<'tcx>(
             | CastKind::FloatToFloat
             | CastKind::FnPtrToPtr
             | CastKind::PtrToPtr
-            | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer | PointerCoercion::ArrayToPointer, _),
+            | CastKind::PointerCoercion(PointerCoercion::MutToConstPointer | PointerCoercion::ArrayToPointer, _)
+            | CastKind::Subtype,
             operand,
             _,
         ) => check_operand(cx, operand, span, body, msrv),
@@ -134,7 +163,7 @@ fn check_rvalue<'tcx>(
             CastKind::PointerCoercion(
                 PointerCoercion::UnsafeFnPointer
                 | PointerCoercion::ClosureFnPointer(_)
-                | PointerCoercion::ReifyFnPointer,
+                | PointerCoercion::ReifyFnPointer(_),
                 _,
             ),
             _,
@@ -160,11 +189,7 @@ fn check_rvalue<'tcx>(
         Rvalue::Cast(CastKind::PointerExposeProvenance, _, _) => {
             Err((span, "casting pointers to ints is unstable in const fn".into()))
         },
-        Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::DynStar, _), _, _) => {
-            // FIXME(dyn-star)
-            unimplemented!()
-        },
-        Rvalue::Cast(CastKind::Transmute, _, _) => Err((
+        Rvalue::Cast(CastKind::Transmute | CastKind::BoxDerefTransmute, _, _) => Err((
             span,
             "transmute can attempt to turn pointers into integers, so is unstable in const fn".into(),
         )),
@@ -182,17 +207,15 @@ fn check_rvalue<'tcx>(
                 ))
             }
         },
-        Rvalue::NullaryOp(
-            NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_) | NullOp::UbChecks | NullOp::ContractChecks,
-            _,
-        )
-        | Rvalue::ShallowInitBox(_, _) => Ok(()),
         Rvalue::UnaryOp(_, operand) => {
             let ty = operand.ty(body, cx.tcx);
-            if ty.is_integral() || ty.is_bool() {
+            if ty.is_integral() | ty.is_bool() {
                 check_operand(cx, operand, span, body, msrv)
             } else {
-                Err((span, "only int and `bool` operations are stable in const fn".into()))
+                Err((
+                    span,
+                    "only int, `bool`, and pointer metadata operations are stable in const fn".into(),
+                ))
             }
         },
         Rvalue::Aggregate(_, operands) => {
@@ -220,9 +243,7 @@ fn check_statement<'tcx>(
 
         StatementKind::FakeRead(box (_, place)) => check_place(cx, *place, span, body, msrv),
         // just an assignment
-        StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) => {
-            check_place(cx, **place, span, body, msrv)
-        },
+        StatementKind::SetDiscriminant { place, .. } => check_place(cx, **place, span, body, msrv),
 
         StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(op)) => check_operand(cx, op, span, body, msrv),
 
@@ -236,7 +257,6 @@ fn check_statement<'tcx>(
         // These are all NOPs
         StatementKind::StorageLive(_)
         | StatementKind::StorageDead(_)
-        | StatementKind::Retag { .. }
         | StatementKind::AscribeUserType(..)
         | StatementKind::PlaceMention(..)
         | StatementKind::Coverage(..)
@@ -271,6 +291,7 @@ fn check_operand<'tcx>(
             Some(_) => Err((span, "cannot access `static` items in const fn".into())),
             None => Ok(()),
         },
+        Operand::RuntimeChecks(..) => Ok(()),
     }
 }
 
@@ -301,7 +322,6 @@ fn check_place<'tcx>(
             | ProjectionElem::OpaqueCast(..)
             | ProjectionElem::Downcast(..)
             | ProjectionElem::Subslice { .. }
-            | ProjectionElem::Subtype(_)
             | ProjectionElem::Index(_)
             | ProjectionElem::UnwrapUnsafeBinder(_) => {},
         }
@@ -349,7 +369,20 @@ fn check_terminator<'tcx>(
         }
         | TerminatorKind::TailCall { func, args, fn_span: _ } => {
             let fn_ty = func.ty(body, cx.tcx);
-            if let ty::FnDef(fn_def_id, _) = *fn_ty.kind() {
+            if let ty::FnDef(fn_def_id, fn_substs) = fn_ty.kind() {
+                // FIXME: when analyzing a function with generic parameters, we may not have enough information to
+                // resolve to an instance. However, we could check if a host effect predicate can guarantee that
+                // this can be made a `const` call.
+                let fn_def_id = match Instance::try_resolve(
+                    cx.tcx,
+                    cx.typing_env(),
+                    *fn_def_id,
+                    fn_substs.no_bound_vars().unwrap(),
+                ) {
+                    Ok(Some(fn_inst)) => fn_inst.def_id(),
+                    Ok(None) => return Err((span, format!("cannot resolve instance for {func:?}").into())),
+                    Err(_) => return Err((span, format!("error during instance resolution of {func:?}").into())),
+                };
                 if !is_stable_const_fn(cx, fn_def_id, msrv) {
                     return Err((
                         span,
@@ -393,18 +426,22 @@ fn check_terminator<'tcx>(
     }
 }
 
-fn is_stable_const_fn(cx: &LateContext<'_>, def_id: DefId, msrv: Msrv) -> bool {
-    cx.tcx.is_const_fn(def_id)
-        && cx
-            .tcx
+/// Checks if the given `def_id` is a stable const fn, in respect to the given MSRV.
+pub fn is_stable_const_fn(cx: &LateContext<'_>, def_id: DefId, msrv: Msrv) -> bool {
+    is_stable_const_fn_at(cx.tcx, cx.last_node_with_lint_attrs, def_id, msrv)
+}
+
+/// Checks if the given `def_id` is a stable const fn, in respect to the given MSRV.
+pub fn is_stable_const_fn_at(tcx: TyCtxt<'_>, node: HirId, def_id: DefId, msrv: Msrv) -> bool {
+    tcx.is_const_fn(def_id)
+        && tcx
             .lookup_const_stability(def_id)
             .or_else(|| {
-                cx.tcx
-                    .trait_of_item(def_id)
-                    .and_then(|trait_def_id| cx.tcx.lookup_const_stability(trait_def_id))
+                tcx.trait_of_assoc(def_id)
+                    .and_then(|trait_def_id| tcx.lookup_const_stability(trait_def_id))
             })
             .is_none_or(|const_stab| {
-                if let rustc_attr_parsing::StabilityLevel::Stable { since, .. } = const_stab.level {
+                if let rustc_hir::StabilityLevel::Stable { since, .. } = const_stab.level {
                     // Checking MSRV is manually necessary because `rustc` has no such concept. This entire
                     // function could be removed if `rustc` provided a MSRV-aware version of `is_stable_const_fn`.
                     // as a part of an unimplemented MSRV check https://github.com/rust-lang/rust/issues/65262.
@@ -412,13 +449,13 @@ fn is_stable_const_fn(cx: &LateContext<'_>, def_id: DefId, msrv: Msrv) -> bool {
                     let const_stab_rust_version = match since {
                         StableSince::Version(version) => version,
                         StableSince::Current => RustcVersion::CURRENT,
-                        StableSince::Err => return false,
+                        StableSince::Err(_) => return false,
                     };
 
-                    msrv.meets(cx, const_stab_rust_version)
+                    msrv.meets_at(tcx, node, const_stab_rust_version)
                 } else {
                     // Unstable const fn, check if the feature is enabled.
-                    cx.tcx.features().enabled(const_stab.feature) && msrv.current(cx).is_none()
+                    tcx.features().enabled(const_stab.feature) && msrv.at(tcx, node).is_none()
                 }
             })
 }
@@ -427,7 +464,7 @@ fn is_ty_const_destruct<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, body: &Body<'tcx>
     // FIXME(const_trait_impl, fee1-dead) revert to const destruct once it works again
     #[expect(unused)]
     fn is_ty_const_destruct_unused<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, body: &Body<'tcx>) -> bool {
-        // If this doesn't need drop at all, then don't select `~const Destruct`.
+        // If this doesn't need drop at all, then don't select `[const] Destruct`.
         if !ty.needs_drop(tcx, body.typing_env(tcx)) {
             return false;
         }
@@ -438,7 +475,7 @@ fn is_ty_const_destruct<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, body: &Body<'tcx>
             tcx,
             ObligationCause::dummy_with_span(body.span),
             param_env,
-            TraitRef::new(tcx, tcx.require_lang_item(LangItem::Destruct, Some(body.span)), [ty]),
+            TraitRef::new(tcx, tcx.require_lang_item(LangItem::Destruct, body.span), [ty]),
         );
 
         let mut selcx = SelectionContext::new(&infcx);
@@ -455,7 +492,7 @@ fn is_ty_const_destruct<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, body: &Body<'tcx>
 
         let ocx = ObligationCtxt::new(&infcx);
         ocx.register_obligations(impl_src.nested_obligations());
-        ocx.select_all_or_error().is_empty()
+        ocx.evaluate_obligations_error_on_ambiguity().is_empty()
     }
 
     !ty.needs_drop(tcx, ConstCx::new(tcx, body).typing_env)

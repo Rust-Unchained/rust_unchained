@@ -10,6 +10,7 @@ use rustc_middle::ty::TyCtxt;
 use tracing::{debug, trace};
 
 use super::simplify::simplify_cfg;
+use crate::PassPolicy;
 
 pub(super) struct RemoveUnneededDrops;
 
@@ -21,15 +22,15 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUnneededDrops {
         let mut should_simplify = false;
         for block in body.basic_blocks.as_mut() {
             let terminator = block.terminator_mut();
-            if let TerminatorKind::Drop { place, target, .. } = terminator.kind {
-                let ty = place.ty(&body.local_decls, tcx);
-                if ty.ty.needs_drop(tcx, typing_env) {
-                    continue;
-                }
-                debug!("SUCCESS: replacing `drop` with goto({:?})", target);
-                terminator.kind = TerminatorKind::Goto { target };
-                should_simplify = true;
+            let TerminatorKind::Drop { place, target, .. } = terminator.kind else { continue };
+            let ty = place.ty(&body.local_decls, tcx).ty;
+
+            if ty.needs_drop(tcx, typing_env) {
+                continue;
             }
+            debug!("SUCCESS: replacing `drop` with goto({:?})", target);
+            terminator.kind = TerminatorKind::Goto { target };
+            should_simplify = true;
         }
 
         // if we applied optimizations, we potentially have some cfg to cleanup to
@@ -39,7 +40,7 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUnneededDrops {
         }
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _sess: &rustc_session::Session) -> PassPolicy {
+        PassPolicy::optional_non_optimization(true)
     }
 }

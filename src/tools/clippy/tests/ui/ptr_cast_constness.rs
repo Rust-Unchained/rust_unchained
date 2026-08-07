@@ -1,12 +1,7 @@
 //@aux-build:proc_macros.rs
 
 #![warn(clippy::ptr_cast_constness)]
-#![allow(
-    clippy::transmute_ptr_to_ref,
-    clippy::unnecessary_cast,
-    unused,
-    clippy::missing_transmute_annotations
-)]
+#![expect(clippy::transmute_ptr_to_ref, clippy::unnecessary_cast)]
 
 extern crate proc_macros;
 use proc_macros::{external, inline_macros};
@@ -104,5 +99,11 @@ fn null_pointers() {
 fn issue14621() {
     let mut local = 4;
     let _ = std::ptr::addr_of_mut!(local) as *const _;
+    //~^ ptr_cast_constness
+}
+
+fn issue11317() {
+    let r = &0_u32;
+    let _ptr: *mut u32 = r as *const _ as *mut _;
     //~^ ptr_cast_constness
 }

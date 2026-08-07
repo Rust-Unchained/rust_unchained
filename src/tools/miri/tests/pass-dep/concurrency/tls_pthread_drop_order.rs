@@ -5,7 +5,7 @@
 //! the fallback path in `guard::key::enable`, which uses a *single* pthread_key
 //! to manage a thread-local list of dtors to call.
 
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+// FIXME(static_mut_refs): use raw pointers instead of references
 #![allow(static_mut_refs)]
 
 use std::{mem, ptr};
@@ -29,7 +29,7 @@ pub unsafe fn set(key: Key, value: *mut u8) {
     assert_eq!(r, 0);
 }
 
-pub fn record(r: usize) {
+fn record(r: usize) {
     assert!(r < 10);
     unsafe { RECORD = RECORD * 10 + r };
 }

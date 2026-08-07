@@ -1,9 +1,9 @@
+use rustc_hir::def::DefKind;
 use rustc_hir::intravisit::{self, Visitor, VisitorExt};
 use rustc_hir::{self as hir, AmbigArg, ForeignItem, ForeignItemKind};
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_infer::traits::{ObligationCause, WellFormedLoc};
+use rustc_infer::traits::{ObligationCause, ObligationCauseCode, WellFormedLoc};
 use rustc_middle::bug;
-use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, TypingMode, fold_regions};
 use rustc_span::def_id::LocalDefId;
 use rustc_trait_selection::traits::{self, ObligationCtxt};
@@ -11,13 +11,9 @@ use tracing::debug;
 
 use crate::collect::ItemCtxt;
 
-pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers { diagnostic_hir_wf_check, ..*providers };
-}
-
 // Ideally, this would be in `rustc_trait_selection`, but we
 // need access to `ItemCtxt`
-fn diagnostic_hir_wf_check<'tcx>(
+pub(super) fn diagnostic_hir_wf_check<'tcx>(
     tcx: TyCtxt<'tcx>,
     (predicate, loc): (ty::Predicate<'tcx>, WellFormedLoc),
 ) -> Option<ObligationCause<'tcx>> {
@@ -55,12 +51,12 @@ fn diagnostic_hir_wf_check<'tcx>(
     struct HirWfCheck<'tcx> {
         tcx: TyCtxt<'tcx>,
         predicate: ty::Predicate<'tcx>,
-        cause: Option<ObligationCause<'tcx>>,
-        cause_depth: usize,
+        cause: Option<ObligationCause<'tcx>> = None,
+        cause_depth: usize = 0,
         icx: ItemCtxt<'tcx>,
         def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
-        depth: usize,
+        depth: usize = 0,
     }
 
     impl<'tcx> Visitor<'tcx> for HirWfCheck<'tcx> {
@@ -99,7 +95,7 @@ fn diagnostic_hir_wf_check<'tcx>(
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(tcx_ty.into())),
             ));
 
-            for error in ocx.select_all_or_error() {
+            for error in ocx.evaluate_obligations_error_on_ambiguity() {
                 debug!("Wf-check got error for {:?}: {:?}", ty, error);
                 if error.obligation.predicate == self.predicate {
                     // Save the cause from the greatest depth - this corresponds
@@ -107,6 +103,16 @@ fn diagnostic_hir_wf_check<'tcx>(
                     // over less-specific types (e.g. `Option<MyStruct<u8>>`)
                     if self.depth >= self.cause_depth {
                         self.cause = Some(error.obligation.cause);
+                        if let hir::TyKind::TraitObject(..) = ty.kind
+                            && let DefKind::AssocTy | DefKind::AssocConst { .. } | DefKind::AssocFn =
+                                self.tcx.def_kind(self.def_id)
+                        {
+                            self.cause = Some(ObligationCause::new(
+                                ty.span,
+                                self.def_id,
+                                ObligationCauseCode::DynCompatible(ty.span),
+                            ));
+                        }
                         self.cause_depth = self.depth
                     }
                 }
@@ -118,16 +124,8 @@ fn diagnostic_hir_wf_check<'tcx>(
         }
     }
 
-    let mut visitor = HirWfCheck {
-        tcx,
-        predicate,
-        cause: None,
-        cause_depth: 0,
-        icx,
-        def_id,
-        param_env: tcx.param_env(def_id.to_def_id()),
-        depth: 0,
-    };
+    let param_env = tcx.param_env(def_id.to_def_id());
+    let mut visitor = HirWfCheck { tcx, predicate, icx, def_id, param_env, .. };
 
     // Get the starting `hir::Ty` using our `WellFormedLoc`.
     // We will walk 'into' this type to try to find
@@ -145,11 +143,12 @@ fn diagnostic_hir_wf_check<'tcx>(
                 ref item => bug!("Unexpected TraitItem {:?}", item),
             },
             hir::Node::Item(item) => match item.kind {
-                hir::ItemKind::TyAlias(_, ty, _)
-                | hir::ItemKind::Static(_, ty, _, _)
-                | hir::ItemKind::Const(_, ty, _, _) => vec![ty],
-                hir::ItemKind::Impl(impl_) => match &impl_.of_trait {
-                    Some(t) => t
+                hir::ItemKind::TyAlias(_, _, ty)
+                | hir::ItemKind::Static(_, _, ty, _)
+                | hir::ItemKind::Const(_, _, ty, _) => vec![ty],
+                hir::ItemKind::Impl(impl_) => match impl_.of_trait {
+                    Some(of_trait) => of_trait
+                        .trait_ref
                         .path
                         .segments
                         .last()

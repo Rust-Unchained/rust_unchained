@@ -1,3 +1,4 @@
+use super::char::EscapeDebugExtArgs;
 use super::from_utf8_unchecked;
 use super::validations::utf8_char_width;
 use crate::fmt;
@@ -121,7 +122,11 @@ impl fmt::Debug for Debug<'_> {
                 let valid = chunk.valid();
                 let mut from = 0;
                 for (i, c) in valid.char_indices() {
-                    let esc = c.escape_debug();
+                    let esc = c.escape_debug_ext(EscapeDebugExtArgs {
+                        escape_grapheme_extender: true,
+                        escape_single_quote: false,
+                        escape_double_quote: true,
+                    });
                     // If char needs escaping, flush backlog so far and write, else skip
                     if esc.len() != 1 {
                         f.write_str(&valid[from..i])?;
@@ -147,12 +152,14 @@ impl fmt::Debug for Debug<'_> {
 /// An iterator used to decode a slice of mostly UTF-8 bytes to string slices
 /// ([`&str`]) and byte slices ([`&[u8]`][byteslice]).
 ///
+/// This struct is created by the [`utf8_chunks`] method on bytes slices.
 /// If you want a simple conversion from UTF-8 byte slices to string slices,
 /// [`from_utf8`] is easier to use.
 ///
 /// See the [`Utf8Chunk`] type for documentation of the items yielded by this iterator.
 ///
 /// [byteslice]: slice
+/// [`utf8_chunks`]: slice::utf8_chunks
 /// [`from_utf8`]: super::from_utf8
 ///
 /// # Examples
@@ -204,12 +211,7 @@ impl<'a> Iterator for Utf8Chunks<'a> {
 
         let mut i = 0;
         let mut valid_up_to = 0;
-        while i < self.source.len() {
-            // SAFETY: `i < self.source.len()` per previous line.
-            // For some reason the following are both significantly slower:
-            // while let Some(&byte) = self.source.get(i) {
-            // while let Some(byte) = self.source.get(i).copied() {
-            let byte = unsafe { *self.source.get_unchecked(i) };
+        while let Some(byte) = self.source.get(i).copied() {
             i += 1;
 
             if byte < 128 {

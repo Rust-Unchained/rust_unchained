@@ -12,6 +12,7 @@ pub(crate) struct KindsSrc {
     pub(crate) literals: &'static [&'static str],
     pub(crate) tokens: &'static [&'static str],
     pub(crate) nodes: &'static [&'static str],
+    pub(crate) _enums: &'static [&'static str],
     pub(crate) edition_dependent_keywords: &'static [(&'static str, Edition)],
 }
 
@@ -110,11 +111,25 @@ const RESERVED: &[&str] = &[
 ];
 // keywords that are keywords only in specific parse contexts
 #[doc(alias = "WEAK_KEYWORDS")]
-const CONTEXTUAL_KEYWORDS: &[&str] =
-    &["macro_rules", "union", "default", "raw", "dyn", "auto", "yeet", "safe"];
+const CONTEXTUAL_KEYWORDS: &[&str] = &[
+    "macro_rules",
+    "union",
+    "default",
+    "raw",
+    "dyn",
+    "auto",
+    "yeet",
+    "safe",
+    "bikeshed",
+    "cfg_attr",
+    "cfg",
+    "null",
+];
 // keywords we use for special macro expansions
 const CONTEXTUAL_BUILTIN_KEYWORDS: &[&str] = &[
     "asm",
+    "naked_asm",
+    "global_asm",
     "att_syntax",
     "builtin",
     "clobber_abi",
@@ -136,6 +151,10 @@ const CONTEXTUAL_BUILTIN_KEYWORDS: &[&str] = &[
     // "raw",
     "readonly",
     "sym",
+    "deref",
+    "pattern_type",
+    "is",
+    "include_bytes",
 ];
 
 // keywords that are keywords depending on the edition
@@ -186,9 +205,9 @@ pub(crate) fn generate_kind_src(
             }
         }
     });
-    PUNCT.iter().zip(used_puncts).filter(|(_, used)| !used).for_each(|((punct, _), _)| {
+    if let Some(punct) = PUNCT.iter().zip(used_puncts).find(|(_, used)| !used) {
         panic!("Punctuation {punct:?} is not used in grammar");
-    });
+    }
     keywords.extend(RESERVED.iter().copied());
     keywords.sort();
     keywords.dedup();
@@ -206,13 +225,21 @@ pub(crate) fn generate_kind_src(
     let nodes = nodes
         .iter()
         .map(|it| &it.name)
-        .chain(enums.iter().map(|it| &it.name))
         .map(|it| to_upper_snake_case(it))
         .map(String::leak)
         .map(|it| &*it)
         .collect();
     let nodes = Vec::leak(nodes);
     nodes.sort();
+    let enums = enums
+        .iter()
+        .map(|it| &it.name)
+        .map(|it| to_upper_snake_case(it))
+        .map(String::leak)
+        .map(|it| &*it)
+        .collect();
+    let enums = Vec::leak(enums);
+    enums.sort();
     let keywords = Vec::leak(keywords);
     let contextual_keywords = Vec::leak(contextual_keywords);
     let edition_dependent_keywords = Vec::leak(edition_dependent_keywords);
@@ -224,6 +251,7 @@ pub(crate) fn generate_kind_src(
     KindsSrc {
         punct: PUNCT,
         nodes,
+        _enums: enums,
         keywords,
         contextual_keywords,
         edition_dependent_keywords,
@@ -249,7 +277,7 @@ pub(crate) struct AstNodeSrc {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Field {
-    Token(String),
+    Token { name: Option<String>, token: String },
     Node { name: String, ty: String, cardinality: Cardinality },
 }
 

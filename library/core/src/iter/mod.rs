@@ -233,10 +233,12 @@
 //!
 //! ```
 //! let mut values = vec![41];
-//! for x in &mut values { // same as `values.iter_mut()`
+//! for x in &mut values {
+//!     //   ^ same as `values.iter_mut()`
 //!     *x += 1;
 //! }
-//! for x in &values { // same as `values.iter()`
+//! for x in &values {
+//!     //   ^ same as `values.iter()`
 //!     assert_eq!(*x, 42);
 //! }
 //! assert_eq!(values.len(), 1);
@@ -380,7 +382,7 @@ macro_rules! impl_fold_via_try_fold {
     };
 }
 
-#[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
+#[unstable(feature = "iter_array_chunks", issue = "100450")]
 pub use self::adapters::ArrayChunks;
 #[unstable(feature = "std_internals", issue = "none")]
 pub use self::adapters::ByRefSized;
@@ -392,7 +394,7 @@ pub use self::adapters::Copied;
 pub use self::adapters::Flatten;
 #[stable(feature = "iter_map_while", since = "1.57.0")]
 pub use self::adapters::MapWhile;
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 pub use self::adapters::MapWindows;
 #[unstable(feature = "inplace_iteration", issue = "none")]
 pub use self::adapters::SourceIter;
@@ -402,7 +404,7 @@ pub use self::adapters::StepBy;
 pub use self::adapters::TrustedRandomAccess;
 #[unstable(feature = "trusted_random_access", issue = "none")]
 pub use self::adapters::TrustedRandomAccessNoCoerce;
-#[unstable(feature = "iter_chain", reason = "recently added", issue = "125964")]
+#[stable(feature = "iter_chain", since = "1.91.0")]
 pub use self::adapters::chain;
 pub(crate) use self::adapters::try_process;
 #[stable(feature = "iter_zip", since = "1.59.0")]
@@ -412,7 +414,7 @@ pub use self::adapters::{
     Chain, Cycle, Enumerate, Filter, FilterMap, FlatMap, Fuse, Inspect, Map, Peekable, Rev, Scan,
     Skip, SkipWhile, Take, TakeWhile, Zip,
 };
-#[unstable(feature = "iter_intersperse", reason = "recently added", issue = "79524")]
+#[unstable(feature = "iter_intersperse", issue = "79524")]
 pub use self::adapters::{Intersperse, IntersperseWith};
 #[unstable(
     feature = "step_trait",
@@ -420,6 +422,8 @@ pub use self::adapters::{Intersperse, IntersperseWith};
     issue = "42168"
 )]
 pub use self::range::Step;
+#[unstable(feature = "iter_macro", issue = "142269", reason = "generators are unstable")]
+pub use self::sources::iter;
 #[stable(feature = "iter_empty", since = "1.2.0")]
 pub use self::sources::{Empty, empty};
 #[unstable(
@@ -454,7 +458,6 @@ pub use self::traits::TrustedFused;
 pub use self::traits::TrustedLen;
 #[unstable(feature = "trusted_step", issue = "85731")]
 pub use self::traits::TrustedStep;
-pub(crate) use self::traits::UncheckedIterator;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::traits::{
     DoubleEndedIterator, ExactSizeIterator, Extend, FromIterator, IntoIterator, Product, Sum,

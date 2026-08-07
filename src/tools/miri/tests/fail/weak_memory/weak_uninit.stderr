@@ -2,12 +2,16 @@ error: Undefined Behavior: using uninitialized data, but this operation requires
   --> tests/fail/weak_memory/weak_uninit.rs:LL:CC
    |
 LL |     let j2 = spawn(move || x.load(Ordering::Relaxed));
-   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^ using uninitialized data, but this operation requires initialized memory
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
    |
    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
-   = note: BACKTRACE on thread `unnamed-ID`:
-   = note: inside closure at tests/fail/weak_memory/weak_uninit.rs:LL:CC
+   = note: this is on thread `unnamed-ID`
+note: the current function got called indirectly due to this code
+  --> tests/fail/weak_memory/weak_uninit.rs:LL:CC
+   |
+LL |     let j2 = spawn(move || x.load(Ordering::Relaxed));
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

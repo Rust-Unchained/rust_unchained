@@ -5,8 +5,8 @@ use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::Span;
 use rustc_span::symbol::sym;
+use rustc_span::{Span, kw};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -49,6 +49,7 @@ declare_clippy_lint! {
     suspicious,
     "using `crate` in a macro definition"
 }
+
 declare_lint_pass!(CrateInMacroDef => [CRATE_IN_MACRO_DEF]);
 
 impl EarlyLintPass for CrateInMacroDef {
@@ -105,12 +106,11 @@ fn contains_unhygienic_crate_reference(tts: &TokenStream) -> Option<Span> {
 fn is_crate_keyword(tt: &TokenTree) -> Option<Span> {
     if let TokenTree::Token(
         Token {
-            kind: TokenKind::Ident(symbol, _),
+            kind: TokenKind::Ident(kw::Crate, _),
             span,
         },
         _,
     ) = tt
-        && symbol.as_str() == "crate"
     {
         Some(*span)
     } else {

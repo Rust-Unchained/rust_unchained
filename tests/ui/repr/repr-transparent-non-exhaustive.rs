@@ -1,5 +1,3 @@
-#![deny(repr_transparent_external_private_fields)]
-
 //@ aux-build: repr-transparent-non-exhaustive.rs
 extern crate repr_transparent_non_exhaustive;
 
@@ -24,6 +22,13 @@ pub struct InternalIndirection<T> {
 
 pub type Sized = i32;
 
+pub trait Trait {
+    type Assoc;
+}
+impl Trait for i32 {
+    type Assoc = NonExhaustive;
+}
+
 #[repr(transparent)]
 pub struct T1(Sized, InternalPrivate);
 #[repr(transparent)]
@@ -34,84 +39,72 @@ pub struct T3(Sized, InternalIndirection<(InternalPrivate, InternalNonExhaustive
 pub struct T4(Sized, ExternalIndirection<(InternalPrivate, InternalNonExhaustive)>);
 
 #[repr(transparent)]
-pub struct T5(Sized, Private);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+pub struct T5<T>(T, Private);
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T6(Sized, NonExhaustive);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
+
+#[repr(transparent)]
+pub struct T6a(Sized, <i32 as Trait>::Assoc); // normalizes to `NonExhaustive`
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T7(Sized, NonExhaustiveEnum);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T8(Sized, NonExhaustiveVariant);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T9(Sized, InternalIndirection<Private>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T10(Sized, InternalIndirection<NonExhaustive>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T11(Sized, InternalIndirection<NonExhaustiveEnum>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T12(Sized, InternalIndirection<NonExhaustiveVariant>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T13(Sized, ExternalIndirection<Private>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T14(Sized, ExternalIndirection<NonExhaustive>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T15(Sized, ExternalIndirection<NonExhaustiveEnum>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T16(Sized, ExternalIndirection<NonExhaustiveVariant>);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T17(NonExhaustive, Sized);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T18(NonExhaustive, NonExhaustive);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T19(NonExhaustive, Private);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T19Flipped(Private, NonExhaustive);
-//~^ ERROR zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR needs at most one non-trivial field
 
 #[repr(transparent)]
 pub struct T20(NonExhaustive);

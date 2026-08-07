@@ -120,17 +120,19 @@ note: parameter used here
 LL |         if flag == 0 { 0 } else { Self::_method(flag - 1, a) }
    |                                                           ^
 
-error: parameter is only used in recursion
+error: `self` is only used in recursion
   --> tests/ui/only_used_in_recursion.rs:76:22
    |
 LL |     fn _method_self(&self, flag: usize, a: usize) -> usize {
    |                      ^^^^
    |
-note: parameter used here
+note: `self` used here
   --> tests/ui/only_used_in_recursion.rs:80:35
    |
 LL |         if flag == 0 { 0 } else { self._method_self(flag - 1, a) }
    |                                   ^^^^
+   = note: `-D clippy::self-only-used-in-recursion` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::self_only_used_in_recursion)]`
 
 error: parameter is only used in recursion
   --> tests/ui/only_used_in_recursion.rs:76:41

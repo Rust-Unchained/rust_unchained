@@ -47,6 +47,10 @@ declare_clippy_lint! {
     ///   }
     /// }
     /// ```
+    ///
+    /// ### Note
+    /// Clippy can only lint compiled code. For this lint to trigger, you must configure `cargo clippy`
+    /// to include test compilation, for instance, by using flags such as `--tests` or `--all-targets`.
     #[clippy::version = "1.88.0"]
     pub REDUNDANT_TEST_PREFIX,
     restriction,
@@ -140,7 +144,7 @@ fn name_conflicts<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'_>, fn_name: S
 
     // Also check that within the body of the function there is also no function call
     // with the same name (since it will result in recursion)
-    for_each_expr(cx, body, |expr| {
+    for_each_expr(cx.tcx, body, |expr| {
         if let ExprKind::Path(qpath) = &expr.kind
             && let Some(def_id) = cx.qpath_res(qpath, expr.hir_id).opt_def_id()
             && let Some(name) = tcx.opt_item_name(def_id)

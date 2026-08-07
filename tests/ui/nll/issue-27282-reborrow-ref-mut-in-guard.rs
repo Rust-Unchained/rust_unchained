@@ -1,11 +1,10 @@
+//@ edition:2015..2021
 // Issue 27282: This is a variation on issue-27282-move-ref-mut-into-guard.rs
 //
 // It reborrows instead of moving the `ref mut` pattern borrow. This
 // means that our conservative check for mutation in guards will
 // reject it. But I want to make sure that we continue to reject it
 // (under NLL) even when that conservative check goes away.
-
-#![feature(if_let_guard)]
 
 fn main() {
     let mut b = &mut true;

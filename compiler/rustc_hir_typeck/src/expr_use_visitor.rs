@@ -2,17 +2,16 @@
 //! normal visitor, which just walks the entire body in one shot, the
 //! `ExprUseVisitor` determines how expressions are being used.
 //!
-//! In the compiler, this is only used for upvar inference, but there
+//! In the compiler, this is only used for upvar inference and diagnostics, but there
 //! are many uses within clippy.
 
 use std::cell::{Ref, RefCell};
 use std::ops::Deref;
-use std::slice::from_ref;
 
-use hir::Expr;
 use hir::def::DefKind;
 use hir::pat_util::EnumerateAndAdjustIterator as _;
 use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
+use rustc_ast::UnsafeBinderCastKind;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir::def::{CtorOf, Res};
 use rustc_hir::def_id::LocalDefId;
@@ -22,6 +21,8 @@ use rustc_middle::hir::place::ProjectionKind;
 // Export these here so that Clippy can use them.
 pub use rustc_middle::hir::place::{Place, PlaceBase, PlaceWithHirId, Projection};
 use rustc_middle::mir::FakeReadCause;
+use rustc_middle::thir::DerefPatBorrowMode;
+use rustc_middle::ty::adjustment::DerefAdjustKind;
 use rustc_middle::ty::{
     self, BorrowKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt as _, adjustment,
 };
@@ -158,7 +159,7 @@ pub trait TypeInformationCtxt<'tcx> {
 
     fn resolve_vars_if_possible<T: TypeFoldable<TyCtxt<'tcx>>>(&self, t: T) -> T;
 
-    fn try_structurally_resolve_type(&self, span: Span, ty: Ty<'tcx>) -> Ty<'tcx>;
+    fn structurally_resolve_type(&self, span: Span, ty: Ty<'tcx>) -> Ty<'tcx>;
 
     fn report_bug(&self, span: Span, msg: impl ToString) -> Self::Error;
 
@@ -191,8 +192,8 @@ impl<'tcx> TypeInformationCtxt<'tcx> for &FnCtxt<'_, 'tcx> {
         self.infcx.resolve_vars_if_possible(t)
     }
 
-    fn try_structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
-        (**self).try_structurally_resolve_type(sp, ty)
+    fn structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+        (**self).structurally_resolve_type(sp, ty)
     }
 
     fn report_bug(&self, span: Span, msg: impl ToString) -> Self::Error {
@@ -216,7 +217,7 @@ impl<'tcx> TypeInformationCtxt<'tcx> for &FnCtxt<'_, 'tcx> {
     }
 
     fn body_owner_def_id(&self) -> LocalDefId {
-        self.body_id
+        self.body_def_id
     }
 
     fn tcx(&self) -> TyCtxt<'tcx> {
@@ -233,10 +234,10 @@ impl<'tcx> TypeInformationCtxt<'tcx> for (&LateContext<'tcx>, LocalDefId) {
     type Error = !;
 
     fn typeck_results(&self) -> Self::TypeckResults<'_> {
-        self.0.maybe_typeck_results().expect("expected typeck results")
+        self.0.typeck_results()
     }
 
-    fn try_structurally_resolve_type(&self, _span: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+    fn structurally_resolve_type(&self, _span: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
         // FIXME: Maybe need to normalize here.
         ty
     }
@@ -312,7 +313,8 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
             let param_place = self.cat_rvalue(param.hir_id, param_ty);
 
-            self.walk_irrefutable_pat(&param_place, param.pat)?;
+            self.fake_read_scrutinee(&param_place, false)?;
+            self.walk_pat(&param_place, param.pat, false)?;
         }
 
         self.consume_expr(body.value)?;
@@ -454,13 +456,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
             hir::ExprKind::Match(discr, arms, _) => {
                 let discr_place = self.cat_expr(discr)?;
-                self.maybe_read_scrutinee(
-                    discr,
-                    discr_place.clone(),
-                    arms.iter().map(|arm| arm.pat),
-                )?;
+                self.fake_read_scrutinee(&discr_place, true)?;
+                self.walk_expr(discr)?;
 
-                // treatment of the discriminant is handled while walking the arms.
                 for arm in arms {
                     self.walk_arm(&discr_place, arm)?;
                 }
@@ -597,116 +595,25 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         Ok(())
     }
 
-    fn maybe_read_scrutinee<'t>(
+    #[instrument(skip(self), level = "debug")]
+    fn fake_read_scrutinee(
         &self,
-        discr: &Expr<'_>,
-        discr_place: PlaceWithHirId<'tcx>,
-        pats: impl Iterator<Item = &'t hir::Pat<'t>>,
+        discr_place: &PlaceWithHirId<'tcx>,
+        refutable: bool,
     ) -> Result<(), Cx::Error> {
-        // Matching should not always be considered a use of the place, hence
-        // discr does not necessarily need to be borrowed.
-        // We only want to borrow discr if the pattern contain something other
-        // than wildcards.
-        let mut needs_to_be_read = false;
-        for pat in pats {
-            self.cat_pattern(discr_place.clone(), pat, &mut |place, pat| {
-                match &pat.kind {
-                    PatKind::Missing => unreachable!(),
-                    PatKind::Binding(.., opt_sub_pat) => {
-                        // If the opt_sub_pat is None, then the binding does not count as
-                        // a wildcard for the purpose of borrowing discr.
-                        if opt_sub_pat.is_none() {
-                            needs_to_be_read = true;
-                        }
-                    }
-                    PatKind::Never => {
-                        // A never pattern reads the value.
-                        // FIXME(never_patterns): does this do what I expect?
-                        needs_to_be_read = true;
-                    }
-                    PatKind::Expr(PatExpr { kind: PatExprKind::Path(qpath), hir_id, span }) => {
-                        // A `Path` pattern is just a name like `Foo`. This is either a
-                        // named constant or else it refers to an ADT variant
+        let closure_def_id = match discr_place.place.base {
+            PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id),
+            _ => None,
+        };
 
-                        let res = self.cx.typeck_results().qpath_res(qpath, *hir_id);
-                        match res {
-                            Res::Def(DefKind::Const, _) | Res::Def(DefKind::AssocConst, _) => {
-                                // Named constants have to be equated with the value
-                                // being matched, so that's a read of the value being matched.
-                                //
-                                // FIXME: We don't actually reads for ZSTs.
-                                needs_to_be_read = true;
-                            }
-                            _ => {
-                                // Otherwise, this is a struct/enum variant, and so it's
-                                // only a read if we need to read the discriminant.
-                                needs_to_be_read |=
-                                    self.is_multivariant_adt(place.place.ty(), *span);
-                            }
-                        }
-                    }
-                    PatKind::TupleStruct(..) | PatKind::Struct(..) | PatKind::Tuple(..) => {
-                        // For `Foo(..)`, `Foo { ... }` and `(...)` patterns, check if we are matching
-                        // against a multivariant enum or struct. In that case, we have to read
-                        // the discriminant. Otherwise this kind of pattern doesn't actually
-                        // read anything (we'll get invoked for the `...`, which may indeed
-                        // perform some reads).
-
-                        let place_ty = place.place.ty();
-                        needs_to_be_read |= self.is_multivariant_adt(place_ty, pat.span);
-                    }
-                    PatKind::Expr(_) | PatKind::Range(..) => {
-                        // If the PatKind is a Lit or a Range then we want
-                        // to borrow discr.
-                        needs_to_be_read = true;
-                    }
-                    PatKind::Slice(lhs, wild, rhs) => {
-                        // We don't need to test the length if the pattern is `[..]`
-                        if matches!((lhs, wild, rhs), (&[], Some(_), &[]))
-                            // Arrays have a statically known size, so
-                            // there is no need to read their length
-                            || place.place.ty().peel_refs().is_array()
-                        {
-                        } else {
-                            needs_to_be_read = true;
-                        }
-                    }
-                    PatKind::Or(_)
-                    | PatKind::Box(_)
-                    | PatKind::Deref(_)
-                    | PatKind::Ref(..)
-                    | PatKind::Guard(..)
-                    | PatKind::Wild
-                    | PatKind::Err(_) => {
-                        // If the PatKind is Or, Box, or Ref, the decision is made later
-                        // as these patterns contains subpatterns
-                        // If the PatKind is Wild or Err, the decision is made based on the other patterns
-                        // being examined
-                    }
-                }
-
-                Ok(())
-            })?
-        }
-
-        if needs_to_be_read {
-            self.borrow_expr(discr, BorrowKind::Immutable)?;
+        let cause = if refutable {
+            FakeReadCause::ForMatchedPlace(closure_def_id)
         } else {
-            let closure_def_id = match discr_place.place.base {
-                PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id),
-                _ => None,
-            };
+            FakeReadCause::ForLet(closure_def_id)
+        };
 
-            self.delegate.borrow_mut().fake_read(
-                &discr_place,
-                FakeReadCause::ForMatchedPlace(closure_def_id),
-                discr_place.hir_id,
-            );
+        self.delegate.borrow_mut().fake_read(discr_place, cause, discr_place.hir_id);
 
-            // We always want to walk the discriminant. We want to make sure, for instance,
-            // that the discriminant has been initialized.
-            self.walk_expr(discr)?;
-        }
         Ok(())
     }
 
@@ -723,12 +630,11 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         self.walk_expr(expr)?;
         let expr_place = self.cat_expr(expr)?;
         f()?;
+        self.fake_read_scrutinee(&expr_place, els.is_some())?;
+        self.walk_pat(&expr_place, pat, false)?;
         if let Some(els) = els {
-            // borrowing because we need to test the discriminant
-            self.maybe_read_scrutinee(expr, expr_place.clone(), from_ref(pat).iter())?;
             self.walk_block(els)?;
         }
-        self.walk_irrefutable_pat(&expr_place, pat)?;
         Ok(())
     }
 
@@ -767,7 +673,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
         let with_expr = match *opt_with {
             hir::StructTailExpr::Base(w) => &*w,
-            hir::StructTailExpr::DefaultFields(_) | hir::StructTailExpr::None => {
+            hir::StructTailExpr::DefaultFields(_)
+            | hir::StructTailExpr::None
+            | hir::StructTailExpr::NoneWithError(_) => {
                 return Ok(());
             }
         };
@@ -776,7 +684,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
         // Select just those fields of the `with`
         // expression that will actually be used
-        match self.cx.try_structurally_resolve_type(with_expr.span, with_place.place.ty()).kind() {
+        match self.cx.structurally_resolve_type(with_expr.span, with_place.place.ty()).kind() {
             ty::Adt(adt, args) if adt.is_struct() => {
                 // Consume those fields of the with expression that are needed.
                 for (f_index, with_field) in adt.non_enum_variant().fields.iter_enumerated() {
@@ -787,7 +695,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                         let field_place = self.cat_projection(
                             with_expr.hir_id,
                             with_place.clone(),
-                            with_field.ty(self.cx.tcx(), args),
+                            with_field.ty(self.cx.tcx(), args).skip_norm_wip(),
                             ProjectionKind::Field(f_index, FIRST_VARIANT),
                         );
                         self.consume_or_copy(&field_place, field_place.hir_id);
@@ -819,7 +727,8 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         let typeck_results = self.cx.typeck_results();
         let adjustments = typeck_results.expr_adjustments(expr);
         let mut place_with_id = self.cat_expr_unadjusted(expr)?;
-        for adjustment in adjustments {
+        for (adjustment_index, adjustment) in adjustments.iter().enumerate() {
+            let is_last_adjustment = adjustment_index + 1 == adjustments.len();
             debug!("walk_adjustment expr={:?} adj={:?}", expr, adjustment);
             match adjustment.kind {
                 adjustment::Adjust::NeverToAny | adjustment::Adjust::Pointer(_) => {
@@ -828,14 +737,14 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     self.consume_or_copy(&place_with_id, place_with_id.hir_id);
                 }
 
-                adjustment::Adjust::Deref(None) => {}
+                adjustment::Adjust::Deref(DerefAdjustKind::Builtin | DerefAdjustKind::Pin) => {}
 
                 // Autoderefs for overloaded Deref calls in fact reference
                 // their receiver. That is, if we have `(*x)` where `x`
                 // is of type `Rc<T>`, then this in fact is equivalent to
                 // `x.deref()`. Since `deref()` is declared with `&self`,
                 // this is an autoref of `x`.
-                adjustment::Adjust::Deref(Some(ref deref)) => {
+                adjustment::Adjust::Deref(DerefAdjustKind::Overloaded(deref)) => {
                     let bk = ty::BorrowKind::from_mutbl(deref.mutbl);
                     self.delegate.borrow_mut().borrow(&place_with_id, place_with_id.hir_id, bk);
                 }
@@ -844,14 +753,13 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     self.walk_autoref(expr, &place_with_id, autoref);
                 }
 
-                adjustment::Adjust::ReborrowPin(mutbl) => {
-                    // Reborrowing a Pin is like a combinations of a deref and a borrow, so we do
-                    // both.
-                    let bk = match mutbl {
-                        ty::Mutability::Not => ty::BorrowKind::Immutable,
-                        ty::Mutability::Mut => ty::BorrowKind::Mutable,
-                    };
+                adjustment::Adjust::GenericReborrow(mutability) if is_last_adjustment => {
+                    let bk = ty::BorrowKind::from_mutbl(mutability);
                     self.delegate.borrow_mut().borrow(&place_with_id, place_with_id.hir_id, bk);
+                }
+
+                adjustment::Adjust::GenericReborrow(_) => {
+                    span_bug!(expr.span, "generic reborrow adjustment must be terminal");
                 }
             }
             place_with_id = self.cat_expr_adjusted(expr, place_with_id, adjustment)?;
@@ -883,7 +791,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 );
             }
 
-            adjustment::AutoBorrow::RawPtr(m) => {
+            adjustment::AutoBorrow::RawPtr(m) | adjustment::AutoBorrow::Pin(m) => {
                 debug!("walk_autoref: expr.hir_id={} base_place={:?}", expr.hir_id, base_place);
 
                 self.delegate.borrow_mut().borrow(
@@ -900,16 +808,6 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         discr_place: &PlaceWithHirId<'tcx>,
         arm: &hir::Arm<'_>,
     ) -> Result<(), Cx::Error> {
-        let closure_def_id = match discr_place.place.base {
-            PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id),
-            _ => None,
-        };
-
-        self.delegate.borrow_mut().fake_read(
-            discr_place,
-            FakeReadCause::ForMatchedPlace(closure_def_id),
-            discr_place.hir_id,
-        );
         self.walk_pat(discr_place, arm.pat, arm.guard.is_some())?;
 
         if let Some(ref e) = arm.guard {
@@ -920,28 +818,18 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         Ok(())
     }
 
-    /// Walks a pat that occurs in isolation (i.e., top-level of fn argument or
-    /// let binding, and *not* a match arm or nested pat.)
-    fn walk_irrefutable_pat(
-        &self,
-        discr_place: &PlaceWithHirId<'tcx>,
-        pat: &hir::Pat<'_>,
-    ) -> Result<(), Cx::Error> {
-        let closure_def_id = match discr_place.place.base {
-            PlaceBase::Upvar(upvar_id) => Some(upvar_id.closure_expr_id),
-            _ => None,
-        };
-
-        self.delegate.borrow_mut().fake_read(
-            discr_place,
-            FakeReadCause::ForLet(closure_def_id),
-            discr_place.hir_id,
-        );
-        self.walk_pat(discr_place, pat, false)?;
-        Ok(())
-    }
-
     /// The core driver for walking a pattern
+    ///
+    /// This should mirror how pattern-matching gets lowered to MIR, as
+    /// otherwise said lowering will ICE when trying to resolve the upvars.
+    ///
+    /// However, it is okay to approximate it here by doing *more* accesses than
+    /// the actual MIR builder will, which is useful when some checks are too
+    /// cumbersome to perform here, because e.g. they require more typeck results
+    /// than available.
+    ///
+    /// Do note that discrepancies like these do still create obscure corners
+    /// in the semantics of the language, and should be avoided if possible.
     #[instrument(skip(self), level = "debug")]
     fn walk_pat(
         &self,
@@ -951,6 +839,11 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     ) -> Result<(), Cx::Error> {
         let tcx = self.cx.tcx();
         self.cat_pattern(discr_place.clone(), pat, &mut |place, pat| {
+            debug!("walk_pat: pat.kind={:?}", pat.kind);
+            let read_discriminant = || {
+                self.delegate.borrow_mut().borrow(place, discr_place.hir_id, BorrowKind::Immutable);
+            };
+
             match pat.kind {
                 PatKind::Binding(_, canonical_id, ..) => {
                     debug!("walk_pat: binding place={:?} pat={:?}", place, pat);
@@ -973,11 +866,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     // binding when lowering pattern guards to ensure that the guard does not
                     // modify the scrutinee.
                     if has_guard {
-                        self.delegate.borrow_mut().borrow(
-                            place,
-                            discr_place.hir_id,
-                            BorrowKind::Immutable,
-                        );
+                        read_discriminant();
                     }
 
                     // It is also a borrow or copy/move of the value being matched.
@@ -985,7 +874,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     // of the pattern, as this just looks confusing, instead use the span
                     // of the discriminant.
                     match bm.0 {
-                        hir::ByRef::Yes(m) => {
+                        hir::ByRef::Yes(_, m) => {
                             let bk = ty::BorrowKind::from_mutbl(m);
                             self.delegate.borrow_mut().borrow(place, discr_place.hir_id, bk);
                         }
@@ -1003,7 +892,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     // Deref patterns on boxes don't borrow, so we ignore them here.
                     // HACK: this could be a fake pattern corresponding to a deref inserted by match
                     // ergonomics, in which case `pat.hir_id` will be the id of the subpattern.
-                    if let hir::ByRef::Yes(mutability) =
+                    if let DerefPatBorrowMode::Borrow(mutability) =
                         self.cx.typeck_results().deref_pat_borrow_mode(place.place.ty(), subpattern)
                     {
                         let bk = ty::BorrowKind::from_mutbl(mutability);
@@ -1013,13 +902,74 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 PatKind::Never => {
                     // A `!` pattern always counts as an immutable read of the discriminant,
                     // even in an irrefutable pattern.
-                    self.delegate.borrow_mut().borrow(
-                        place,
-                        discr_place.hir_id,
-                        BorrowKind::Immutable,
-                    );
+                    read_discriminant();
                 }
-                _ => {}
+                PatKind::Expr(PatExpr { kind: PatExprKind::Path(qpath), hir_id, span }) => {
+                    // A `Path` pattern is just a name like `Foo`. This is either a
+                    // named constant or else it refers to an ADT variant
+
+                    let res = self.cx.typeck_results().qpath_res(qpath, *hir_id);
+                    match res {
+                        Res::Def(DefKind::Const { .. }, _)
+                        | Res::Def(DefKind::AssocConst { .. }, _) => {
+                            // Named constants have to be equated with the value
+                            // being matched, so that's a read of the value being matched.
+                            //
+                            // FIXME: Does the MIR code skip this read when matching on a ZST?
+                            // If so, we can also skip it here.
+                            read_discriminant();
+                        }
+                        _ => {
+                            // Otherwise, this is a struct/enum variant, and so it's
+                            // only a read if we need to read the discriminant.
+                            if self.is_multivariant_adt(place.place.ty(), *span) {
+                                read_discriminant();
+                            }
+                        }
+                    }
+                }
+                PatKind::Expr(_) | PatKind::Range(..) => {
+                    // When matching against a literal or range, we need to
+                    // borrow the place to compare it against the pattern.
+                    //
+                    // Note that we do this read even if the range matches all
+                    // possible values, such as 0..=u8::MAX. This is because
+                    // we don't want to depend on consteval here.
+                    //
+                    // FIXME: What if the type being matched only has one
+                    // possible value?
+                    read_discriminant();
+                }
+                PatKind::Struct(..) | PatKind::TupleStruct(..) => {
+                    if self.is_multivariant_adt(place.place.ty(), pat.span) {
+                        read_discriminant();
+                    }
+                }
+                PatKind::Slice(lhs, wild, rhs) => {
+                    // We don't need to test the length if the pattern is `[..]`
+                    if matches!((lhs, wild, rhs), (&[], Some(_), &[]))
+                        // Arrays have a statically known size, so
+                        // there is no need to read their length
+                        || place.place.ty().peel_refs().is_array()
+                    {
+                        // No read necessary
+                    } else {
+                        read_discriminant();
+                    }
+                }
+                PatKind::Or(_)
+                | PatKind::Box(_)
+                | PatKind::Ref(..)
+                | PatKind::Guard(..)
+                | PatKind::Tuple(..)
+                | PatKind::Wild
+                | PatKind::Missing
+                | PatKind::Err(_) => {
+                    // If the PatKind is Or, Box, Ref, Guard, or Tuple, the relevant accesses
+                    // are made later as these patterns contains subpatterns.
+                    // If the PatKind is Missing, Wild or Err, any relevant accesses are made when processing
+                    // the other patterns that are part of the match
+                }
             }
 
             Ok(())
@@ -1176,7 +1126,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 /// two operations: a dereference to reach the array data and then an index to
 /// jump forward to the relevant item.
 impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx, Cx, D> {
-    fn resolve_type_vars_or_bug(
+    fn expect_and_resolve_type(
         &self,
         id: HirId,
         ty: Option<Ty<'tcx>>,
@@ -1185,12 +1135,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             Some(ty) => {
                 let ty = self.cx.resolve_vars_if_possible(ty);
                 self.cx.error_reported_in_ty(ty)?;
-                if ty.is_ty_var() {
-                    debug!("resolve_type_vars_or_bug: infer var from {:?}", ty);
-                    Err(self.cx.report_bug(self.cx.tcx().hir_span(id), "encountered type variable"))
-                } else {
-                    Ok(ty)
-                }
+                Ok(ty)
             }
             None => {
                 // FIXME: We shouldn't be relying on the infcx being tainted.
@@ -1201,15 +1146,15 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     }
 
     fn node_ty(&self, hir_id: HirId) -> Result<Ty<'tcx>, Cx::Error> {
-        self.resolve_type_vars_or_bug(hir_id, self.cx.typeck_results().node_type_opt(hir_id))
+        self.expect_and_resolve_type(hir_id, self.cx.typeck_results().node_type_opt(hir_id))
     }
 
     fn expr_ty(&self, expr: &hir::Expr<'_>) -> Result<Ty<'tcx>, Cx::Error> {
-        self.resolve_type_vars_or_bug(expr.hir_id, self.cx.typeck_results().expr_ty_opt(expr))
+        self.expect_and_resolve_type(expr.hir_id, self.cx.typeck_results().expr_ty_opt(expr))
     }
 
     fn expr_ty_adjusted(&self, expr: &hir::Expr<'_>) -> Result<Ty<'tcx>, Cx::Error> {
-        self.resolve_type_vars_or_bug(
+        self.expect_and_resolve_type(
             expr.hir_id,
             self.cx.typeck_results().expr_ty_adjusted_opt(expr),
         )
@@ -1235,7 +1180,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 debug!("pat_ty(pat={:?}) found adjustment `{:?}`", pat, first_adjust);
                 return Ok(first_adjust.source);
             }
-        } else if let PatKind::Ref(subpat, _) = pat.kind
+        } else if let PatKind::Ref(subpat, _, _) = pat.kind
             && self.cx.typeck_results().skipped_ref_pats().contains(pat.hir_id)
         {
             return self.pat_ty_adjusted(subpat);
@@ -1260,18 +1205,23 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     .get(pat.hir_id)
                     .expect("missing binding mode");
 
-                if matches!(bm.0, hir::ByRef::Yes(_)) {
+                if let hir::ByRef::Yes(pinnedness, _) = bm.0 {
+                    let base_ty = if pinnedness.is_pinned() {
+                        base_ty.pinned_ty().ok_or_else(|| {
+                            debug!("By-pin-ref binding of non-`Pin` type: {base_ty:?}");
+                            self.cx.report_bug(pat.span, "by-pin-ref binding of non-`Pin` type")
+                        })?
+                    } else {
+                        base_ty
+                    };
                     // a bind-by-ref means that the base_ty will be the type of the ident itself,
                     // but what we want here is the type of the underlying value being borrowed.
                     // So peel off one-level, turning the &T into T.
-                    match self
-                        .cx
-                        .try_structurally_resolve_type(pat.span, base_ty)
-                        .builtin_deref(false)
+                    match self.cx.structurally_resolve_type(pat.span, base_ty).builtin_deref(false)
                     {
                         Some(ty) => Ok(ty),
                         None => {
-                            debug!("By-ref binding of non-derefable type");
+                            debug!("By-ref binding of non-derefable type: {base_ty:?}");
                             Err(self
                                 .cx
                                 .report_bug(pat.span, "by-ref binding of non-derefable type"))
@@ -1324,9 +1274,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     {
         let target = self.cx.resolve_vars_if_possible(adjustment.target);
         match adjustment.kind {
-            adjustment::Adjust::Deref(overloaded) => {
+            adjustment::Adjust::Deref(deref_kind) => {
                 // Equivalent to *expr or something similar.
-                let base = if let Some(deref) = overloaded {
+                let base = if let DerefAdjustKind::Overloaded(deref) = deref_kind {
                     let ref_ty = Ty::new_ref(
                         self.cx.tcx(),
                         self.cx.tcx().lifetimes.re_erased,
@@ -1343,7 +1293,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             adjustment::Adjust::NeverToAny
             | adjustment::Adjust::Pointer(_)
             | adjustment::Adjust::Borrow(_)
-            | adjustment::Adjust::ReborrowPin(..) => {
+            | adjustment::Adjust::GenericReborrow(..) => {
                 // Result is an rvalue.
                 Ok(self.cat_rvalue(expr.hir_id, target))
             }
@@ -1401,10 +1351,18 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 self.cat_res(expr.hir_id, expr.span, expr_ty, res)
             }
 
-            // both type ascription and unsafe binder casts don't affect
-            // the place-ness of the subexpression.
+            // type ascription doesn't affect the place-ness of the subexpression.
             hir::ExprKind::Type(e, _) => self.cat_expr(e),
-            hir::ExprKind::UnsafeBinderCast(_, e, _) => self.cat_expr(e),
+
+            hir::ExprKind::UnsafeBinderCast(UnsafeBinderCastKind::Unwrap, e, _) => {
+                let base = self.cat_expr(e)?;
+                Ok(self.cat_projection(
+                    expr.hir_id,
+                    base,
+                    expr_ty,
+                    ProjectionKind::UnwrapUnsafeBinder,
+                ))
+            }
 
             hir::ExprKind::AddrOf(..)
             | hir::ExprKind::Call(..)
@@ -1435,6 +1393,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             | hir::ExprKind::Repeat(..)
             | hir::ExprKind::InlineAsm(..)
             | hir::ExprKind::OffsetOf(..)
+            | hir::ExprKind::UnsafeBinderCast(UnsafeBinderCastKind::Wrap, ..)
             | hir::ExprKind::Err(_) => Ok(self.cat_rvalue(expr.hir_id, expr_ty)),
         }
     }
@@ -1449,9 +1408,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         match res {
             Res::Def(
                 DefKind::Ctor(..)
-                | DefKind::Const
+                | DefKind::Const { .. }
                 | DefKind::ConstParam
-                | DefKind::AssocConst
+                | DefKind::AssocConst { .. }
                 | DefKind::Fn
                 | DefKind::AssocFn,
                 _,
@@ -1513,11 +1472,8 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             if node_ty != place_ty
                 && self
                     .cx
-                    .try_structurally_resolve_type(
-                        self.cx.tcx().hir_span(base_place.hir_id),
-                        place_ty,
-                    )
-                    .is_impl_trait()
+                    .structurally_resolve_type(self.cx.tcx().hir_span(base_place.hir_id), place_ty)
+                    .is_opaque()
             {
                 projections.push(Projection { kind: ProjectionKind::OpaqueCast, ty: node_ty });
             }
@@ -1538,7 +1494,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         let base_ty = self.expr_ty_adjusted(base)?;
 
         let ty::Ref(region, _, mutbl) =
-            *self.cx.try_structurally_resolve_type(base.span, base_ty).kind()
+            *self.cx.structurally_resolve_type(base.span, base_ty).kind()
         else {
             span_bug!(expr.span, "cat_overloaded_place: base is not a reference");
         };
@@ -1554,19 +1510,15 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         base_place: PlaceWithHirId<'tcx>,
     ) -> Result<PlaceWithHirId<'tcx>, Cx::Error> {
         let base_curr_ty = base_place.place.ty();
-        let deref_ty = match self
+        let Some(deref_ty) = self
             .cx
-            .try_structurally_resolve_type(self.cx.tcx().hir_span(base_place.hir_id), base_curr_ty)
+            .structurally_resolve_type(self.cx.tcx().hir_span(base_place.hir_id), base_curr_ty)
             .builtin_deref(true)
-        {
-            Some(ty) => ty,
-            None => {
-                debug!("explicit deref of non-derefable type: {:?}", base_curr_ty);
-                return Err(self.cx.report_bug(
-                    self.cx.tcx().hir_span(node),
-                    "explicit deref of non-derefable type",
-                ));
-            }
+        else {
+            debug!("explicit deref of non-derefable type: {:?}", base_curr_ty);
+            return Err(self
+                .cx
+                .report_bug(self.cx.tcx().hir_span(node), "explicit deref of non-derefable type"));
         };
         let mut projections = base_place.place.projections;
         projections.push(Projection { kind: ProjectionKind::Deref, ty: deref_ty });
@@ -1584,7 +1536,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     ) -> Result<VariantIdx, Cx::Error> {
         let res = self.cx.typeck_results().qpath_res(qpath, pat_hir_id);
         let ty = self.cx.typeck_results().node_type(pat_hir_id);
-        let ty::Adt(adt_def, _) = self.cx.try_structurally_resolve_type(span, ty).kind() else {
+        let ty::Adt(adt_def, _) = self.cx.structurally_resolve_type(span, ty).kind() else {
             return Err(self
                 .cx
                 .report_bug(span, "struct or tuple struct pattern not applied to an ADT"));
@@ -1616,7 +1568,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         span: Span,
     ) -> Result<usize, Cx::Error> {
         let ty = self.cx.typeck_results().node_type(pat_hir_id);
-        match self.cx.try_structurally_resolve_type(span, ty).kind() {
+        match self.cx.structurally_resolve_type(span, ty).kind() {
             ty::Adt(adt_def, _) => Ok(adt_def.variant(variant_index).fields.len()),
             _ => {
                 self.cx
@@ -1631,7 +1583,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     /// Here `pat_hir_id` is the HirId of the pattern itself.
     fn total_fields_in_tuple(&self, pat_hir_id: HirId, span: Span) -> Result<usize, Cx::Error> {
         let ty = self.cx.typeck_results().node_type(pat_hir_id);
-        match self.cx.try_structurally_resolve_type(span, ty).kind() {
+        match self.cx.structurally_resolve_type(span, ty).kind() {
             ty::Tuple(args) => Ok(args.len()),
             _ => Err(self.cx.report_bug(span, "tuple pattern not applied to a tuple")),
         }
@@ -1706,6 +1658,18 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                         None => self.pat_ty_unadjusted(pat)?,
                     };
                     self.pat_deref_place(pat.hir_id, place_with_id, pat, target_ty)?
+                }
+                adjustment::PatAdjust::PinDeref => {
+                    debug!("`PinDeref` of non-pinned-reference type: {:?}", adjust.source);
+                    let target_ty = adjust.source.pinned_ty().ok_or_else(|| {
+                        self.cx.report_bug(
+                            self.cx.tcx().hir_span(pat.hir_id),
+                            "`PinDeref` of non-pinned-reference type",
+                        )
+                    })?;
+                    let kind = ProjectionKind::Field(FieldIdx::ZERO, FIRST_VARIANT);
+                    place_with_id = self.cat_projection(pat.hir_id, place_with_id, target_ty, kind);
+                    self.cat_deref(pat.hir_id, place_with_id)?
                 }
             };
         }
@@ -1798,13 +1762,13 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 self.cat_pattern(place_with_id, subpat, op)?;
             }
 
-            PatKind::Ref(subpat, _)
+            PatKind::Ref(subpat, _, _)
                 if self.cx.typeck_results().skipped_ref_pats().contains(pat.hir_id) =>
             {
                 self.cat_pattern(place_with_id, subpat, op)?;
             }
 
-            PatKind::Box(subpat) | PatKind::Ref(subpat, _) => {
+            PatKind::Box(subpat) | PatKind::Ref(subpat, _, _) => {
                 // box p1, &p1, &mut p1. we can ignore the mutability of
                 // PatKind::Ref since that information is already contained
                 // in the type.
@@ -1820,7 +1784,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             PatKind::Slice(before, ref slice, after) => {
                 let Some(element_ty) = self
                     .cx
-                    .try_structurally_resolve_type(pat.span, place_with_id.place.ty())
+                    .structurally_resolve_type(pat.span, place_with_id.place.ty())
                     .builtin_index()
                 else {
                     debug!("explicit index of non-indexable type {:?}", place_with_id);
@@ -1876,9 +1840,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     ) -> Result<PlaceWithHirId<'tcx>, Cx::Error> {
         match self.cx.typeck_results().deref_pat_borrow_mode(base_place.place.ty(), inner) {
             // Deref patterns on boxes are lowered using a built-in deref.
-            hir::ByRef::No => self.cat_deref(hir_id, base_place),
+            DerefPatBorrowMode::Box => self.cat_deref(hir_id, base_place),
             // For other types, we create a temporary to match on.
-            hir::ByRef::Yes(mutability) => {
+            DerefPatBorrowMode::Borrow(mutability) => {
                 let re_erased = self.cx.tcx().lifetimes.re_erased;
                 let ty = Ty::new_ref(self.cx.tcx(), re_erased, target_ty, mutability);
                 // A deref pattern stores the result of `Deref::deref` or `DerefMut::deref_mut` ...
@@ -1889,15 +1853,40 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         }
     }
 
+    /// Checks whether a type has multiple variants, and therefore, whether a
+    /// read of the discriminant might be necessary.
+    #[instrument(skip(self, span), level = "debug")]
     fn is_multivariant_adt(&self, ty: Ty<'tcx>, span: Span) -> bool {
-        if let ty::Adt(def, _) = self.cx.try_structurally_resolve_type(span, ty).kind() {
-            // Note that if a non-exhaustive SingleVariant is defined in another crate, we need
-            // to assume that more cases will be added to the variant in the future. This mean
-            // that we should handle non-exhaustive SingleVariant the same way we would handle
-            // a MultiVariant.
-            def.variants().len() > 1 || def.variant_list_has_applicable_non_exhaustive()
+        if let ty::Adt(def, _) = self.cx.structurally_resolve_type(span, ty).kind() {
+            // We treat non-exhaustive enums the same independent of the crate they are
+            // defined in, to avoid differences in the operational semantics between crates.
+            def.variants().len() > 1 || def.is_variant_list_non_exhaustive()
         } else {
             false
         }
     }
+}
+
+struct ExprPlaceDelegate;
+
+impl<'tcx> Delegate<'tcx> for ExprPlaceDelegate {
+    fn consume(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId) {}
+
+    fn use_cloned(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId) {}
+
+    fn borrow(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId, _: ty::BorrowKind) {}
+
+    fn mutate(&mut self, _: &PlaceWithHirId<'tcx>, _: HirId) {}
+
+    fn fake_read(&mut self, _: &PlaceWithHirId<'tcx>, _: FakeReadCause, _: HirId) {}
+}
+
+/// Categorizes `expr` as a place for diagnostic suggestions.
+///
+/// This should be used for diagnostics purpose only.
+pub(crate) fn expr_place<'tcx>(
+    fcx: &FnCtxt<'_, 'tcx>,
+    expr: &hir::Expr<'_>,
+) -> Result<PlaceWithHirId<'tcx>, ErrorGuaranteed> {
+    ExprUseVisitor::new(fcx, ExprPlaceDelegate).cat_expr(expr)
 }

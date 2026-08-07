@@ -1,3 +1,4 @@
+mod duplicate_underscore_argument;
 mod impl_trait_in_params;
 mod misnamed_getters;
 mod must_use;
@@ -9,60 +10,182 @@ mod too_many_arguments;
 mod too_many_lines;
 
 use clippy_config::Conf;
-use clippy_utils::def_path_def_ids;
 use clippy_utils::msrvs::Msrv;
+use clippy_utils::paths::{PathNS, lookup_path_str};
+use rustc_ast::{self as ast, visit};
 use rustc_hir as hir;
 use rustc_hir::intravisit;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
+use rustc_session::{declare_lint_pass, impl_lint_pass};
 use rustc_span::Span;
 use rustc_span::def_id::{DefIdSet, LocalDefId};
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for functions with too many parameters.
+    /// Checks for a `#[must_use]` attribute without
+    /// further information on functions and methods that return a type already
+    /// marked as `#[must_use]`.
     ///
     /// ### Why is this bad?
-    /// Functions with lots of parameters are considered bad
-    /// style and reduce readability (“what does the 5th parameter mean?”). Consider
-    /// grouping some parameters into a new type.
+    /// The attribute isn't needed. Not using the result
+    /// will already be reported. Alternatively, one can add some text to the
+    /// attribute to improve the lint message.
     ///
-    /// ### Example
+    /// ### Examples
     /// ```no_run
-    /// # struct Color;
-    /// fn foo(x: u32, y: u32, name: &str, c: Color, w: f32, h: f32, a: f32, b: f32) {
-    ///     // ..
+    /// #[must_use]
+    /// fn double_must_use() -> Result<(), ()> {
+    ///     unimplemented!();
     /// }
     /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub TOO_MANY_ARGUMENTS,
-    complexity,
-    "functions with too many arguments"
+    #[clippy::version = "1.40.0"]
+    pub DOUBLE_MUST_USE,
+    style,
+    "`#[must_use]` attribute on a `#[must_use]`-returning function / method"
 }
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for functions with a large amount of lines.
+    /// Checks for function arguments having the similar names
+    /// differing by an underscore.
     ///
     /// ### Why is this bad?
-    /// Functions with a lot of lines are harder to understand
-    /// due to having to look at a larger amount of code to understand what the
-    /// function is doing. Consider splitting the body of the function into
-    /// multiple functions.
+    /// It affects code readability.
     ///
     /// ### Example
     /// ```no_run
-    /// fn im_too_long() {
-    ///     println!("");
-    ///     // ... 100 more LoC
-    ///     println!("");
+    /// fn foo(a: i32, _a: i32) {}
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// fn bar(a: i32, _b: i32) {}
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub DUPLICATE_UNDERSCORE_ARGUMENT,
+    style,
+    "function arguments having names which only differ by an underscore"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Lints when `impl Trait` is being used in a function's parameters.
+    ///
+    /// ### Why restrict this?
+    /// Turbofish syntax (`::<>`) cannot be used to specify the type of an `impl Trait` parameter,
+    /// making `impl Trait` less powerful. Readability may also be a factor.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// trait MyTrait {}
+    /// fn foo(a: impl MyTrait) {
+    /// 	// [...]
     /// }
     /// ```
-    #[clippy::version = "1.34.0"]
-    pub TOO_MANY_LINES,
+    /// Use instead:
+    /// ```no_run
+    /// trait MyTrait {}
+    /// fn foo<T: MyTrait>(a: T) {
+    /// 	// [...]
+    /// }
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub IMPL_TRAIT_IN_PARAMS,
+    restriction,
+    "`impl Trait` is used in the function's parameters"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for getter methods that return a field that doesn't correspond
+    /// to the name of the method, when there is a field's whose name matches that of the method.
+    ///
+    /// ### Why is this bad?
+    /// It is most likely that such a method is a bug caused by a typo or by copy-pasting.
+    ///
+    /// ### Example
+
+    /// ```no_run
+    /// struct A {
+    ///     a: String,
+    ///     b: String,
+    /// }
+    ///
+    /// impl A {
+    ///     fn a(&self) -> &str{
+    ///         &self.b
+    ///     }
+    /// }
+
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// struct A {
+    ///     a: String,
+    ///     b: String,
+    /// }
+    ///
+    /// impl A {
+    ///     fn a(&self) -> &str{
+    ///         &self.a
+    ///     }
+    /// }
+    /// ```
+    #[clippy::version = "1.67.0"]
+    pub MISNAMED_GETTERS,
+    suspicious,
+    "getter method returning the wrong field"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for public functions that have no
+    /// `#[must_use]` attribute, but return something not already marked
+    /// must-use, have no mutable arg and mutate no statics.
+    ///
+    /// ### Why is this bad?
+    /// Not bad at all, this lint just shows places where
+    /// you could add the attribute.
+    ///
+    /// ### Known problems
+    /// The lint only checks the arguments for mutable
+    /// types without looking if they are actually changed. On the other hand,
+    /// it also ignores a broad range of potentially interesting side effects,
+    /// because we cannot decide whether the programmer intends the function to
+    /// be called for the side effect or the result. Expect many false
+    /// positives. At least we don't lint if the result type is unit or already
+    /// `#[must_use]`.
+    ///
+    /// ### Examples
+    /// ```no_run
+    /// // this could be annotated with `#[must_use]`.
+    /// pub fn id<T>(t: T) -> T { t }
+    /// ```
+    #[clippy::version = "1.40.0"]
+    pub MUST_USE_CANDIDATE,
     pedantic,
-    "functions with too many lines"
+    "function or method that could take a `#[must_use]` attribute"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for a `#[must_use]` attribute on
+    /// unit-returning functions and methods.
+    ///
+    /// ### Why is this bad?
+    /// Unit values are useless. The attribute is likely
+    /// a remnant of a refactoring that removed the return type.
+    ///
+    /// ### Examples
+    /// ```no_run
+    /// #[must_use]
+    /// fn useless() { }
+    /// ```
+    #[clippy::version = "1.40.0"]
+    pub MUST_USE_UNIT,
+    style,
+    "`#[must_use]` attribute on a unit-returning function / method"
 }
 
 declare_clippy_lint! {
@@ -127,76 +250,131 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for a `#[must_use]` attribute on
-    /// unit-returning functions and methods.
+    /// Warns when a function signature uses `&Option<T>` instead of `Option<&T>`.
     ///
     /// ### Why is this bad?
-    /// Unit values are useless. The attribute is likely
-    /// a remnant of a refactoring that removed the return type.
+    /// More flexibility, better memory optimization, and more idiomatic Rust code.
     ///
-    /// ### Examples
-    /// ```no_run
-    /// #[must_use]
-    /// fn useless() { }
-    /// ```
-    #[clippy::version = "1.40.0"]
-    pub MUST_USE_UNIT,
-    style,
-    "`#[must_use]` attribute on a unit-returning function / method"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for a `#[must_use]` attribute without
-    /// further information on functions and methods that return a type already
-    /// marked as `#[must_use]`.
+    /// `&Option<T>` in a function signature breaks encapsulation because the caller must own T
+    /// and move it into an Option to call with it. When returned, the owner must internally store
+    /// it as `Option<T>` in order to return it.
+    /// At a lower level, `&Option<T>` points to memory with the `presence` bit flag plus the `T` value,
+    /// whereas `Option<&T>` is usually [optimized](https://doc.rust-lang.org/1.81.0/std/option/index.html#representation)
+    /// to a single pointer, so it may be more optimal.
     ///
-    /// ### Why is this bad?
-    /// The attribute isn't needed. Not using the result
-    /// will already be reported. Alternatively, one can add some text to the
-    /// attribute to improve the lint message.
-    ///
-    /// ### Examples
-    /// ```no_run
-    /// #[must_use]
-    /// fn double_must_use() -> Result<(), ()> {
-    ///     unimplemented!();
-    /// }
-    /// ```
-    #[clippy::version = "1.40.0"]
-    pub DOUBLE_MUST_USE,
-    style,
-    "`#[must_use]` attribute on a `#[must_use]`-returning function / method"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for public functions that have no
-    /// `#[must_use]` attribute, but return something not already marked
-    /// must-use, have no mutable arg and mutate no statics.
-    ///
-    /// ### Why is this bad?
-    /// Not bad at all, this lint just shows places where
-    /// you could add the attribute.
+    /// See this [YouTube video](https://www.youtube.com/watch?v=6c7pZYP_iIE) by
+    /// Logan Smith for an in-depth explanation of why this is important.
     ///
     /// ### Known problems
-    /// The lint only checks the arguments for mutable
-    /// types without looking if they are actually changed. On the other hand,
-    /// it also ignores a broad range of potentially interesting side effects,
-    /// because we cannot decide whether the programmer intends the function to
-    /// be called for the side effect or the result. Expect many false
-    /// positives. At least we don't lint if the result type is unit or already
-    /// `#[must_use]`.
+    /// This lint recommends changing the function signatures, but it cannot
+    /// automatically change the function calls or the function implementations.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// // caller uses  foo(&opt)
+    /// fn foo(a: &Option<String>) {}
+    /// # struct Unit {}
+    /// # impl Unit {
+    /// fn bar(&self) -> &Option<String> { &None }
+    /// # }
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// // caller should use  `foo1(opt.as_ref())`
+    /// fn foo1(a: Option<&String>) {}
+    /// // better yet, use string slice  `foo2(opt.as_deref())`
+    /// fn foo2(a: Option<&str>) {}
+    /// # struct Unit {}
+    /// # impl Unit {
+    /// fn bar(&self) -> Option<&String> { None }
+    /// # }
+    /// ```
+    #[clippy::version = "1.83.0"]
+    pub REF_OPTION,
+    pedantic,
+    "function signature uses `&Option<T>` instead of `Option<&T>`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Lints when the name of function parameters from trait impl is
+    /// different than its default implementation.
+    ///
+    /// ### Why restrict this?
+    /// Using the default name for parameters of a trait method is more consistent.
+    ///
+    /// ### Example
+    /// ```rust
+    /// struct A(u32);
+    ///
+    /// impl PartialEq for A {
+    ///     fn eq(&self, b: &Self) -> bool {
+    ///         self.0 == b.0
+    ///     }
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```rust
+    /// struct A(u32);
+    ///
+    /// impl PartialEq for A {
+    ///     fn eq(&self, other: &Self) -> bool {
+    ///         self.0 == other.0
+    ///     }
+    /// }
+    /// ```
+    #[clippy::version = "1.80.0"]
+    pub RENAMED_FUNCTION_PARAMS,
+    restriction,
+    "renamed function parameters in trait implementation"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for functions that return `Result` with an unusually large
+    /// `Err`-variant.
+    ///
+    /// ### Why is this bad?
+    /// A `Result` is at least as large as the `Err`-variant. While we
+    /// expect that variant to be seldom used, the compiler needs to reserve
+    /// and move that much memory every single time.
+    /// Furthermore, errors are often simply passed up the call-stack, making
+    /// use of the `?`-operator and its type-conversion mechanics. If the
+    /// `Err`-variant further up the call-stack stores the `Err`-variant in
+    /// question (as library code often does), it itself needs to be at least
+    /// as large, propagating the problem.
+    ///
+    /// ### Known problems
+    /// The size determined by Clippy is platform-dependent.
     ///
     /// ### Examples
     /// ```no_run
-    /// // this could be annotated with `#[must_use]`.
-    /// pub fn id<T>(t: T) -> T { t }
+    /// pub enum ParseError {
+    ///     UnparsedBytes([u8; 512]),
+    ///     UnexpectedEof,
+    /// }
+    ///
+    /// // The `Result` has at least 512 bytes, even in the `Ok`-case
+    /// pub fn parse() -> Result<(), ParseError> {
+    ///     Ok(())
+    /// }
     /// ```
-    #[clippy::version = "1.40.0"]
-    pub MUST_USE_CANDIDATE,
-    pedantic,
-    "function or method that could take a `#[must_use]` attribute"
+    /// should be
+    /// ```no_run
+    /// pub enum ParseError {
+    ///     UnparsedBytes(Box<[u8; 512]>),
+    ///     UnexpectedEof,
+    /// }
+    ///
+    /// // The `Result` is slightly larger than a pointer
+    /// pub fn parse() -> Result<(), ParseError> {
+    ///     Ok(())
+    /// }
+    /// ```
+    #[clippy::version = "1.65.0"]
+    pub RESULT_LARGE_ERR,
+    perf,
+    "function returning `Result` with large `Err` type"
 }
 
 declare_clippy_lint! {
@@ -251,207 +429,78 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for functions that return `Result` with an unusually large
-    /// `Err`-variant.
+    /// Checks for functions with too many parameters.
     ///
     /// ### Why is this bad?
-    /// A `Result` is at least as large as the `Err`-variant. While we
-    /// expect that variant to be seldom used, the compiler needs to reserve
-    /// and move that much memory every single time.
-    /// Furthermore, errors are often simply passed up the call-stack, making
-    /// use of the `?`-operator and its type-conversion mechanics. If the
-    /// `Err`-variant further up the call-stack stores the `Err`-variant in
-    /// question (as library code often does), it itself needs to be at least
-    /// as large, propagating the problem.
+    /// Functions with lots of parameters are considered bad
+    /// style and reduce readability (“what does the 5th parameter mean?”). Consider
+    /// grouping some parameters into a new type.
     ///
-    /// ### Known problems
-    /// The size determined by Clippy is platform-dependent.
-    ///
-    /// ### Examples
+    /// ### Example
     /// ```no_run
-    /// pub enum ParseError {
-    ///     UnparsedBytes([u8; 512]),
-    ///     UnexpectedEof,
-    /// }
-    ///
-    /// // The `Result` has at least 512 bytes, even in the `Ok`-case
-    /// pub fn parse() -> Result<(), ParseError> {
-    ///     Ok(())
+    /// # struct Color;
+    /// fn foo(x: u32, y: u32, name: &str, c: Color, w: f32, h: f32, a: f32, b: f32) {
+    ///     // ..
     /// }
     /// ```
-    /// should be
-    /// ```no_run
-    /// pub enum ParseError {
-    ///     UnparsedBytes(Box<[u8; 512]>),
-    ///     UnexpectedEof,
-    /// }
-    ///
-    /// // The `Result` is slightly larger than a pointer
-    /// pub fn parse() -> Result<(), ParseError> {
-    ///     Ok(())
-    /// }
-    /// ```
-    #[clippy::version = "1.65.0"]
-    pub RESULT_LARGE_ERR,
-    perf,
-    "function returning `Result` with large `Err` type"
+    #[clippy::version = "pre 1.29.0"]
+    pub TOO_MANY_ARGUMENTS,
+    complexity,
+    "functions with too many arguments"
 }
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for getter methods that return a field that doesn't correspond
-    /// to the name of the method, when there is a field's whose name matches that of the method.
+    /// Checks for functions with a large amount of lines.
     ///
     /// ### Why is this bad?
-    /// It is most likely that such a  method is a bug caused by a typo or by copy-pasting.
-    ///
-    /// ### Example
-
-    /// ```no_run
-    /// struct A {
-    ///     a: String,
-    ///     b: String,
-    /// }
-    ///
-    /// impl A {
-    ///     fn a(&self) -> &str{
-    ///         &self.b
-    ///     }
-    /// }
-
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// struct A {
-    ///     a: String,
-    ///     b: String,
-    /// }
-    ///
-    /// impl A {
-    ///     fn a(&self) -> &str{
-    ///         &self.a
-    ///     }
-    /// }
-    /// ```
-    #[clippy::version = "1.67.0"]
-    pub MISNAMED_GETTERS,
-    suspicious,
-    "getter method returning the wrong field"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Lints when `impl Trait` is being used in a function's parameters.
-    ///
-    /// ### Why restrict this?
-    /// Turbofish syntax (`::<>`) cannot be used to specify the type of an `impl Trait` parameter,
-    /// making `impl Trait` less powerful. Readability may also be a factor.
+    /// Functions with a lot of lines are harder to understand
+    /// due to having to look at a larger amount of code to understand what the
+    /// function is doing. Consider splitting the body of the function into
+    /// multiple functions.
     ///
     /// ### Example
     /// ```no_run
-    /// trait MyTrait {}
-    /// fn foo(a: impl MyTrait) {
-    /// 	// [...]
+    /// fn im_too_long() {
+    ///     println!("");
+    ///     // ... 100 more LoC
+    ///     println!("");
     /// }
     /// ```
-    /// Use instead:
-    /// ```no_run
-    /// trait MyTrait {}
-    /// fn foo<T: MyTrait>(a: T) {
-    /// 	// [...]
-    /// }
-    /// ```
-    #[clippy::version = "1.69.0"]
-    pub IMPL_TRAIT_IN_PARAMS,
-    restriction,
-    "`impl Trait` is used in the function's parameters"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Lints when the name of function parameters from trait impl is
-    /// different than its default implementation.
-    ///
-    /// ### Why restrict this?
-    /// Using the default name for parameters of a trait method is more consistent.
-    ///
-    /// ### Example
-    /// ```rust
-    /// struct A(u32);
-    ///
-    /// impl PartialEq for A {
-    ///     fn eq(&self, b: &Self) -> bool {
-    ///         self.0 == b.0
-    ///     }
-    /// }
-    /// ```
-    /// Use instead:
-    /// ```rust
-    /// struct A(u32);
-    ///
-    /// impl PartialEq for A {
-    ///     fn eq(&self, other: &Self) -> bool {
-    ///         self.0 == other.0
-    ///     }
-    /// }
-    /// ```
-    #[clippy::version = "1.80.0"]
-    pub RENAMED_FUNCTION_PARAMS,
-    restriction,
-    "renamed function parameters in trait implementation"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Warns when a function signature uses `&Option<T>` instead of `Option<&T>`.
-    ///
-    /// ### Why is this bad?
-    /// More flexibility, better memory optimization, and more idiomatic Rust code.
-    ///
-    /// `&Option<T>` in a function signature breaks encapsulation because the caller must own T
-    /// and move it into an Option to call with it. When returned, the owner must internally store
-    /// it as `Option<T>` in order to return it.
-    /// At a lower level, `&Option<T>` points to memory with the `presence` bit flag plus the `T` value,
-    /// whereas `Option<&T>` is usually [optimized](https://doc.rust-lang.org/1.81.0/std/option/index.html#representation)
-    /// to a single pointer, so it may be more optimal.
-    ///
-    /// See this [YouTube video](https://www.youtube.com/watch?v=6c7pZYP_iIE) by
-    /// Logan Smith for an in-depth explanation of why this is important.
-    ///
-    /// ### Known problems
-    /// This lint recommends changing the function signatures, but it cannot
-    /// automatically change the function calls or the function implementations.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// // caller uses  foo(&opt)
-    /// fn foo(a: &Option<String>) {}
-    /// # struct Unit {}
-    /// # impl Unit {
-    /// fn bar(&self) -> &Option<String> { &None }
-    /// # }
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// // caller should use  `foo1(opt.as_ref())`
-    /// fn foo1(a: Option<&String>) {}
-    /// // better yet, use string slice  `foo2(opt.as_deref())`
-    /// fn foo2(a: Option<&str>) {}
-    /// # struct Unit {}
-    /// # impl Unit {
-    /// fn bar(&self) -> Option<&String> { None }
-    /// # }
-    /// ```
-    #[clippy::version = "1.83.0"]
-    pub REF_OPTION,
+    #[clippy::version = "1.34.0"]
+    pub TOO_MANY_LINES,
     pedantic,
-    "function signature uses `&Option<T>` instead of `Option<&T>`"
+    "functions with too many lines"
+}
+
+declare_lint_pass!(EarlyFunctions => [DUPLICATE_UNDERSCORE_ARGUMENT]);
+
+impl_lint_pass!(Functions => [
+    DOUBLE_MUST_USE,
+    IMPL_TRAIT_IN_PARAMS,
+    MISNAMED_GETTERS,
+    MUST_USE_CANDIDATE,
+    MUST_USE_UNIT,
+    NOT_UNSAFE_PTR_ARG_DEREF,
+    REF_OPTION,
+    RENAMED_FUNCTION_PARAMS,
+    RESULT_LARGE_ERR,
+    RESULT_UNIT_ERR,
+    TOO_MANY_ARGUMENTS,
+    TOO_MANY_LINES,
+]);
+
+impl EarlyLintPass for EarlyFunctions {
+    fn check_fn(&mut self, cx: &EarlyContext<'_>, fn_kind: visit::FnKind<'_>, _: Span, _: ast::NodeId) {
+        duplicate_underscore_argument::check(cx, fn_kind);
+    }
 }
 
 pub struct Functions {
     too_many_arguments_threshold: u64,
     too_many_lines_threshold: u64,
     large_error_threshold: u64,
+    large_error_ignored: DefIdSet,
     avoid_breaking_exported_api: bool,
     /// A set of resolved `def_id` of traits that are configured to allow
     /// function params renaming.
@@ -465,31 +514,21 @@ impl Functions {
             too_many_arguments_threshold: conf.too_many_arguments_threshold,
             too_many_lines_threshold: conf.too_many_lines_threshold,
             large_error_threshold: conf.large_error_threshold,
+            large_error_ignored: conf
+                .large_error_ignored
+                .iter()
+                .flat_map(|ignored_ty| lookup_path_str(tcx, PathNS::Type, ignored_ty))
+                .collect(),
             avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
             trait_ids: conf
                 .allow_renamed_params_for
                 .iter()
-                .flat_map(|p| def_path_def_ids(tcx, &p.split("::").collect::<Vec<_>>()))
+                .flat_map(|p| lookup_path_str(tcx, PathNS::Type, p))
                 .collect(),
             msrv: conf.msrv,
         }
     }
 }
-
-impl_lint_pass!(Functions => [
-    TOO_MANY_ARGUMENTS,
-    TOO_MANY_LINES,
-    NOT_UNSAFE_PTR_ARG_DEREF,
-    MUST_USE_UNIT,
-    DOUBLE_MUST_USE,
-    MUST_USE_CANDIDATE,
-    RESULT_UNIT_ERR,
-    RESULT_LARGE_ERR,
-    MISNAMED_GETTERS,
-    IMPL_TRAIT_IN_PARAMS,
-    RENAMED_FUNCTION_PARAMS,
-    REF_OPTION,
-]);
 
 impl<'tcx> LateLintPass<'tcx> for Functions {
     fn check_fn(
@@ -502,8 +541,8 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         def_id: LocalDefId,
     ) {
         let hir_id = cx.tcx.local_def_id_to_hir_id(def_id);
-        too_many_arguments::check_fn(cx, kind, decl, span, hir_id, self.too_many_arguments_threshold);
-        too_many_lines::check_fn(cx, kind, span, body, self.too_many_lines_threshold);
+        too_many_arguments::check_fn(cx, kind, decl, hir_id, def_id, self.too_many_arguments_threshold);
+        too_many_lines::check_fn(cx, kind, body, span, def_id, self.too_many_lines_threshold);
         not_unsafe_ptr_arg_deref::check_fn(cx, kind, decl, body, def_id);
         misnamed_getters::check_fn(cx, kind, decl, body, span);
         impl_trait_in_params::check_fn(cx, &kind, body, hir_id);
@@ -521,12 +560,24 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'_>) {
         must_use::check_item(cx, item);
-        result::check_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::ImplItem<'_>) {
         must_use::check_impl_item(cx, item);
-        result::check_impl_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_impl_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
         impl_trait_in_params::check_impl_item(cx, item);
         renamed_function_params::check_impl_item(cx, item, &self.trait_ids);
     }
@@ -535,8 +586,18 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         too_many_arguments::check_trait_item(cx, item, self.too_many_arguments_threshold);
         not_unsafe_ptr_arg_deref::check_trait_item(cx, item);
         must_use::check_trait_item(cx, item);
-        result::check_trait_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_trait_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
         impl_trait_in_params::check_trait_item(cx, item, self.avoid_breaking_exported_api);
         ref_option::check_trait_item(cx, item, self.avoid_breaking_exported_api);
+    }
+
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
+        result::check_expr(cx, expr, self.large_error_threshold, &self.large_error_ignored);
     }
 }

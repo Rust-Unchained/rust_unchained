@@ -5,7 +5,7 @@ use rustc_span::Span;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
 
-use crate::ty::{self, Ty, TyCtxt};
+use crate::ty::{self, Ty, TyCtxt, Unnormalized};
 
 /// An additional filter to exclude well-known types from the ecosystem
 /// because their drops are trivial.
@@ -70,7 +70,7 @@ fn true_significant_drop_ty<'tcx>(
     }
 }
 
-/// Returns the list of types with a "potentially sigificant" that may be dropped
+/// Returns the list of types with a "potentially significant" that may be dropped
 /// by dropping a value of type `ty`.
 #[instrument(level = "trace", skip(tcx, typing_env))]
 pub fn extract_component_raw<'tcx>(
@@ -80,7 +80,7 @@ pub fn extract_component_raw<'tcx>(
     ty_seen: &mut UnordSet<Ty<'tcx>>,
 ) -> SmallVec<[Ty<'tcx>; 4]> {
     // Droppiness does not depend on regions, so let us erase them.
-    let ty = tcx.try_normalize_erasing_regions(typing_env, ty).unwrap_or(ty);
+    let ty = tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(ty)).unwrap_or(ty);
 
     let tys = tcx.list_significant_drop_tys(typing_env.as_query_input(ty));
     debug!(?ty, "components");
@@ -119,7 +119,7 @@ pub fn extract_component_with_significant_dtor<'tcx>(
 /// when we are working with current local crate.
 #[instrument(level = "trace", skip(tcx))]
 pub fn ty_dtor_span<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Span> {
-    match ty.kind() {
+    match *ty.kind() {
         ty::Bool
         | ty::Char
         | ty::Int(_)
@@ -132,7 +132,7 @@ pub fn ty_dtor_span<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Span> {
         | ty::Ref(_, _, _)
         | ty::FnPtr(_, _)
         | ty::Tuple(_)
-        | ty::Dynamic(_, _, _)
+        | ty::Dynamic(_, _)
         | ty::Alias(_, _)
         | ty::Bound(_, _)
         | ty::Pat(_, _)

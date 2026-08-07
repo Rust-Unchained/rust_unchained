@@ -7,8 +7,7 @@ use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::layout::HasTyCtxt;
 use rustc_middle::ty::{Ty, TypeckResults};
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
+use rustc_span::{Span, Spanned};
 
 use clippy_utils::SpanlessEq;
 use clippy_utils::diagnostics::span_lint_and_note;
@@ -22,7 +21,7 @@ fn comparison_to_const<'tcx>(
     cx: &LateContext<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     expr: &'tcx Expr<'tcx>,
-) -> Option<(CmpOp, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>, Constant<'tcx>, Ty<'tcx>)> {
+) -> Option<(CmpOp, &'tcx Expr<'tcx>, &'tcx Expr<'tcx>, Constant, Ty<'tcx>)> {
     if let ExprKind::Binary(operator, left, right) = expr.kind
         && let Ok(cmp_op) = CmpOp::try_from(operator.node)
     {
@@ -64,7 +63,7 @@ pub(super) fn check<'tcx>(
         && left_type == right_type
 
         // Check that the same expression is compared in both comparisons
-        && SpanlessEq::new(cx).eq_expr(left_expr, right_expr)
+        && SpanlessEq::new(cx).eq_expr(span.ctxt(), left_expr, right_expr)
 
         && !left_expr.can_have_side_effects()
 

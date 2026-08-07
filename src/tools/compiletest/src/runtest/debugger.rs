@@ -4,64 +4,82 @@ use std::io::{BufRead, BufReader};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::common::Config;
+use crate::directives::{LineNumber, line_directive};
 use crate::runtest::ProcRes;
 
 /// Representation of information to invoke a debugger and check its output
-pub(super) struct DebuggerCommands {
+pub(crate) struct DebuggerCommands {
     /// Commands for the debuuger
-    pub commands: Vec<String>,
+    pub(crate) commands: Vec<String>,
     /// Lines to insert breakpoints at
-    pub breakpoint_lines: Vec<usize>,
+    pub(crate) breakpoint_lines: Vec<LineNumber>,
     /// Contains the source line number to check and the line itself
-    check_lines: Vec<(usize, String)>,
+    check_lines: Vec<(LineNumber, String)>,
     /// Source file name
     file: Utf8PathBuf,
+    /// The revision being tested, if any
+    revision: Option<String>,
 }
 
 impl DebuggerCommands {
-    pub fn parse_from(
+    pub(crate) fn parse_from(
         file: &Utf8Path,
-        config: &Config,
         debugger_prefix: &str,
+        test_revision: Option<&str>,
     ) -> Result<Self, String> {
-        let command_directive = format!("{debugger_prefix}-command");
-        let check_directive = format!("{debugger_prefix}-check");
-
         let mut breakpoint_lines = vec![];
         let mut commands = vec![];
         let mut check_lines = vec![];
-        let mut counter = 0;
         let reader = BufReader::new(File::open(file.as_std_path()).unwrap());
-        for (line_no, line) in reader.lines().enumerate() {
-            counter += 1;
+        for (line_number, line) in LineNumber::enumerate().zip(reader.lines()) {
             let line = line.map_err(|e| format!("Error while parsing debugger commands: {}", e))?;
 
             // Breakpoints appear on lines with actual code, typically at the end of the line.
             if line.contains("#break") {
-                breakpoint_lines.push(counter);
+                breakpoint_lines.push(line_number);
                 continue;
             }
 
-            let Some(line) = line.trim_start().strip_prefix("//").map(str::trim_start) else {
+            let Some(directive) = line_directive(file, line_number, &line) else {
                 continue;
             };
 
-            if let Some(command) = config.parse_name_value_directive(&line, &command_directive) {
-                commands.push(command);
+            if !directive.applies_to_test_revision(test_revision) {
+                continue;
             }
-            if let Some(pattern) = config.parse_name_value_directive(&line, &check_directive) {
-                check_lines.push((line_no, pattern));
+
+            let Some(directive_kind) = directive.name.strip_prefix(debugger_prefix) else {
+                continue;
+            };
+
+            match (directive_kind, directive.value_after_colon()) {
+                ("-command", Some(command)) => commands.push(command.to_string()),
+                ("-check", Some(pattern)) => check_lines.push((line_number, pattern.to_string())),
+                ("-repr", Some(var_name)) => {
+                    // pseudo-command intercepted by `lldb_batchmode` to run custom variable
+                    // inspection logic.
+                    commands.push(format!("repr {}", var_name.trim()));
+                    // Artificially output by `lldb_batchmode` to confirm that the inspection logic
+                    // encountered no errors.
+                    check_lines.push((line_number, format!("{var_name}: Ok")));
+                }
+                _ => continue,
             }
         }
 
-        Ok(Self { commands, breakpoint_lines, check_lines, file: file.to_path_buf() })
+        Ok(Self {
+            commands,
+            breakpoint_lines,
+            check_lines,
+            file: file.to_path_buf(),
+            revision: test_revision.map(str::to_owned),
+        })
     }
 
     /// Given debugger output and lines to check, ensure that every line is
     /// contained in the debugger output. The check lines need to be found in
     /// order, but there can be extra lines between.
-    pub fn check_output(&self, debugger_run_result: &ProcRes) -> Result<(), String> {
+    pub(crate) fn check_output(&self, debugger_run_result: &ProcRes) -> Result<(), String> {
         // (src_lineno, ck_line)  that we did find
         let mut found = vec![];
         // (src_lineno, ck_line) that we couldn't find
@@ -87,21 +105,22 @@ impl DebuggerCommands {
             Ok(())
         } else {
             let fname = self.file.file_name().unwrap();
+            let revision_suffix =
+                self.revision.as_ref().map_or(String::new(), |r| format!("#{}", r));
             let mut msg = format!(
-                "check directive(s) from `{}` not found in debugger output. errors:",
-                self.file
+                "check directive(s) from `{}{}` not found in debugger output. errors:",
+                self.file, revision_suffix
             );
 
             for (src_lineno, err_line) in missing {
-                write!(msg, "\n    ({fname}:{num}) `{err_line}`", num = src_lineno + 1).unwrap();
+                write!(msg, "\n    ({fname}:{src_lineno}) `{err_line}`").unwrap();
             }
 
             if !found.is_empty() {
                 let init = "\nthe following subset of check directive(s) was found successfully:";
                 msg.push_str(init);
                 for (src_lineno, found_line) in found {
-                    write!(msg, "\n    ({fname}:{num}) `{found_line}`", num = src_lineno + 1)
-                        .unwrap();
+                    write!(msg, "\n    ({fname}:{src_lineno}) `{found_line}`").unwrap();
                 }
             }
 

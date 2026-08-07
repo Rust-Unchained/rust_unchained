@@ -1,7 +1,8 @@
 use rustc_hir::def::DefKind;
 use rustc_hir::{Expr, ExprKind};
 use rustc_middle::ty;
-use rustc_middle::ty::adjustment::Adjust;
+use rustc_middle::ty::Unnormalized;
+use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
 use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::sym;
 
@@ -84,7 +85,7 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
             return;
         };
 
-        let Some(trait_id) = cx.tcx.trait_of_item(did) else { return };
+        let Some(trait_id) = cx.tcx.trait_of_assoc(did) else { return };
 
         let Some(trait_) = cx.tcx.get_diagnostic_name(trait_id) else { return };
 
@@ -92,9 +93,10 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
             return;
         };
 
-        let args = cx
-            .tcx
-            .normalize_erasing_regions(cx.typing_env(), cx.typeck_results().node_args(expr.hir_id));
+        let args = cx.tcx.normalize_erasing_regions(
+            cx.typing_env(),
+            Unnormalized::new_wip(cx.typeck_results().node_args(expr.hir_id)),
+        );
         // Resolve the trait method instance.
         let Ok(Some(i)) = ty::Instance::try_resolve(cx.tcx, cx.typing_env(), did, args) else {
             return;
@@ -114,7 +116,10 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
 
         // If there is any user defined auto-deref step, then we don't want to warn.
         // https://github.com/rust-lang/rust-clippy/issues/9272
-        if arg_adjustments.iter().any(|adj| matches!(adj.kind, Adjust::Deref(Some(_)))) {
+        if arg_adjustments
+            .iter()
+            .any(|adj| matches!(adj.kind, Adjust::Deref(DerefAdjustKind::Overloaded(_))))
+        {
             return;
         }
 
@@ -140,6 +145,8 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
                 },
             );
         } else {
+            // Report the method call's return type before adjustments required by its parent.
+            let unadjusted_expr_ty = cx.typeck_results().expr_ty(expr);
             match name {
                 // If `type_of(x) == T` and `x.borrow()` is used to get `&T`,
                 // then that should be allowed
@@ -147,12 +154,12 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
                 sym::noop_method_clone => cx.emit_span_lint(
                     SUSPICIOUS_DOUBLE_REF_OP,
                     span,
-                    SuspiciousDoubleRefCloneDiag { ty: expr_ty },
+                    SuspiciousDoubleRefCloneDiag { ty: unadjusted_expr_ty },
                 ),
                 sym::noop_method_deref => cx.emit_span_lint(
                     SUSPICIOUS_DOUBLE_REF_OP,
                     span,
-                    SuspiciousDoubleRefDerefDiag { ty: expr_ty },
+                    SuspiciousDoubleRefDerefDiag { ty: unadjusted_expr_ty },
                 ),
                 _ => return,
             }

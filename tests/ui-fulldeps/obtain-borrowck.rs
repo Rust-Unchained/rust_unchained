@@ -1,24 +1,25 @@
 //@ edition: 2021
 //@ run-pass
 //@ check-run-results
+// ignore-tidy-linelength
 //@ run-flags: --sysroot {{sysroot-base}} --edition=2021 {{src-base}}/auxiliary/obtain-borrowck-input.rs
 //@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
-// ignore-tidy-linelength
 
 #![feature(rustc_private)]
 
 //! This program implements a rustc driver that retrieves MIR bodies with
 //! borrowck information. This cannot be done in a straightforward way because
-//! `get_body_with_borrowck_facts`–the function for retrieving a MIR body with
-//! borrowck facts–can panic if the body is stolen before it is invoked.
+//! `get_bodies_with_borrowck_facts`–the function for retrieving MIR bodies with
+//! borrowck facts–can panic if the bodies are stolen before it is invoked.
 //! Therefore, the driver overrides `mir_borrowck` query (this is done in the
-//! `config` callback), which retrieves the body that is about to be borrow
-//! checked and stores it in a thread local `MIR_BODIES`. Then, `after_analysis`
+//! `config` callback), which retrieves the bodies that are about to be borrow
+//! checked and stores them in a thread local `MIR_BODIES`. Then, `after_analysis`
 //! callback triggers borrow checking of all MIR bodies by retrieving
 //! `optimized_mir` and pulls out the MIR bodies with the borrowck information
 //! from the thread local storage.
 
 extern crate rustc_borrowck;
+extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -27,29 +28,30 @@ extern crate rustc_session;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::process::ExitCode;
 use std::thread_local;
 
 use rustc_borrowck::consumers::{self, BodyWithBorrowckFacts, ConsumerOptions};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_driver::Compilation;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_interface::Config;
 use rustc_interface::interface::Compiler;
-use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
+use rustc_middle::queries::mir_borrowck::ProvidedValue;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
 
-fn main() {
-    let exit_code = rustc_driver::catch_with_exit_code(move || {
+fn main() -> ExitCode {
+    rustc_driver::catch_with_exit_code(move || {
         let mut rustc_args: Vec<_> = std::env::args().collect();
         // We must pass -Zpolonius so that the borrowck information is computed.
         rustc_args.push("-Zpolonius".to_owned());
         let mut callbacks = CompilerCalls::default();
         // Call the Rust compiler with our callbacks.
         rustc_driver::run_compiler(&rustc_args, &mut callbacks);
-    });
-    std::process::exit(exit_code);
+    })
 }
 
 #[derive(Default)]
@@ -112,7 +114,7 @@ impl rustc_driver::Callbacks for CompilerCalls {
 }
 
 fn override_queries(_session: &Session, local: &mut Providers) {
-    local.mir_borrowck = mir_borrowck;
+    local.queries.mir_borrowck = mir_borrowck;
 }
 
 // Since mir_borrowck does not have access to any other state, we need to use a
@@ -129,17 +131,19 @@ thread_local! {
 
 fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'tcx> {
     let opts = ConsumerOptions::PoloniusInputFacts;
-    let body_with_facts = consumers::get_body_with_borrowck_facts(tcx, def_id, opts);
+    let bodies_with_facts = consumers::get_bodies_with_borrowck_facts(tcx, def_id, opts);
     // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
-    let body_with_facts: BodyWithBorrowckFacts<'static> =
-        unsafe { std::mem::transmute(body_with_facts) };
+    let bodies_with_facts: FxHashMap<LocalDefId, BodyWithBorrowckFacts<'static>> =
+        unsafe { std::mem::transmute(bodies_with_facts) };
     MIR_BODIES.with(|state| {
         let mut map = state.borrow_mut();
-        assert!(map.insert(def_id, body_with_facts).is_none());
+        for (def_id, body_with_facts) in bodies_with_facts {
+            assert!(map.insert(def_id, body_with_facts).is_none());
+        }
     });
     let mut providers = Providers::default();
-    rustc_borrowck::provide(&mut providers);
-    let original_mir_borrowck = providers.mir_borrowck;
+    rustc_borrowck::provide(&mut providers.queries);
+    let original_mir_borrowck = providers.queries.mir_borrowck;
     original_mir_borrowck(tcx, def_id)
 }
 

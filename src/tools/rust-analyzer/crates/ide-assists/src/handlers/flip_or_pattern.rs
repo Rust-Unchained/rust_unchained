@@ -1,10 +1,10 @@
 use syntax::{
+    Direction, T,
     algo::non_trivia_sibling,
     ast::{self, AstNode},
-    Direction, T,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: flip_or_pattern
 //
@@ -21,7 +21,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     let (b | a) = 1;
 // }
 // ```
-pub(crate) fn flip_or_pattern(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn flip_or_pattern(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     // Only flip on the `|` token
     let pipe = ctx.find_token_syntax_at_offset(T![|])?;
 
@@ -31,17 +31,12 @@ pub(crate) fn flip_or_pattern(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opt
     let after = non_trivia_sibling(pipe.clone().into(), Direction::Next)?.into_node()?;
 
     let target = pipe.text_range();
-    acc.add(
-        AssistId("flip_or_pattern", AssistKind::RefactorRewrite),
-        "Flip patterns",
-        target,
-        |builder| {
-            let mut editor = builder.make_editor(parent.syntax());
-            editor.replace(before.clone(), after.clone());
-            editor.replace(after, before);
-            builder.add_file_edits(ctx.file_id(), editor);
-        },
-    )
+    acc.add(AssistId::refactor_rewrite("flip_or_pattern"), "Flip patterns", target, |builder| {
+        let editor = builder.make_editor(parent.syntax());
+        editor.replace(before.clone(), after.clone());
+        editor.replace(after, before);
+        builder.add_file_edits(ctx.vfs_file_id(), editor);
+    })
 }
 
 #[cfg(test)]

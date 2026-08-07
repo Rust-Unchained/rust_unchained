@@ -1,7 +1,42 @@
 # Opaque types in the new solver
 
-The way opaque types are handled in the new solver differs from the old implementation.
+The way [opaque types] are handled in the new solver differs from the old implementation.
 This should be a self-contained explanation of the behavior in the new solver.
+
+[opaque types]: ../opaque-types-type-alias-impl-trait.md
+
+## Non-Defining vs Defining Uses
+
+The distinction between non-defining and defining uses determines the inference behavior and governs the strictness of the abstraction. A defining use reveals the underlying hidden type, while a non-defining use enforces rigidity, treating the type as an abstract placeholder.
+
+### Non-defining Use
+
+This concept is what makes an opaque type rigid. By treating the underlying type as unknown, the solver maintains abstraction.
+
+```rust
+fn foo() -> impl Copy {
+    let x: u32 = 56;
+    x 
+}
+
+fn bar() {
+    let x = foo();
+    // Even though we know 'foo' returns a u32.The solver enforces 
+    // rigidity here and is a NON-DEFINING use.
+}
+```
+
+### Defining Use
+
+This is where the opaque type is actually defined. A defining use tells the compiler exactly what the concrete type is behind the abstraction.
+
+```rust
+fn foo() -> impl Copy {
+    let x: u32 = 56;
+    // The return value x defines the hidden type as u32 and is a DEFINING use.
+    x
+}
+```
 
 ## opaques are alias types
 
@@ -49,12 +84,12 @@ We then check whether we're able to *semantically* unify the generic arguments o
 with the arguments of any opaque type already in the opaque types storage. If so, we unify the
 previously stored type with the expected type of this `normalizes-to` call: [source][eq-prev][^1].
 
-If not, we insert the expected type in the opaque types storage: [source][insert-storage][^2]. 
+If not, we insert the expected type in the opaque types storage: [source][insert-storage][^2].
 Finally, we check whether the item bounds of the opaque hold for the expected type:
 [source][item-bounds-ck].
 
 [norm]: https://github.com/rust-lang/rust/blob/384d26fc7e3bdd7687cc17b2662b091f6017ec2a/compiler/rustc_trait_selection/src/solve/normalizes_to/opaque_types.rs#L13
-[coherence-example]: https://github.com/rust-lang/rust/blob/master/tests/ui/type-alias-impl-trait/coherence_different_hidden_ty.rs
+[coherence-example]: https://github.com/rust-lang/rust/blob/HEAD/tests/ui/type-alias-impl-trait/coherence/coherence_different_hidden_ty.rs
 [placeholder-ck]: https://github.com/rust-lang/rust/blob/384d26fc7e3bdd7687cc17b2662b091f6017ec2a/compiler/rustc_trait_selection/src/solve/normalizes_to/opaque_types.rs#L33
 [check-storage]: https://github.com/rust-lang/rust/blob/384d26fc7e3bdd7687cc17b2662b091f6017ec2a/compiler/rustc_trait_selection/src/solve/normalizes_to/opaque_types.rs#L51-L52
 [eq-prev]: https://github.com/rust-lang/rust/blob/384d26fc7e3bdd7687cc17b2662b091f6017ec2a/compiler/rustc_trait_selection/src/solve/normalizes_to/opaque_types.rs#L51-L59
@@ -96,7 +131,7 @@ end up leaking placeholders.
 The handling of member constraints does not change in the new solver. See the
 [relevant existing chapter][member-constraints] for that.
 
-[member-constraints]: ../borrow_check/region_inference/member_constraints.md
+[member-constraints]: ../borrow-check/region-inference/member-constraints.md
 
 ## calling methods on opaque types
 

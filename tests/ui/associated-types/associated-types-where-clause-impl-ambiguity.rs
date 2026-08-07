@@ -1,3 +1,4 @@
+//@ edition:2015
 //@ run-pass
 #![allow(dead_code)]
 #![allow(unused_imports)]
@@ -7,7 +8,6 @@
 // for `ByRef`. The right answer was to consider the result ambiguous
 // until more type information was available.
 
-#![feature(lang_items)]
 #![no_implicit_prelude]
 
 use std::marker::Sized;
@@ -20,7 +20,7 @@ trait Iterator {
 }
 
 trait IteratorExt: Iterator + Sized {
-    fn by_ref(&mut self) -> ByRef<Self> {
+    fn by_ref(&mut self) -> ByRef<'_, Self> {
         ByRef(self)
     }
 }

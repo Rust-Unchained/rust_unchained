@@ -5,8 +5,8 @@
 //@ [unchk_fail_post] run-pass
 //@ [chk_pass] run-pass
 //
-//@ [chk_fail_pre] run-fail
-//@ [chk_fail_post] run-fail
+//@ [chk_fail_pre] run-crash
+//@ [chk_fail_post] run-crash
 //
 //@ [unchk_pass] compile-flags: -Zcontract-checks=no
 //@ [unchk_fail_pre] compile-flags: -Zcontract-checks=no
@@ -19,8 +19,8 @@
 #![feature(contracts_internals)]
 
 fn tail(x: Baz) -> i32
-    contract_requires(|| x.baz > 0)
-    contract_ensures(|ret| *ret > 100)
+    contract_requires { x.baz > 0 }
+    contract_ensures { |ret| *ret > 100 }
 {
     x.baz + 50
 }

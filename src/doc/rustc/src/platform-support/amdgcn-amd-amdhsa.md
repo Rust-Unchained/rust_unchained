@@ -20,8 +20,8 @@ The format of binaries is a linked ELF.
 
 Binaries must be built with no-std.
 They can use `core` and `alloc` (`alloc` only if an allocator is supplied).
-At least one function needs to use the `"gpu-kernel"` calling convention and should be marked with `no_mangle` for simplicity.
-Functions using the `"gpu-kernel"` calling convention are kernel entrypoints and can be used from the host runtime.
+At least one function should use the `"gpu-kernel"` calling convention and should be marked with `no_mangle` or `export_name`.
+Functions using the `"gpu-kernel"` calling convention are kernel entrypoints and can be launched from the host runtime.
 
 ## Building the target
 
@@ -33,6 +33,9 @@ The amdgpu target supports many hardware generations, which need different binar
 The generations are exposed as different target-cpus in the backend.
 As there are many, Rust does not ship pre-compiled libraries for this target.
 Therefore, you have to build your own copy of `core` by using `cargo -Zbuild-std=core` or similar.
+
+An allocator and `println!()` support is provided by the [`amdgpu-device-libs`] crate.
+Both features rely on the [HIP] runtime.
 
 To build a binary, create a no-std library:
 ```rust,ignore (platform-specific)
@@ -56,15 +59,12 @@ Build the library as `cdylib`:
 # Cargo.toml
 [lib]
 crate-type = ["cdylib"]
-
-[profile.dev]
-lto = true # LTO must be explicitly enabled for now
-[profile.release]
-lto = true
 ```
 
-The target-cpu must be from the list [supported by LLVM] (or printed with `rustc --target amdgcn-amd-amdhsa --print target-cpus`).
+The target-cpu[^1] must be from the list [supported by LLVM] (or printed with `rustc --target amdgcn-amd-amdhsa --print target-cpus`).
 The GPU version on the current system can be found e.g. with [`rocminfo`].
+For a GPU series that has xnack support but the target GPU has not, the `-xnack-support` target-feature needs to be enabled.
+I.e. if the ISA info as printed with [`rocminfo`] says something about `xnack-`, e.g. `gfx1010:xnack-`, add `-Ctarget-feature=-xnack-support` to the rustflags.
 
 Example `.cargo/config.toml` file to set the target and GPU generation:
 ```toml
@@ -72,10 +72,17 @@ Example `.cargo/config.toml` file to set the target and GPU generation:
 [build]
 target = "amdgcn-amd-amdhsa"
 rustflags = ["-Ctarget-cpu=gfx1100"]
+# Add "-Ctarget-feature=-xnack-support" for xnack- GPUs (see above)
 
 [unstable]
 build-std = ["core"] # Optional: "alloc"
 ```
+
+[^1]: For this target, crates with different values of `-C target-cpu` are not link-compatible.
+Because of this, the compiler ensures that all crates that are linked together
+were compiled with the same `target-cpu`. This must be considered when
+using `rustc` commands for building. It is less relevant for Cargo, since Cargo
+generally uses the same `target-cpu` for all crates in a build.
 
 ## Running Rust programs
 
@@ -84,8 +91,6 @@ On Linux and Windows, [HIP] can be used to load and run binaries.
 Example code on how to load a compiled binary and run it is available in [ROCm examples].
 
 On Linux, binaries can also run through the HSA runtime as implemented in [ROCR-Runtime].
-
-<!-- Mention an allocator once a suitable one exists for amdgpu -->
 
 <!--
 ## Testing
@@ -109,3 +114,4 @@ More information can be found on the [LLVM page for amdgpu].
 [LLVM page for amdgpu]: https://llvm.org/docs/AMDGPUUsage.html
 [`rocminfo`]: https://github.com/ROCm/rocminfo
 [ROCm examples]: https://github.com/ROCm/rocm-examples/tree/ca8ef5b6f1390176616cd1c18fbc98785cbc73f6/HIP-Basic/module_api
+[`amdgpu-device-libs`]: https://crates.io/crates/amdgpu-device-libs

@@ -1,3 +1,4 @@
+//@ edition:2015
 // Test that `fn foo::bar::{self}` only imports `bar` in the type namespace.
 
 mod foo {
@@ -12,5 +13,5 @@ mod bar {
 use bar::baz::{self};
 
 fn main() {
-    baz(); //~ ERROR expected function, found module `baz`
+    baz(); //~ ERROR cannot find function `baz` in this scope
 }

@@ -1,77 +1,50 @@
-error[E0517]: attribute should be applied to a struct, enum, or union
-  --> $DIR/naked-with-invalid-repr-attr.rs:6:8
+error: the `repr(C)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:10:3
    |
-LL |   #[repr(C)]
-   |          ^
-...
-LL | / extern "C" fn example1() {
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not a struct, enum, or union
+LL | #[repr(C)]
+   |   ^^^^^^^
+   |
+   = help: the `repr(C)` attribute can only be applied to data types
 
-error[E0517]: attribute should be applied to a struct, enum, or union
-  --> $DIR/naked-with-invalid-repr-attr.rs:14:8
+error: the `repr(transparent)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:17:3
    |
-LL |   #[repr(transparent)]
-   |          ^^^^^^^^^^^
-...
-LL | / extern "C" fn example2() {
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not a struct, enum, or union
+LL | #[repr(transparent)]
+   |   ^^^^^^^^^^^^^^^^^
+   |
+   = help: the `repr(transparent)` attribute can only be applied to data types
 
-error[E0517]: attribute should be applied to a struct, enum, or union
-  --> $DIR/naked-with-invalid-repr-attr.rs:22:19
+error: the `repr(C)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:24:3
    |
-LL |   #[repr(align(16), C)]
-   |                     ^
-...
-LL | / extern "C" fn example3() {
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not a struct, enum, or union
+LL | #[repr(C)]
+   |   ^^^^^^^
+   |
+   = help: the `repr(C)` attribute can only be applied to data types
 
-error[E0517]: attribute should be applied to a struct, enum, or union
-  --> $DIR/naked-with-invalid-repr-attr.rs:31:8
+error: the `repr(C)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:33:3
    |
-LL |   #[repr(C, packed)]
-   |          ^
-...
-LL | / extern "C" fn example4() {
-LL | |
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not a struct, enum, or union
+LL | #[repr(C, packed)]
+   |   ^^^^^^^^^^^^^^^
+   |
+   = help: the `repr(C)` attribute can only be applied to data types
 
-error[E0517]: attribute should be applied to a struct or union
-  --> $DIR/naked-with-invalid-repr-attr.rs:31:11
+error: the `repr(packed)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:33:3
    |
-LL |   #[repr(C, packed)]
-   |             ^^^^^^
-...
-LL | / extern "C" fn example4() {
-LL | |
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not a struct or union
+LL | #[repr(C, packed)]
+   |   ^^^^^^^^^^^^^^^
+   |
+   = help: the `repr(packed)` attribute can only be applied to data types
 
-error[E0517]: attribute should be applied to an enum
-  --> $DIR/naked-with-invalid-repr-attr.rs:41:8
+error: the `repr(u8)` attribute cannot be used on functions
+  --> $DIR/naked-with-invalid-repr-attr.rs:41:3
    |
-LL |   #[repr(u8)]
-   |          ^^
-...
-LL | / extern "C" fn example5() {
-LL | |
-LL | |     naked_asm!("")
-LL | | }
-   | |_- not an enum
+LL | #[repr(u8)]
+   |   ^^^^^^^^
+   |
+   = help: the `repr(u8)` attribute can only be applied to enums
 
 error: aborting due to 6 previous errors
 
-For more information about this error, try `rustc --explain E0517`.

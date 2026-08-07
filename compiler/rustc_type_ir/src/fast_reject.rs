@@ -5,11 +5,7 @@ use std::marker::PhantomData;
 
 use rustc_ast_ir::Mutability;
 #[cfg(feature = "nightly")]
-use rustc_data_structures::fingerprint::Fingerprint;
-#[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
-#[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
 
 use crate::inherent::*;
 use crate::visit::TypeVisitableExt as _;
@@ -17,10 +13,7 @@ use crate::{self as ty, Interner};
 
 /// See `simplify_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum SimplifiedType<DefId> {
     Bool,
     Char,
@@ -49,19 +42,6 @@ pub enum SimplifiedType<DefId> {
     Error,
 }
 
-#[cfg(feature = "nightly")]
-impl<HCX: Clone, DefId: HashStable<HCX>> ToStableHashKey<HCX> for SimplifiedType<DefId> {
-    type KeyType = Fingerprint;
-
-    #[inline]
-    fn to_stable_hash_key(&self, hcx: &HCX) -> Fingerprint {
-        let mut hasher = StableHasher::new();
-        let mut hcx: HCX = hcx.clone();
-        self.hash_stable(&mut hcx, &mut hasher);
-        hasher.finish()
-    }
-}
-
 /// Generic parameters are pretty much just bound variables, e.g.
 /// the type of `fn foo<'a, T>(x: &'a T) -> u32 { ... }` can be thought of as
 /// `for<'a, T> fn(&'a T) -> u32`.
@@ -84,6 +64,9 @@ pub enum TreatParams {
     ///
     /// This also treats projections with inference variables as infer vars
     /// since they could be further normalized.
+    // FIXME(@lcnr): This treats aliases as rigid. This is only correct if the
+    // type has been structurally normalized. We should reflect this requirement
+    // in the variant name. It is currently incorrectly used in diagnostics.
     AsRigid,
 }
 
@@ -119,7 +102,7 @@ pub fn simplify_type<I: Interner>(
         ty::Int(int_type) => Some(SimplifiedType::Int(int_type)),
         ty::Uint(uint_type) => Some(SimplifiedType::Uint(uint_type)),
         ty::Float(float_type) => Some(SimplifiedType::Float(float_type)),
-        ty::Adt(def, _) => Some(SimplifiedType::Adt(def.def_id())),
+        ty::Adt(def, _) => Some(SimplifiedType::Adt(def.def_id().into())),
         ty::Str => Some(SimplifiedType::Str),
         ty::Array(..) => Some(SimplifiedType::Array),
         ty::Slice(..) => Some(SimplifiedType::Slice),
@@ -127,16 +110,16 @@ pub fn simplify_type<I: Interner>(
         ty::RawPtr(_, mutbl) => Some(SimplifiedType::Ptr(mutbl)),
         ty::Dynamic(trait_info, ..) => match trait_info.principal_def_id() {
             Some(principal_def_id) if !cx.trait_is_auto(principal_def_id) => {
-                Some(SimplifiedType::Trait(principal_def_id))
+                Some(SimplifiedType::Trait(principal_def_id.into()))
             }
             _ => Some(SimplifiedType::MarkerTraitObject),
         },
         ty::Ref(_, _, mutbl) => Some(SimplifiedType::Ref(mutbl)),
-        ty::FnDef(def_id, _) | ty::Closure(def_id, _) | ty::CoroutineClosure(def_id, _) => {
-            Some(SimplifiedType::Closure(def_id))
-        }
-        ty::Coroutine(def_id, _) => Some(SimplifiedType::Coroutine(def_id)),
-        ty::CoroutineWitness(def_id, _) => Some(SimplifiedType::CoroutineWitness(def_id)),
+        ty::FnDef(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::Closure(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::CoroutineClosure(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::Coroutine(def_id, _) => Some(SimplifiedType::Coroutine(def_id.into())),
+        ty::CoroutineWitness(def_id, _) => Some(SimplifiedType::CoroutineWitness(def_id.into())),
         ty::Never => Some(SimplifiedType::Never),
         ty::Tuple(tys) => Some(SimplifiedType::Tuple(tys.len())),
         ty::FnPtr(sig_tys, _hdr) => {
@@ -151,12 +134,14 @@ pub fn simplify_type<I: Interner>(
         ty::Alias(..) => match treat_params {
             // When treating `ty::Param` as a placeholder, projections also
             // don't unify with anything else as long as they are fully normalized.
-            // FIXME(-Znext-solver): Can remove this `if` and always simplify to `Placeholder`
-            // when the new solver is enabled by default.
-            TreatParams::AsRigid if !ty.has_non_region_infer() => Some(SimplifiedType::Placeholder),
+            TreatParams::AsRigid
+                if !ty.has_non_region_infer() || cx.next_trait_solver_globally() =>
+            {
+                Some(SimplifiedType::Placeholder)
+            }
             TreatParams::AsRigid | TreatParams::InstantiateWithInfer => None,
         },
-        ty::Foreign(def_id) => Some(SimplifiedType::Foreign(def_id)),
+        ty::Foreign(def_id) => Some(SimplifiedType::Foreign(def_id.into())),
         ty::Error(_) => Some(SimplifiedType::Error),
         ty::Bound(..) | ty::Infer(_) => None,
     }
@@ -235,6 +220,10 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
         self.types_may_unify_inner(lhs, rhs, Self::STARTING_DEPTH)
     }
 
+    pub fn types_may_unify_with_depth(self, lhs: I::Ty, rhs: I::Ty, depth_limit: usize) -> bool {
+        self.types_may_unify_inner(lhs, rhs, depth_limit)
+    }
+
     fn args_may_unify_inner(
         self,
         obligation_args: I::GenericArgs,
@@ -244,7 +233,7 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
         // No need to decrement the depth here as this function is only
         // recursively reachable via `types_may_unify_inner` which already
         // increments the depth for us.
-        iter::zip(obligation_args.iter(), impl_args.iter()).all(|(obl, imp)| {
+        let may_unify = |(obl, imp): (I::GenericArg, I::GenericArg)| {
             match (obl.kind(), imp.kind()) {
                 // We don't fast reject based on regions.
                 (ty::GenericArgKind::Lifetime(_), ty::GenericArgKind::Lifetime(_)) => true,
@@ -256,19 +245,30 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
                 }
                 _ => panic!("kind mismatch: {obl:?} {imp:?}"),
             }
-        })
+        };
+
+        // Specialize the common `(1, 1)` case to avoid iterator machinery.
+        if let ([obl], [imp]) = (obligation_args.as_slice(), impl_args.as_slice()) {
+            return may_unify((*obl, *imp));
+        }
+
+        iter::zip(obligation_args.iter(), impl_args.iter()).all(may_unify)
     }
 
     fn types_may_unify_inner(self, lhs: I::Ty, rhs: I::Ty, depth: usize) -> bool {
+        if lhs == rhs {
+            return true;
+        }
+
         match rhs.kind() {
             // Start by checking whether the `rhs` type may unify with
             // pretty much everything. Just return `true` in that case.
-            ty::Param(_) => {
+            ty::Param(_) | ty::Alias(ty::IsRigid::Yes, _) => {
                 if INSTANTIATE_RHS_WITH_INFER {
                     return true;
                 }
             }
-            ty::Error(_) | ty::Alias(..) | ty::Bound(..) => return true,
+            ty::Error(_) | ty::Alias(ty::IsRigid::No, _) | ty::Bound(..) => return true,
             ty::Infer(var) => return self.var_and_ty_may_unify(var, lhs),
 
             // These types only unify with inference variables or their own
@@ -345,12 +345,22 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
 
             ty::Infer(var) => self.var_and_ty_may_unify(var, rhs),
 
+            // Since we ensure that the rhs is not non-rigid alias,
+            // lhs rigid alias can only unify with it if it's a rigid alias of the same kind.
+            ty::Alias(ty::IsRigid::Yes, lhs_alias) => {
+                INSTANTIATE_LHS_WITH_INFER
+                    || match rhs.kind() {
+                        ty::Alias(ty::IsRigid::Yes, rhs_alias) => {
+                            lhs_alias.kind == rhs_alias.kind
+                                && self.args_may_unify_inner(lhs_alias.args, rhs_alias.args, depth)
+                        }
+                        _ => false,
+                    }
+            }
             // As we're walking the whole type, it may encounter projections
             // inside of binders and what not, so we're just going to assume that
-            // projections can unify with other stuff.
-            //
-            // Looking forward to lazy normalization this is the safer strategy anyways.
-            ty::Alias(..) => true,
+            // non-rigid alias can unify with anything.
+            ty::Alias(ty::IsRigid::No, _) => true,
 
             ty::Int(_)
             | ty::Uint(_)
@@ -415,7 +425,12 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
 
             ty::FnDef(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::FnDef(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
+                    lhs_def_id == rhs_def_id
+                        && self.args_may_unify_inner(
+                            lhs_args.no_bound_vars().unwrap(),
+                            rhs_args.no_bound_vars().unwrap(),
+                            depth,
+                        )
                 }
                 _ => false,
             },
@@ -475,7 +490,7 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
             }
 
             ty::ConstKind::Expr(_)
-            | ty::ConstKind::Unevaluated(_)
+            | ty::ConstKind::Alias(_, _)
             | ty::ConstKind::Error(_)
             | ty::ConstKind::Infer(_)
             | ty::ConstKind::Bound(..) => {
@@ -506,9 +521,7 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
 
             // As we don't necessarily eagerly evaluate constants,
             // they might unify with any value.
-            ty::ConstKind::Expr(_) | ty::ConstKind::Unevaluated(_) | ty::ConstKind::Error(_) => {
-                true
-            }
+            ty::ConstKind::Expr(_) | ty::ConstKind::Alias(_, _) | ty::ConstKind::Error(_) => true,
 
             ty::ConstKind::Infer(_) | ty::ConstKind::Bound(..) => true,
         }

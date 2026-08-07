@@ -1,8 +1,10 @@
 use crate::ffi::OsString;
 use crate::fmt;
+use crate::fs::TryLockError;
 use crate::hash::{Hash, Hasher};
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
+pub use crate::sys::fs::common::Dir;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 
@@ -206,11 +208,11 @@ impl File {
         self.0
     }
 
-    pub fn try_lock(&self) -> io::Result<bool> {
+    pub fn try_lock(&self) -> Result<(), TryLockError> {
         self.0
     }
 
-    pub fn try_lock_shared(&self) -> io::Result<bool> {
+    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
         self.0
     }
 
@@ -234,7 +236,7 @@ impl File {
         self.0
     }
 
-    pub fn read_buf(&self, _cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, _cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.0
     }
 
@@ -255,6 +257,10 @@ impl File {
     }
 
     pub fn seek(&self, _pos: SeekFrom) -> io::Result<u64> {
+        self.0
+    }
+
+    pub fn size(&self) -> Option<io::Result<u64>> {
         self.0
     }
 
@@ -305,6 +311,18 @@ pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
 
 pub fn set_perm(_p: &Path, perm: FilePermissions) -> io::Result<()> {
     match perm.0 {}
+}
+
+pub fn set_perm_nofollow(_p: &Path, perm: FilePermissions) -> io::Result<()> {
+    match perm.0 {}
+}
+
+pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
+    unsupported()
 }
 
 pub fn rmdir(_p: &Path) -> io::Result<()> {

@@ -5,7 +5,8 @@ use tracing::{debug, instrument, trace};
 
 use crate::error::ConstNotUsedTraitAlias;
 use crate::ty::{
-    self, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    self, GenericArg, GenericArgKind, RegionExt, Ty, TyCtxt, TypeFoldable, TypeFolder,
+    TypeSuperFoldable,
 };
 
 pub type OpaqueTypeKey<'tcx> = rustc_type_ir::OpaqueTypeKey<TyCtxt<'tcx>>;
@@ -120,7 +121,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
             }
         }
 
-        match self.map.get(&r.into()).map(|k| k.unpack()) {
+        match self.map.get(&r.into()).map(|arg| arg.kind()) {
             Some(GenericArgKind::Lifetime(r1)) => r1,
             Some(u) => panic!("region mapped to unexpected kind: {u:?}"),
             None if self.do_not_error => self.tcx.lifetimes.re_static,
@@ -133,7 +134,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
                         self.span,
                         format!(
                             "lifetime `{r}` is part of concrete type but not used in \
-                             parameter list of the `impl Trait` type alias"
+                             parameter list of the `impl Trait` type alias",
                         ),
                     )
                     .emit();
@@ -162,7 +163,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
 
             ty::Param(param) => {
                 // Look it up in the generic parameters list.
-                match self.map.get(&ty.into()).map(|k| k.unpack()) {
+                match self.map.get(&ty.into()).map(|arg| arg.kind()) {
                     // Found it in the generic parameters list; replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Type(t1)) => t1,
@@ -195,7 +196,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
         match ct.kind() {
             ty::ConstKind::Param(..) => {
                 // Look it up in the generic parameters list.
-                match self.map.get(&ct.into()).map(|k| k.unpack()) {
+                match self.map.get(&ct.into()).map(|arg| arg.kind()) {
                     // Found it in the generic parameters list, replace with the parameter from the
                     // opaque type.
                     Some(GenericArgKind::Const(c1)) => c1,

@@ -5,41 +5,12 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::ptr::P;
-use crate::tokenstream::LazyAttrTokenStream;
+use crate::tokenstream::{LazyAttrTokenStream, WithTokens};
 use crate::{
     Arm, AssocItem, AttrItem, AttrKind, AttrVec, Attribute, Block, Crate, Expr, ExprField,
     FieldDef, ForeignItem, GenericParam, Item, NodeId, Param, Pat, PatField, Path, Stmt, StmtKind,
     Ty, Variant, Visibility, WherePredicate,
 };
-
-/// A utility trait to reduce boilerplate.
-/// Standard `Deref(Mut)` cannot be reused due to coherence.
-pub trait AstDeref {
-    type Target;
-    fn ast_deref(&self) -> &Self::Target;
-    fn ast_deref_mut(&mut self) -> &mut Self::Target;
-}
-
-macro_rules! impl_not_ast_deref {
-    ($($T:ty),+ $(,)?) => {
-        $(
-            impl !AstDeref for $T {}
-        )+
-    };
-}
-
-impl_not_ast_deref!(AssocItem, Expr, ForeignItem, Item, Stmt);
-
-impl<T> AstDeref for P<T> {
-    type Target = T;
-    fn ast_deref(&self) -> &Self::Target {
-        self
-    }
-    fn ast_deref_mut(&mut self) -> &mut Self::Target {
-        self
-    }
-}
 
 /// A trait for AST nodes having an ID.
 pub trait HasNodeId {
@@ -81,17 +52,17 @@ impl_has_node_id!(
     WherePredicate,
 );
 
-impl<T: AstDeref<Target: HasNodeId>> HasNodeId for T {
+impl<T: HasNodeId> HasNodeId for Box<T> {
     fn node_id(&self) -> NodeId {
-        self.ast_deref().node_id()
+        (**self).node_id()
     }
     fn node_id_mut(&mut self) -> &mut NodeId {
-        self.ast_deref_mut().node_id_mut()
+        (**self).node_id_mut()
     }
 }
 
 /// A trait for AST nodes having (or not having) collected tokens.
-pub trait HasTokens {
+pub trait HasTokens: HasAttrs {
     fn tokens(&self) -> Option<&LazyAttrTokenStream>;
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>>;
 }
@@ -126,7 +97,7 @@ macro_rules! impl_has_tokens_none {
     };
 }
 
-impl_has_tokens!(AssocItem, AttrItem, Block, Expr, ForeignItem, Item, Pat, Path, Ty, Visibility);
+impl_has_tokens!(AssocItem, Expr, ForeignItem, Item);
 impl_has_tokens_none!(
     Arm,
     ExprField,
@@ -138,12 +109,12 @@ impl_has_tokens_none!(
     WherePredicate
 );
 
-impl<T: AstDeref<Target: HasTokens>> HasTokens for T {
+impl<T: HasAttrs> HasTokens for WithTokens<T> {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
-        self.ast_deref().tokens()
+        self.tokens.as_ref()
     }
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
-        self.ast_deref_mut().tokens_mut()
+        Some(&mut self.tokens)
     }
 }
 
@@ -153,6 +124,15 @@ impl<T: HasTokens> HasTokens for Option<T> {
     }
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
         self.as_mut().and_then(|inner| inner.tokens_mut())
+    }
+}
+
+impl<T: HasTokens> HasTokens for Box<T> {
+    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
+        (**self).tokens()
+    }
+    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
+        (**self).tokens_mut()
     }
 }
 
@@ -190,17 +170,13 @@ impl HasTokens for Attribute {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
         match &self.kind {
             AttrKind::Normal(normal) => normal.tokens.as_ref(),
-            kind @ AttrKind::DocComment(..) => {
-                panic!("Called tokens on doc comment attr {kind:?}")
-            }
+            AttrKind::Synthetic(..) | AttrKind::DocComment(..) => unreachable!(),
         }
     }
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
         Some(match &mut self.kind {
             AttrKind::Normal(normal) => &mut normal.tokens,
-            kind @ AttrKind::DocComment(..) => {
-                panic!("Called tokens_mut on doc comment attr {kind:?}")
-            }
+            AttrKind::Synthetic(..) | AttrKind::DocComment(..) => unreachable!(),
         })
     }
 }
@@ -273,13 +249,23 @@ impl_has_attrs!(
 );
 impl_has_attrs_none!(Attribute, AttrItem, Block, Pat, Path, Ty, Visibility);
 
-impl<T: AstDeref<Target: HasAttrs>> HasAttrs for T {
-    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = T::Target::SUPPORTS_CUSTOM_INNER_ATTRS;
+impl<T: HasAttrs> HasAttrs for WithTokens<T> {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = T::SUPPORTS_CUSTOM_INNER_ATTRS;
     fn attrs(&self) -> &[Attribute] {
-        self.ast_deref().attrs()
+        self.node.attrs()
     }
     fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
-        self.ast_deref_mut().visit_attrs(f)
+        self.node.visit_attrs(f);
+    }
+}
+
+impl<T: HasAttrs> HasAttrs for Box<T> {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = T::SUPPORTS_CUSTOM_INNER_ATTRS;
+    fn attrs(&self) -> &[Attribute] {
+        (**self).attrs()
+    }
+    fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
+        (**self).visit_attrs(f);
     }
 }
 
@@ -332,6 +318,7 @@ impl HasAttrs for Stmt {
 }
 
 /// A newtype around an AST node that implements the traits above if the node implements them.
+#[repr(transparent)]
 pub struct AstNodeWrapper<Wrapped, Tag> {
     pub wrapped: Wrapped,
     pub tag: PhantomData<Tag>,
@@ -341,15 +328,36 @@ impl<Wrapped, Tag> AstNodeWrapper<Wrapped, Tag> {
     pub fn new(wrapped: Wrapped, _tag: Tag) -> AstNodeWrapper<Wrapped, Tag> {
         AstNodeWrapper { wrapped, tag: Default::default() }
     }
+
+    pub fn from_mut(wrapped: &mut Wrapped, _tag: Tag) -> &mut AstNodeWrapper<Wrapped, Tag> {
+        // SAFETY: `AstNodeWrapper` is `repr(transparent)` w.r.t `Wrapped`
+        unsafe { &mut *<*mut Wrapped>::cast(wrapped) }
+    }
 }
 
-impl<Wrapped, Tag> AstDeref for AstNodeWrapper<Wrapped, Tag> {
-    type Target = Wrapped;
-    fn ast_deref(&self) -> &Self::Target {
-        &self.wrapped
+// FIXME: remove after `stmt_expr_attributes` is stabilized.
+impl<T, Tag> From<AstNodeWrapper<Box<T>, Tag>> for AstNodeWrapper<T, Tag> {
+    fn from(value: AstNodeWrapper<Box<T>, Tag>) -> Self {
+        AstNodeWrapper { wrapped: *value.wrapped, tag: value.tag }
     }
-    fn ast_deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.wrapped
+}
+
+impl<Wrapped: HasNodeId, Tag> HasNodeId for AstNodeWrapper<Wrapped, Tag> {
+    fn node_id(&self) -> NodeId {
+        self.wrapped.node_id()
+    }
+    fn node_id_mut(&mut self) -> &mut NodeId {
+        self.wrapped.node_id_mut()
+    }
+}
+
+impl<Wrapped: HasAttrs, Tag> HasAttrs for AstNodeWrapper<Wrapped, Tag> {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = Wrapped::SUPPORTS_CUSTOM_INNER_ATTRS;
+    fn attrs(&self) -> &[Attribute] {
+        self.wrapped.attrs()
+    }
+    fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
+        self.wrapped.visit_attrs(f);
     }
 }
 

@@ -3,8 +3,7 @@ use std::str::Utf8Error;
 use rustc_ast::LitKind;
 use rustc_hir::{Expr, ExprKind};
 use rustc_session::{declare_lint, declare_lint_pass};
-use rustc_span::source_map::Spanned;
-use rustc_span::sym;
+use rustc_span::{Spanned, sym};
 
 use crate::lints::InvalidFromUtf8Diag;
 use crate::{LateContext, LateLintPass, LintContext};
@@ -108,8 +107,8 @@ impl<'tcx> LateLintPass<'tcx> for InvalidFromUtf8 {
             }
             match init.kind {
                 ExprKind::Lit(Spanned { node: lit, .. }) => {
-                    if let LitKind::ByteStr(bytes, _) = &lit
-                        && let Err(utf8_error) = std::str::from_utf8(bytes)
+                    if let LitKind::ByteStr(byte_sym, _) = &lit
+                        && let Err(utf8_error) = std::str::from_utf8(byte_sym.as_byte_str())
                     {
                         lint(init.span, utf8_error);
                     }

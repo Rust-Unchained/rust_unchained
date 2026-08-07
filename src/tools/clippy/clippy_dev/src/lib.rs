@@ -1,5 +1,11 @@
-#![feature(let_chains)]
-#![feature(rustc_private)]
+#![feature(
+    exit_status_error,
+    new_range,
+    os_str_slice,
+    os_string_truncate,
+    pattern,
+    rustc_private
+)]
 #![warn(
     trivial_casts,
     trivial_numeric_casts,
@@ -7,15 +13,16 @@
     unused_lifetimes,
     unused_qualifications
 )]
-#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::case_sensitive_file_extension_comparisons, clippy::missing_panics_doc)]
 
-// The `rustc_driver` crate seems to be required in order to use the `rust_lexer` crate.
-#[allow(unused_extern_crates)]
+extern crate rustc_arena;
+extern crate rustc_data_structures;
+#[expect(unused_extern_crates, reason = "required to link to rustc crates")]
 extern crate rustc_driver;
 extern crate rustc_lexer;
-extern crate rustc_literal_escaper;
 
 pub mod dogfood;
+pub mod edit_lints;
 pub mod fmt;
 pub mod lint;
 pub mod new_lint;
@@ -23,5 +30,10 @@ pub mod release;
 pub mod serve;
 pub mod setup;
 pub mod sync;
-pub mod update_lints;
-pub mod utils;
+
+mod generate;
+mod parse;
+mod utils;
+
+pub use self::parse::{ParseCx, new_parse_cx};
+pub use self::utils::{ClippyInfo, UpdateMode};

@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+
 use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::source::snippet_with_context;
 use clippy_utils::sugg::{Sugg, make_binop};
 use clippy_utils::{
-    SpanlessEq, eq_expr_value, higher, is_in_const_context, is_integer_literal, peel_blocks, peel_blocks_with_stmt,
+    SpanlessEq, eq_expr_value, higher, is_in_const_context, is_integer_literal, is_integer_literal_untyped,
+    peel_blocks, peel_blocks_with_stmt, sym,
 };
 use rustc_ast::ast::LitKind;
 use rustc_data_structures::packed::Pu128;
@@ -11,7 +15,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{AssignOpKind, BinOp, BinOpKind, Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -69,17 +73,20 @@ declare_clippy_lint! {
     ///
     /// let result = a.saturating_sub(b);
     /// ```
-    #[clippy::version = "1.44.0"]
+    #[clippy::version = "1.83.0"]
     pub INVERTED_SATURATING_SUB,
     correctness,
     "Check if a variable is smaller than another one and still subtract from it even if smaller"
 }
 
+impl_lint_pass!(ImplicitSaturatingSub => [
+    IMPLICIT_SATURATING_SUB,
+    INVERTED_SATURATING_SUB,
+]);
+
 pub struct ImplicitSaturatingSub {
     msrv: Msrv,
 }
-
-impl_lint_pass!(ImplicitSaturatingSub => [IMPLICIT_SATURATING_SUB, INVERTED_SATURATING_SUB]);
 
 impl ImplicitSaturatingSub {
     pub fn new(conf: &'static Conf) -> Self {
@@ -112,7 +119,7 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn check_manual_check<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &Expr<'tcx>,
@@ -165,7 +172,7 @@ fn check_manual_check<'tcx>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn check_gt(
     cx: &LateContext<'_>,
     condition_span: Span,
@@ -177,7 +184,7 @@ fn check_gt(
     msrv: Msrv,
     is_composited: bool,
 ) {
-    if is_side_effect_free(cx, big_expr) && is_side_effect_free(cx, little_expr) {
+    if !big_expr.can_have_side_effects() && !little_expr.can_have_side_effects() {
         check_subtraction(
             cx,
             condition_span,
@@ -192,11 +199,7 @@ fn check_gt(
     }
 }
 
-fn is_side_effect_free(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    eq_expr_value(cx, expr, expr)
-}
-
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn check_subtraction(
     cx: &LateContext<'_>,
     condition_span: Span,
@@ -235,30 +238,44 @@ fn check_subtraction(
         && let ExprKind::Binary(op, left, right) = if_block.kind
         && let BinOpKind::Sub = op.node
     {
-        if eq_expr_value(cx, left, big_expr) && eq_expr_value(cx, right, little_expr) {
+        let ctxt = expr_span.ctxt();
+        if eq_expr_value(cx, ctxt, left, big_expr) && eq_expr_value(cx, ctxt, right, little_expr) {
             // This part of the condition is voluntarily split from the one before to ensure that
             // if `snippet_opt` fails, it won't try the next conditions.
-            if (!is_in_const_context(cx) || msrv.meets(cx, msrvs::SATURATING_SUB_CONST))
-                && let Some(big_expr_sugg) = Sugg::hir_opt(cx, big_expr).map(Sugg::maybe_paren)
-                && let Some(little_expr_sugg) = Sugg::hir_opt(cx, little_expr)
-            {
-                let sugg = format!(
-                    "{}{big_expr_sugg}.saturating_sub({little_expr_sugg}){}",
-                    if is_composited { "{ " } else { "" },
-                    if is_composited { " }" } else { "" }
-                );
-                span_lint_and_sugg(
+            if !is_in_const_context(cx) || msrv.meets(cx, msrvs::SATURATING_SUB_CONST) {
+                span_lint_and_then(
                     cx,
                     IMPLICIT_SATURATING_SUB,
                     expr_span,
                     "manual arithmetic check found",
-                    "replace it with",
-                    sugg,
-                    Applicability::MachineApplicable,
+                    |diag| {
+                        let mut applicability = Applicability::MachineApplicable;
+                        let expr_span_ctxt = expr_span.ctxt();
+                        let big_expr_sugg = (if is_integer_literal_untyped(big_expr) {
+                            let get_snippet = |span: Span| {
+                                let (snippet, _) =
+                                    snippet_with_context(cx, span, expr_span_ctxt, "..", &mut applicability);
+                                let big_expr_ty = cx.typeck_results().expr_ty(big_expr);
+                                Cow::Owned(format!("{snippet}_{big_expr_ty}"))
+                            };
+                            Sugg::hir_from_snippet(cx, big_expr, get_snippet)
+                        } else {
+                            Sugg::hir_with_context(cx, big_expr, expr_span_ctxt, "..", &mut applicability)
+                        })
+                        .maybe_paren();
+                        let little_expr_sugg =
+                            Sugg::hir_with_context(cx, little_expr, expr_span_ctxt, "..", &mut applicability);
+                        let sugg = format!(
+                            "{}{big_expr_sugg}.saturating_sub({little_expr_sugg}){}",
+                            if is_composited { "{ " } else { "" },
+                            if is_composited { " }" } else { "" }
+                        );
+                        diag.span_suggestion(expr_span, "replace it with", sugg, applicability);
+                    },
                 );
             }
-        } else if eq_expr_value(cx, left, little_expr)
-            && eq_expr_value(cx, right, big_expr)
+        } else if eq_expr_value(cx, ctxt, left, little_expr)
+            && eq_expr_value(cx, ctxt, right, big_expr)
             && let Some(big_expr_sugg) = Sugg::hir_opt(cx, big_expr)
             && let Some(little_expr_sugg) = Sugg::hir_opt(cx, little_expr)
         {
@@ -302,14 +319,15 @@ fn check_with_condition<'tcx>(
         // Extracting out the variable name
         && let ExprKind::Path(QPath::Resolved(_, ares_path)) = target.kind
     {
+        let ctxt = expr.span.ctxt();
         // Handle symmetric conditions in the if statement
-        let (cond_var, cond_num_val) = if SpanlessEq::new(cx).eq_expr(cond_left, target) {
+        let (cond_var, cond_num_val) = if SpanlessEq::new(cx).eq_expr(ctxt, cond_left, target) {
             if BinOpKind::Gt == cond_op || BinOpKind::Ne == cond_op {
                 (cond_left, cond_right)
             } else {
                 return;
             }
-        } else if SpanlessEq::new(cx).eq_expr(cond_right, target) {
+        } else if SpanlessEq::new(cx).eq_expr(ctxt, cond_right, target) {
             if BinOpKind::Lt == cond_op || BinOpKind::Ne == cond_op {
                 (cond_right, cond_left)
             } else {
@@ -325,7 +343,7 @@ fn check_with_condition<'tcx>(
         }
 
         // Get the variable name
-        let var_name = ares_path.segments[0].ident.name.as_str();
+        let var_name = ares_path.segments[0].ident.name;
         match cond_num_val.kind {
             ExprKind::Lit(cond_lit) => {
                 // Check if the constant is zero
@@ -337,22 +355,30 @@ fn check_with_condition<'tcx>(
                 }
             },
             ExprKind::Path(QPath::TypeRelative(_, name)) => {
-                if name.ident.as_str() == "MIN"
+                if name.ident.name == sym::MIN
                     && let Some(const_id) = cx.typeck_results().type_dependent_def_id(cond_num_val.hir_id)
-                    && let Some(impl_id) = cx.tcx.impl_of_method(const_id)
-                    && let None = cx.tcx.impl_trait_ref(impl_id) // An inherent impl
-                    && cx.tcx.type_of(impl_id).instantiate_identity().is_integral()
+                    && let Some(impl_id) = cx.tcx.inherent_impl_of_assoc(const_id)
+                    && cx
+                        .tcx
+                        .type_of(impl_id)
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .is_integral()
                 {
                     print_lint_and_sugg(cx, var_name, expr);
                 }
             },
             ExprKind::Call(func, []) => {
                 if let ExprKind::Path(QPath::TypeRelative(_, name)) = func.kind
-                    && name.ident.as_str() == "min_value"
+                    && name.ident.name == sym::min_value
                     && let Some(func_id) = cx.typeck_results().type_dependent_def_id(func.hir_id)
-                    && let Some(impl_id) = cx.tcx.impl_of_method(func_id)
-                    && let None = cx.tcx.impl_trait_ref(impl_id) // An inherent impl
-                    && cx.tcx.type_of(impl_id).instantiate_identity().is_integral()
+                    && let Some(impl_id) = cx.tcx.inherent_impl_of_assoc(func_id)
+                    && cx
+                        .tcx
+                        .type_of(impl_id)
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .is_integral()
                 {
                     print_lint_and_sugg(cx, var_name, expr);
                 }
@@ -371,7 +397,7 @@ fn subtracts_one<'a>(cx: &LateContext<'_>, expr: &'a Expr<'a>) -> Option<&'a Exp
         ExprKind::Assign(target, value, _) => {
             if let ExprKind::Binary(ref op1, left1, right1) = value.kind
                 && BinOpKind::Sub == op1.node
-                && SpanlessEq::new(cx).eq_expr(left1, target)
+                && SpanlessEq::new(cx).eq_expr(expr.span.ctxt(), left1, target)
                 && is_integer_literal(right1, 1)
             {
                 Some(target)
@@ -383,7 +409,7 @@ fn subtracts_one<'a>(cx: &LateContext<'_>, expr: &'a Expr<'a>) -> Option<&'a Exp
     }
 }
 
-fn print_lint_and_sugg(cx: &LateContext<'_>, var_name: &str, expr: &Expr<'_>) {
+fn print_lint_and_sugg(cx: &LateContext<'_>, var_name: Symbol, expr: &Expr<'_>) {
     span_lint_and_sugg(
         cx,
         IMPLICIT_SATURATING_SUB,

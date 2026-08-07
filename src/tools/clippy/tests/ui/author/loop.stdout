@@ -2,7 +2,8 @@ if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::Fo
     && let PatKind::Binding(BindingMode::NONE, _, name, None) = pat.kind
     && name.as_str() == "y"
     && let ExprKind::Struct(qpath, fields, None) = arg.kind
-    && matches!(qpath, QPath::LangItem(LangItem::Range, _))
+    && let Some(def_id) = cx.qpath_res(qpath, arg.hir_id).opt_def_id()
+    && paths::CORE_OPS_RANGE_RANGE.matches(cx, def_id) // Add the path to `clippy_utils::paths` if needed
     && fields.len() == 2
     && fields[0].ident.as_str() == "start"
     && let ExprKind::Lit(ref lit) = fields[0].expr.kind
@@ -14,8 +15,6 @@ if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::Fo
     && block.stmts.len() == 1
     && let StmtKind::Let(local) = block.stmts[0].kind
     && let Some(init) = local.init
-    && let ExprKind::Path(ref qpath1) = init.kind
-    && match_qpath(qpath1, &["y"])
     && let PatKind::Binding(BindingMode::NONE, _, name1, None) = local.pat.kind
     && name1.as_str() == "z"
     && block.expr.is_none()
@@ -25,7 +24,8 @@ if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::Fo
 if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::ForLoop::hir(expr)
     && let PatKind::Wild = pat.kind
     && let ExprKind::Struct(qpath, fields, None) = arg.kind
-    && matches!(qpath, QPath::LangItem(LangItem::Range, _))
+    && let Some(def_id) = cx.qpath_res(qpath, arg.hir_id).opt_def_id()
+    && paths::CORE_OPS_RANGE_RANGE.matches(cx, def_id) // Add the path to `clippy_utils::paths` if needed
     && fields.len() == 2
     && fields[0].ident.as_str() == "start"
     && let ExprKind::Lit(ref lit) = fields[0].expr.kind
@@ -45,7 +45,8 @@ if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::Fo
 if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::ForLoop::hir(expr)
     && let PatKind::Wild = pat.kind
     && let ExprKind::Struct(qpath, fields, None) = arg.kind
-    && matches!(qpath, QPath::LangItem(LangItem::Range, _))
+    && let Some(def_id) = cx.qpath_res(qpath, arg.hir_id).opt_def_id()
+    && paths::CORE_OPS_RANGE_RANGE.matches(cx, def_id) // Add the path to `clippy_utils::paths` if needed
     && fields.len() == 2
     && fields[0].ident.as_str() == "start"
     && let ExprKind::Lit(ref lit) = fields[0].expr.kind
@@ -64,8 +65,6 @@ if let Some(higher::ForLoop { pat: pat, arg: arg, body: body, .. }) = higher::Fo
     // report your lint here
 }
 if let Some(higher::While { condition: condition, body: body }) = higher::While::hir(expr)
-    && let ExprKind::Path(ref qpath) = condition.kind
-    && match_qpath(qpath, &["a"])
     && let ExprKind::Block(block, None) = body.kind
     && block.stmts.len() == 1
     && let StmtKind::Semi(e) = block.stmts[0].kind
@@ -77,10 +76,8 @@ if let Some(higher::While { condition: condition, body: body }) = higher::While:
 }
 if let Some(higher::WhileLet { let_pat: let_pat, let_expr: let_expr, if_then: if_then }) = higher::WhileLet::hir(expr)
     && let PatKind::Expr(lit_expr) = let_pat.kind
-    && let PatExprKind::Lit{ref lit, negated } = lit_expr.kind
+    && let PatExprKind::Lit { ref lit, negated } = lit_expr.kind
     && let LitKind::Bool(true) = lit.node
-    && let ExprKind::Path(ref qpath) = let_expr.kind
-    && match_qpath(qpath, &["a"])
     && let ExprKind::Block(block, None) = if_then.kind
     && block.stmts.len() == 1
     && let StmtKind::Semi(e) = block.stmts[0].kind

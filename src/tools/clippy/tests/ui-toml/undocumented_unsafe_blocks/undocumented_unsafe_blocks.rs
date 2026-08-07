@@ -201,6 +201,66 @@ fn comment_macro_def() {
     t!();
 }
 
+fn comment_macro_def_with_let() {
+    macro_rules! t {
+        () => {
+            let _x =
+                // SAFETY: here be exactly one dragon
+                unsafe { 1 };
+        };
+    }
+
+    t!();
+}
+
+#[rustfmt::skip]
+fn comment_macro_def_with_let_same_line() {
+    macro_rules! t {
+        () => {
+            let _x =// SAFETY: same line comment
+            unsafe { 1 };
+        };
+    }
+
+    t!();
+}
+
+fn inner_comment_macro_def_with_let() {
+    macro_rules! t {
+        () => {
+            let _x = unsafe {
+                // SAFETY: inside the block
+                1
+            };
+        };
+    }
+
+    t!();
+}
+
+fn no_comment_macro_def_with_let() {
+    macro_rules! t {
+        () => {
+            let _x = unsafe { 1 };
+            //~^ undocumented_unsafe_blocks
+        };
+    }
+
+    t!();
+}
+
+fn prefixed_safety_comment_macro_def_with_let() {
+    macro_rules! t {
+        () => {
+            let _x =// not a SAFETY: comment, should lint
+            unsafe { 1 };
+            //~^ undocumented_unsafe_blocks
+        };
+    }
+
+    t!();
+}
+
 fn non_ascii_comment() {
     // ॐ᧻໒ SaFeTy: ௵∰
     unsafe {};
@@ -261,6 +321,13 @@ fn from_proc_macro() {
 fn in_closure(x: *const u32) {
     // Safety: reason
     let _ = || unsafe { *x };
+}
+
+fn inner_block_comment_block_style(x: *const u32) {
+    let _ = unsafe {
+        /* SAFETY: block comment inside */
+        *x
+    };
 }
 
 // Invalid comments
@@ -701,6 +768,8 @@ mod issue_11709_regression {
     const UNIX_EPOCH_JULIAN_DAY: i32 =
         unsafe { Date::__from_ordinal_date_unchecked(1970, 1) }.into_julian_day_just_make_this_line_longer();
     //~[disabled]^ undocumented_unsafe_blocks
+    // This shouldn't be linted, Issue #15755
+    //~[default]^^^^ unnecessary_safety_comment
 }
 
 fn issue_13039() {
@@ -721,6 +790,77 @@ fn issue_13039() {
 
     // SAFETY: unnecessary_safety_comment should not trigger here
     _ = unsafe { foo() }
+}
+
+fn rfl_issue15034() -> i32 {
+    unsafe fn h() -> i32 {
+        1i32
+    }
+    // This shouldn't lint with accept-comment-above-attributes! Thus fixing a false positive!
+    // SAFETY: My safety comment!
+    #[allow(clippy::unnecessary_cast)]
+    return unsafe { h() };
+    //~[disabled]^ ERROR: unsafe block missing a safety comment
+}
+
+mod issue_14555 {
+    // SAFETY: ...
+    mod x {}
+    //~^ unnecessary_safety_comment
+
+    // SAFETY: ...
+    #[doc(hidden)]
+    mod y {}
+    //~[default]^ unnecessary_safety_comment
+
+    #[doc(hidden)]
+    // SAFETY: ...
+    mod z {}
+    //~^ unnecessary_safety_comment
+}
+
+mod issue_15754 {
+    #[must_use]
+    // SAFETY: ...
+    #[doc(hidden)]
+    mod y {}
+    //~[default]^ unnecessary_safety_comment
+
+    fn foo() {
+        #[doc(hidden)]
+        // SAFETY: unnecessary_safety_comment should not trigger here
+        #[allow(unsafe_code)]
+        unsafe {}
+        //~[disabled]^ undocumented_unsafe_blocks
+    }
+
+    fn bar() {
+        #[doc(hidden)]
+        // SAFETY: ...
+        #[allow(clippy::unnecessary_cast)]
+        let x = 34;
+        //~[default]^ unnecessary_safety_comment
+    }
+}
+
+mod unsafe_fns {
+    // SAFETY: Bla
+    unsafe fn unsafe_comment() {}
+    //~^ unnecessary_safety_comment
+
+    /*
+       SAFETY: Bla
+    */
+    unsafe fn unsafe_block_comment() {}
+    //~^ unnecessary_safety_comment
+
+    // SAFETY: Bla
+    fn safe_comment() {}
+    //~^ unnecessary_safety_comment
+
+    /// SAFETY: Bla
+    fn safe_doc_comment() {}
+    //~^ unnecessary_safety_comment
 }
 
 fn main() {}

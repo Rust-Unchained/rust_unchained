@@ -1,12 +1,6 @@
 #![warn(clippy::match_single_binding)]
-#![allow(
-    unused,
-    clippy::let_unit_value,
-    clippy::no_effect,
-    clippy::toplevel_ref_arg,
-    clippy::uninlined_format_args,
-    clippy::useless_vec
-)]
+#![allow(clippy::no_effect, clippy::toplevel_ref_arg)]
+#![expect(clippy::let_unit_value, clippy::useless_vec)]
 
 struct Point {
     x: i32,
@@ -33,13 +27,13 @@ fn main() {
     match (a, b, c) {
         //~^ match_single_binding
         (x, y, z) => {
-            println!("{} {} {}", x, y, z);
+            println!("{x} {y} {z}");
         },
     }
     // Lint
     match (a, b, c) {
         //~^ match_single_binding
-        (x, y, z) => println!("{} {} {}", x, y, z),
+        (x, y, z) => println!("{x} {y} {z}"),
     }
     // Ok
     foo!(a);
@@ -51,7 +45,7 @@ fn main() {
     // Ok
     let d = Some(5);
     match d {
-        Some(d) => println!("{}", d),
+        Some(d) => println!("{d}"),
         _ => println!("None"),
     }
     // Lint
@@ -64,7 +58,7 @@ fn main() {
         //~^ match_single_binding
         _ => {
             let x = 29;
-            println!("x has a value of {}", x);
+            println!("x has a value of {x}");
         },
     }
     // Lint
@@ -81,24 +75,24 @@ fn main() {
     let p = Point { x: 0, y: 7 };
     match p {
         //~^ match_single_binding
-        Point { x, y } => println!("Coords: ({}, {})", x, y),
+        Point { x, y } => println!("Coords: ({x}, {y})"),
     }
     // Lint
     match p {
         //~^ match_single_binding
-        Point { x: x1, y: y1 } => println!("Coords: ({}, {})", x1, y1),
+        Point { x: x1, y: y1 } => println!("Coords: ({x1}, {y1})"),
     }
     // Lint
     let x = 5;
     match x {
         //~^ match_single_binding
-        ref r => println!("Got a reference to {}", r),
+        ref r => println!("Got a reference to {r}"),
     }
     // Lint
     let mut x = 5;
     match x {
         //~^ match_single_binding
-        ref mut mr => println!("Got a mutable reference to {}", mr),
+        ref mut mr => println!("Got a mutable reference to {mr}"),
     }
     // Lint
     let product = match coords() {
@@ -150,7 +144,7 @@ fn issue_8723() {
     val = match val.split_at(idx) {
         //~^ match_single_binding
         (pre, suf) => {
-            println!("{}", pre);
+            println!("{pre}");
             suf
         },
     };
@@ -248,4 +242,179 @@ fn issue14634() {
         id!(b) => dbg!(b + 1),
     };
     //~^^^ match_single_binding
+}
+
+mod issue14991 {
+    struct AnnoConstWOBlock {
+        inner: [(); match 1 {
+            //~^ match_single_binding
+            _n => 42,
+        }],
+    }
+
+    struct AnnoConstWBlock {
+        inner: [(); {
+            match 1 {
+                //~^ match_single_binding
+                _n => 42,
+            }
+        }],
+    }
+}
+
+mod issue15018 {
+    fn used_later(a: i32, b: i32, c: i32) {
+        let x = 1;
+        match (a, b, c) {
+            //~^ match_single_binding
+            (x, y, z) => println!("{x} {y} {z}"),
+        }
+        println!("x = {x}");
+    }
+
+    fn not_used_later(a: i32, b: i32, c: i32) {
+        match (a, b, c) {
+            //~^ match_single_binding
+            (x, y, z) => println!("{x} {y} {z}"),
+        }
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    fn not_used_later_but_shadowed(a: i32, b: i32, c: i32) {
+        match (a, b, c) {
+            //~^ match_single_binding
+            (x, y, z) => println!("{x} {y} {z}"),
+        }
+        let x = 1;
+        println!("x = {x}");
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    fn not_used_later_but_shadowed_nested(a: i32, b: i32, c: i32) {
+        match (a, b, c) {
+            //~^ match_single_binding
+            (x, y, z) => println!("{x} {x} {y}"),
+        }
+        if let (x, y, z) = (a, b, c) {
+            println!("{x} {y} {z}")
+        }
+
+        {
+            let x: i32 = 1;
+            match (a, b, c) {
+                //~^ match_single_binding
+                (x, y, z) => println!("{x} {y} {z}"),
+            }
+            if let (x, y, z) = (a, x, c) {
+                println!("{x} {y} {z}")
+            }
+        }
+
+        {
+            match (a, b, c) {
+                //~^ match_single_binding
+                (x, y, z) => println!("{x} {y} {z}"),
+            }
+            let fn_ = |y| {
+                println!("{a} {b} {y}");
+            };
+            fn_(c);
+        }
+    }
+}
+
+#[allow(clippy::short_circuit_statement)]
+fn issue15269(a: usize, b: usize, c: usize) -> bool {
+    a < b
+        && match b {
+            //~^ match_single_binding
+            b => b < c,
+        };
+
+    a < b
+        && match (a, b) {
+            //~^ match_single_binding
+            (a, b) => b < c,
+        }
+}
+
+#[allow(
+    irrefutable_let_patterns,
+    clippy::blocks_in_conditions,
+    clippy::unused_unit,
+    clippy::let_unit_value,
+    clippy::unit_arg,
+    clippy::unnecessary_operation
+)]
+fn issue15537(a: i32) -> ((), (), ()) {
+    let y = (
+        { todo!() },
+        match { a } {
+            //~^ match_single_binding
+            _ => (),
+        },
+        (),
+    );
+
+    let y = [
+        { todo!() },
+        match { a } {
+            //~^ match_single_binding
+            _ => (),
+        },
+        (),
+    ];
+
+    fn call(x: (), y: (), z: ()) {}
+    let y = call(
+        { todo!() },
+        match { a } {
+            //~^ match_single_binding
+            _ => (),
+        },
+        (),
+    );
+
+    struct Foo;
+    impl Foo {
+        fn method(&self, x: (), y: (), z: ()) {}
+    }
+    let x = Foo;
+    x.method(
+        { todo!() },
+        match { a } {
+            //~^ match_single_binding
+            _ => (),
+        },
+        (),
+    );
+
+    -match { a } {
+        //~^ match_single_binding
+        _ => 1,
+    };
+
+    _ = match { a } {
+        //~^ match_single_binding
+        _ => 1,
+    };
+
+    if let x = match { a } {
+        //~^ match_single_binding
+        _ => 1,
+    } {}
+
+    if match { a } {
+        //~^ match_single_binding
+        _ => true,
+    } {
+        todo!()
+    }
+
+    [1, 2, 3][match { a } {
+        //~^ match_single_binding
+        _ => 1usize,
+    }];
+
+    todo!()
 }

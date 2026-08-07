@@ -8,7 +8,6 @@ use rustc_middle::mir;
 /// Collect possible borrowed for every `&mut` local.
 /// For example, `_1 = &mut _2` generate _1: {_2,...}
 /// Known Problems: not sure all borrowed are tracked
-#[allow(clippy::module_name_repetitions)]
 pub(super) struct PossibleOriginVisitor<'a, 'tcx> {
     possible_origin: TransitiveRelation,
     body: &'a mir::Body<'tcx>,
@@ -47,7 +46,7 @@ impl<'tcx> mir::visit::Visitor<'tcx> for PossibleOriginVisitor<'_, 'tcx> {
             mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, borrowed) |
             // _2: &mut _;
             // _3 = move _2
-            mir::Rvalue::Use(mir::Operand::Move(borrowed))  |
+            mir::Rvalue::Use(mir::Operand::Move(borrowed), _)  |
             // _3 = move _2 as &mut _;
             mir::Rvalue::Cast(_, mir::Operand::Move(borrowed), _)
                 => {

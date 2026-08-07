@@ -80,8 +80,7 @@ ENV PGO_HOST=x86_64-unknown-linux-gnu
 
 ENV HOSTS=x86_64-unknown-linux-gnu
 
-ENV RUST_CONFIGURE_ARGS \
-      --enable-full-tools \
+ENV RUST_CONFIGURE_ARGS="--enable-full-tools \
       --enable-sanitizers \
       --enable-profiler \
       --enable-compiler-docs \
@@ -91,29 +90,26 @@ ENV RUST_CONFIGURE_ARGS \
       --set llvm.thin-lto=true \
       --set llvm.ninja=false \
       --set llvm.libzstd=true \
-      --set rust.jemalloc \
-      --set rust.use-lld=true \
+      --set build.allocator=jemalloc \
+      --set rust.bootstrap-override-lld=true \
       --set rust.lto=thin \
-      --set rust.codegen-units=1
+      --set rust.codegen-units=1"
 
-# Note that `rust.debug` is set to true *only* for `opt-dist`
-ENV SCRIPT python3 ../x.py build --set rust.debug=true opt-dist && \
-    ./build/$HOSTS/stage0-tools-bin/opt-dist linux-ci -- python3 ../x.py dist \
-    --host $HOSTS --target $HOSTS \
-    --include-default-paths \
-    build-manifest bootstrap && \
-    # Use GCC for building GCC, as it seems to behave badly when built with Clang
-    CC=/rustroot/bin/cc CXX=/rustroot/bin/c++ python3 ../x.py dist gcc
+COPY host-x86_64/dist-x86_64-linux/dist.sh /scripts/
+COPY host-x86_64/dist-x86_64-linux/dist-alt.sh /scripts/
+
+ENV SCRIPT="Must specify DOCKER_SCRIPT for this image"
+
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
 
 # This is the only builder which will create source tarballs
-ENV DIST_SRC 1
+ENV DIST_SRC="1"
 
 # When we build cargo in this container, we don't want it to use the system
 # libcurl, instead it should compile its own.
-ENV LIBCURL_NO_PKG_CONFIG 1
+ENV LIBCURL_NO_PKG_CONFIG="1"
 
-ENV DIST_REQUIRE_ALL_TOOLS 1
+ENV DIST_REQUIRE_ALL_TOOLS="1"
 
 # FIXME: Without this, LLVMgold.so incorrectly resolves to the system
 # libstdc++, instead of the one we build.

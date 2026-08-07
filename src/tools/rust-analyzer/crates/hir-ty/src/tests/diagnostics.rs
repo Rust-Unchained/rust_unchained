@@ -1,6 +1,4 @@
-use crate::tests::check_no_mismatches;
-
-use super::check;
+use super::{check, check_no_mismatches};
 
 #[test]
 fn function_return_type_mismatch_1() {
@@ -89,7 +87,6 @@ fn test(x: bool) {
       //^^^^ expected (), got &'static str
     }
     match x { true => true, false => 0 }
-  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected (), got bool
                                    //^ expected bool, got i32
     ()
 }

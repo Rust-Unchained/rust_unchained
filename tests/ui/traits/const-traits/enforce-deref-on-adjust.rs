@@ -1,6 +1,6 @@
 //@ check-pass
 
-#![feature(const_deref)]
+#![feature(const_convert)]
 #![feature(const_trait_impl)]
 
 use std::ops::Deref;
@@ -12,7 +12,7 @@ impl Foo {
     const fn call(&self) {}
 }
 
-impl<T> const Deref for Wrap<T> {
+const impl<T> Deref for Wrap<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

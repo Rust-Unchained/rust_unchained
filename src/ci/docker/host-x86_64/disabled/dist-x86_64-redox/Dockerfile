@@ -4,6 +4,7 @@ COPY scripts/cross-apt-packages.sh /scripts/
 RUN sh /scripts/cross-apt-packages.sh
 
 COPY scripts/crosstool-ng.sh /scripts/
+COPY scripts/crosstool-ng-sha256-20260705.diff /scripts/
 RUN sh /scripts/crosstool-ng.sh
 
 WORKDIR /tmp
@@ -18,5 +19,5 @@ ENV \
     CC_x86_64_unknown_redox=x86_64-unknown-redox-gcc \
     CXX_x86_64_unknown_redox=x86_64-unknown-redox-g++
 
-ENV RUST_CONFIGURE_ARGS --enable-extended
-ENV SCRIPT python3 ../x.py dist --host='' --target x86_64-unknown-redox
+ENV RUST_CONFIGURE_ARGS="--enable-extended"
+ENV SCRIPT="python3 ../x.py dist --host= --target x86_64-unknown-redox"

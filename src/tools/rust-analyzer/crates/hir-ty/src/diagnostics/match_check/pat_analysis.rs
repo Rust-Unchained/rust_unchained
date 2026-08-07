@@ -1,34 +1,40 @@
 //! Interface with `rustc_pattern_analysis`.
 
-use std::cell::LazyCell;
-use std::fmt;
+use std::{cell::LazyCell, fmt};
 
-use hir_def::{DefWithBodyId, EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId};
-use intern::sym;
-use rustc_pattern_analysis::{
-    constructor::{Constructor, ConstructorSet, VariantVisibility},
-    usefulness::{compute_match_usefulness, PlaceValidity, UsefulnessReport},
-    Captures, IndexVec, PatCx, PrivateUninhabitedField,
+use hir_def::{
+    EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId, attrs::AttrFlags,
+    signatures::VariantFields, unstable_features::UnstableFeatures,
 };
-use smallvec::{smallvec, SmallVec};
+use rustc_pattern_analysis::{
+    IndexVec, PatCx, PrivateUninhabitedField,
+    constructor::{Constructor, ConstructorSet, VariantVisibility},
+    usefulness::{PlaceValidity, UsefulnessReport, compute_match_usefulness},
+};
+use rustc_type_ir::inherent::IntoKind;
+use smallvec::{SmallVec, smallvec};
 use stdx::never;
 
 use crate::{
     db::HirDatabase,
-    infer::normalize,
     inhabitedness::{is_enum_variant_uninhabited_from, is_ty_uninhabited_from},
-    AdtId, Interner, Scalar, Ty, TyExt, TyKind,
+    next_solver::{
+        ParamEnv, Ty, TyKind,
+        infer::{InferCtxt, traits::ObligationCause},
+    },
 };
 
-use super::{is_box, FieldPat, Pat, PatKind};
+use super::{FieldPat, Pat, PatKind};
 
 use Constructor::*;
 
 // Re-export r-a-specific versions of all these types.
-pub(crate) type DeconstructedPat<'db> =
-    rustc_pattern_analysis::pat::DeconstructedPat<MatchCheckCtx<'db>>;
-pub(crate) type MatchArm<'db> = rustc_pattern_analysis::MatchArm<'db, MatchCheckCtx<'db>>;
-pub(crate) type WitnessPat<'db> = rustc_pattern_analysis::pat::WitnessPat<MatchCheckCtx<'db>>;
+pub(crate) type DeconstructedPat<'a, 'db> =
+    rustc_pattern_analysis::pat::DeconstructedPat<MatchCheckCtx<'a, 'db>>;
+pub(crate) type MatchArm<'a, 'b, 'db> =
+    rustc_pattern_analysis::MatchArm<'b, MatchCheckCtx<'a, 'db>>;
+pub(crate) type WitnessPat<'a, 'db> =
+    rustc_pattern_analysis::pat::WitnessPat<MatchCheckCtx<'a, 'db>>;
 
 /// [Constructor] uses this in unimplemented variants.
 /// It allows porting match expressions from upstream algorithm without losing semantics.
@@ -43,13 +49,12 @@ pub(crate) struct EnumVariantContiguousIndex(usize);
 impl EnumVariantContiguousIndex {
     fn from_enum_variant_id(db: &dyn HirDatabase, target_evid: EnumVariantId) -> Self {
         // Find the index of this variant in the list of variants.
-        use hir_def::Lookup;
-        let i = target_evid.lookup(db.upcast()).index as usize;
+        let i = target_evid.index(db);
         EnumVariantContiguousIndex(i)
     }
 
     fn to_enum_variant_id(self, db: &dyn HirDatabase, eid: EnumId) -> EnumVariantId {
-        db.enum_data(eid).variants[self.0].0
+        eid.enum_variants(db).variants[self.0].0
     }
 }
 
@@ -64,31 +69,32 @@ impl rustc_pattern_analysis::Idx for EnumVariantContiguousIndex {
 }
 
 #[derive(Clone)]
-pub(crate) struct MatchCheckCtx<'db> {
+pub(crate) struct MatchCheckCtx<'a, 'db> {
     module: ModuleId,
-    body: DefWithBodyId,
     pub(crate) db: &'db dyn HirDatabase,
     exhaustive_patterns: bool,
+    env: ParamEnv<'db>,
+    infcx: &'a InferCtxt<'db>,
 }
 
-impl<'db> MatchCheckCtx<'db> {
-    pub(crate) fn new(module: ModuleId, body: DefWithBodyId, db: &'db dyn HirDatabase) -> Self {
-        let def_map = db.crate_def_map(module.krate());
-        let exhaustive_patterns = def_map.is_unstable_feature_enabled(&sym::exhaustive_patterns);
-        Self { module, body, db, exhaustive_patterns }
+impl<'a, 'db> MatchCheckCtx<'a, 'db> {
+    pub(crate) fn new(module: ModuleId, infcx: &'a InferCtxt<'db>, env: ParamEnv<'db>) -> Self {
+        let db = infcx.interner.db;
+        let exhaustive_patterns = UnstableFeatures::query(db, module.krate(db)).exhaustive_patterns;
+        Self { module, db, exhaustive_patterns, env, infcx }
     }
 
-    pub(crate) fn compute_match_usefulness(
+    pub(crate) fn compute_match_usefulness<'b>(
         &self,
-        arms: &[MatchArm<'db>],
-        scrut_ty: Ty,
+        arms: &[MatchArm<'a, 'b, 'db>],
+        scrut_ty: Ty<'db>,
         known_valid_scrutinee: Option<bool>,
-    ) -> Result<UsefulnessReport<'db, Self>, ()> {
-        if scrut_ty.contains_unknown() {
+    ) -> Result<UsefulnessReport<'b, Self>, ()> {
+        if scrut_ty.references_non_lt_error() {
             return Err(());
         }
         for arm in arms {
-            if arm.pat.ty().contains_unknown() {
+            if arm.pat.ty().references_non_lt_error() {
                 return Err(());
             }
         }
@@ -99,14 +105,14 @@ impl<'db> MatchCheckCtx<'db> {
         compute_match_usefulness(self, arms, scrut_ty, place_validity, complexity_limit)
     }
 
-    fn is_uninhabited(&self, ty: &Ty) -> bool {
-        is_ty_uninhabited_from(self.db, ty, self.module)
+    fn is_uninhabited(&self, ty: Ty<'db>) -> bool {
+        is_ty_uninhabited_from(self.infcx, ty, self.module, self.env)
     }
 
     /// Returns whether the given ADT is from another crate declared `#[non_exhaustive]`.
     fn is_foreign_non_exhaustive(&self, adt: hir_def::AdtId) -> bool {
-        let is_local = adt.krate(self.db.upcast()) == self.module.krate();
-        !is_local && self.db.attrs(adt.into()).by_key(&sym::non_exhaustive).exists()
+        let is_local = adt.krate(self.db) == self.module.krate(self.db);
+        !is_local && AttrFlags::query(self.db, adt.into()).contains(AttrFlags::NON_EXHAUSTIVE)
     }
 
     fn variant_id_for_adt(
@@ -131,25 +137,29 @@ impl<'db> MatchCheckCtx<'db> {
     }
 
     // This lists the fields of a variant along with their types.
-    fn list_variant_fields<'a>(
-        &'a self,
-        ty: &'a Ty,
+    fn list_variant_fields(
+        &self,
+        ty: Ty<'db>,
         variant: VariantId,
-    ) -> impl Iterator<Item = (LocalFieldId, Ty)> + Captures<'a> + Captures<'db> {
+    ) -> impl Iterator<Item = (LocalFieldId, Ty<'db>)> {
         let (_, substs) = ty.as_adt().unwrap();
 
         let field_tys = self.db.field_types(variant);
-        let fields_len = variant.variant_data(self.db.upcast()).fields().len() as u32;
+        let fields_len = variant.fields(self.db).fields().len() as u32;
 
         (0..fields_len).map(|idx| LocalFieldId::from_raw(idx.into())).map(move |fid| {
-            let ty = field_tys[fid].clone().substitute(Interner, substs);
-            let ty = normalize(self.db, self.db.trait_environment_for_body(self.body), ty);
+            let ty = field_tys[fid].ty().instantiate(self.infcx.interner, substs).skip_norm_wip();
+            let ty = self
+                .infcx
+                .at(&ObligationCause::dummy(), self.env)
+                .deeply_normalize(ty)
+                .unwrap_or(ty);
             (fid, ty)
         })
     }
 
-    pub(crate) fn lower_pat(&self, pat: &Pat) -> DeconstructedPat<'db> {
-        let singleton = |pat: DeconstructedPat<'db>| vec![pat.at_index(0)];
+    pub(crate) fn lower_pat(&self, pat: &Pat<'db>) -> DeconstructedPat<'a, 'db> {
+        let singleton = |pat: DeconstructedPat<'a, 'db>| vec![pat.at_index(0)];
         let ctor;
         let mut fields: Vec<_>;
         let arity;
@@ -162,9 +172,7 @@ impl<'db> MatchCheckCtx<'db> {
                 arity = 0;
             }
             PatKind::Deref { subpattern } => {
-                ctor = match pat.ty.kind(Interner) {
-                    // This is a box pattern.
-                    TyKind::Adt(adt, _) if is_box(self.db, adt.0) => Struct,
+                ctor = match pat.ty.kind() {
                     TyKind::Ref(..) => Ref,
                     _ => {
                         never!("pattern has unexpected type: pat: {:?}, ty: {:?}", pat, &pat.ty);
@@ -182,29 +190,13 @@ impl<'db> MatchCheckCtx<'db> {
                         self.lower_pat(&pat.pattern).at_index(idx as usize)
                     })
                     .collect();
-                match pat.ty.kind(Interner) {
-                    TyKind::Tuple(_, substs) => {
+                match pat.ty.kind() {
+                    TyKind::Tuple(substs) => {
                         ctor = Struct;
-                        arity = substs.len(Interner);
+                        arity = substs.len();
                     }
-                    TyKind::Adt(adt, _) if is_box(self.db, adt.0) => {
-                        // The only legal patterns of type `Box` (outside `std`) are `_` and box
-                        // patterns. If we're here we can assume this is a box pattern.
-                        // FIXME(Nadrieril): A `Box` can in theory be matched either with `Box(_,
-                        // _)` or a box pattern. As a hack to avoid an ICE with the former, we
-                        // ignore other fields than the first one. This will trigger an error later
-                        // anyway.
-                        // See https://github.com/rust-lang/rust/issues/82772 ,
-                        // explanation: https://github.com/rust-lang/rust/pull/82789#issuecomment-796921977
-                        // The problem is that we can't know from the type whether we'll match
-                        // normally or through box-patterns. We'll have to figure out a proper
-                        // solution when we introduce generalized deref patterns. Also need to
-                        // prevent mixing of those two options.
-                        fields.retain(|ipat| ipat.idx == 0);
-                        ctor = Struct;
-                        arity = 1;
-                    }
-                    &TyKind::Adt(AdtId(adt), _) => {
+                    TyKind::Adt(adt_def, _) => {
+                        let adt = adt_def.def_id();
                         ctor = match pat.kind.as_ref() {
                             PatKind::Leaf { .. } if matches!(adt, hir_def::AdtId::UnionId(_)) => {
                                 UnionField
@@ -222,7 +214,7 @@ impl<'db> MatchCheckCtx<'db> {
                             }
                         };
                         let variant = Self::variant_id_for_adt(self.db, &ctor, adt).unwrap();
-                        arity = variant.variant_data(self.db.upcast()).fields().len();
+                        arity = variant.fields(self.db).fields().len();
                     }
                     _ => {
                         never!("pattern has unexpected type: pat: {:?}, ty: {:?}", pat, &pat.ty);
@@ -252,15 +244,15 @@ impl<'db> MatchCheckCtx<'db> {
                 arity = pats.len();
             }
         }
-        DeconstructedPat::new(ctor, fields, arity, pat.ty.clone(), ())
+        DeconstructedPat::new(ctor, fields, arity, pat.ty, ())
     }
 
-    pub(crate) fn hoist_witness_pat(&self, pat: &WitnessPat<'db>) -> Pat {
+    pub(crate) fn hoist_witness_pat(&self, pat: &WitnessPat<'a, 'db>) -> Pat<'db> {
         let mut subpatterns = pat.iter_fields().map(|p| self.hoist_witness_pat(p));
         let kind = match pat.ctor() {
             &Bool(value) => PatKind::LiteralBool { value },
             IntRange(_) => unimplemented!(),
-            Struct | Variant(_) | UnionField => match pat.ty().kind(Interner) {
+            Struct | Variant(_) | UnionField => match pat.ty().kind() {
                 TyKind::Tuple(..) => PatKind::Leaf {
                     subpatterns: subpatterns
                         .zip(0u32..)
@@ -270,22 +262,17 @@ impl<'db> MatchCheckCtx<'db> {
                         })
                         .collect(),
                 },
-                TyKind::Adt(adt, _) if is_box(self.db, adt.0) => {
-                    // Without `box_patterns`, the only legal pattern of type `Box` is `_` (outside
-                    // of `std`). So this branch is only reachable when the feature is enabled and
-                    // the pattern is a box pattern.
-                    PatKind::Deref { subpattern: subpatterns.next().unwrap() }
-                }
                 TyKind::Adt(adt, substs) => {
-                    let variant = Self::variant_id_for_adt(self.db, pat.ctor(), adt.0).unwrap();
+                    let variant =
+                        Self::variant_id_for_adt(self.db, pat.ctor(), adt.def_id()).unwrap();
                     let subpatterns = self
-                        .list_variant_fields(pat.ty(), variant)
+                        .list_variant_fields(*pat.ty(), variant)
                         .zip(subpatterns)
                         .map(|((field, _ty), pattern)| FieldPat { field, pattern })
                         .collect();
 
                     if let VariantId::EnumVariantId(enum_variant) = variant {
-                        PatKind::Variant { substs: substs.clone(), enum_variant, subpatterns }
+                        PatKind::Variant { substs, enum_variant, subpatterns }
                     } else {
                         PatKind::Leaf { subpatterns }
                     }
@@ -301,6 +288,7 @@ impl<'db> MatchCheckCtx<'db> {
             // ignore this issue.
             Ref => PatKind::Deref { subpattern: subpatterns.next().unwrap() },
             Slice(_) => unimplemented!(),
+            DerefPattern(_) => unimplemented!(),
             &Str(void) => match void {},
             Wildcard | NonExhaustive | Hidden | PrivateUninhabited => PatKind::Wild,
             Never => PatKind::Never,
@@ -310,13 +298,13 @@ impl<'db> MatchCheckCtx<'db> {
                 PatKind::Wild
             }
         };
-        Pat { ty: pat.ty().clone(), kind: Box::new(kind) }
+        Pat { ty: *pat.ty(), kind: Box::new(kind) }
     }
 }
 
-impl PatCx for MatchCheckCtx<'_> {
+impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
     type Error = ();
-    type Ty = Ty;
+    type Ty = Ty<'db>;
     type VariantIdx = EnumVariantContiguousIndex;
     type StrLit = Void;
     type ArmData = ();
@@ -332,17 +320,12 @@ impl PatCx for MatchCheckCtx<'_> {
         ty: &Self::Ty,
     ) -> usize {
         match ctor {
-            Struct | Variant(_) | UnionField => match *ty.kind(Interner) {
-                TyKind::Tuple(arity, ..) => arity,
-                TyKind::Adt(AdtId(adt), ..) => {
-                    if is_box(self.db, adt) {
-                        // The only legal patterns of type `Box` (outside `std`) are `_` and box
-                        // patterns. If we're here we can assume this is a box pattern.
-                        1
-                    } else {
-                        let variant = Self::variant_id_for_adt(self.db, ctor, adt).unwrap();
-                        variant.variant_data(self.db.upcast()).fields().len()
-                    }
+            Struct | Variant(_) | UnionField => match ty.kind() {
+                TyKind::Tuple(tys) => tys.len(),
+                TyKind::Adt(adt_def, ..) => {
+                    let variant =
+                        Self::variant_id_for_adt(self.db, ctor, adt_def.def_id()).unwrap();
+                    variant.fields(self.db).fields().len()
                 }
                 _ => {
                     never!("Unexpected type for `Single` constructor: {:?}", ty);
@@ -351,6 +334,7 @@ impl PatCx for MatchCheckCtx<'_> {
             },
             Ref => 1,
             Slice(..) => unimplemented!(),
+            DerefPattern(..) => unimplemented!(),
             Never | Bool(..) | IntRange(..) | F16Range(..) | F32Range(..) | F64Range(..)
             | F128Range(..) | Str(..) | Opaque(..) | NonExhaustive | PrivateUninhabited
             | Hidden | Missing | Wildcard => 0,
@@ -368,50 +352,44 @@ impl PatCx for MatchCheckCtx<'_> {
     ) -> impl ExactSizeIterator<Item = (Self::Ty, PrivateUninhabitedField)> {
         let single = |ty| smallvec![(ty, PrivateUninhabitedField(false))];
         let tys: SmallVec<[_; 2]> = match ctor {
-            Struct | Variant(_) | UnionField => match ty.kind(Interner) {
-                TyKind::Tuple(_, substs) => {
-                    let tys = substs.iter(Interner).map(|ty| ty.assert_ty_ref(Interner));
-                    tys.cloned().map(|ty| (ty, PrivateUninhabitedField(false))).collect()
+            Struct | Variant(_) | UnionField => match ty.kind() {
+                TyKind::Tuple(substs) => {
+                    substs.iter().map(|ty| (ty, PrivateUninhabitedField(false))).collect()
                 }
-                TyKind::Ref(.., rty) => single(rty.clone()),
-                &TyKind::Adt(AdtId(adt), ref substs) => {
-                    if is_box(self.db, adt) {
-                        // The only legal patterns of type `Box` (outside `std`) are `_` and box
-                        // patterns. If we're here we can assume this is a box pattern.
-                        let subst_ty = substs.at(Interner, 0).assert_ty_ref(Interner).clone();
-                        single(subst_ty)
-                    } else {
-                        let variant = Self::variant_id_for_adt(self.db, ctor, adt).unwrap();
+                TyKind::Ref(_, rty, _) => single(rty),
+                TyKind::Adt(adt_def, ..) => {
+                    let adt = adt_def.def_id();
+                    let variant = Self::variant_id_for_adt(self.db, ctor, adt).unwrap();
 
-                        let visibilities = LazyCell::new(|| self.db.field_visibilities(variant));
+                    let visibilities =
+                        LazyCell::new(|| VariantFields::field_visibilities(self.db, variant));
 
-                        self.list_variant_fields(ty, variant)
-                            .map(move |(fid, ty)| {
-                                let is_visible = || {
-                                    matches!(adt, hir_def::AdtId::EnumId(..))
-                                        || visibilities[fid]
-                                            .is_visible_from(self.db.upcast(), self.module)
-                                };
-                                let is_uninhabited = self.is_uninhabited(&ty);
-                                let private_uninhabited = is_uninhabited && !is_visible();
-                                (ty, PrivateUninhabitedField(private_uninhabited))
-                            })
-                            .collect()
-                    }
+                    self.list_variant_fields(*ty, variant)
+                        .map(move |(fid, ty)| {
+                            let is_visible = || {
+                                matches!(adt, hir_def::AdtId::EnumId(..))
+                                    || visibilities[fid].is_visible_from(self.db, self.module)
+                            };
+                            let is_uninhabited = self.is_uninhabited(ty);
+                            let private_uninhabited = is_uninhabited && !is_visible();
+                            (ty, PrivateUninhabitedField(private_uninhabited))
+                        })
+                        .collect()
                 }
                 ty_kind => {
                     never!("Unexpected type for `{:?}` constructor: {:?}", ctor, ty_kind);
-                    single(ty.clone())
+                    single(*ty)
                 }
             },
-            Ref => match ty.kind(Interner) {
-                TyKind::Ref(.., rty) => single(rty.clone()),
+            Ref => match ty.kind() {
+                TyKind::Ref(_, rty, _) => single(rty),
                 ty_kind => {
                     never!("Unexpected type for `{:?}` constructor: {:?}", ctor, ty_kind);
-                    single(ty.clone())
+                    single(*ty)
                 }
             },
             Slice(_) => unreachable!("Found a `Slice` constructor in match checking"),
+            DerefPattern(_) => unreachable!("Found a `DerefPattern` constructor in match checking"),
             Never | Bool(..) | IntRange(..) | F16Range(..) | F32Range(..) | F64Range(..)
             | F128Range(..) | Str(..) | Opaque(..) | NonExhaustive | PrivateUninhabited
             | Hidden | Missing | Wildcard => {
@@ -443,37 +421,47 @@ impl PatCx for MatchCheckCtx<'_> {
         // returned list of constructors.
         // Invariant: this is empty if and only if the type is uninhabited (as determined by
         // `cx.is_uninhabited()`).
-        Ok(match ty.kind(Interner) {
-            TyKind::Scalar(Scalar::Bool) => ConstructorSet::Bool,
-            TyKind::Scalar(Scalar::Char) => unhandled(),
-            TyKind::Scalar(Scalar::Int(..) | Scalar::Uint(..)) => unhandled(),
+        Ok(match ty.kind() {
+            TyKind::Bool => ConstructorSet::Bool,
+            TyKind::Char => unhandled(),
+            TyKind::Int(..) | TyKind::Uint(..) => unhandled(),
             TyKind::Array(..) | TyKind::Slice(..) => unhandled(),
-            &TyKind::Adt(AdtId(adt @ hir_def::AdtId::EnumId(enum_id)), ref subst) => {
-                let enum_data = cx.db.enum_data(enum_id);
-                let is_declared_nonexhaustive = cx.is_foreign_non_exhaustive(adt);
+            TyKind::Adt(adt_def, subst) => {
+                let adt = adt_def.def_id();
+                match adt {
+                    hir_def::AdtId::EnumId(enum_id) => {
+                        let enum_data = enum_id.enum_variants(cx.db);
+                        let is_declared_nonexhaustive = cx.is_foreign_non_exhaustive(adt);
 
-                if enum_data.variants.is_empty() && !is_declared_nonexhaustive {
-                    ConstructorSet::NoConstructors
-                } else {
-                    let mut variants = IndexVec::with_capacity(enum_data.variants.len());
-                    for &(variant, _) in enum_data.variants.iter() {
-                        let is_uninhabited =
-                            is_enum_variant_uninhabited_from(cx.db, variant, subst, cx.module);
-                        let visibility = if is_uninhabited {
-                            VariantVisibility::Empty
+                        if enum_data.variants.is_empty() && !is_declared_nonexhaustive {
+                            ConstructorSet::NoConstructors
                         } else {
-                            VariantVisibility::Visible
-                        };
-                        variants.push(visibility);
-                    }
+                            let mut variants = IndexVec::with_capacity(enum_data.variants.len());
+                            for &(variant, _) in enum_data.variants.values() {
+                                let is_uninhabited = is_enum_variant_uninhabited_from(
+                                    cx.infcx, variant, subst, cx.module, self.env,
+                                );
+                                let visibility = if is_uninhabited {
+                                    VariantVisibility::Empty
+                                } else {
+                                    VariantVisibility::Visible
+                                };
+                                variants.push(visibility);
+                            }
 
-                    ConstructorSet::Variants { variants, non_exhaustive: is_declared_nonexhaustive }
+                            ConstructorSet::Variants {
+                                variants,
+                                non_exhaustive: is_declared_nonexhaustive,
+                            }
+                        }
+                    }
+                    hir_def::AdtId::UnionId(_) => ConstructorSet::Union,
+                    hir_def::AdtId::StructId(_) => {
+                        ConstructorSet::Struct { empty: cx.is_uninhabited(*ty) }
+                    }
                 }
             }
-            TyKind::Adt(AdtId(hir_def::AdtId::UnionId(_)), _) => ConstructorSet::Union,
-            TyKind::Adt(..) | TyKind::Tuple(..) => {
-                ConstructorSet::Struct { empty: cx.is_uninhabited(ty) }
-            }
+            TyKind::Tuple(..) => ConstructorSet::Struct { empty: cx.is_uninhabited(*ty) },
             TyKind::Ref(..) => ConstructorSet::Ref,
             TyKind::Never => ConstructorSet::NoConstructors,
             // This type is one for which we cannot list constructors, like `str` or `f64`.
@@ -493,13 +481,13 @@ impl PatCx for MatchCheckCtx<'_> {
         // if let Some(variant) = variant {
         //     match variant {
         //         VariantId::EnumVariantId(v) => {
-        //             write!(f, "{}", db.enum_variant_data(v).name.display(db.upcast()))?;
+        //             write!(f, "{}", db.enum_variant_data(v).name.display(db))?;
         //         }
         //         VariantId::StructId(s) => {
-        //             write!(f, "{}", db.struct_data(s).name.display(db.upcast()))?
+        //             write!(f, "{}", db.struct_data(s).name.display(db))?
         //         }
         //         VariantId::UnionId(u) => {
-        //             write!(f, "{}", db.union_data(u).name.display(db.upcast()))?
+        //             write!(f, "{}", db.union_data(u).name.display(db))?
         //         }
         //     }
         // }
@@ -513,9 +501,17 @@ impl PatCx for MatchCheckCtx<'_> {
     fn complexity_exceeded(&self) -> Result<(), Self::Error> {
         Err(())
     }
+
+    fn report_mixed_deref_pat_ctors(
+        &self,
+        _deref_pat: &DeconstructedPat<'a, 'db>,
+        _normal_pat: &DeconstructedPat<'a, 'db>,
+    ) {
+        // FIXME(deref_patterns): This could report an error comparable to the one in rustc.
+    }
 }
 
-impl fmt::Debug for MatchCheckCtx<'_> {
+impl fmt::Debug for MatchCheckCtx<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MatchCheckCtx").finish()
     }

@@ -1,4 +1,7 @@
-//@ compile-flags: --crate-type lib -O -C debug-assertions=yes
+#![allow(unused_macros)]
+//@ compile-flags: --crate-type lib
+//@ dont-require-annotations: NOTE
+//@ run-rustfix
 
 // Regression test for issue 118786
 
@@ -7,7 +10,7 @@ macro_rules! make_macro {
         macro_rules! $macro_name {
         //~^ ERROR macro expansion ignores `{` and any tokens following
         //~| ERROR cannot find macro `macro_rules` in this scope
-        //~| put a macro name here
+        //~| NOTE put a macro name here
             () => {}
         }
     }

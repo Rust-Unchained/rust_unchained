@@ -3,8 +3,7 @@
 
 struct S;
 
-#[const_trait]
-trait Foo {
+const trait Foo {
     fn eq(&self, _: &Self) -> bool;
 }
 
@@ -14,7 +13,7 @@ impl Foo for S {
     }
 }
 
-const fn equals_self<T: ~const Foo>(t: &T) -> bool {
+const fn equals_self<T: [const] Foo>(t: &T) -> bool {
     true
 }
 

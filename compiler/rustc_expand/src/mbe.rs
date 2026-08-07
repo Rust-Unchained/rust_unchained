@@ -21,14 +21,14 @@ use rustc_span::{Ident, Span};
 /// Contains the sub-token-trees of a "delimited" token tree such as `(a b c)`.
 /// The delimiters are not represented explicitly in the `tts` vector.
 #[derive(PartialEq, Encodable, Decodable, Debug)]
-struct Delimited {
+pub(crate) struct Delimited {
     delim: Delimiter,
     /// FIXME: #67062 has details about why this is sub-optimal.
     tts: Vec<TokenTree>,
 }
 
 #[derive(PartialEq, Encodable, Decodable, Debug)]
-struct SequenceRepetition {
+pub(crate) struct SequenceRepetition {
     /// The sequence of token trees
     tts: Vec<TokenTree>,
     /// The optional separator
@@ -66,7 +66,7 @@ pub(crate) enum KleeneOp {
 /// Similar to `tokenstream::TokenTree`, except that `Sequence`, `MetaVar`, `MetaVarDecl`, and
 /// `MetaVarExpr` are "first-class" token trees. Useful for parsing macros.
 #[derive(Debug, PartialEq, Encodable, Decodable)]
-enum TokenTree {
+pub(crate) enum TokenTree {
     /// A token. Unlike `tokenstream::TokenTree::Token` this lacks a `Spacing`.
     /// See the comments about `Spacing` in the `transcribe` function.
     Token(Token),
@@ -78,7 +78,13 @@ enum TokenTree {
     /// only covers the ident, e.g. `var`.)
     MetaVar(Span, Ident),
     /// e.g., `$var:expr`. Only appears on the LHS.
-    MetaVarDecl(Span, Ident /* name to bind */, Option<NonterminalKind>),
+    MetaVarDecl {
+        span: Span,
+        /// Name to bind.
+        name: Ident,
+        /// The fragment specifier.
+        kind: NonterminalKind,
+    },
     /// A meta-variable expression inside `${...}`.
     MetaVarExpr(DelimSpan, MetaVarExpr),
 }
@@ -102,7 +108,7 @@ impl TokenTree {
         match *self {
             TokenTree::Token(Token { span, .. })
             | TokenTree::MetaVar(span, _)
-            | TokenTree::MetaVarDecl(span, _, _) => span,
+            | TokenTree::MetaVarDecl { span, .. } => span,
             TokenTree::Delimited(span, ..)
             | TokenTree::MetaVarExpr(span, _)
             | TokenTree::Sequence(span, _) => span.entire(),
@@ -111,5 +117,25 @@ impl TokenTree {
 
     fn token(kind: TokenKind, span: Span) -> TokenTree {
         TokenTree::Token(Token::new(kind, span))
+    }
+
+    // Used only in diagnostics.
+    fn meta_vars(&self, vars: &mut Vec<Ident>) {
+        match self {
+            Self::Token(_) => {}
+            Self::MetaVar(_, ident) => vars.push(*ident),
+            Self::MetaVarDecl { name, .. } => vars.push(*name),
+            Self::Delimited(_, _, delimited) => {
+                for tt in &delimited.tts {
+                    tt.meta_vars(vars);
+                }
+            }
+            Self::Sequence(_, sequence) => {
+                for tt in &sequence.tts {
+                    tt.meta_vars(vars);
+                }
+            }
+            Self::MetaVarExpr(_, _) => {}
+        }
     }
 }

@@ -1,10 +1,8 @@
-//@revisions: 32bit 64bit
+//@revisions: r32bit r64bit
 //@aux-build:proc_macros.rs
 //@no-rustfix
-//@[32bit]ignore-bitwidth: 64
-//@[64bit]ignore-bitwidth: 32
-#![allow(dead_code)]
-#![allow(unused_variables)]
+//@[r32bit]ignore-bitwidth: 64
+//@[r64bit]ignore-bitwidth: 32
 #![warn(clippy::large_enum_variant)]
 
 extern crate proc_macros;
@@ -221,13 +219,13 @@ mod issue11915 {
     }
 
     enum NoWarnings {
-        //~[64bit]^ large_enum_variant
+        //~[r64bit]^ large_enum_variant
         BigBoi(PublishWithBytes),
         _SmallBoi(u8),
     }
 
     enum MakesClippyAngry {
-        //~[64bit]^ large_enum_variant
+        //~[r64bit]^ large_enum_variant
         BigBoi(PublishWithVec),
         _SmallBoi(u8),
     }

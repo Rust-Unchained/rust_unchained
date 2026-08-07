@@ -9,17 +9,17 @@ use std::hash::Hash;
 use rustc_abi::{Align, Size};
 use rustc_apfloat::{Float, FloatConvert};
 use rustc_middle::query::TyCtxtAt;
-use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::{AtomicOrdering, Ty};
 use rustc_middle::{mir, ty};
-use rustc_span::Span;
 use rustc_span::def_id::DefId;
 use rustc_target::callconv::FnAbi;
 
 use super::{
-    AllocBytes, AllocId, AllocKind, AllocRange, Allocation, CTFE_ALLOC_SALT, ConstAllocation,
-    CtfeProvenance, FnArg, Frame, ImmTy, InterpCx, InterpResult, MPlaceTy, MemoryKind,
-    Misalignment, OpTy, PlaceTy, Pointer, Provenance, RangeSet, interp_ok, throw_unsup,
+    AllocBytes, AllocId, AllocKind, AllocRange, Allocation, AtomicRmwOp, CTFE_ALLOC_SALT,
+    ConstAllocation, CtfeProvenance, EnteredTraceSpan, FnArg, Frame, ImmTy, InterpCx, InterpResult,
+    MPlaceTy, MemoryKind, Misalignment, OpTy, PlaceTy, Pointer, Provenance, RangeSet, Scalar,
+    interp_ok, throw_unsup,
 };
 
 /// Data returned by [`Machine::after_stack_pop`], and consumed by
@@ -39,6 +39,21 @@ pub enum ReturnAction {
 
     /// Returned by [`InterpCx::pop_stack_frame_raw`] when no cleanup should be done.
     NoCleanup,
+}
+
+/// The currently active retagging mode.
+#[derive(Eq, PartialEq, Debug, Copy, Clone)]
+pub enum RetagMode {
+    /// A regular retag.
+    Default,
+    /// Retag preparing for a two-phase borrow.
+    TwoPhase,
+    /// The initial retag of arguments when entering a function.
+    FnEntry,
+    /// Retagging for reference-to-raw-pointer cast.
+    Raw,
+    /// No retagging.
+    None,
 }
 
 /// Whether this kind of memory is allowed to leak
@@ -183,8 +198,8 @@ pub trait Machine<'tcx>: Sized {
     fn load_mir(
         ecx: &InterpCx<'tcx, Self>,
         instance: ty::InstanceKind<'tcx>,
-    ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
-        interp_ok(ecx.tcx.instance_mir(instance))
+    ) -> &'tcx mir::Body<'tcx> {
+        ecx.tcx.instance_mir(instance)
     }
 
     /// Entry point to all function calls.
@@ -202,7 +217,7 @@ pub trait Machine<'tcx>: Sized {
         instance: ty::Instance<'tcx>,
         abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[FnArg<'tcx, Self::Provenance>],
-        destination: &MPlaceTy<'tcx, Self::Provenance>,
+        destination: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'tcx mir::Body<'tcx>, ty::Instance<'tcx>)>>;
@@ -214,7 +229,7 @@ pub trait Machine<'tcx>: Sized {
         fn_val: Self::ExtraFnVal,
         abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[FnArg<'tcx, Self::Provenance>],
-        destination: &MPlaceTy<'tcx, Self::Provenance>,
+        destination: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx>;
@@ -228,10 +243,20 @@ pub trait Machine<'tcx>: Sized {
         ecx: &mut InterpCx<'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx, Self::Provenance>],
-        destination: &MPlaceTy<'tcx, Self::Provenance>,
+        destination: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>>;
+
+    /// Directly process an LLVM intrinsic without pushing a stack frame. It is the hook's
+    /// responsibility to advance the instruction pointer as appropriate.
+    fn call_llvm_intrinsic(
+        ecx: &mut InterpCx<'tcx, Self>,
+        instance: ty::Instance<'tcx>,
+        args: &[OpTy<'tcx, Self::Provenance>],
+        destination: &PlaceTy<'tcx, Self::Provenance>,
+        target: Option<mir::BasicBlock>,
+    ) -> InterpResult<'tcx>;
 
     /// Check whether the given function may be executed on the current machine, in terms of the
     /// target features is requires.
@@ -257,8 +282,6 @@ pub trait Machine<'tcx>: Sized {
     ) -> InterpResult<'tcx>;
 
     /// Called for all binary operations where the LHS has pointer type.
-    ///
-    /// Returns a (value, overflowed) pair if the operation succeeded
     fn binary_ptr_op(
         ecx: &InterpCx<'tcx, Self>,
         bin_op: mir::BinOp,
@@ -276,11 +299,61 @@ pub trait Machine<'tcx>: Sized {
         F2::NAN
     }
 
+    /// Apply non-determinism to float operations that do not return a precise result.
+    fn apply_float_nondet(
+        _ecx: &mut InterpCx<'tcx, Self>,
+        val: ImmTy<'tcx, Self::Provenance>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx, Self::Provenance>> {
+        interp_ok(val)
+    }
+
     /// Determines the result of `min`/`max` on floats when the arguments are equal.
     fn equal_float_min_max<F: Float>(_ecx: &InterpCx<'tcx, Self>, a: F, _b: F) -> F {
         // By default, we pick the left argument.
         a
     }
+
+    /// Determines whether the `fmuladd` intrinsics fuse the multiply-add or use separate operations.
+    fn float_fuse_mul_add(ecx: &InterpCx<'tcx, Self>) -> bool;
+
+    fn atomic_load(
+        ecx: &InterpCx<'tcx, Self>,
+        place: &MPlaceTy<'tcx, Self::Provenance>,
+        ordering: AtomicOrdering,
+    ) -> InterpResult<'tcx, Scalar<Self::Provenance>>;
+
+    fn atomic_store(
+        ecx: &mut InterpCx<'tcx, Self>,
+        place: &MPlaceTy<'tcx, Self::Provenance>,
+        val: &ImmTy<'tcx, Self::Provenance>,
+        ordering: AtomicOrdering,
+    ) -> InterpResult<'tcx>;
+
+    /// Returns the old value.
+    fn atomic_rmw(
+        ecx: &mut InterpCx<'tcx, Self>,
+        place: &MPlaceTy<'tcx, Self::Provenance>,
+        op: AtomicRmwOp,
+        operand: &ImmTy<'tcx, Self::Provenance>,
+        ordering: AtomicOrdering,
+    ) -> InterpResult<'tcx, Scalar<Self::Provenance>>;
+
+    /// Returns a pair of the old value and a boolean indicating whether the update happened.
+    fn atomic_compare_exchange(
+        ecx: &mut InterpCx<'tcx, Self>,
+        place: &MPlaceTy<'tcx, Self::Provenance>,
+        expected_old: &ImmTy<'tcx, Self::Provenance>,
+        new: &ImmTy<'tcx, Self::Provenance>,
+        can_fail_spuriously: bool,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+    ) -> InterpResult<'tcx, (Scalar<Self::Provenance>, bool)>;
+
+    fn atomic_fence(
+        ecx: &InterpCx<'tcx, Self>,
+        ordering: AtomicOrdering,
+        singlethread: bool,
+    ) -> InterpResult<'tcx>;
 
     /// Called before a basic block terminator is executed.
     #[inline]
@@ -288,11 +361,11 @@ pub trait Machine<'tcx>: Sized {
         interp_ok(())
     }
 
-    /// Determines the result of a `NullaryOp::UbChecks` invocation.
-    fn ub_checks(_ecx: &InterpCx<'tcx, Self>) -> InterpResult<'tcx, bool>;
-
-    /// Determines the result of a `NullaryOp::ContractChecks` invocation.
-    fn contract_checks(_ecx: &InterpCx<'tcx, Self>) -> InterpResult<'tcx, bool>;
+    /// Determines the result of a `Operand::RuntimeChecks` invocation.
+    fn runtime_checks(
+        _ecx: &InterpCx<'tcx, Self>,
+        r: mir::RuntimeChecks,
+    ) -> InterpResult<'tcx, bool>;
 
     /// Called when the interpreter encounters a `StatementKind::ConstEvalCounter` instruction.
     /// You can use this to detect long or endlessly running programs.
@@ -429,7 +502,11 @@ pub trait Machine<'tcx>: Sized {
     ///
     /// Used to prevent statics from self-initializing by reading from their own memory
     /// as it is being initialized.
-    fn before_alloc_read(_ecx: &InterpCx<'tcx, Self>, _alloc_id: AllocId) -> InterpResult<'tcx> {
+    fn before_alloc_access(
+        _tcx: TyCtxtAt<'tcx>,
+        _machine: &Self,
+        _alloc_id: AllocId,
+    ) -> InterpResult<'tcx> {
         interp_ok(())
     }
 
@@ -467,25 +544,28 @@ pub trait Machine<'tcx>: Sized {
     }
 
     /// Executes a retagging operation for a single pointer.
-    /// Returns the possibly adjusted pointer.
+    /// Returns the possibly adjusted pointer. Return `None` if the pointer
+    /// was left unchanged.
+    ///
+    /// `ty` is the full type of the pointer. This is not the same as `val.layout.ty` for boxes
+    /// where `val` is just the inner raw pointer, but `ty` is the entire `Box` type.
     #[inline]
     fn retag_ptr_value(
         _ecx: &mut InterpCx<'tcx, Self>,
-        _kind: mir::RetagKind,
-        val: &ImmTy<'tcx, Self::Provenance>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, Self::Provenance>> {
-        interp_ok(val.clone())
+        _val: &ImmTy<'tcx, Self::Provenance>,
+        _ty: Ty<'tcx>,
+    ) -> InterpResult<'tcx, Option<ImmTy<'tcx, Self::Provenance>>> {
+        interp_ok(None)
     }
 
-    /// Executes a retagging operation on a compound value.
-    /// Replaces all pointers stored in the given place.
-    #[inline]
-    fn retag_place_contents(
-        _ecx: &mut InterpCx<'tcx, Self>,
-        _kind: mir::RetagKind,
-        _place: &PlaceTy<'tcx, Self::Provenance>,
-    ) -> InterpResult<'tcx> {
-        interp_ok(())
+    /// Invoke `f` in a state where calls to `retag_ptr_value` will use the given retag mode.
+    #[inline(always)]
+    fn with_retag_mode<T>(
+        ecx: &mut InterpCx<'tcx, Self>,
+        _mode: RetagMode,
+        f: impl FnOnce(&mut InterpCx<'tcx, Self>) -> InterpResult<'tcx, T>,
+    ) -> InterpResult<'tcx, T> {
+        f(ecx)
     }
 
     /// Called on places used for in-place function argument and return value handling.
@@ -522,11 +602,9 @@ pub trait Machine<'tcx>: Sized {
         interp_ok(())
     }
 
-    /// Called just before the return value is copied to the caller-provided return place.
-    fn before_stack_pop(
-        _ecx: &InterpCx<'tcx, Self>,
-        _frame: &Frame<'tcx, Self::Provenance, Self::FrameExtra>,
-    ) -> InterpResult<'tcx> {
+    /// Called just before the frame is removed from the stack (followed by return value copy and
+    /// local cleanup).
+    fn before_stack_pop(_ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
         interp_ok(())
     }
 
@@ -577,27 +655,6 @@ pub trait Machine<'tcx>: Sized {
         interp_ok(())
     }
 
-    /// Evaluate the given constant. The `eval` function will do all the required evaluation,
-    /// but this hook has the chance to do some pre/postprocessing.
-    #[inline(always)]
-    fn eval_mir_constant<F>(
-        ecx: &InterpCx<'tcx, Self>,
-        val: mir::Const<'tcx>,
-        span: Span,
-        layout: Option<TyAndLayout<'tcx>>,
-        eval: F,
-    ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>
-    where
-        F: Fn(
-            &InterpCx<'tcx, Self>,
-            mir::Const<'tcx>,
-            Span,
-            Option<TyAndLayout<'tcx>>,
-        ) -> InterpResult<'tcx, OpTy<'tcx, Self::Provenance>>,
-    {
-        eval(ecx, val, span, layout)
-    }
-
     /// Returns the salt to be used for a deduplicated global alloation.
     /// If the allocation is for a function, the instance is provided as well
     /// (this lets Miri ensure unique addresses for some functions).
@@ -614,6 +671,21 @@ pub trait Machine<'tcx>: Sized {
         // Default to no caching.
         Cow::Owned(compute_range())
     }
+
+    /// Compute the value passed to the constructors of the `AllocBytes` type for
+    /// abstract machine allocations.
+    fn get_default_alloc_params(&self) -> <Self::Bytes as AllocBytes>::AllocParams;
+
+    /// Allows enabling/disabling tracing calls from within `rustc_const_eval` at compile time, by
+    /// delegating the entering of [tracing::Span]s to implementors of the [Machine] trait. The
+    /// default implementation corresponds to tracing being disabled, meaning the tracing calls will
+    /// supposedly be optimized out completely. To enable tracing, override this trait method and
+    /// return `span.entered()`. Also see [crate::enter_trace_span].
+    #[must_use]
+    #[inline(always)]
+    fn enter_trace_span(_span: impl FnOnce() -> tracing::Span) -> impl EnteredTraceSpan {
+        ()
+    }
 }
 
 /// A lot of the flexibility above is just needed for `Miri`, but all "compile-time" machines
@@ -624,6 +696,7 @@ pub macro compile_time_machine(<$tcx: lifetime>) {
 
     type ExtraFnVal = !;
 
+    type MemoryKind = $crate::const_eval::MemoryKind;
     type MemoryMap =
         rustc_data_structures::fx::FxIndexMap<AllocId, (MemoryKind<Self::MemoryKind>, Allocation)>;
     const GLOBAL_KIND: Option<Self::MemoryKind> = None; // no copying of globals from `tcx` to machine memory
@@ -661,7 +734,7 @@ pub macro compile_time_machine(<$tcx: lifetime>) {
         fn_val: !,
         _abi: &FnAbi<$tcx, Ty<$tcx>>,
         _args: &[FnArg<$tcx>],
-        _destination: &MPlaceTy<$tcx, Self::Provenance>,
+        _destination: &PlaceTy<$tcx, Self::Provenance>,
         _target: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction,
     ) -> InterpResult<$tcx> {
@@ -669,17 +742,72 @@ pub macro compile_time_machine(<$tcx: lifetime>) {
     }
 
     #[inline(always)]
-    fn ub_checks(_ecx: &InterpCx<$tcx, Self>) -> InterpResult<$tcx, bool> {
-        // We can't look at `tcx.sess` here as that can differ across crates, which can lead to
-        // unsound differences in evaluating the same constant at different instantiation sites.
-        interp_ok(true)
+    fn float_fuse_mul_add(_ecx: &InterpCx<$tcx, Self>) -> bool {
+        true
     }
 
     #[inline(always)]
-    fn contract_checks(_ecx: &InterpCx<$tcx, Self>) -> InterpResult<$tcx, bool> {
-        // We can't look at `tcx.sess` here as that can differ across crates, which can lead to
-        // unsound differences in evaluating the same constant at different instantiation sites.
-        interp_ok(true)
+    fn atomic_load(
+        ecx: &InterpCx<$tcx, Self>,
+        place: &MPlaceTy<$tcx, Self::Provenance>,
+        _ordering: AtomicOrdering,
+    ) -> InterpResult<$tcx, Scalar<Self::Provenance>> {
+        // Compile-time machines are single-threaded so this is like a regular load.
+        ecx.read_scalar(place)
+    }
+
+    #[inline(always)]
+    fn atomic_store(
+        ecx: &mut InterpCx<$tcx, Self>,
+        place: &MPlaceTy<$tcx, Self::Provenance>,
+        val: &ImmTy<$tcx, Self::Provenance>,
+        _ordering: AtomicOrdering,
+    ) -> InterpResult<$tcx> {
+        // Compile-time machines are single-threaded so this is like a regular store.
+        ecx.write_scalar(val.to_scalar(), place)
+    }
+
+    fn atomic_rmw(
+        ecx: &mut InterpCx<$tcx, Self>,
+        place: &MPlaceTy<$tcx, Self::Provenance>,
+        op: AtomicRmwOp,
+        operand: &ImmTy<$tcx, Self::Provenance>,
+        _ordering: AtomicOrdering,
+    ) -> InterpResult<$tcx, Scalar<Self::Provenance>> {
+        // Compile-time machines are single-threaded so we ignore the ordering.
+        let old_val = ecx.read_immediate(place)?;
+        let new_val = ecx.atomic_rmw_op(op, &old_val, operand)?;
+        ecx.write_immediate(*new_val, place)?;
+        interp_ok(old_val.to_scalar())
+    }
+
+    fn atomic_compare_exchange(
+        ecx: &mut InterpCx<$tcx, Self>,
+        place: &MPlaceTy<$tcx, Self::Provenance>,
+        expected_old: &ImmTy<$tcx, Self::Provenance>,
+        new: &ImmTy<$tcx, Self::Provenance>,
+        _can_fail_spuriously: bool,
+        _success_ordering: AtomicOrdering,
+        _failure_ordering: AtomicOrdering,
+    ) -> InterpResult<$tcx, (Scalar<Self::Provenance>, bool)> {
+        // Compile-time machines are single-threaded so we ignore the ordering.
+        // They are also deterministic so we do not fail spuriously.
+        let actual_old = ecx.read_immediate(place)?;
+        let eq = ecx.binary_op(mir::BinOp::Eq, &actual_old, expected_old)?.to_scalar().to_bool()?;
+        if eq {
+            ecx.write_immediate(**new, place)?;
+        }
+        interp_ok((actual_old.to_scalar(), eq))
+    }
+
+    #[inline(always)]
+    fn atomic_fence(
+        _ecx: &InterpCx<$tcx, Self>,
+        _ordering: AtomicOrdering,
+        _singlethread: bool,
+    ) -> InterpResult<$tcx> {
+        // Compile-time machines are single-threaded so this is a NOP.
+        interp_ok(())
     }
 
     #[inline(always)]
@@ -727,7 +855,7 @@ pub macro compile_time_machine(<$tcx: lifetime>) {
         // Allow these casts, but make the pointer not dereferenceable.
         // (I.e., they behave like transmutation.)
         // This is correct because no pointers can ever be exposed in compile-time evaluation.
-        interp_ok(Pointer::from_addr_invalid(addr))
+        interp_ok(Pointer::without_provenance(addr))
     }
 
     #[inline(always)]
@@ -736,8 +864,7 @@ pub macro compile_time_machine(<$tcx: lifetime>) {
         ptr: Pointer<CtfeProvenance>,
         _size: i64,
     ) -> Option<(AllocId, Size, Self::ProvenanceExtra)> {
-        // We know `offset` is relative to the allocation, so we can use `into_parts`.
-        let (prov, offset) = ptr.into_parts();
+        let (prov, offset) = ptr.prov_and_relative_offset();
         Some((prov.alloc_id(), offset, prov.immutable()))
     }
 

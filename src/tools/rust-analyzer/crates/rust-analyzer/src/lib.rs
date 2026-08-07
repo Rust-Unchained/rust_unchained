@@ -9,10 +9,20 @@
 //! The `cli` submodule implements some batch-processing analysis, primarily as
 //! a debugging aid.
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
+extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+
+/*
+    If you bump this, grep for `FIXME(MINIMUM_SUPPORTED_TOOLCHAIN_VERSION)` to check for old support code we can drop
+*/
 /// Any toolchain less than this version will likely not work with rust-analyzer built from this revision.
 pub const MINIMUM_SUPPORTED_TOOLCHAIN_VERSION: semver::Version = semver::Version {
     major: 1,
-    minor: 78,
+    minor: 94,
     patch: 0,
     pre: semver::Prerelease::EMPTY,
     build: semver::BuildMetadata::EMPTY,
@@ -24,11 +34,11 @@ mod command;
 mod diagnostics;
 mod discover;
 mod flycheck;
-mod hack_recover_crate_name;
 mod line_index;
 mod main_loop;
 mod mem_docs;
 mod op_queue;
+mod priming_scope;
 mod reload;
 mod target_spec;
 mod task_pool;
@@ -51,6 +61,8 @@ pub mod tracing {
 pub mod config;
 mod global_state;
 pub mod lsp;
+pub mod session;
+
 use self::lsp::ext as lsp_ext;
 
 #[cfg(test)]
@@ -63,10 +75,7 @@ pub use crate::{
     version::version,
 };
 
-pub fn from_json<T: DeserializeOwned>(
-    what: &'static str,
-    json: &serde_json::Value,
-) -> anyhow::Result<T> {
+pub fn from_json<T: DeserializeOwned>(what: &str, json: &serde_json::Value) -> anyhow::Result<T> {
     serde_json::from_value(json.clone())
         .map_err(|e| anyhow::format_err!("Failed to deserialize {what}: {e}; {json}"))
 }
@@ -81,3 +90,10 @@ macro_rules! try_default_ {
     };
 }
 pub(crate) use try_default_ as try_default;
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "dhat")]
+static DHAT_PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::new(None);

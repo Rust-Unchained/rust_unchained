@@ -2,7 +2,7 @@ error: Undefined Behavior: not granting access to tag <TAG> because that would r
   --> RUSTLIB/alloc/src/boxed.rs:LL:CC
    |
 LL |         Box(unsafe { Unique::new_unchecked(raw) }, alloc)
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not granting access to tag <TAG> because that would remove [Unique for <TAG>] which is strongly protected
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
    |
    = help: this indicates a potential bug in the program: it performed an invalid operation, but the Stacked Borrows rules it violated are still experimental
    = help: see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md for further information
@@ -16,27 +16,17 @@ help: <TAG> is this argument
    |
 LL | fn dealloc_while_running(_n: Newtype<'_>, dealloc: impl FnOnce()) {
    |                          ^^
-   = note: BACKTRACE (of the first span):
-   = note: inside `std::boxed::Box::<i32>::from_raw_in` at RUSTLIB/alloc/src/boxed.rs:LL:CC
-   = note: inside `std::boxed::Box::<i32>::from_raw` at RUSTLIB/alloc/src/boxed.rs:LL:CC
-note: inside closure
-  --> tests/fail/both_borrows/newtype_retagging.rs:LL:CC
-   |
-LL |             || drop(Box::from_raw(ptr)),
-   |                     ^^^^^^^^^^^^^^^^^^
-note: inside `dealloc_while_running::<{closure@tests/fail/both_borrows/newtype_retagging.rs:LL:CC}>`
-  --> tests/fail/both_borrows/newtype_retagging.rs:LL:CC
-   |
-LL |     dealloc();
-   |     ^^^^^^^^^
-note: inside `main`
-  --> tests/fail/both_borrows/newtype_retagging.rs:LL:CC
-   |
-LL | /         dealloc_while_running(
-LL | |             Newtype(&mut *ptr),
-LL | |             || drop(Box::from_raw(ptr)),
-LL | |         )
-   | |_________^
+   = note: stack backtrace:
+           0: std::boxed::Box::<i32>::from_raw_in
+               at RUSTLIB/alloc/src/boxed.rs:LL:CC
+           1: std::boxed::Box::<i32>::from_raw
+               at RUSTLIB/alloc/src/boxed.rs:LL:CC
+           2: main::{closure#0}
+               at tests/fail/both_borrows/newtype_retagging.rs:LL:CC
+           3: dealloc_while_running::<{closure@tests/fail/both_borrows/newtype_retagging.rs:LL:CC}>
+               at tests/fail/both_borrows/newtype_retagging.rs:LL:CC
+           4: main
+               at tests/fail/both_borrows/newtype_retagging.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

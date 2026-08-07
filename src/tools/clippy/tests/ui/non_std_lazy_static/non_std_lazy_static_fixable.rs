@@ -2,7 +2,7 @@
 //@aux-build:lazy_static.rs
 
 #![warn(clippy::non_std_lazy_statics)]
-#![allow(static_mut_refs)]
+#![expect(static_mut_refs)]
 
 use once_cell::sync::Lazy;
 
@@ -69,4 +69,11 @@ mod msrv_not_meet {
 mod external_macros {
     once_cell::external!();
     lazy_static::external!();
+}
+
+mod issue14729 {
+    use once_cell::sync::Lazy;
+
+    #[expect(clippy::non_std_lazy_statics)]
+    static LAZY_FOO: Lazy<String> = Lazy::new(|| "foo".to_uppercase());
 }

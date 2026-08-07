@@ -9,7 +9,7 @@ use rustc_errors::ErrorGuaranteed;
 use rustc_hir::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, AdtDef, Ty};
+use rustc_middle::ty::{self, AdtDef, Ty, TypingMode};
 use rustc_middle::{bug, mir};
 use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
 use tracing::instrument;
@@ -99,17 +99,15 @@ impl Qualif for HasMutInterior {
         // requires borrowck, which in turn will invoke mir_const_qualifs again, causing a cycle error.
         // Instead we invoke an obligation context manually, and provide the opaque type inference settings
         // that allow the trait solver to just error out instead of cycling.
-        let freeze_def_id = cx.tcx.require_lang_item(LangItem::Freeze, Some(cx.body.span));
-        // FIXME(#132279): Once we've got a typing mode which reveals opaque types using the HIR
-        // typeck results without causing query cycles, we should use this here instead of defining
-        // opaque types.
-        let typing_env = ty::TypingEnv {
-            typing_mode: ty::TypingMode::analysis_in_body(
-                cx.tcx,
-                cx.body.source.def_id().expect_local(),
-            ),
-            param_env: cx.typing_env.param_env,
+        let freeze_def_id = cx.tcx.require_lang_item(LangItem::Freeze, cx.body.span);
+        let did = cx.body.source.def_id().expect_local();
+
+        let typing_env = if cx.tcx.use_typing_mode_post_typeck_until_borrowck() {
+            cx.typing_env
+        } else {
+            ty::TypingEnv::new(cx.typing_env.param_env, TypingMode::analysis_in_body(cx.tcx, did))
         };
+
         let (infcx, param_env) = cx.tcx.infer_ctxt().build_with_typing_env(typing_env);
         let ocx = ObligationCtxt::new(&infcx);
         let obligation = Obligation::new(
@@ -119,7 +117,7 @@ impl Qualif for HasMutInterior {
             ty::TraitRef::new(cx.tcx, freeze_def_id, [ty::GenericArg::from(ty)]),
         );
         ocx.register_obligation(obligation);
-        let errors = ocx.select_all_or_error();
+        let errors = ocx.evaluate_obligations_error_on_ambiguity();
         !errors.is_empty()
     }
 
@@ -170,17 +168,17 @@ impl Qualif for NeedsNonConstDrop {
 
     #[instrument(level = "trace", skip(cx), ret)]
     fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
-        // If this doesn't need drop at all, then don't select `~const Destruct`.
+        // If this doesn't need drop at all, then don't select `[const] Destruct`.
         if !ty.needs_drop(cx.tcx, cx.typing_env) {
             return false;
         }
 
-        // We check that the type is `~const Destruct` since that will verify that
-        // the type is both `~const Drop` (if a drop impl exists for the adt), *and*
-        // that the components of this type are also `~const Destruct`. This
+        // We check that the type is `[const] Destruct` since that will verify that
+        // the type is both `[const] Drop` (if a drop impl exists for the adt), *and*
+        // that the components of this type are also `[const] Destruct`. This
         // amounts to verifying that there are no values in this ADT that may have
         // a non-const drop.
-        let destruct_def_id = cx.tcx.require_lang_item(LangItem::Destruct, Some(cx.body.span));
+        let destruct_def_id = cx.tcx.require_lang_item(LangItem::Destruct, cx.body.span);
         let (infcx, param_env) = cx.tcx.infer_ctxt().build_with_typing_env(cx.typing_env);
         let ocx = ObligationCtxt::new(&infcx);
         ocx.register_obligation(Obligation::new(
@@ -197,15 +195,15 @@ impl Qualif for NeedsNonConstDrop {
                     },
                 ),
         ));
-        !ocx.select_all_or_error().is_empty()
+        !ocx.evaluate_obligations_error_on_ambiguity().is_empty()
     }
 
     fn is_structural_in_adt_value<'tcx>(cx: &ConstCx<'_, 'tcx>, adt: AdtDef<'tcx>) -> bool {
         // As soon as an ADT has a destructor, then the drop becomes non-structural
         // in its value since:
-        // 1. The destructor may have `~const` bounds which are not present on the type.
+        // 1. The destructor may have `[const]` bounds which are not present on the type.
         //   Someone needs to check that those are satisfied.
-        //   While this could be instead satisfied by checking that the `~const Drop`
+        //   While this could be instead satisfied by checking that the `[const] Drop`
         //   impl holds (i.e. replicating part of the `in_any_value_of_ty` logic above),
         //   even in this case, we have another problem, which is,
         // 2. The destructor may *modify* the operand being dropped, so even if we
@@ -228,23 +226,18 @@ where
     F: FnMut(Local) -> bool,
 {
     match rvalue {
-        Rvalue::ThreadLocalRef(_) | Rvalue::NullaryOp(..) => {
-            Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx))
-        }
+        Rvalue::ThreadLocalRef(_) => Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx)),
 
-        Rvalue::Discriminant(place) | Rvalue::Len(place) => {
-            in_place::<Q, _>(cx, in_local, place.as_ref())
-        }
+        Rvalue::Discriminant(place) => in_place::<Q, _>(cx, in_local, place.as_ref()),
 
         Rvalue::CopyForDeref(place) => in_place::<Q, _>(cx, in_local, place.as_ref()),
 
-        Rvalue::Use(operand)
+        Rvalue::Use(operand, _)
         | Rvalue::Repeat(operand, _)
         | Rvalue::UnaryOp(_, operand)
-        | Rvalue::Cast(_, operand, _)
-        | Rvalue::ShallowInitBox(operand, _) => in_operand::<Q, _>(cx, in_local, operand),
+        | Rvalue::Cast(_, operand, _) => in_operand::<Q, _>(cx, in_local, operand),
 
-        Rvalue::BinaryOp(_, box (lhs, rhs)) => {
+        Rvalue::BinaryOp(_, (lhs, rhs)) => {
             in_operand::<Q, _>(cx, in_local, lhs) || in_operand::<Q, _>(cx, in_local, rhs)
         }
 
@@ -259,6 +252,8 @@ where
 
             in_place::<Q, _>(cx, in_local, place.as_ref())
         }
+
+        Rvalue::Reborrow(_, _, place) => in_place::<Q, _>(cx, in_local, place.as_ref()),
 
         Rvalue::WrapUnsafeBinder(op, _) => in_operand::<Q, _>(cx, in_local, op),
 
@@ -295,7 +290,6 @@ where
             ProjectionElem::Index(index) if in_local(index) => return true,
 
             ProjectionElem::Deref
-            | ProjectionElem::Subtype(_)
             | ProjectionElem::Field(_, _)
             | ProjectionElem::OpaqueCast(_)
             | ProjectionElem::ConstantIndex { .. }
@@ -315,7 +309,7 @@ where
         // i.e., we treat all qualifs as non-structural for deref projections. Generally,
         // we can say very little about `*ptr` even if we know that `ptr` satisfies all
         // sorts of properties.
-        if matches!(elem, ProjectionElem::Deref) {
+        if elem == ProjectionElem::Deref {
             // We have to assume that this qualifies.
             return true;
         }
@@ -341,23 +335,25 @@ where
         Operand::Copy(place) | Operand::Move(place) => {
             return in_place::<Q, _>(cx, in_local, place.as_ref());
         }
+        Operand::RuntimeChecks(_) => return Q::in_any_value_of_ty(cx, cx.tcx.types.bool),
 
         Operand::Constant(c) => c,
     };
 
     // Check the qualifs of the value of `const` items.
     let uneval = match constant.const_ {
-        Const::Ty(_, ct)
-            if matches!(
-                ct.kind(),
-                ty::ConstKind::Param(_) | ty::ConstKind::Error(_) | ty::ConstKind::Value(_)
-            ) =>
-        {
-            None
-        }
-        Const::Ty(_, c) => {
-            bug!("expected ConstKind::Param or ConstKind::Value here, found {:?}", c)
-        }
+        Const::Ty(_, ct) => match ct.kind() {
+            ty::ConstKind::Param(_) | ty::ConstKind::Error(_) => None,
+            // Alias consts in MIR bodies don't have associated MIR (e.g. `type const`).
+            ty::ConstKind::Alias(_, _) => None,
+            // FIXME(mgca): Investigate whether using `None` for `ConstKind::Value` is overly
+            // strict, and if instead we should be doing some kind of value-based analysis.
+            ty::ConstKind::Value(_) => None,
+            _ => bug!(
+                "expected ConstKind::Param, ConstKind::Value, ConstKind::Alias, or ConstKind::Error here, found {:?}",
+                ct
+            ),
+        },
         Const::Unevaluated(uv, _) => Some(uv),
         Const::Val(..) => None,
     };
@@ -368,8 +364,8 @@ where
         // check performed after the promotion. Verify that with an assertion.
         assert!(promoted.is_none() || Q::ALLOW_PROMOTED);
 
-        // Don't peek inside trait associated constants.
-        if promoted.is_none() && cx.tcx.trait_of_item(def).is_none() {
+        // Don't peak inside trait associated constants.
+        if promoted.is_none() && cx.tcx.trait_of_assoc(def).is_none() {
             let qualifs = cx.tcx.at(constant.span).mir_const_qualif(def);
 
             if !Q::in_qualifs(&qualifs) {

@@ -109,6 +109,42 @@ fn main() {
 }
 
 #[test]
+fn ty_fragment_followed_by_expr() {
+    check(
+        r#"
+macro_rules! a {
+    ($t:tt) => {};
+}
+
+macro_rules! b {
+    ($t:ty) => {
+        a!($t);
+    };
+}
+
+fn main() {
+    b!(&'static str);
+}
+"#,
+        expect![[r#"
+macro_rules! a {
+    ($t:tt) => {};
+}
+
+macro_rules! b {
+    ($t:ty) => {
+        a!($t);
+    };
+}
+
+fn main() {
+    a!(&'static str);;
+}
+"#]],
+    );
+}
+
+#[test]
 fn test_winapi_struct() {
     // from https://github.com/retep998/winapi-rs/blob/a7ef2bca086aae76cf6c4ce4c2552988ed9798ad/src/macros.rs#L366
 
@@ -169,7 +205,7 @@ impl Clone for D3DVSHADERCAPS2_0 {
         *self
     }
 }
-#[cfg(feature = "impl-default")] impl Default for D3DVSHADERCAPS2_0 {
+#[cfg (feature = "impl-default")] impl Default for D3DVSHADERCAPS2_0 {
     #[inline] fn default() -> D3DVSHADERCAPS2_0 {
         unsafe {
             $crate::_core::mem::zeroed()
@@ -179,7 +215,7 @@ impl Clone for D3DVSHADERCAPS2_0 {
 
 #[repr(C)]
 #[derive(Copy)]
-#[cfg_attr(target_arch = "x86", repr(packed))] pub struct D3DCONTENTPROTECTIONCAPS {
+#[cfg_attr (target_arch = "x86", repr(packed))] pub struct D3DCONTENTPROTECTIONCAPS {
     pub Caps: u8,
 }
 impl Clone for D3DCONTENTPROTECTIONCAPS {
@@ -187,7 +223,7 @@ impl Clone for D3DCONTENTPROTECTIONCAPS {
         *self
     }
 }
-#[cfg(feature = "impl-default")] impl Default for D3DCONTENTPROTECTIONCAPS {
+#[cfg (feature = "impl-default")] impl Default for D3DCONTENTPROTECTIONCAPS {
     #[inline] fn default() -> D3DCONTENTPROTECTIONCAPS {
         unsafe {
             $crate::_core::mem::zeroed()
@@ -582,8 +618,8 @@ macro_rules! arbitrary {
 }
 
 impl <A: Arbitrary> $crate::arbitrary::Arbitrary for Vec<A> {
-    type Parameters = RangedParams1<A::Parameters>;
-    type Strategy = VecStrategy<A::Strategy>;
+    type Parameters = RangedParams1<A::Parameters> ;
+    type Strategy = VecStrategy<A::Strategy> ;
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy { {
             let product_unpack![range, a] = args;
             vec(any_with::<A>(a), range)
@@ -784,7 +820,7 @@ macro_rules! delegate_impl {
         }
     }
 }
-impl <> Data for &'amut G where G: Data {}
+impl <> Data for &'a mut G where G: Data {}
 "#]],
     );
 }
@@ -931,11 +967,12 @@ pub fn new() {
 //                             PATH_TYPE@23..26
 //                               PATH@23..26
 //                                 PATH_SEGMENT@23..26
-//                                   L_ANGLE@23..24 "<"
-//                                   PAREN_TYPE@24..26
-//                                     L_PAREN@24..25 "("
-//                                     ERROR@25..26
-//                                       INT_NUMBER@25..26 "8"
+//                                   TYPE_ANCHOR@23..26
+//                                     L_ANGLE@23..24 "<"
+//                                     PAREN_TYPE@24..26
+//                                       L_PAREN@24..25 "("
+//                                       ERROR@25..26
+//                                         INT_NUMBER@25..26 "8"
 //                           PLUS@26..27 "+"
 //                     CONST_ARG@27..28
 //                       LITERAL@27..28
@@ -964,8 +1001,8 @@ macro_rules! with_std {
     ($($i:item)*) => ($(#[cfg(feature = "std")]$i)*)
 }
 
-#[cfg(feature = "std")] mod m;
-#[cfg(feature = "std")] mod f;
+#[cfg (feature = "std")] mod m;
+#[cfg (feature = "std")] mod f;
 "#]],
     )
 }

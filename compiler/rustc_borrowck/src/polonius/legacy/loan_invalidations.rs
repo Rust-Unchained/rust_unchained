@@ -45,22 +45,20 @@ impl<'a, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'a, 'tcx> {
         self.check_activations(location);
 
         match &statement.kind {
-            StatementKind::Assign(box (lhs, rhs)) => {
+            StatementKind::Assign((lhs, rhs)) => {
                 self.consume_rvalue(location, rhs);
 
                 self.mutate_place(location, *lhs, Shallow(None));
             }
-            StatementKind::FakeRead(box (_, _)) => {
+            StatementKind::FakeRead((_, _)) => {
                 // Only relevant for initialized/liveness/safety checks.
             }
-            StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(op)) => {
+            StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op)) => {
                 self.consume_operand(location, op);
             }
-            StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(CopyNonOverlapping {
-                src,
-                dst,
-                count,
-            })) => {
+            StatementKind::Intrinsic(NonDivergingIntrinsic::CopyNonOverlapping(
+                CopyNonOverlapping { src, dst, count },
+            )) => {
                 self.consume_operand(location, src);
                 self.consume_operand(location, dst);
                 self.consume_operand(location, count);
@@ -72,7 +70,9 @@ impl<'a, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'a, 'tcx> {
             // Doesn't have any language semantics
             | StatementKind::Coverage(..)
             // Does not actually affect borrowck
-            | StatementKind::StorageLive(..) => {}
+            | StatementKind::StorageLive(..)
+            // Does not affect borrowck
+            | StatementKind::BackwardIncompatibleDropHint { .. } => {}
             StatementKind::StorageDead(local) => {
                 self.access_place(
                     location,
@@ -83,9 +83,6 @@ impl<'a, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'a, 'tcx> {
             }
             StatementKind::ConstEvalCounter
             | StatementKind::Nop
-            | StatementKind::Retag { .. }
-            | StatementKind::Deinit(..)
-            | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::SetDiscriminant { .. } => {
                 bug!("Statement not allowed in this MIR phase")
             }
@@ -101,7 +98,7 @@ impl<'a, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'a, 'tcx> {
             TerminatorKind::SwitchInt { discr, targets: _ } => {
                 self.consume_operand(location, discr);
             }
-            TerminatorKind::Drop { place: drop_place, target: _, unwind: _, replace } => {
+            TerminatorKind::Drop { place: drop_place, target: _, unwind: _, replace, drop: _ } => {
                 let write_kind =
                     if *replace { WriteKind::Replace } else { WriteKind::StorageDeadOrDrop };
                 self.access_place(
@@ -241,7 +238,7 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
                     LocalMutationIsAllowed::Yes,
                 );
             }
-            Operand::Constant(_) => {}
+            Operand::Constant(_) | Operand::RuntimeChecks(_) => {}
         }
     }
 
@@ -258,13 +255,28 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
                     }
                     BorrowKind::Mut { .. } => {
                         let wk = WriteKind::MutableBorrow(bk);
-                        if bk.allows_two_phase_borrow() {
+                        if bk.is_two_phase_borrow() {
                             (Deep, Reservation(wk))
                         } else {
                             (Deep, Write(wk))
                         }
                     }
                 };
+
+                self.access_place(location, place, access_kind, LocalMutationIsAllowed::No);
+            }
+
+            &Rvalue::Reborrow(_target, mutability, place) => {
+                let access_kind = (
+                    Deep,
+                    if mutability == Mutability::Mut {
+                        Reservation(WriteKind::MutableBorrow(BorrowKind::Mut {
+                            kind: MutBorrowKind::TwoPhaseBorrow,
+                        }))
+                    } else {
+                        Read(ReadKind::Borrow(BorrowKind::Shared))
+                    },
+                );
 
                 self.access_place(location, place, access_kind, LocalMutationIsAllowed::No);
             }
@@ -288,37 +300,26 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
 
             Rvalue::ThreadLocalRef(_) => {}
 
-            Rvalue::Use(operand)
+            Rvalue::Use(operand, _)
             | Rvalue::Repeat(operand, _)
             | Rvalue::UnaryOp(_ /*un_op*/, operand)
-            | Rvalue::Cast(_ /*cast_kind*/, operand, _ /*ty*/)
-            | Rvalue::ShallowInitBox(operand, _ /*ty*/) => self.consume_operand(location, operand),
-
-            &Rvalue::CopyForDeref(place) => {
-                let op = &Operand::Copy(place);
-                self.consume_operand(location, op);
+            | Rvalue::Cast(_ /*cast_kind*/, operand, _ /*ty*/) => {
+                self.consume_operand(location, operand)
             }
 
-            &(Rvalue::Len(place) | Rvalue::Discriminant(place)) => {
-                let af = match rvalue {
-                    Rvalue::Len(..) => Some(ArtificialField::ArrayLength),
-                    Rvalue::Discriminant(..) => None,
-                    _ => unreachable!(),
-                };
+            &Rvalue::Discriminant(place) => {
                 self.access_place(
                     location,
                     place,
-                    (Shallow(af), Read(ReadKind::Copy)),
+                    (Shallow(None), Read(ReadKind::Copy)),
                     LocalMutationIsAllowed::No,
                 );
             }
 
-            Rvalue::BinaryOp(_bin_op, box (operand1, operand2)) => {
+            Rvalue::BinaryOp(_bin_op, (operand1, operand2)) => {
                 self.consume_operand(location, operand1);
                 self.consume_operand(location, operand2);
             }
-
-            Rvalue::NullaryOp(_op, _ty) => {}
 
             Rvalue::Aggregate(_, operands) => {
                 for operand in operands {
@@ -329,6 +330,8 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
             Rvalue::WrapUnsafeBinder(op, _) => {
                 self.consume_operand(location, op);
             }
+
+            Rvalue::CopyForDeref(_) => bug!("`CopyForDeref` in borrowck"),
         }
     }
 
@@ -388,7 +391,7 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
                         // Reading from mere reservations of mutable-borrows is OK.
                         if !is_active(this.dominators, borrow, location) {
                             // If the borrow isn't active yet, reads don't invalidate it
-                            assert!(borrow.kind.allows_two_phase_borrow());
+                            assert!(borrow.kind.is_two_phase_borrow());
                             return ControlFlow::Continue(());
                         }
 
@@ -420,7 +423,7 @@ impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
         // Two-phase borrow support: For each activation that is newly
         // generated at this statement, check if it interferes with
         // another borrow.
-        for &borrow_index in self.borrow_set.activations_at_location(location) {
+        for &borrow_index in self.borrow_set.activations_at_location(&location) {
             let borrow = &self.borrow_set[borrow_index];
 
             // only mutable borrows should be 2-phase

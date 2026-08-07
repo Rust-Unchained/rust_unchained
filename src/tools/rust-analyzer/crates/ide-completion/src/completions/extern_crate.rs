@@ -1,14 +1,14 @@
 //! Completion for extern crates
 
 use hir::Name;
-use ide_db::{documentation::HasDocs, SymbolKind};
+use ide_db::{SymbolKind, documentation::HasDocs};
 use syntax::ToSmolStr;
 
-use crate::{context::CompletionContext, CompletionItem, CompletionItemKind};
+use crate::{CompletionItem, CompletionItemKind, context::CompletionContext};
 
 use super::Completions;
 
-pub(crate) fn complete_extern_crate(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+pub(crate) fn complete_extern_crate(acc: &mut Completions, ctx: &CompletionContext<'_, '_>) {
     let imported_extern_crates: Vec<Name> = ctx.scope.extern_crate_decls().collect();
 
     for (name, module) in ctx.scope.extern_crates() {
@@ -17,7 +17,7 @@ pub(crate) fn complete_extern_crate(acc: &mut Completions, ctx: &CompletionConte
         }
 
         let mut item = CompletionItem::new(
-            CompletionItemKind::SymbolKind(SymbolKind::Module),
+            CompletionItemKind::SymbolKind(SymbolKind::CrateRoot),
             ctx.source_range(),
             name.display_no_db(ctx.edition).to_smolstr(),
             ctx.edition,
@@ -48,7 +48,7 @@ mod other_mod {}
 
         let completion_list = completion_list_no_kw(case);
 
-        assert_eq!("md other_crate_a\n".to_owned(), completion_list);
+        assert_eq!("cr other_crate_a\n".to_owned(), completion_list);
     }
 
     #[test]
@@ -68,6 +68,6 @@ mod other_mod {}
 
         let completion_list = completion_list_no_kw(case);
 
-        assert_eq!("md other_crate_a\n".to_owned(), completion_list);
+        assert_eq!("cr other_crate_a\n".to_owned(), completion_list);
     }
 }

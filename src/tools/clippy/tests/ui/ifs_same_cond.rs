@@ -1,24 +1,34 @@
 #![warn(clippy::ifs_same_cond)]
-#![allow(clippy::if_same_then_else, clippy::needless_if, clippy::needless_else)] // all empty blocks
+#![expect(
+    clippy::if_same_then_else,
+    // all empty blocks
+    clippy::needless_else
+)]
 
 fn ifs_same_cond() {
     let a = 0;
     let b = false;
 
     if b {
-    } else if b {
         //~^ ifs_same_cond
+    } else if b {
+    }
+
+    if b {
+        //~^ ifs_same_cond
+    } else if b {
+    } else if b {
     }
 
     if a == 1 {
-    } else if a == 1 {
         //~^ ifs_same_cond
+    } else if a == 1 {
     }
 
     if 2 * a == 1 {
+        //~^ ifs_same_cond
     } else if 2 * a == 2 {
     } else if 2 * a == 1 {
-        //~^ ifs_same_cond
     } else if a == 1 {
     }
 
@@ -50,8 +60,8 @@ fn ifs_same_cond() {
 fn issue10272() {
     let a = String::from("ha");
     if a.contains("ah") {
-    } else if a.contains("ah") {
         //~^ ifs_same_cond
+    } else if a.contains("ah") {
 
         // Trigger this lint
     } else if a.contains("ha") {

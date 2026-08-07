@@ -31,20 +31,26 @@
 //! }
 //! ```
 
-use hir::{db::ExpandDatabase, MacroFileId, Name};
+use hir::{MacroCallId, Name};
 use ide_db::text_edit::TextEdit;
 use ide_db::{
-    documentation::HasDocs, path_transform::PathTransform,
-    syntax_helpers::prettify_macro_expansion, traits::get_missing_assoc_items, SymbolKind,
+    SymbolKind, documentation::HasDocs, path_transform::PathTransform,
+    syntax_helpers::prettify_macro_expansion, traits::get_missing_assoc_items,
 };
+use syntax::ast::HasGenericParams;
+use syntax::syntax_editor::{Position, SyntaxEditor};
 use syntax::{
-    ast::{self, edit_in_place::AttrsOwnerEdit, make, HasGenericArgs, HasTypeBounds},
-    format_smolstr, ted, AstNode, SmolStr, SyntaxElement, SyntaxKind, TextRange, ToSmolStr, T,
+    AstNode, SmolStr, SyntaxElement, SyntaxKind, T, TextRange, ToSmolStr,
+    ast::{
+        self, HasGenericArgs, HasTypeBounds,
+        edit::{AstNodeEdit, AttrsOwnerEdit},
+    },
+    format_smolstr,
 };
 
 use crate::{
-    context::PathCompletionCtx, CompletionContext, CompletionItem, CompletionItemKind,
-    CompletionRelevance, Completions,
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance, Completions,
+    context::PathCompletionCtx,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -57,7 +63,7 @@ enum ImplCompletionKind {
 
 pub(crate) fn complete_trait_impl_const(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     name: &Option<ast::Name>,
 ) -> Option<()> {
     complete_trait_impl_name(acc, ctx, name, ImplCompletionKind::Const)
@@ -65,7 +71,7 @@ pub(crate) fn complete_trait_impl_const(
 
 pub(crate) fn complete_trait_impl_type_alias(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     name: &Option<ast::Name>,
 ) -> Option<()> {
     complete_trait_impl_name(acc, ctx, name, ImplCompletionKind::TypeAlias)
@@ -73,7 +79,7 @@ pub(crate) fn complete_trait_impl_type_alias(
 
 pub(crate) fn complete_trait_impl_fn(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     name: &Option<ast::Name>,
 ) -> Option<()> {
     complete_trait_impl_name(acc, ctx, name, ImplCompletionKind::Fn)
@@ -81,7 +87,7 @@ pub(crate) fn complete_trait_impl_fn(
 
 fn complete_trait_impl_name(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     name: &Option<ast::Name>,
     kind: ImplCompletionKind,
 ) -> Option<()> {
@@ -120,8 +126,8 @@ fn complete_trait_impl_name(
 
 pub(crate) fn complete_trait_impl_item_by_name(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx: &PathCompletionCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx: &PathCompletionCtx<'_>,
     name_ref: &Option<ast::NameRef>,
     impl_: &Option<ast::Impl>,
 ) {
@@ -147,7 +153,7 @@ pub(crate) fn complete_trait_impl_item_by_name(
 
 fn complete_trait_impl(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     kind: ImplCompletionKind,
     replacement_range: TextRange,
     impl_def: &ast::Impl,
@@ -176,7 +182,7 @@ fn complete_trait_impl(
 
 fn add_function_impl(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     replacement_range: TextRange,
     func: hir::Function,
     impl_def: hir::Impl,
@@ -196,7 +202,7 @@ fn add_function_impl(
 
 fn add_function_impl_(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     replacement_range: TextRange,
     func: hir::Function,
     impl_def: hir::Impl,
@@ -226,24 +232,23 @@ fn add_function_impl_(
         .set_documentation(func.docs(ctx.db))
         .set_relevance(CompletionRelevance { exact_name_match: true, ..Default::default() });
 
-    if let Some(source) = ctx.sema.source(func) {
-        if let Some(transformed_fn) =
+    if let Some(source) = ctx.sema.source(func)
+        && let Some(transformed_fn) =
             get_transformed_fn(ctx, source.value, impl_def, async_sugaring)
-        {
-            let function_decl =
-                function_declaration(ctx, &transformed_fn, source.file_id.macro_file());
-            match ctx.config.snippet_cap {
-                Some(cap) => {
-                    let snippet = format!("{function_decl} {{\n    $0\n}}");
-                    item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
-                }
-                None => {
-                    let header = format!("{function_decl} {{");
-                    item.text_edit(TextEdit::replace(replacement_range, header));
-                }
-            };
-            item.add_to(acc, ctx.db);
-        }
+    {
+        let function_decl = function_declaration(ctx, &transformed_fn, source.file_id.macro_file());
+        let ws = if function_decl.contains('\n') { "\n" } else { " " };
+        match ctx.config.snippet_cap {
+            Some(cap) => {
+                let snippet = format!("{function_decl}{ws}{{\n    $0\n}}");
+                item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
+            }
+            None => {
+                let header = format!("{function_decl}{ws}{{");
+                item.text_edit(TextEdit::replace(replacement_range, header));
+            }
+        };
+        item.add_to(acc, ctx.db);
     }
 }
 
@@ -257,70 +262,75 @@ enum AsyncSugaring {
 
 /// Transform a relevant associated item to inline generics from the impl, remove attrs and docs, etc.
 fn get_transformed_assoc_item(
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     assoc_item: ast::AssocItem,
     impl_def: hir::Impl,
+    macro_file: Option<MacroCallId>,
 ) -> Option<ast::AssocItem> {
     let trait_ = impl_def.trait_(ctx.db)?;
     let source_scope = &ctx.sema.scope(assoc_item.syntax())?;
-    let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value)?;
-    let transform = PathTransform::trait_impl(
-        target_scope,
-        source_scope,
-        trait_,
-        ctx.sema.source(impl_def)?.value,
-    );
+    let impl_source = ctx.sema.source(impl_def)?;
+    let target_scope = &ctx.sema.scope(impl_source.syntax().value)?;
+    let transform =
+        PathTransform::trait_impl(target_scope, source_scope, trait_, impl_source.value);
 
-    let assoc_item = assoc_item.clone_for_update();
     // FIXME: Paths in nested macros are not handled well. See
     // `macro_generated_assoc_item2` test.
-    transform.apply(assoc_item.syntax());
-    assoc_item.remove_attrs_and_docs();
-    Some(assoc_item)
+    let assoc_item = ast::AssocItem::cast(transform.apply(assoc_item.syntax()))?;
+    let (editor, assoc_item) = SyntaxEditor::with_ast_node(&assoc_item);
+    assoc_item.remove_attrs_and_docs(&editor);
+    let transformed = editor.finish().new_root().clone();
+
+    let prettied = if let Some(macro_file) = macro_file {
+        let span_map = macro_file.expansion_span_map(ctx.db);
+        prettify_macro_expansion(ctx.db, transformed, span_map, ctx.krate.into())
+    } else {
+        transformed
+    };
+
+    ast::AssocItem::cast(prettied)
 }
 
 /// Transform a relevant associated item to inline generics from the impl, remove attrs and docs, etc.
 fn get_transformed_fn(
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     fn_: ast::Fn,
     impl_def: hir::Impl,
     async_: AsyncSugaring,
 ) -> Option<ast::Fn> {
     let trait_ = impl_def.trait_(ctx.db)?;
     let source_scope = &ctx.sema.scope(fn_.syntax())?;
-    let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value)?;
-    let transform = PathTransform::trait_impl(
-        target_scope,
-        source_scope,
-        trait_,
-        ctx.sema.source(impl_def)?.value,
-    );
+    let impl_source = ctx.sema.source(impl_def)?;
+    let target_scope = &ctx.sema.scope(impl_source.syntax().value)?;
+    let transform =
+        PathTransform::trait_impl(target_scope, source_scope, trait_, impl_source.value);
 
-    let fn_ = fn_.clone_for_update();
+    let fn_ = fn_.reset_indent();
     // FIXME: Paths in nested macros are not handled well. See
     // `macro_generated_assoc_item2` test.
-    transform.apply(fn_.syntax());
-    fn_.remove_attrs_and_docs();
+    let fn_ = ast::Fn::cast(transform.apply(fn_.syntax()))?;
+    let (editor, fn_) = SyntaxEditor::with_ast_node(&fn_);
+    let factory = editor.make();
+    fn_.remove_attrs_and_docs(&editor);
     match async_ {
         AsyncSugaring::Desugar => {
             match fn_.ret_type() {
                 Some(ret_ty) => {
                     let ty = ret_ty.ty()?;
-                    ted::replace(
+                    editor.replace(
                         ty.syntax(),
-                        make::ty(&format!("impl Future<Output = {ty}>"))
-                            .syntax()
-                            .clone_for_update(),
+                        factory.ty(&format!("impl Future<Output = {ty}>")).syntax(),
                     );
                 }
-                None => ted::append_child(
-                    fn_.param_list()?.syntax(),
-                    make::ret_type(make::ty("impl Future<Output = ()>"))
-                        .syntax()
-                        .clone_for_update(),
-                ),
+                None => {
+                    let ret_type = factory.ret_type(factory.ty("impl Future<Output = ()>"));
+                    editor.insert_with_whitespace(
+                        Position::after(fn_.param_list()?.syntax()),
+                        ret_type.syntax(),
+                    );
+                }
             }
-            fn_.async_token().unwrap().detach();
+            editor.delete(fn_.async_token()?);
         }
         AsyncSugaring::Resugar => {
             let ty = fn_.ret_type()?.ty()?;
@@ -344,20 +354,29 @@ fn get_transformed_fn(
                         }
                         _ => None,
                     })?;
-                    ted::replace(ty.syntax(), output.syntax());
+                    if let ast::Type::TupleType(ty) = &output
+                        && ty.fields().next().is_none()
+                    {
+                        editor.delete(fn_.ret_type()?.syntax());
+                    } else {
+                        editor.replace(ty.syntax(), output.syntax());
+                    }
                 }
                 _ => (),
             }
-            ted::prepend_child(fn_.syntax(), make::token(T![async]));
+            editor.insert_with_whitespace(
+                Position::first_child_of(fn_.syntax()),
+                factory.token(T![async]),
+            );
         }
         AsyncSugaring::Async | AsyncSugaring::Plain => (),
     }
-    Some(fn_)
+    ast::Fn::cast(editor.finish().new_root().clone())
 }
 
 fn add_type_alias_impl(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     replacement_range: TextRange,
     type_alias: hir::TypeAlias,
     impl_def: hir::Impl,
@@ -374,7 +393,9 @@ fn add_type_alias_impl(
 
     if let Some(source) = ctx.sema.source(type_alias) {
         let assoc_item = ast::AssocItem::TypeAlias(source.value);
-        if let Some(transformed_item) = get_transformed_assoc_item(ctx, assoc_item, impl_def) {
+        if let Some(transformed_item) =
+            get_transformed_assoc_item(ctx, assoc_item, impl_def, source.file_id.macro_file())
+        {
             let transformed_ty = match transformed_item {
                 ast::AssocItem::TypeAlias(ty) => ty,
                 _ => unreachable!(),
@@ -389,6 +410,12 @@ fn add_type_alias_impl(
             } else if let Some(end) = transformed_ty.eq_token().map(|tok| tok.text_range().start())
             {
                 end
+            } else if let Some(end) = transformed_ty
+                .where_clause()
+                .and_then(|wc| wc.where_token())
+                .map(|tok| tok.text_range().start())
+            {
+                end
             } else if let Some(end) =
                 transformed_ty.semicolon_token().map(|tok| tok.text_range().start())
             {
@@ -399,17 +426,29 @@ fn add_type_alias_impl(
 
             let len = end - start;
             let mut decl = transformed_ty.syntax().text().slice(..len).to_string();
-            if !decl.ends_with(' ') {
-                decl.push(' ');
-            }
-            decl.push_str("= ");
+            decl.truncate(decl.trim_end().len());
+            decl.push_str(" = ");
+
+            let wc = transformed_ty
+                .where_clause()
+                .map(|wc| {
+                    let ws = wc
+                        .where_token()
+                        .and_then(|it| it.prev_token())
+                        .filter(|token| token.kind() == SyntaxKind::WHITESPACE)
+                        .map(|token| token.to_string())
+                        .unwrap_or_else(|| " ".into());
+                    format!("{ws}{wc}")
+                })
+                .unwrap_or_default();
 
             match ctx.config.snippet_cap {
                 Some(cap) => {
-                    let snippet = format!("{decl}$0;");
+                    let snippet = format!("{decl}$0{wc};");
                     item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
                 }
                 None => {
+                    decl.push_str(&wc);
                     item.text_edit(TextEdit::replace(replacement_range, decl));
                 }
             };
@@ -420,58 +459,50 @@ fn add_type_alias_impl(
 
 fn add_const_impl(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     replacement_range: TextRange,
     const_: hir::Const,
     impl_def: hir::Impl,
 ) {
     let const_name = const_.name(ctx.db).map(|n| n.display_no_db(ctx.edition).to_smolstr());
 
-    if let Some(const_name) = const_name {
-        if let Some(source) = ctx.sema.source(const_) {
-            let assoc_item = ast::AssocItem::Const(source.value);
-            if let Some(transformed_item) = get_transformed_assoc_item(ctx, assoc_item, impl_def) {
-                let transformed_const = match transformed_item {
-                    ast::AssocItem::Const(const_) => const_,
-                    _ => unreachable!(),
-                };
+    if let Some(const_name) = const_name
+        && let Some(source) = ctx.sema.source(const_)
+    {
+        let assoc_item = ast::AssocItem::Const(source.value);
+        if let Some(transformed_item) =
+            get_transformed_assoc_item(ctx, assoc_item, impl_def, source.file_id.macro_file())
+        {
+            let transformed_const = match transformed_item {
+                ast::AssocItem::Const(const_) => const_,
+                _ => unreachable!(),
+            };
 
-                let label =
-                    make_const_compl_syntax(ctx, &transformed_const, source.file_id.macro_file());
-                let replacement = format!("{label} ");
+            let label = make_const_compl_syntax(&transformed_const);
+            let replacement = format!("{label} ");
 
-                let mut item =
-                    CompletionItem::new(SymbolKind::Const, replacement_range, label, ctx.edition);
-                item.lookup_by(format_smolstr!("const {const_name}"))
-                    .set_documentation(const_.docs(ctx.db))
-                    .set_relevance(CompletionRelevance {
-                        exact_name_match: true,
-                        ..Default::default()
-                    });
-                match ctx.config.snippet_cap {
-                    Some(cap) => item.snippet_edit(
-                        cap,
-                        TextEdit::replace(replacement_range, format!("{replacement}$0;")),
-                    ),
-                    None => item.text_edit(TextEdit::replace(replacement_range, replacement)),
-                };
-                item.add_to(acc, ctx.db);
-            }
+            let mut item =
+                CompletionItem::new(SymbolKind::Const, replacement_range, label, ctx.edition);
+            item.lookup_by(format_smolstr!("const {const_name}"))
+                .set_documentation(const_.docs(ctx.db))
+                .set_relevance(CompletionRelevance {
+                    exact_name_match: true,
+                    ..Default::default()
+                });
+            match ctx.config.snippet_cap {
+                Some(cap) => item.snippet_edit(
+                    cap,
+                    TextEdit::replace(replacement_range, format!("{replacement}$0;")),
+                ),
+                None => item.text_edit(TextEdit::replace(replacement_range, replacement)),
+            };
+            item.add_to(acc, ctx.db);
         }
     }
 }
 
-fn make_const_compl_syntax(
-    ctx: &CompletionContext<'_>,
-    const_: &ast::Const,
-    macro_file: Option<MacroFileId>,
-) -> SmolStr {
-    let const_ = if let Some(macro_file) = macro_file {
-        let span_map = ctx.db.expansion_span_map(macro_file);
-        prettify_macro_expansion(ctx.db, const_.syntax().clone(), &span_map, ctx.krate.into())
-    } else {
-        const_.syntax().clone()
-    };
+fn make_const_compl_syntax(const_: &ast::Const) -> SmolStr {
+    let const_ = const_.syntax();
 
     let start = const_.text_range().start();
     let const_end = const_.text_range().end();
@@ -484,19 +515,19 @@ fn make_const_compl_syntax(
     let len = end - start;
     let range = TextRange::new(0.into(), len);
 
-    let syntax = const_.text().slice(range).to_string();
+    let syntax = const_.text().slice(range).to_smolstr();
 
     format_smolstr!("{} =", syntax.trim_end())
 }
 
 fn function_declaration(
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     node: &ast::Fn,
-    macro_file: Option<MacroFileId>,
+    macro_file: Option<MacroCallId>,
 ) -> String {
     let node = if let Some(macro_file) = macro_file {
-        let span_map = ctx.db.expansion_span_map(macro_file);
-        prettify_macro_expansion(ctx.db, node.syntax().clone(), &span_map, ctx.krate.into())
+        let span_map = macro_file.expansion_span_map(ctx.db);
+        prettify_macro_expansion(ctx.db, node.syntax().clone(), span_map, ctx.krate.into())
     } else {
         node.syntax().clone()
     };
@@ -510,9 +541,10 @@ fn function_declaration(
         .map_or(end, |f| f.text_range().start());
 
     let len = end - start;
-    let syntax = node.text().slice(..len).to_string();
+    let mut syntax = node.text().slice(..len).to_string();
+    syntax.truncate(syntax.trim_end().len());
 
-    syntax.trim_end().to_owned()
+    syntax
 }
 
 #[cfg(test)]
@@ -1232,7 +1264,7 @@ trait SomeTrait<T> {}
 
 trait Foo<T> {
     fn function()
-        where Self: SomeTrait<T>;
+    where Self: SomeTrait<T>;
 }
 struct Bar;
 
@@ -1245,13 +1277,14 @@ trait SomeTrait<T> {}
 
 trait Foo<T> {
     fn function()
-        where Self: SomeTrait<T>;
+    where Self: SomeTrait<T>;
 }
 struct Bar;
 
 impl Foo<u32> for Bar {
     fn function()
-        where Self: SomeTrait<u32> {
+where Self: SomeTrait<u32>
+{
     $0
 }
 }
@@ -1332,9 +1365,47 @@ noop! {
 struct Test;
 
 impl Foo for Test {
-    fn foo(&mut self,bar:i64,baz: &mut u32) -> Result<(),u32> {
+    fn foo(&mut self,bar: i64,baz: &mut u32) -> Result<(),u32> {
     $0
 }
+}
+"#,
+        );
+
+        check_edit(
+            "type T",
+            r#"
+macro_rules! noop {
+    ($($item: item)*) => {
+        $($item)*
+    }
+}
+
+noop! {
+    trait Foo {
+        type T where Self: Sized;
+    }
+}
+
+impl Foo for () {
+    $0
+}
+"#,
+            r#"
+macro_rules! noop {
+    ($($item: item)*) => {
+        $($item)*
+    }
+}
+
+noop! {
+    trait Foo {
+        type T where Self: Sized;
+    }
+}
+
+impl Foo for () {
+    type T = $0 where Self: Sized;
 }
 "#,
         );
@@ -1435,6 +1506,30 @@ trait Tr<'b> {
 
 impl<'b> Tr<'b> for () {
     type Ty<'a: 'b, T: Copy, const C: usize> = $0;
+}
+"#,
+        );
+    }
+    #[test]
+    fn includes_where_clause() {
+        check_edit(
+            "type Ty",
+            r#"
+trait Tr {
+    type Ty where Self: Copy;
+}
+
+impl Tr for () {
+    $0
+}
+"#,
+            r#"
+trait Tr {
+    type Ty where Self: Copy;
+}
+
+impl Tr for () {
+    type Ty = $0 where Self: Copy;
 }
 "#,
         );
@@ -1577,6 +1672,35 @@ impl DesugaredAsyncTrait for () {
 }
 "#,
         );
+
+        check_edit(
+            "async fn foo",
+            r#"
+//- minicore: future, send, sized
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = ()> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    $0
+}
+"#,
+            r#"
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = ()> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    async fn foo(&self) {
+    $0
+}
+}
+"#,
+        );
     }
 
     #[test]
@@ -1663,7 +1787,7 @@ impl Trait for () {
                 me fn bar(..)
                 me fn baz(..)
                 me fn foo(..)
-                md proc_macros
+                md proc_macros::
                 kw crate::
                 kw self::
             "#]],

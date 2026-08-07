@@ -1,13 +1,10 @@
 #![warn(clippy::option_if_let_else)]
 #![allow(
-    clippy::ref_option_ref,
-    clippy::equatable_if_let,
-    clippy::let_unit_value,
-    clippy::redundant_locals,
-    clippy::manual_midpoint,
-    clippy::manual_unwrap_or_default,
-    clippy::manual_unwrap_or
+    clippy::manual_unwrap_or,
+    clippy::map_or_identity,
+    clippy::unnecessary_option_map_or_else
 )]
+#![expect(clippy::let_unit_value, clippy::redundant_locals)]
 
 fn bad1(string: Option<&str>) -> (bool, &str) {
     if let Some(x) = string {
@@ -152,6 +149,22 @@ fn complex_subpat() -> DummyEnum {
     DummyEnum::Two
 }
 
+// #10335
+pub fn test_result_err_ignored_1(r: Result<&[u8], &[u8]>) -> Vec<u8> {
+    match r {
+        //~^ option_if_let_else
+        Ok(s) => s.to_owned(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// #10335
+pub fn test_result_err_ignored_2(r: Result<&[u8], &[u8]>) -> Vec<u8> {
+    if let Ok(s) = r { s.to_owned() }
+    //~^ option_if_let_else
+    else { Vec::new() }
+}
+
 fn main() {
     let optional = Some(5);
     let _ = if let Some(x) = optional { x + 2 } else { 5 };
@@ -265,7 +278,6 @@ fn main() {
     //~^ option_if_let_else
 }
 
-#[allow(dead_code)]
 fn issue9742() -> Option<&'static str> {
     // should not lint because of guards
     match Some("foo  ") {
@@ -275,7 +287,7 @@ fn issue9742() -> Option<&'static str> {
 }
 
 mod issue10729 {
-    #![allow(clippy::unit_arg, dead_code)]
+    #![allow(clippy::unit_arg)]
 
     pub fn reproduce(initial: &Option<String>) {
         // 👇 needs `.as_ref()` because initial is an `&Option<_>`
@@ -364,4 +376,20 @@ mod issue11059 {
     fn deref_with_overload(o: Option<&str>) -> &str {
         if let Some(o) = o { o } else { &S }
     }
+}
+
+fn issue15379() {
+    let opt = Some(0usize);
+    let opt_raw_ptr = &opt as *const Option<usize>;
+    let _ = unsafe { if let Some(o) = *opt_raw_ptr { o } else { 1 } };
+    //~^ option_if_let_else
+}
+
+fn issue15002() {
+    let res: Result<String, ()> = Ok("_".to_string());
+    let _ = match res {
+        //~^ option_if_let_else
+        Ok(s) => s.clone(),
+        Err(_) => String::new(),
+    };
 }

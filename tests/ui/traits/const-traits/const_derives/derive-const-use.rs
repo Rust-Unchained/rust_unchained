@@ -1,15 +1,18 @@
-//@ known-bug: #110395
-
-#![feature(const_trait_impl, const_cmp, const_default_impls, derive_const)]
+//@ check-pass
+#![feature(const_trait_impl, const_default, const_cmp, derive_const)]
 
 pub struct A;
 
-impl const Default for A {
-    fn default() -> A { A }
+const impl Default for A {
+    fn default() -> A {
+        A
+    }
 }
 
-impl const PartialEq for A {
-    fn eq(&self, _: &A) -> bool { true }
+const impl PartialEq for A {
+    fn eq(&self, _: &A) -> bool {
+        true
+    }
 }
 
 #[derive_const(Default, PartialEq)]

@@ -16,12 +16,18 @@ use crate::fmt::{self, Debug, Display, Formatter};
 /// assert_eq!(err.to_string(), "invalid digit found in string");
 /// ```
 ///
+/// # Error source
+///
 /// Errors may provide cause information. [`Error::source()`] is generally
 /// used when errors cross "abstraction boundaries". If one module must report
 /// an error that is caused by an error from a lower-level module, it can allow
-/// accessing that error via [`Error::source()`]. This makes it possible for the
+/// accessing that error via `Error::source()`. This makes it possible for the
 /// high-level module to provide its own errors while also revealing some of the
 /// implementation for debugging.
+///
+/// In error types that wrap an underlying error, the underlying error
+/// should be either returned by the outer error's `Error::source()`, or rendered
+/// by the outer error's `Display` implementation, but not both.
 ///
 /// # Example
 ///
@@ -199,6 +205,56 @@ pub trait Error: Debug + Display {
     ///     assert!(request_ref::<MyLittleTeaPot>(dyn_error).is_none());
     /// }
     /// ```
+    ///
+    /// # Delegating Impls
+    ///
+    /// <div class="warning">
+    ///
+    /// **Warning**: We recommend implementors avoid delegating implementations of `provide` to
+    /// source error implementations.
+    ///
+    /// </div>
+    ///
+    /// This method should expose context from the current piece of the source chain only, not from
+    /// sources that are exposed in the chain of sources. Delegating `provide` implementations cause
+    /// the same context to be provided by multiple errors in the chain of sources which can cause
+    /// unintended duplication of information in error reports or require heuristics to deduplicate.
+    ///
+    /// In other words, the following implementation pattern for `provide` is discouraged and should
+    /// not be used for [`Error`] types exposed in public APIs to third parties.
+    ///
+    /// ```rust
+    /// # #![feature(error_generic_member_access)]
+    /// # use core::fmt;
+    /// # use core::error::Request;
+    /// # #[derive(Debug)]
+    /// struct MyError {
+    ///     source: Error,
+    /// }
+    /// # #[derive(Debug)]
+    /// # struct Error;
+    /// # impl fmt::Display for Error {
+    /// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// #         write!(f, "Example Source Error")
+    /// #     }
+    /// # }
+    /// # impl fmt::Display for MyError {
+    /// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// #         write!(f, "Example Error")
+    /// #     }
+    /// # }
+    /// # impl std::error::Error for Error { }
+    ///
+    /// impl std::error::Error for MyError {
+    ///     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    ///         Some(&self.source)
+    ///     }
+    ///
+    ///     fn provide<'a>(&'a self, request: &mut Request<'a>) {
+    ///         self.source.provide(request) // <--- Discouraged
+    ///     }
+    /// }
+    /// ```
     #[unstable(feature = "error_generic_member_access", issue = "99301")]
     #[allow(unused_variables)]
     fn provide<'a>(&'a self, request: &mut Request<'a>) {}
@@ -347,7 +403,7 @@ impl dyn Error {
     /// let b = B(Some(Box::new(A)));
     ///
     /// // let err : Box<Error> = b.into(); // or
-    /// let err = &b as &(dyn Error);
+    /// let err = &b as &dyn Error;
     ///
     /// let mut iter = err.sources();
     ///
@@ -438,7 +494,7 @@ where
 /// `Request` supports generic, type-driven access to data. Its use is currently restricted to the
 /// standard library in cases where trait authors wish to allow trait implementors to share generic
 /// information across trait boundaries. The motivating and prototypical use case is
-/// `core::error::Error` which would otherwise require a method per concrete type (eg.
+/// `core::error::Error` which would otherwise require a method per concrete type (e.g.
 /// `std::backtrace::Backtrace` instance that implementors want to expose to users).
 ///
 /// # Data flow
@@ -446,29 +502,29 @@ where
 /// To describe the intended data flow for Request objects, let's consider two conceptual users
 /// separated by API boundaries:
 ///
-/// * Consumer - the consumer requests objects using a Request instance; eg a crate that offers
-/// fancy `Error`/`Result` reporting to users wants to request a Backtrace from a given `dyn Error`.
+/// * Consumer - the consumer requests objects using a Request instance; e.g. a crate that offers
+///   fancy `Error`/`Result` reporting to users wants to request a Backtrace from a given `dyn Error`.
 ///
-/// * Producer - the producer provides objects when requested via Request; eg. a library with an
-/// an `Error` implementation that automatically captures backtraces at the time instances are
-/// created.
+/// * Producer - the producer provides objects when requested via Request; e.g. a library with an
+///   an `Error` implementation that automatically captures backtraces at the time instances are
+///   created.
 ///
-/// The consumer only needs to know where to submit their request and are expected to handle the
+/// The consumer only needs to know where to submit their request and is expected to handle the
 /// request not being fulfilled by the use of `Option<T>` in the responses offered by the producer.
 ///
 /// * A Producer initializes the value of one of its fields of a specific type. (or is otherwise
-/// prepared to generate a value requested). eg, `backtrace::Backtrace` or
-/// `std::backtrace::Backtrace`
+///   prepared to generate a value requested). e.g., `backtrace::Backtrace` or
+///   `std::backtrace::Backtrace`.
 /// * A Consumer requests an object of a specific type (say `std::backtrace::Backtrace`). In the
-/// case of a `dyn Error` trait object (the Producer), there are functions called `request_ref` and
-/// `request_value` to simplify obtaining an `Option<T>` for a given type.
+///   case of a `dyn Error` trait object (the Producer), there are functions called `request_ref` and
+///   `request_value` to simplify obtaining an `Option<T>` for a given type.
 /// * The Producer, when requested, populates the given Request object which is given as a mutable
-/// reference.
+///   reference.
 /// * The Consumer extracts a value or reference to the requested type from the `Request` object
-/// wrapped in an `Option<T>`; in the case of `dyn Error` the aforementioned `request_ref` and `
-/// request_value` methods mean that `dyn Error` users don't have to deal with the `Request` type at
-/// all (but `Error` implementors do). The `None` case of the `Option` suggests only that the
-/// Producer cannot currently offer an instance of the requested type, not it can't or never will.
+///   wrapped in an `Option<T>`; in the case of `dyn Error` the aforementioned `request_ref` and
+///   `request_value` methods mean that `dyn Error` users don't have to deal with the `Request` type at
+///   all (but `Error` implementors do). The `None` case of the `Option` suggests only that the
+///   Producer cannot currently offer an instance of the requested type, not that it can't or never will.
 ///
 /// # Examples
 ///
@@ -1042,11 +1098,6 @@ impl<'a> crate::iter::FusedIterator for Source<'a> {}
 
 #[stable(feature = "error_by_ref", since = "1.51.0")]
 impl<'a, T: Error + ?Sized> Error for &'a T {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        Error::description(&**self)
-    }
-
     #[allow(deprecated)]
     fn cause(&self) -> Option<&dyn Error> {
         Error::cause(&**self)
@@ -1062,36 +1113,16 @@ impl<'a, T: Error + ?Sized> Error for &'a T {
 }
 
 #[stable(feature = "fmt_error", since = "1.11.0")]
-impl Error for crate::fmt::Error {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "an error occurred when formatting an argument"
-    }
-}
+impl Error for crate::fmt::Error {}
 
 #[stable(feature = "try_borrow", since = "1.13.0")]
-impl Error for crate::cell::BorrowError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "already mutably borrowed"
-    }
-}
+impl Error for crate::cell::BorrowError {}
 
 #[stable(feature = "try_borrow", since = "1.13.0")]
-impl Error for crate::cell::BorrowMutError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "already borrowed"
-    }
-}
+impl Error for crate::cell::BorrowMutError {}
 
 #[stable(feature = "try_from", since = "1.34.0")]
-impl Error for crate::char::CharTryFromError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "converted integer out of range for `char`"
-    }
-}
+impl Error for crate::char::CharTryFromError {}
 
 #[stable(feature = "duration_checked_float", since = "1.66.0")]
 impl Error for crate::time::TryFromFloatSecsError {}

@@ -1,9 +1,9 @@
-// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
-#![allow(static_mut_refs)]
-
-use core::iter::TrustedLen;
+use std::iter::TrustedLen;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::*;
+use crate::testing::crash_test::{CrashTestDummy, Panic};
+use crate::testing::macros::struct_with_counted_drop;
 
 #[bench]
 fn bench_push_back_100(b: &mut test::Bencher) {
@@ -12,7 +12,7 @@ fn bench_push_back_100(b: &mut test::Bencher) {
         for i in 0..100 {
             deq.push_back(i);
         }
-        deq.head = 0;
+        deq.head = WrappedIndex::zero();
         deq.len = 0;
     })
 }
@@ -24,7 +24,7 @@ fn bench_push_front_100(b: &mut test::Bencher) {
         for i in 0..100 {
             deq.push_front(i);
         }
-        deq.head = 0;
+        deq.head = WrappedIndex::zero();
         deq.len = 0;
     })
 }
@@ -38,7 +38,7 @@ fn bench_pop_back_100(b: &mut test::Bencher) {
     unsafe { deq.ptr().write_bytes(0u8, size + 1) };
 
     b.iter(|| {
-        deq.head = 0;
+        deq.head = WrappedIndex::zero();
         deq.len = 100;
         while !deq.is_empty() {
             test::black_box(deq.pop_back());
@@ -88,7 +88,7 @@ fn bench_pop_front_100(b: &mut test::Bencher) {
     unsafe { deq.ptr().write_bytes(0u8, size + 1) };
 
     b.iter(|| {
-        deq.head = 0;
+        deq.head = WrappedIndex::zero();
         deq.len = 100;
         while !deq.is_empty() {
             test::black_box(deq.pop_front());
@@ -109,7 +109,7 @@ fn test_swap_front_back_remove() {
             let expected: VecDeque<_> =
                 if back { (0..len).collect() } else { (0..len).rev().collect() };
             for head_pos in 0..usable_cap {
-                tester.head = head_pos;
+                tester.head = WrappedIndex::from_arbitrary_number(head_pos);
                 tester.len = 0;
                 if back {
                     for i in 0..len * 2 {
@@ -127,7 +127,7 @@ fn test_swap_front_back_remove() {
                         assert_eq!(tester.swap_remove_front(idx), Some(len * 2 - 1 - i));
                     }
                 }
-                assert!(tester.head <= tester.capacity());
+                assert!(tester.head.as_index() <= tester.capacity());
                 assert!(tester.len <= tester.capacity());
                 assert_eq!(tester, expected);
             }
@@ -155,7 +155,7 @@ fn test_insert() {
         let expected = (0..).take(len).collect::<VecDeque<_>>();
         for head_pos in 0..cap {
             for to_insert in 0..len {
-                tester.head = head_pos;
+                tester.head = WrappedIndex::from_arbitrary_number(head_pos);
                 tester.len = 0;
                 for i in 0..len {
                     if i != to_insert {
@@ -369,7 +369,7 @@ fn test_rotate_right_panic() {
 
 #[test]
 fn test_binary_search() {
-    // If the givin VecDeque is not sorted, the returned result is unspecified and meaningless,
+    // If the given VecDeque is not sorted, the returned result is unspecified and meaningless,
     // as this method performs a binary search.
 
     let tester: VecDeque<_> = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55].into();
@@ -393,7 +393,7 @@ fn test_binary_search() {
 
 #[test]
 fn test_binary_search_by() {
-    // If the givin VecDeque is not sorted, the returned result is unspecified and meaningless,
+    // If the given VecDeque is not sorted, the returned result is unspecified and meaningless,
     // as this method performs a binary search.
 
     let tester: VecDeque<_> = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55].into();
@@ -408,7 +408,7 @@ fn test_binary_search_by() {
 
 #[test]
 fn test_binary_search_key() {
-    // If the givin VecDeque is not sorted, the returned result is unspecified and meaningless,
+    // If the given VecDeque is not sorted, the returned result is unspecified and meaningless,
     // as this method performs a binary search.
 
     let tester: VecDeque<_> = [
@@ -636,7 +636,7 @@ fn test_remove() {
         let expected = (0..).take(len).collect::<VecDeque<_>>();
         for head_pos in 0..cap {
             for to_remove in 0..=len {
-                tester.head = head_pos;
+                tester.head = WrappedIndex::from_arbitrary_number(head_pos);
                 tester.len = 0;
                 for i in 0..len {
                     if i == to_remove {
@@ -666,7 +666,7 @@ fn test_range() {
         for head in 0..=cap {
             for start in 0..=len {
                 for end in start..=len {
-                    tester.head = head;
+                    tester.head = WrappedIndex::from_arbitrary_number(head);
                     tester.len = 0;
                     for i in 0..len {
                         tester.push_back(i);
@@ -691,7 +691,7 @@ fn test_range_mut() {
         for head in 0..=cap {
             for start in 0..=len {
                 for end in start..=len {
-                    tester.head = head;
+                    tester.head = WrappedIndex::from_arbitrary_number(head);
                     tester.len = 0;
                     for i in 0..len {
                         tester.push_back(i);
@@ -725,7 +725,7 @@ fn test_drain() {
         for head in 0..cap {
             for drain_start in 0..=len {
                 for drain_end in drain_start..=len {
-                    tester.head = head;
+                    tester.head = WrappedIndex::from_arbitrary_number(head);
                     tester.len = 0;
                     for i in 0..len {
                         tester.push_back(i);
@@ -782,7 +782,7 @@ fn test_shrink_to() {
                 assert_eq!(deque.capacity(), cap);
 
                 // we can let the head point anywhere in the buffer since the deque is empty.
-                deque.head = head;
+                deque.head = WrappedIndex::from_arbitrary_number(head);
                 deque.extend(1..=len);
 
                 deque.shrink_to(target_cap);
@@ -811,7 +811,7 @@ fn test_shrink_to_fit() {
         let expected = (0..).take(len).collect::<VecDeque<_>>();
         for head_pos in 0..=max_cap {
             tester.reserve(head_pos);
-            tester.head = head_pos;
+            tester.head = WrappedIndex::from_arbitrary_number(head_pos);
             tester.len = 0;
             tester.reserve(63);
             for i in 0..len {
@@ -848,7 +848,7 @@ fn test_split_off() {
             let expected_other = (at..).take(len - at).collect::<VecDeque<_>>();
 
             for head_pos in 0..cap {
-                tester.head = head_pos;
+                tester.head = WrappedIndex::from_arbitrary_number(head_pos);
                 tester.len = 0;
                 for i in 0..len {
                     tester.push_back(i);
@@ -1086,36 +1086,24 @@ fn test_clone_from() {
 
 #[test]
 fn test_vec_deque_truncate_drop() {
-    static mut DROPS: u32 = 0;
-    #[derive(Clone)]
-    struct Elem(#[allow(dead_code)] i32);
-    impl Drop for Elem {
-        fn drop(&mut self) {
-            unsafe {
-                DROPS += 1;
-            }
-        }
-    }
+    struct_with_counted_drop!(Elem, DROPS);
 
-    let v = vec![Elem(1), Elem(2), Elem(3), Elem(4), Elem(5)];
-    for push_front in 0..=v.len() {
-        let v = v.clone();
-        let mut tester = VecDeque::with_capacity(5);
-        for (index, elem) in v.into_iter().enumerate() {
+    const LEN: usize = 5;
+    for push_front in 0..=LEN {
+        let mut tester = VecDeque::with_capacity(LEN);
+        for index in 0..LEN {
             if index < push_front {
-                tester.push_front(elem);
+                tester.push_front(Elem);
             } else {
-                tester.push_back(elem);
+                tester.push_back(Elem);
             }
         }
-        assert_eq!(unsafe { DROPS }, 0);
+        assert_eq!(DROPS.get(), 0);
         tester.truncate(3);
-        assert_eq!(unsafe { DROPS }, 2);
+        assert_eq!(DROPS.get(), 2);
         tester.truncate(0);
-        assert_eq!(unsafe { DROPS }, 5);
-        unsafe {
-            DROPS = 0;
-        }
+        assert_eq!(DROPS.get(), 5);
+        DROPS.set(0);
     }
 }
 
@@ -1174,4 +1162,272 @@ fn issue_80303() {
     assert_ne!(vda.as_slices(), vdb.as_slices());
     assert_eq!(vda, vdb);
     assert_eq!(hash_code(vda), hash_code(vdb));
+}
+
+#[test]
+fn extract_if_test() {
+    let mut m: VecDeque<u32> = VecDeque::from([1, 2, 3, 4, 5, 6]);
+    let deleted = m.extract_if(.., |v| *v < 4).collect::<Vec<_>>();
+
+    assert_eq!(deleted, &[1, 2, 3]);
+    assert_eq!(m, &[4, 5, 6]);
+}
+
+#[test]
+fn drain_to_empty_test() {
+    let mut m: VecDeque<u32> = VecDeque::from([1, 2, 3, 4, 5, 6]);
+    let deleted = m.extract_if(.., |_| true).collect::<Vec<_>>();
+
+    assert_eq!(deleted, &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(m, &[]);
+}
+
+#[test]
+fn extract_if_empty() {
+    let mut list: VecDeque<i32> = VecDeque::new();
+
+    {
+        let mut iter = list.extract_if(.., |_| true);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(list.len(), 0);
+    assert_eq!(list, vec![]);
+}
+
+#[test]
+fn extract_if_zst() {
+    let mut list: VecDeque<_> = [(), (), (), (), ()].into_iter().collect();
+    let initial_len = list.len();
+    let mut count = 0;
+
+    {
+        let mut iter = list.extract_if(.., |_| true);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        while let Some(_) = iter.next() {
+            count += 1;
+            assert_eq!(iter.size_hint(), (0, Some(initial_len - count)));
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, initial_len);
+    assert_eq!(list.len(), 0);
+    assert_eq!(list, vec![]);
+}
+
+#[test]
+fn extract_if_false() {
+    let mut list: VecDeque<_> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+
+    let initial_len = list.len();
+    let mut count = 0;
+
+    {
+        let mut iter = list.extract_if(.., |_| false);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        for _ in iter.by_ref() {
+            count += 1;
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, 0);
+    assert_eq!(list.len(), initial_len);
+    assert_eq!(list, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+}
+
+#[test]
+fn extract_if_true() {
+    let mut list: VecDeque<_> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+
+    let initial_len = list.len();
+    let mut count = 0;
+
+    {
+        let mut iter = list.extract_if(.., |_| true);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        while let Some(_) = iter.next() {
+            count += 1;
+            assert_eq!(iter.size_hint(), (0, Some(initial_len - count)));
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, initial_len);
+    assert_eq!(list.len(), 0);
+    assert_eq!(list, vec![]);
+}
+
+#[test]
+fn extract_if_non_contiguous() {
+    let mut list =
+        [1, 2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36, 37, 39]
+            .into_iter()
+            .collect::<VecDeque<_>>();
+    list.rotate_left(3);
+
+    assert!(!list.is_contiguous());
+    assert_eq!(
+        list,
+        [6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36, 37, 39, 1, 2, 4]
+    );
+
+    let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+    assert_eq!(removed.len(), 10);
+    assert_eq!(removed, vec![6, 18, 20, 22, 24, 26, 34, 36, 2, 4]);
+
+    assert_eq!(list.len(), 14);
+    assert_eq!(list, vec![7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35, 37, 39, 1]);
+}
+
+#[test]
+fn extract_if_complex() {
+    {
+        //                [+xxx++++++xxxxx++++x+x++]
+        let mut list = [
+            1, 2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36, 37,
+            39,
+        ]
+        .into_iter()
+        .collect::<VecDeque<_>>();
+
+        let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(list.len(), 14);
+        assert_eq!(list, vec![1, 7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35, 37, 39]);
+    }
+
+    {
+        // [xxx++++++xxxxx++++x+x++]
+        let mut list =
+            [2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36, 37, 39]
+                .into_iter()
+                .collect::<VecDeque<_>>();
+
+        let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(list.len(), 13);
+        assert_eq!(list, vec![7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35, 37, 39]);
+    }
+
+    {
+        // [xxx++++++xxxxx++++x+x]
+        let mut list =
+            [2, 4, 6, 7, 9, 11, 13, 15, 17, 18, 20, 22, 24, 26, 27, 29, 31, 33, 34, 35, 36]
+                .into_iter()
+                .collect::<VecDeque<_>>();
+
+        let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(list.len(), 11);
+        assert_eq!(list, vec![7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35]);
+    }
+
+    {
+        // [xxxxxxxxxx+++++++++++]
+        let mut list = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+            .into_iter()
+            .collect::<VecDeque<_>>();
+
+        let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+
+        assert_eq!(list.len(), 10);
+        assert_eq!(list, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    }
+
+    {
+        // [+++++++++++xxxxxxxxxx]
+        let mut list = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+            .into_iter()
+            .collect::<VecDeque<_>>();
+
+        let removed = list.extract_if(.., |x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+
+        assert_eq!(list.len(), 10);
+        assert_eq!(list, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    }
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn extract_if_drop_panic_leak() {
+    let d0 = CrashTestDummy::new(0);
+    let d1 = CrashTestDummy::new(1);
+    let d2 = CrashTestDummy::new(2);
+    let d3 = CrashTestDummy::new(3);
+    let d4 = CrashTestDummy::new(4);
+    let d5 = CrashTestDummy::new(5);
+    let d6 = CrashTestDummy::new(6);
+    let d7 = CrashTestDummy::new(7);
+    let mut q = VecDeque::new();
+    q.push_back(d3.spawn(Panic::Never));
+    q.push_back(d4.spawn(Panic::Never));
+    q.push_back(d5.spawn(Panic::Never));
+    q.push_back(d6.spawn(Panic::Never));
+    q.push_back(d7.spawn(Panic::Never));
+    q.push_front(d2.spawn(Panic::Never));
+    q.push_front(d1.spawn(Panic::InDrop));
+    q.push_front(d0.spawn(Panic::Never));
+
+    catch_unwind(AssertUnwindSafe(|| q.extract_if(.., |_| true).for_each(drop))).unwrap_err();
+
+    assert_eq!(d0.dropped(), 1);
+    assert_eq!(d1.dropped(), 1);
+    assert_eq!(d2.dropped(), 0);
+    assert_eq!(d3.dropped(), 0);
+    assert_eq!(d4.dropped(), 0);
+    assert_eq!(d5.dropped(), 0);
+    assert_eq!(d6.dropped(), 0);
+    assert_eq!(d7.dropped(), 0);
+    drop(q);
+    assert_eq!(d2.dropped(), 1);
+    assert_eq!(d3.dropped(), 1);
+    assert_eq!(d4.dropped(), 1);
+    assert_eq!(d5.dropped(), 1);
+    assert_eq!(d6.dropped(), 1);
+    assert_eq!(d7.dropped(), 1);
+}
+
+#[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+fn extract_if_pred_panic_leak() {
+    struct_with_counted_drop!(D(u32), DROPS);
+
+    let mut q = VecDeque::new();
+    q.push_back(D(3));
+    q.push_back(D(4));
+    q.push_back(D(5));
+    q.push_back(D(6));
+    q.push_back(D(7));
+    q.push_front(D(2));
+    q.push_front(D(1));
+    q.push_front(D(0));
+
+    _ = catch_unwind(AssertUnwindSafe(|| {
+        q.extract_if(.., |item| if item.0 >= 2 { panic!() } else { true }).for_each(drop)
+    }));
+
+    assert_eq!(DROPS.get(), 2); // 0 and 1
+    assert_eq!(q.len(), 6);
 }

@@ -1,7 +1,7 @@
-use rustc_ast::{self as ast, Generics, ItemKind, MetaItem, VariantData};
+use rustc_ast::{self as ast, Generics, ItemKind, MetaItem, Safety, VariantData};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::{Ident, Span, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use crate::deriving::generic::ty::*;
@@ -34,8 +34,8 @@ pub(crate) fn expand_deriving_clone(
     let is_simple;
     match item {
         Annotatable::Item(annitem) => match &annitem.kind {
-            ItemKind::Struct(_, _, Generics { params, .. })
-            | ItemKind::Enum(_, _, Generics { params, .. }) => {
+            ItemKind::Struct(_, Generics { params, .. }, _)
+            | ItemKind::Enum(_, Generics { params, .. }, _) => {
                 let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
                 let has_derive_copy = cx.resolver.has_derive_copy(container_id);
                 if has_derive_copy
@@ -68,6 +68,29 @@ pub(crate) fn expand_deriving_clone(
         _ => cx.dcx().span_bug(span, "`#[derive(Clone)]` on trait item or impl item"),
     }
 
+    // If the clone method is just copying the value, also mark the type as
+    // `TrivialClone` to allow some library optimizations.
+    if is_simple {
+        let trivial_def = TraitDef {
+            span,
+            path: path_std!(clone::TrivialClone),
+            skip_path_as_bound: false,
+            needs_copy_as_bound_if_packed: true,
+            additional_bounds: bounds.clone(),
+            supports_unions: true,
+            methods: Vec::new(),
+            associated_types: Vec::new(),
+            is_const,
+            is_staged_api_crate: cx.ecfg.features.staged_api(),
+            safety: Safety::Unsafe(DUMMY_SP),
+            // `TrivialClone` is not part of an API guarantee, so it shouldn't
+            // appear in rustdoc output.
+            document: false,
+        };
+
+        trivial_def.expand_ext(cx, mitem, item, push, true);
+    }
+
     let trait_def = TraitDef {
         span,
         path: path_std!(clone::Clone),
@@ -87,6 +110,9 @@ pub(crate) fn expand_deriving_clone(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
+        safety: Safety::Default,
+        document: true,
     };
 
     trait_def.expand_ext(cx, mitem, item, push, is_simple)

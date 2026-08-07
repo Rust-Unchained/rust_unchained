@@ -4,7 +4,6 @@
 //@[default_exp] rustc-env:CLIPPY_CONF_DIR=tests/ui-toml/arbitrary_source_item_ordering/default_exp
 //@[ord_within] rustc-env:CLIPPY_CONF_DIR=tests/ui-toml/arbitrary_source_item_ordering/ord_within
 
-#![allow(dead_code)]
 #![warn(clippy::arbitrary_source_item_ordering)]
 
 /// This module gets linted before clippy gives up.
@@ -50,6 +49,22 @@ enum EnumUnorderedAllowed {
     A,
     C,
     B,
+}
+
+struct EnumWithoutExtern {
+    r: u8,
+    g: u8,
+    //~^ arbitrary_source_item_ordering
+    b: u8,
+    //~^ arbitrary_source_item_ordering
+}
+
+#[repr(C)]
+struct EnumWithExternButAtWrongPosition {
+    //~[ord_within]^ arbitrary_source_item_ordering
+    r: u8,
+    g: u8,
+    b: u8,
 }
 
 struct StructOrdered {

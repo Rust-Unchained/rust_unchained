@@ -1,11 +1,9 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_hir};
-use clippy_utils::is_bool;
-use clippy_utils::macros::span_is_local;
-use clippy_utils::source::is_present_in_source;
 use clippy_utils::str_utils::{camel_case_split, count_match_end, count_match_start, to_camel_case, to_snake_case};
+use clippy_utils::{is_bool, is_from_proc_macro};
 use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::{EnumDef, FieldDef, Item, ItemKind, OwnerId, Variant, VariantData};
+use rustc_hir::{Body, EnumDef, FieldDef, Item, ItemKind, QPath, TyKind, UseKind, Variant, VariantData};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::Symbol;
@@ -45,6 +43,37 @@ declare_clippy_lint! {
     pub ENUM_VARIANT_NAMES,
     style,
     "enums where all variants share a prefix/postfix"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for modules that have the same name as their
+    /// parent module
+    ///
+    /// ### Why is this bad?
+    /// A typical beginner mistake is to have `mod foo;` and
+    /// again `mod foo { ..
+    /// }` in `foo.rs`.
+    /// The expectation is that items inside the inner `mod foo { .. }` are then
+    /// available
+    /// through `foo::x`, but they are only available through
+    /// `foo::foo::x`.
+    /// If this is done on purpose, it would be better to choose a more
+    /// representative module name.
+    ///
+    /// ### Example
+    /// ```ignore
+    /// // lib.rs
+    /// mod foo;
+    /// // foo.rs
+    /// mod foo {
+    ///     ...
+    /// }
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub MODULE_INCEPTION,
+    style,
+    "modules that have the same name as their parent module"
 }
 
 declare_clippy_lint! {
@@ -93,36 +122,6 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for modules that have the same name as their
-    /// parent module
-    ///
-    /// ### Why is this bad?
-    /// A typical beginner mistake is to have `mod foo;` and
-    /// again `mod foo { ..
-    /// }` in `foo.rs`.
-    /// The expectation is that items inside the inner `mod foo { .. }` are then
-    /// available
-    /// through `foo::x`, but they are only available through
-    /// `foo::foo::x`.
-    /// If this is done on purpose, it would be better to choose a more
-    /// representative module name.
-    ///
-    /// ### Example
-    /// ```ignore
-    /// // lib.rs
-    /// mod foo;
-    /// // foo.rs
-    /// mod foo {
-    ///     ...
-    /// }
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub MODULE_INCEPTION,
-    style,
-    "modules that have the same name as their parent module"
-}
-declare_clippy_lint! {
-    /// ### What it does
     /// Detects struct fields that are prefixed or suffixed
     /// by the same characters or the name of the struct itself.
     ///
@@ -157,13 +156,33 @@ declare_clippy_lint! {
     "structs where all fields share a prefix/postfix or contain the name of the struct"
 }
 
+impl_lint_pass!(ItemNameRepetitions => [
+    ENUM_VARIANT_NAMES,
+    MODULE_INCEPTION,
+    MODULE_NAME_REPETITIONS,
+    STRUCT_FIELD_NAMES,
+]);
+
 pub struct ItemNameRepetitions {
-    modules: Vec<(Symbol, String, OwnerId)>,
+    /// The module path the lint pass is in.
+    modules: Vec<ModInfo>,
     enum_threshold: u64,
     struct_threshold: u64,
     avoid_breaking_exported_api: bool,
+    allow_exact_repetitions: bool,
     allow_private_module_inception: bool,
     allowed_prefixes: FxHashSet<String>,
+}
+
+struct ModInfo {
+    name: Symbol,
+    name_camel: String,
+    /// Does this module have the `pub` visibility modifier.
+    is_public: bool,
+    /// How many bodies are between this module and the current lint pass position.
+    ///
+    /// Only the most recently seen module is updated when entering/exiting a body.
+    in_body_count: u32,
 }
 
 impl ItemNameRepetitions {
@@ -173,6 +192,7 @@ impl ItemNameRepetitions {
             enum_threshold: conf.enum_variant_name_threshold,
             struct_threshold: conf.struct_field_name_threshold,
             avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
+            allow_exact_repetitions: conf.allow_exact_repetitions,
             allow_private_module_inception: conf.allow_private_module_inception,
             allowed_prefixes: conf.allowed_prefixes.iter().map(|s| to_camel_case(s)).collect(),
         }
@@ -182,13 +202,6 @@ impl ItemNameRepetitions {
         self.allowed_prefixes.contains(prefix)
     }
 }
-
-impl_lint_pass!(ItemNameRepetitions => [
-    ENUM_VARIANT_NAMES,
-    STRUCT_FIELD_NAMES,
-    MODULE_NAME_REPETITIONS,
-    MODULE_INCEPTION
-]);
 
 #[must_use]
 fn have_no_extra_prefix(prefixes: &[&str]) -> bool {
@@ -405,6 +418,7 @@ fn check_enum_start(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>
     if count_match_start(item_name, name).char_count == item_name_chars
         && name.chars().nth(item_name_chars).is_some_and(|c| !c.is_lowercase())
         && name.chars().nth(item_name_chars + 1).is_some_and(|c| !c.is_numeric())
+        && !check_enum_tuple_path_match(name, variant.data)
     {
         span_lint_hir(
             cx,
@@ -420,7 +434,9 @@ fn check_enum_end(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>) 
     let name = variant.ident.name.as_str();
     let item_name_chars = item_name.chars().count();
 
-    if count_match_end(item_name, name).char_count == item_name_chars {
+    if count_match_end(item_name, name).char_count == item_name_chars
+        && !check_enum_tuple_path_match(name, variant.data)
+    {
         span_lint_hir(
             cx,
             ENUM_VARIANT_NAMES,
@@ -431,61 +447,131 @@ fn check_enum_end(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>) 
     }
 }
 
-impl LateLintPass<'_> for ItemNameRepetitions {
-    fn check_item_post(&mut self, _cx: &LateContext<'_>, item: &Item<'_>) {
-        let Some(_ident) = item.kind.ident() else { return };
+/// Checks if an enum tuple variant contains a single field
+/// whose qualified path contains the variant's name.
+fn check_enum_tuple_path_match(variant_name: &str, variant_data: VariantData<'_>) -> bool {
+    // Only check single-field tuple variants
+    let VariantData::Tuple(fields, ..) = variant_data else {
+        return false;
+    };
+    if fields.len() != 1 {
+        return false;
+    }
+    // Check if field type is a path and contains the variant name
+    match fields[0].ty.kind {
+        TyKind::Path(QPath::Resolved(_, path)) => path
+            .segments
+            .iter()
+            .any(|segment| segment.ident.name.as_str() == variant_name),
+        TyKind::Path(QPath::TypeRelative(_, segment)) => segment.ident.name.as_str() == variant_name,
+        _ => false,
+    }
+}
 
-        let last = self.modules.pop();
-        assert!(last.is_some());
+impl LateLintPass<'_> for ItemNameRepetitions {
+    fn check_item_post(&mut self, _: &LateContext<'_>, item: &Item<'_>) {
+        if matches!(item.kind, ItemKind::Mod(..)) {
+            let prev = self.modules.pop();
+            debug_assert!(prev.is_some());
+        }
+    }
+
+    fn check_body(&mut self, _: &LateContext<'_>, _: &Body<'_>) {
+        if let [.., last] = &mut *self.modules {
+            last.in_body_count += 1;
+        }
+    }
+
+    fn check_body_post(&mut self, _: &LateContext<'_>, _: &Body<'_>) {
+        if let [.., last] = &mut *self.modules {
+            last.in_body_count -= 1;
+        }
     }
 
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
-        let Some(ident) = item.kind.ident() else { return };
+        let ident = match item.kind {
+            ItemKind::Mod(ident, _) => {
+                if let [.., prev] = &*self.modules
+                    && prev.name == ident.name
+                    && prev.in_body_count == 0
+                    && (!self.allow_private_module_inception || prev.is_public)
+                    && !item.span.from_expansion()
+                    && !is_from_proc_macro(cx, item)
+                {
+                    span_lint(
+                        cx,
+                        MODULE_INCEPTION,
+                        item.span,
+                        "module has the same name as its containing module",
+                    );
+                }
+                ident
+            },
+
+            ItemKind::Enum(ident, _, def) => {
+                if !ident.span.in_external_macro(cx.tcx.sess.source_map()) {
+                    self.check_variants(cx, item, &def);
+                }
+                ident
+            },
+            ItemKind::Struct(ident, _, data) => {
+                if let VariantData::Struct { fields, .. } = data
+                    && !ident.span.in_external_macro(cx.tcx.sess.source_map())
+                {
+                    self.check_fields(cx, item, fields);
+                }
+                ident
+            },
+
+            ItemKind::Const(ident, ..)
+            | ItemKind::ExternCrate(_, ident)
+            | ItemKind::Fn { ident, .. }
+            | ItemKind::Macro(ident, ..)
+            | ItemKind::Static(_, ident, ..)
+            | ItemKind::Trait { ident, .. }
+            | ItemKind::TraitAlias(_, ident, ..)
+            | ItemKind::TyAlias(ident, ..)
+            | ItemKind::Union(ident, ..)
+            | ItemKind::Use(_, UseKind::Single(ident)) => ident,
+
+            ItemKind::ForeignMod { .. } | ItemKind::GlobalAsm { .. } | ItemKind::Impl(_) | ItemKind::Use(..) => return,
+        };
 
         let item_name = ident.name.as_str();
         let item_camel = to_camel_case(item_name);
-        if !item.span.from_expansion() && is_present_in_source(cx, item.span)
-            && let [.., (mod_name, mod_camel, mod_owner_id)] = &*self.modules
-            // constants don't have surrounding modules
-            && !mod_camel.is_empty()
+
+        if let [.., prev] = &*self.modules
+            && prev.is_public
+            && prev.in_body_count == 0
+            && !item.span.from_expansion()
+            && !matches!(item.kind, ItemKind::Macro(..))
+            && cx.tcx.visibility(item.owner_id).is_public()
         {
-            if mod_name == &ident.name
-                && let ItemKind::Mod(..) = item.kind
-                && (!self.allow_private_module_inception || cx.tcx.visibility(mod_owner_id.def_id).is_public())
-            {
-                span_lint(
-                    cx,
-                    MODULE_INCEPTION,
-                    item.span,
-                    "module has the same name as its containing module",
-                );
-            }
-
-            // The `module_name_repetitions` lint should only trigger if the item has the module in its
-            // name. Having the same name is accepted.
-            if cx.tcx.visibility(item.owner_id).is_public()
-                && cx.tcx.visibility(mod_owner_id.def_id).is_public()
-                && item_camel.len() > mod_camel.len()
-            {
-                let matching = count_match_start(mod_camel, &item_camel);
-                let rmatching = count_match_end(mod_camel, &item_camel);
-                let nchars = mod_camel.chars().count();
-
-                let is_word_beginning = |c: char| c == '_' || c.is_uppercase() || c.is_numeric();
-
-                if matching.char_count == nchars {
-                    match item_camel.chars().nth(nchars) {
-                        Some(c) if is_word_beginning(c) => span_lint(
+            if !self.allow_exact_repetitions && item_camel == prev.name_camel {
+                if !is_from_proc_macro(cx, item) {
+                    span_lint(
+                        cx,
+                        MODULE_NAME_REPETITIONS,
+                        ident.span,
+                        "item name is the same as its containing module's name",
+                    );
+                }
+            } else if item_camel.len() > prev.name_camel.len() {
+                if let Some(s) = item_camel.strip_prefix(&prev.name_camel)
+                    && let Some(c) = s.chars().next()
+                    && (c == '_' || c.is_uppercase() || c.is_numeric())
+                {
+                    if !is_from_proc_macro(cx, item) {
+                        span_lint(
                             cx,
                             MODULE_NAME_REPETITIONS,
                             ident.span,
                             "item name starts with its containing module's name",
-                        ),
-                        _ => (),
+                        );
                     }
-                }
-                if rmatching.char_count == nchars
-                    && !self.is_allowed_prefix(&item_camel[..item_camel.len() - rmatching.byte_count])
+                } else if let Some(s) = item_camel.strip_suffix(&prev.name_camel)
+                    && !self.is_allowed_prefix(s)
+                    && !is_from_proc_macro(cx, item)
                 {
                     span_lint(
                         cx,
@@ -497,17 +583,13 @@ impl LateLintPass<'_> for ItemNameRepetitions {
             }
         }
 
-        if span_is_local(item.span) {
-            match item.kind {
-                ItemKind::Enum(_, def, _) => {
-                    self.check_variants(cx, item, &def);
-                },
-                ItemKind::Struct(_, VariantData::Struct { fields, .. }, _) => {
-                    self.check_fields(cx, item, fields);
-                },
-                _ => (),
-            }
+        if matches!(item.kind, ItemKind::Mod(..)) {
+            self.modules.push(ModInfo {
+                name: ident.name,
+                name_camel: item_camel,
+                is_public: cx.tcx.visibility(item.owner_id).is_public(),
+                in_body_count: 0,
+            });
         }
-        self.modules.push((ident.name, item_camel, item.owner_id));
     }
 }

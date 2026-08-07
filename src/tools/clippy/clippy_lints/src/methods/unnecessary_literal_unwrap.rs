@@ -1,10 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{MaybePath, is_res_lang_ctor, last_path_segment, path_res};
+use clippy_utils::res::{MaybeDef, MaybeQPath};
+use clippy_utils::{is_none_expr, last_path_segment, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{self as hir, AmbigArg};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
+use rustc_span::Symbol;
 
 use super::UNNECESSARY_LITERAL_UNWRAP;
 
@@ -21,11 +23,12 @@ fn get_ty_from_args<'a>(args: Option<&'a [hir::GenericArg<'a>]>, index: usize) -
     }
 }
 
+#[expect(clippy::too_many_lines)]
 pub(super) fn check(
     cx: &LateContext<'_>,
     expr: &hir::Expr<'_>,
     recv: &hir::Expr<'_>,
-    method: &str,
+    method: Symbol,
     args: &[hir::Expr<'_>],
 ) {
     let init = clippy_utils::expr_or_init(cx, recv);
@@ -36,23 +39,26 @@ pub(super) fn check(
     }
 
     let (constructor, call_args, ty) = if let hir::ExprKind::Call(call, call_args) = init.kind {
-        let Some(qpath) = call.qpath_opt() else { return };
-
-        let args = last_path_segment(qpath).args.map(|args| args.args);
-        let res = cx.qpath_res(qpath, call.hir_id());
-
-        if is_res_lang_ctor(cx, res, hir::LangItem::OptionSome) {
-            ("Some", call_args, get_ty_from_args(args, 0))
-        } else if is_res_lang_ctor(cx, res, hir::LangItem::ResultOk) {
-            ("Ok", call_args, get_ty_from_args(args, 0))
-        } else if is_res_lang_ctor(cx, res, hir::LangItem::ResultErr) {
-            ("Err", call_args, get_ty_from_args(args, 1))
+        if let Some((qpath, hir_id)) = call.opt_qpath()
+            && let args = last_path_segment(qpath).args.map(|args| args.args)
+            && let Some(did) = cx.qpath_res(qpath, hir_id).ctor_parent(cx).opt_def_id()
+        {
+            let lang_items = cx.tcx.lang_items();
+            if Some(did) == lang_items.option_some_variant() {
+                (sym::Some, call_args, get_ty_from_args(args, 0))
+            } else if Some(did) == lang_items.result_ok_variant() {
+                (sym::Ok, call_args, get_ty_from_args(args, 0))
+            } else if Some(did) == lang_items.result_err_variant() {
+                (sym::Err, call_args, get_ty_from_args(args, 1))
+            } else {
+                return;
+            }
         } else {
             return;
         }
-    } else if is_res_lang_ctor(cx, path_res(cx, init), hir::LangItem::OptionNone) {
+    } else if is_none_expr(cx, init) {
         let call_args: &[hir::Expr<'_>] = &[];
-        ("None", call_args, None)
+        (sym::None, call_args, None)
     } else {
         return;
     };
@@ -62,12 +68,12 @@ pub(super) fn check(
 
     span_lint_and_then(cx, UNNECESSARY_LITERAL_UNWRAP, expr.span, help_message, |diag| {
         let suggestions = match (constructor, method, ty) {
-            ("None", "unwrap", _) => Some(vec![(expr.span, "panic!()".to_string())]),
-            ("None", "expect", _) => Some(vec![
+            (sym::None, sym::unwrap, _) => Some(vec![(expr.span, "panic!()".to_string())]),
+            (sym::None, sym::expect, _) => Some(vec![
                 (expr.span.with_hi(args[0].span.lo()), "panic!(".to_string()),
                 (expr.span.with_lo(args[0].span.hi()), ")".to_string()),
             ]),
-            ("Some" | "Ok", "unwrap_unchecked", _) | ("Err", "unwrap_err_unchecked", _) => {
+            (sym::Some | sym::Ok, sym::unwrap_unchecked, _) | (sym::Err, sym::unwrap_err_unchecked, _) => {
                 let mut suggs = vec![
                     (recv.span.with_hi(call_args[0].span.lo()), String::new()),
                     (expr.span.with_lo(call_args[0].span.hi()), String::new()),
@@ -83,20 +89,20 @@ pub(super) fn check(
                 }
                 Some(suggs)
             },
-            ("None", "unwrap_or_default", _) => {
+            (sym::None, sym::unwrap_or_default, _) => {
                 let ty = cx.typeck_results().expr_ty(expr);
                 let default_ty_string = if let ty::Adt(def, ..) = ty.kind() {
-                    with_forced_trimmed_paths!(format!("{}", cx.tcx.def_path_str(def.did())))
+                    with_forced_trimmed_paths!(cx.tcx.def_path_str(def.did()))
                 } else {
                     "Default".to_string()
                 };
                 Some(vec![(expr.span, format!("{default_ty_string}::default()"))])
             },
-            ("None", "unwrap_or", _) => Some(vec![
+            (sym::None, sym::unwrap_or, _) => Some(vec![
                 (expr.span.with_hi(args[0].span.lo()), String::new()),
                 (expr.span.with_lo(args[0].span.hi()), String::new()),
             ]),
-            ("None", "unwrap_or_else", _) => match args[0].kind {
+            (sym::None, sym::unwrap_or_else, _) => match args[0].kind {
                 hir::ExprKind::Closure(hir::Closure { body, .. }) => Some(vec![
                     (expr.span.with_hi(cx.tcx.hir_body(*body).value.span.lo()), String::new()),
                     (expr.span.with_lo(args[0].span.hi()), String::new()),
@@ -105,14 +111,14 @@ pub(super) fn check(
             },
             _ if call_args.is_empty() => None,
             (_, _, Some(_)) => None,
-            ("Ok", "unwrap_err", None) | ("Err", "unwrap", None) => Some(vec![
+            (sym::Ok, sym::unwrap_err, None) | (sym::Err, sym::unwrap, None) => Some(vec![
                 (
                     recv.span.with_hi(call_args[0].span.lo()),
                     "panic!(\"{:?}\", ".to_string(),
                 ),
                 (expr.span.with_lo(call_args[0].span.hi()), ")".to_string()),
             ]),
-            ("Ok", "expect_err", None) | ("Err", "expect", None) => Some(vec![
+            (sym::Ok, sym::expect_err, None) | (sym::Err, sym::expect, None) => Some(vec![
                 (
                     recv.span.with_hi(call_args[0].span.lo()),
                     "panic!(\"{1}: {:?}\", ".to_string(),

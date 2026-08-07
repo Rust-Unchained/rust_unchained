@@ -2,9 +2,10 @@ use tracing::{debug, instrument};
 
 use self::combine::{PredicateEmittingRelation, super_combine_consts, super_combine_tys};
 use crate::data_structures::DelayedSet;
+use crate::relate::combine::combine_ty_args;
 pub use crate::relate::*;
-use crate::solve::Goal;
-use crate::{self as ty, InferCtxtLike, Interner};
+use crate::solve::{Goal, VisibleForLeakCheck};
+use crate::{self as ty, InferCtxtLike, Interner, Region};
 
 pub trait RelateExt: InferCtxtLike {
     fn relate<T: Relate<Self::Interner>>(
@@ -12,17 +13,6 @@ pub trait RelateExt: InferCtxtLike {
         param_env: <Self::Interner as Interner>::ParamEnv,
         lhs: T,
         variance: ty::Variance,
-        rhs: T,
-        span: <Self::Interner as Interner>::Span,
-    ) -> Result<
-        Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
-        TypeError<Self::Interner>,
-    >;
-
-    fn eq_structurally_relating_aliases<T: Relate<Self::Interner>>(
-        &self,
-        param_env: <Self::Interner as Interner>::ParamEnv,
-        lhs: T,
         rhs: T,
         span: <Self::Interner as Interner>::Span,
     ) -> Result<
@@ -43,29 +33,7 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
     > {
-        let mut relate =
-            SolverRelating::new(self, StructurallyRelateAliases::No, variance, param_env, span);
-        relate.relate(lhs, rhs)?;
-        Ok(relate.goals)
-    }
-
-    fn eq_structurally_relating_aliases<T: Relate<Self::Interner>>(
-        &self,
-        param_env: <Self::Interner as Interner>::ParamEnv,
-        lhs: T,
-        rhs: T,
-        span: <Self::Interner as Interner>::Span,
-    ) -> Result<
-        Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
-        TypeError<Self::Interner>,
-    > {
-        let mut relate = SolverRelating::new(
-            self,
-            StructurallyRelateAliases::Yes,
-            ty::Invariant,
-            param_env,
-            span,
-        );
+        let mut relate = SolverRelating::new(self, variance, param_env, span);
         relate.relate(lhs, rhs)?;
         Ok(relate.goals)
     }
@@ -75,7 +43,6 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
 pub struct SolverRelating<'infcx, Infcx, I: Interner> {
     infcx: &'infcx Infcx,
     // Immutable fields.
-    structurally_relate_aliases: StructurallyRelateAliases,
     param_env: I::ParamEnv,
     span: I::Span,
     // Mutable fields.
@@ -113,14 +80,12 @@ where
 {
     pub fn new(
         infcx: &'infcx Infcx,
-        structurally_relate_aliases: StructurallyRelateAliases,
         ambient_variance: ty::Variance,
         param_env: I::ParamEnv,
         span: I::Span,
     ) -> Self {
         SolverRelating {
             infcx,
-            structurally_relate_aliases,
             span,
             ambient_variance,
             param_env,
@@ -139,21 +104,24 @@ where
         self.infcx.cx()
     }
 
-    fn relate_item_args(
+    fn relate_ty_args(
         &mut self,
-        item_def_id: I::DefId,
-        a_arg: I::GenericArgs,
-        b_arg: I::GenericArgs,
-    ) -> RelateResult<I, I::GenericArgs> {
+        a_ty: I::Ty,
+        b_ty: I::Ty,
+        def_id: I::DefId,
+        a_args: I::GenericArgs,
+        b_args: I::GenericArgs,
+        _: impl FnOnce(I::GenericArgs) -> I::Ty,
+    ) -> RelateResult<I, I::Ty> {
         if self.ambient_variance == ty::Invariant {
             // Avoid fetching the variance if we are in an invariant
             // context; no need, and it can induce dependency cycles
             // (e.g., #41849).
-            relate_args_invariantly(self, a_arg, b_arg)
+            relate_args_invariantly(self, a_args, b_args)?;
+            Ok(a_ty)
         } else {
-            let tcx = self.cx();
-            let opt_variances = tcx.variances_of(item_def_id);
-            relate_args_with_variances(self, item_def_id, opt_variances, a_arg, b_arg, false)
+            let variances = self.cx().variances_of(def_id);
+            combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, |_| a_ty)
         }
     }
 
@@ -226,11 +194,30 @@ where
                 }
             }
 
+            (ty::Alias(ty::IsRigid::No, alias), _) if infcx.next_trait_solver() => {
+                let new_var = infcx.next_ty_infer();
+                self.goals.push(Goal::new(
+                    self.cx(),
+                    self.param_env,
+                    ty::ProjectionPredicate { projection_term: alias.into(), term: new_var.into() },
+                ));
+                self.tys(new_var, b)?;
+            }
+            (_, ty::Alias(ty::IsRigid::No, alias)) if infcx.next_trait_solver() => {
+                let new_var = infcx.next_ty_infer();
+                self.goals.push(Goal::new(
+                    self.cx(),
+                    self.param_env,
+                    ty::ProjectionPredicate { projection_term: alias.into(), term: new_var.into() },
+                ));
+                self.tys(a, new_var)?;
+            }
+
             (ty::Infer(ty::TyVar(a_vid)), _) => {
-                infcx.instantiate_ty_var_raw(self, true, a_vid, self.ambient_variance, b)?;
+                infcx.instantiate_ty_var(self, true, a_vid, self.ambient_variance, b)?;
             }
             (_, ty::Infer(ty::TyVar(b_vid))) => {
-                infcx.instantiate_ty_var_raw(
+                infcx.instantiate_ty_var(
                     self,
                     false,
                     b_vid,
@@ -250,13 +237,13 @@ where
     }
 
     #[instrument(skip(self), level = "trace")]
-    fn regions(&mut self, a: I::Region, b: I::Region) -> RelateResult<I, I::Region> {
+    fn regions(&mut self, a: Region<I>, b: Region<I>) -> RelateResult<I, Region<I>> {
         match self.ambient_variance {
             // Subtype(&'a u8, &'b u8) => Outlives('a: 'b) => SubRegion('b, 'a)
-            ty::Covariant => self.infcx.sub_regions(b, a, self.span),
+            ty::Covariant => self.infcx.sub_regions(b, a, VisibleForLeakCheck::Yes, self.span),
             // Suptype(&'a u8, &'b u8) => Outlives('b: 'a) => SubRegion('a, 'b)
-            ty::Contravariant => self.infcx.sub_regions(a, b, self.span),
-            ty::Invariant => self.infcx.equate_regions(a, b, self.span),
+            ty::Contravariant => self.infcx.sub_regions(a, b, VisibleForLeakCheck::Yes, self.span),
+            ty::Invariant => self.infcx.equate_regions(a, b, VisibleForLeakCheck::Yes, self.span),
             ty::Bivariant => {
                 unreachable!("Expected bivariance to be handled in relate_with_variance")
             }
@@ -284,12 +271,12 @@ where
         }
 
         // If they have no bound vars, relate normally.
-        if let Some(a_inner) = a.no_bound_vars() {
-            if let Some(b_inner) = b.no_bound_vars() {
-                self.relate(a_inner, b_inner)?;
-                return Ok(a);
-            }
-        };
+        if let Some(a_inner) = a.no_bound_vars()
+            && let Some(b_inner) = b.no_bound_vars()
+        {
+            self.relate(a_inner, b_inner)?;
+            return Ok(a);
+        }
 
         match self.ambient_variance {
             // Checks whether `for<..> sub <: for<..> sup` holds.
@@ -308,13 +295,13 @@ where
             //
             // [rd]: https://rustc-dev-guide.rust-lang.org/borrow_check/region_inference/placeholders_and_universes.html
             ty::Covariant => {
-                self.infcx.enter_forall(b, |b| {
+                self.infcx.enter_forall_with_empty_assumptions(b, |b| {
                     let a = self.infcx.instantiate_binder_with_infer(a);
                     self.relate(a, b)
                 })?;
             }
             ty::Contravariant => {
-                self.infcx.enter_forall(a, |a| {
+                self.infcx.enter_forall_with_empty_assumptions(a, |a| {
                     let b = self.infcx.instantiate_binder_with_infer(b);
                     self.relate(a, b)
                 })?;
@@ -331,13 +318,13 @@ where
             // `exists<..> A == for<..> B` and `exists<..> B == for<..> A`.
             // Check if `exists<..> A == for<..> B`
             ty::Invariant => {
-                self.infcx.enter_forall(b, |b| {
+                self.infcx.enter_forall_with_empty_assumptions(b, |b| {
                     let a = self.infcx.instantiate_binder_with_infer(a);
                     self.relate(a, b)
                 })?;
 
                 // Check if `exists<..> B == for<..> A`.
-                self.infcx.enter_forall(a, |a| {
+                self.infcx.enter_forall_with_empty_assumptions(a, |a| {
                     let b = self.infcx.instantiate_binder_with_infer(b);
                     self.relate(a, b)
                 })?;
@@ -363,10 +350,6 @@ where
         self.param_env
     }
 
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
-        self.structurally_relate_aliases
-    }
-
     fn register_predicates(
         &mut self,
         obligations: impl IntoIterator<Item: ty::Upcast<I, I::Predicate>>,
@@ -378,29 +361,5 @@ where
 
     fn register_goals(&mut self, obligations: impl IntoIterator<Item = Goal<I, I::Predicate>>) {
         self.goals.extend(obligations);
-    }
-
-    fn register_alias_relate_predicate(&mut self, a: I::Ty, b: I::Ty) {
-        self.register_predicates([ty::Binder::dummy(match self.ambient_variance {
-            ty::Covariant => ty::PredicateKind::AliasRelate(
-                a.into(),
-                b.into(),
-                ty::AliasRelationDirection::Subtype,
-            ),
-            // a :> b is b <: a
-            ty::Contravariant => ty::PredicateKind::AliasRelate(
-                b.into(),
-                a.into(),
-                ty::AliasRelationDirection::Subtype,
-            ),
-            ty::Invariant => ty::PredicateKind::AliasRelate(
-                a.into(),
-                b.into(),
-                ty::AliasRelationDirection::Equate,
-            ),
-            ty::Bivariant => {
-                unreachable!("Expected bivariance to be handled in relate_with_variance")
-            }
-        })]);
     }
 }

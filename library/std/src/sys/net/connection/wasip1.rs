@@ -2,34 +2,33 @@
 
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
 use crate::os::wasi::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
-use crate::sys::fd::WasiFd;
-use crate::sys::{err2io, unsupported};
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::fd::FileDesc;
+use crate::sys::{AsInner, FromInner, IntoInner, err2io, unsupported};
 use crate::time::Duration;
 
-pub struct Socket(WasiFd);
+pub struct Socket(FileDesc);
 
 pub struct TcpStream {
     inner: Socket,
 }
 
-impl AsInner<WasiFd> for Socket {
+impl AsInner<FileDesc> for Socket {
     #[inline]
-    fn as_inner(&self) -> &WasiFd {
+    fn as_inner(&self) -> &FileDesc {
         &self.0
     }
 }
 
-impl IntoInner<WasiFd> for Socket {
-    fn into_inner(self) -> WasiFd {
+impl IntoInner<FileDesc> for Socket {
+    fn into_inner(self) -> FileDesc {
         self.0
     }
 }
 
-impl FromInner<WasiFd> for Socket {
-    fn from_inner(inner: WasiFd) -> Socket {
+impl FromInner<FileDesc> for Socket {
+    fn from_inner(inner: FileDesc) -> Socket {
         Socket(inner)
     }
 }
@@ -60,7 +59,7 @@ impl FromRawFd for Socket {
 }
 
 impl TcpStream {
-    pub fn connect(_: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
+    pub fn connect<A: ToSocketAddrs>(_: A) -> io::Result<TcpStream> {
         unsupported()
     }
 
@@ -92,12 +91,12 @@ impl TcpStream {
         self.read_vectored(&mut [IoSliceMut::new(buf)])
     }
 
-    pub fn read_buf(&self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.socket().as_inner().read_buf(buf)
     }
 
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        self.socket().as_inner().read(bufs)
+        self.socket().as_inner().read_vectored(bufs)
     }
 
     pub fn is_read_vectored(&self) -> bool {
@@ -109,7 +108,7 @@ impl TcpStream {
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.socket().as_inner().write(bufs)
+        self.socket().as_inner().write_vectored(bufs)
     }
 
     pub fn is_write_vectored(&self) -> bool {
@@ -126,12 +125,12 @@ impl TcpStream {
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         let wasi_how = match how {
-            Shutdown::Read => wasi::SDFLAGS_RD,
-            Shutdown::Write => wasi::SDFLAGS_WR,
-            Shutdown::Both => wasi::SDFLAGS_RD | wasi::SDFLAGS_WR,
+            Shutdown::Read => wasip1::SDFLAGS_RD,
+            Shutdown::Write => wasip1::SDFLAGS_WR,
+            Shutdown::Both => wasip1::SDFLAGS_RD | wasip1::SDFLAGS_WR,
         };
 
-        unsafe { wasi::sock_shutdown(self.socket().as_raw_fd() as _, wasi_how).map_err(err2io) }
+        unsafe { wasip1::sock_shutdown(self.socket().as_raw_fd() as _, wasi_how).map_err(err2io) }
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
@@ -143,6 +142,14 @@ impl TcpStream {
     }
 
     pub fn linger(&self) -> io::Result<Option<Duration>> {
+        unsupported()
+    }
+
+    pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn keepalive(&self) -> io::Result<bool> {
         unsupported()
     }
 
@@ -168,19 +175,20 @@ impl TcpStream {
 
     pub fn set_nonblocking(&self, state: bool) -> io::Result<()> {
         let fdstat = unsafe {
-            wasi::fd_fdstat_get(self.socket().as_inner().as_raw_fd() as wasi::Fd).map_err(err2io)?
+            wasip1::fd_fdstat_get(self.socket().as_inner().as_raw_fd() as wasip1::Fd)
+                .map_err(err2io)?
         };
 
         let mut flags = fdstat.fs_flags;
 
         if state {
-            flags |= wasi::FDFLAGS_NONBLOCK;
+            flags |= wasip1::FDFLAGS_NONBLOCK;
         } else {
-            flags &= !wasi::FDFLAGS_NONBLOCK;
+            flags &= !wasip1::FDFLAGS_NONBLOCK;
         }
 
         unsafe {
-            wasi::fd_fdstat_set_flags(self.socket().as_inner().as_raw_fd() as wasi::Fd, flags)
+            wasip1::fd_fdstat_set_flags(self.socket().as_inner().as_raw_fd() as wasip1::Fd, flags)
                 .map_err(err2io)
         }
     }
@@ -212,7 +220,7 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn bind(_: io::Result<&SocketAddr>) -> io::Result<TcpListener> {
+    pub fn bind<A: ToSocketAddrs>(_: A) -> io::Result<TcpListener> {
         unsupported()
     }
 
@@ -222,7 +230,7 @@ impl TcpListener {
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let fd = unsafe {
-            wasi::sock_accept(self.as_inner().as_inner().as_raw_fd() as _, 0).map_err(err2io)?
+            wasip1::sock_accept(self.as_inner().as_inner().as_raw_fd() as _, 0).map_err(err2io)?
         };
 
         Ok((
@@ -259,19 +267,20 @@ impl TcpListener {
 
     pub fn set_nonblocking(&self, state: bool) -> io::Result<()> {
         let fdstat = unsafe {
-            wasi::fd_fdstat_get(self.socket().as_inner().as_raw_fd() as wasi::Fd).map_err(err2io)?
+            wasip1::fd_fdstat_get(self.socket().as_inner().as_raw_fd() as wasip1::Fd)
+                .map_err(err2io)?
         };
 
         let mut flags = fdstat.fs_flags;
 
         if state {
-            flags |= wasi::FDFLAGS_NONBLOCK;
+            flags |= wasip1::FDFLAGS_NONBLOCK;
         } else {
-            flags &= !wasi::FDFLAGS_NONBLOCK;
+            flags &= !wasip1::FDFLAGS_NONBLOCK;
         }
 
         unsafe {
-            wasi::fd_fdstat_set_flags(self.socket().as_inner().as_raw_fd() as wasi::Fd, flags)
+            wasip1::fd_fdstat_set_flags(self.socket().as_inner().as_raw_fd() as wasip1::Fd, flags)
                 .map_err(err2io)
         }
     }
@@ -316,7 +325,7 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    pub fn bind(_: io::Result<&SocketAddr>) -> io::Result<UdpSocket> {
+    pub fn bind<A: ToSocketAddrs>(_: A) -> io::Result<UdpSocket> {
         unsupported()
     }
 
@@ -436,7 +445,7 @@ impl UdpSocket {
         unsupported()
     }
 
-    pub fn connect(&self, _: io::Result<&SocketAddr>) -> io::Result<()> {
+    pub fn connect<A: ToSocketAddrs>(&self, _: A) -> io::Result<()> {
         unsupported()
     }
 
@@ -477,12 +486,6 @@ impl fmt::Debug for UdpSocket {
 
 pub struct LookupHost(!);
 
-impl LookupHost {
-    pub fn port(&self) -> u16 {
-        self.0
-    }
-}
-
 impl Iterator for LookupHost {
     type Item = SocketAddr;
     fn next(&mut self) -> Option<SocketAddr> {
@@ -490,18 +493,6 @@ impl Iterator for LookupHost {
     }
 }
 
-impl<'a> TryFrom<&'a str> for LookupHost {
-    type Error = io::Error;
-
-    fn try_from(_v: &'a str) -> io::Result<LookupHost> {
-        unsupported()
-    }
-}
-
-impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
-    type Error = io::Error;
-
-    fn try_from(_v: (&'a str, u16)) -> io::Result<LookupHost> {
-        unsupported()
-    }
+pub fn lookup_host(_host: &str, _port: u16) -> io::Result<LookupHost> {
+    unsupported()
 }

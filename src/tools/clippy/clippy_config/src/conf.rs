@@ -1,9 +1,9 @@
 use crate::ClippyConfiguration;
 use crate::types::{
-    DisallowedPath, DisallowedPathWithoutReplacement, MacroMatcher, MatchLintBehaviour, PubUnderscoreFieldsBehaviour,
-    Rename, SourceItemOrdering, SourceItemOrderingCategory, SourceItemOrderingModuleItemGroupings,
-    SourceItemOrderingModuleItemKind, SourceItemOrderingTraitAssocItemKind, SourceItemOrderingTraitAssocItemKinds,
-    SourceItemOrderingWithinModuleItemGroupings,
+    DisallowedPath, DisallowedPathWithoutReplacement, InherentImplLintScope, MacroMatcher, MatchLintBehaviour,
+    PubUnderscoreFieldsBehaviour, Rename, SourceItemOrdering, SourceItemOrderingCategory,
+    SourceItemOrderingModuleItemGroupings, SourceItemOrderingModuleItemKind, SourceItemOrderingTraitAssocItemKind,
+    SourceItemOrderingTraitAssocItemKinds, SourceItemOrderingWithinModuleItemGroupings,
 };
 use clippy_utils::msrvs::Msrv;
 use itertools::Itertools;
@@ -33,10 +33,12 @@ const DEFAULT_DOC_VALID_IDENTS: &[&str] = &[
     "GPLv2", "GPLv3",
     "GitHub", "GitLab",
     "IPv4", "IPv6",
+    "InfiniBand", "RoCE",
     "ClojureScript", "CoffeeScript", "JavaScript", "PostScript", "PureScript", "TypeScript",
-    "WebAssembly",
+    "PowerPC", "PowerShell", "WebAssembly",
     "NaN", "NaNs",
     "OAuth", "GraphQL",
+    "SQLite", "MySQL", "PostgreSQL", "MariaDB", "MongoDB",
     "OCaml",
     "OpenAL", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry",
     "OpenType",
@@ -44,7 +46,7 @@ const DEFAULT_DOC_VALID_IDENTS: &[&str] = &[
     "WebP", "OpenExr", "YCbCr", "sRGB",
     "TensorFlow",
     "TrueType",
-    "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD",
+    "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD", "NixOS",
     "TeX", "LaTeX", "BibTeX", "BibLaTeX",
     "MinGW",
     "CamelCase",
@@ -107,7 +109,7 @@ struct ConfError {
 
 impl ConfError {
     fn from_toml(file: &SourceFile, error: &toml::de::Error) -> Self {
-        let span = error.span().unwrap_or(0..file.source_len.0 as usize);
+        let span = error.span().unwrap_or(0..file.normalized_source_len.0 as usize);
         Self::spanned(file, error.message(), None, span)
     }
 
@@ -247,7 +249,7 @@ macro_rules! define_Conf {
 
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "kebab-case")]
-        #[allow(non_camel_case_types)]
+        #[expect(non_camel_case_types)]
         enum Field { $($name,)* third_party, }
 
         struct ConfVisitor<'a>(&'a SourceFile);
@@ -360,6 +362,9 @@ define_Conf! {
     /// Whether `dbg!` should be allowed in test functions or `#[cfg(test)]`
     #[lints(dbg_macro)]
     allow_dbg_in_tests: bool = false,
+    /// Whether an item should be allowed to have the same name as its containing module
+    #[lints(module_name_repetitions)]
+    allow_exact_repetitions: bool = true,
     /// Whether `expect` should be allowed in code always evaluated at compile time
     #[lints(expect_used)]
     allow_expect_in_consts: bool = true,
@@ -369,6 +374,9 @@ define_Conf! {
     /// Whether `indexing_slicing` should be allowed in test functions or `#[cfg(test)]`
     #[lints(indexing_slicing)]
     allow_indexing_slicing_in_tests: bool = false,
+    /// Whether functions inside `#[cfg(test)]` modules or test functions should be checked.
+    #[lints(large_stack_frames)]
+    allow_large_stack_frames_in_tests: bool = true,
     /// Whether to allow mixed uninlined format args, e.g. `format!("{} {}", a, foo.bar)`
     #[lints(uninlined_format_args)]
     allow_mixed_uninlined_format_args: bool = true,
@@ -406,6 +414,15 @@ define_Conf! {
     /// Whether `unwrap` should be allowed in test functions or `#[cfg(test)]`
     #[lints(unwrap_used)]
     allow_unwrap_in_tests: bool = false,
+    /// List of types to allow `unwrap()` and `expect()` on.
+    ///
+    /// #### Example
+    ///
+    /// ```toml
+    /// allow-unwrap-types = [ "std::sync::LockResult" ]
+    /// ```
+    #[lints(expect_used, unwrap_used)]
+    allow_unwrap_types: Vec<String> = Vec::new(),
     /// Whether `useless_vec` should ignore test functions or `#[cfg(test)]`
     #[lints(useless_vec)]
     allow_useless_vec_in_tests: bool = false,
@@ -416,7 +433,7 @@ define_Conf! {
     #[lints(multiple_crate_versions)]
     allowed_duplicate_crates: Vec<String> = Vec::new(),
     /// Allowed names below the minimum allowed characters. The value `".."` can be used as part of
-    /// the list to indicate, that the configured values should be appended to the default
+    /// the list to indicate that the configured values should be appended to the default
     /// configuration of Clippy. By default, any configuration will replace the default value.
     #[lints(min_ident_chars)]
     allowed_idents_below_min_chars: Vec<String> =
@@ -537,6 +554,30 @@ define_Conf! {
     /// For internal testing only, ignores the current `publish` settings in the Cargo manifest.
     #[lints(cargo_common_metadata)]
     cargo_ignore_publish: bool = false,
+    /// Whether to check for grouped late initializations from multiple `let` statements.
+    ///
+    /// #### Example
+    /// ```rust
+    /// let a;
+    /// let b;
+    /// if true {
+    ///     a = 1;
+    ///     b = 2;
+    /// } else {
+    ///     a = 3;
+    ///     b = 4;
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```rust
+    /// let (a, b) = if true {
+    ///     (1, 2)
+    /// } else {
+    ///     (3, 4)
+    /// };
+    /// ```
+    #[lints(needless_late_init)]
+    check_grouped_late_init: bool = true,
     /// Whether to check MSRV compatibility in `#[test]` and `#[cfg(test)]` code.
     #[lints(incompatible_msrv)]
     check_incompatible_msrv_in_tests: bool = false,
@@ -566,16 +607,44 @@ define_Conf! {
     /// The maximum cognitive complexity a function can have
     #[lints(cognitive_complexity)]
     cognitive_complexity_threshold: u64 = 25,
+    /// The minimum digits a const float literal must have to supress the `excessive_precicion` lint
+    #[lints(excessive_precision)]
+    const_literal_digits_threshold: usize = 30,
     /// DEPRECATED LINT: CYCLOMATIC_COMPLEXITY.
     ///
     /// Use the Cognitive Complexity lint instead.
     #[conf_deprecated("Please use `cognitive-complexity-threshold` instead", cognitive_complexity_threshold)]
     cyclomatic_complexity_threshold: u64 = 25,
+    /// The list of disallowed fields, written as fully qualified paths.
+    ///
+    /// **Fields:**
+    /// - `path` (required): the fully qualified path to the field that should be disallowed
+    /// - `reason` (optional): explanation why this field is disallowed
+    /// - `replacement` (optional): suggested alternative method
+    /// - `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+    ///   if the path doesn't exist, instead of emitting an error
+    #[disallowed_paths_allow_replacements = true]
+    #[lints(disallowed_fields)]
+    disallowed_fields: Vec<DisallowedPath> = Vec::new(),
     /// The list of disallowed macros, written as fully qualified paths.
+    ///
+    /// **Fields:**
+    /// - `path` (required): the fully qualified path to the macro that should be disallowed
+    /// - `reason` (optional): explanation why this macro is disallowed
+    /// - `replacement` (optional): suggested alternative macro
+    /// - `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+    ///   if the path doesn't exist, instead of emitting an error
     #[disallowed_paths_allow_replacements = true]
     #[lints(disallowed_macros)]
     disallowed_macros: Vec<DisallowedPath> = Vec::new(),
     /// The list of disallowed methods, written as fully qualified paths.
+    ///
+    /// **Fields:**
+    /// - `path` (required): the fully qualified path to the method that should be disallowed
+    /// - `reason` (optional): explanation why this method is disallowed
+    /// - `replacement` (optional): suggested alternative method
+    /// - `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+    ///   if the path doesn't exist, instead of emitting an error
     #[disallowed_paths_allow_replacements = true]
     #[lints(disallowed_methods)]
     disallowed_methods: Vec<DisallowedPath> = Vec::new(),
@@ -585,11 +654,18 @@ define_Conf! {
     #[lints(disallowed_names)]
     disallowed_names: Vec<String> = DEFAULT_DISALLOWED_NAMES.iter().map(ToString::to_string).collect(),
     /// The list of disallowed types, written as fully qualified paths.
+    ///
+    /// **Fields:**
+    /// - `path` (required): the fully qualified path to the type that should be disallowed
+    /// - `reason` (optional): explanation why this type is disallowed
+    /// - `replacement` (optional): suggested alternative type
+    /// - `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+    ///   if the path doesn't exist, instead of emitting an error
     #[disallowed_paths_allow_replacements = true]
     #[lints(disallowed_types)]
     disallowed_types: Vec<DisallowedPath> = Vec::new(),
     /// The list of words this lint should not consider as identifiers needing ticks. The value
-    /// `".."` can be used as part of the list to indicate, that the configured values should be appended to the
+    /// `".."` can be used as part of the list to indicate that the configured values should be appended to the
     /// default configuration of Clippy. By default, any configuration will replace the default value. For example:
     /// * `doc-valid-idents = ["ClipPy"]` would replace the default list with `["ClipPy"]`.
     /// * `doc-valid-idents = ["ClipPy", ".."]` would append `ClipPy` to the default list.
@@ -635,12 +711,19 @@ define_Conf! {
     /// A list of paths to types that should be treated as if they do not contain interior mutability
     #[lints(borrow_interior_mutable_const, declare_interior_mutable_const, ifs_same_cond, mutable_key_type)]
     ignore_interior_mutability: Vec<String> = Vec::from(["bytes::Bytes".into()]),
+    /// Sets the scope ("crate", "file", or "module") in which duplicate inherent `impl` blocks for the same type are linted.
+    #[lints(multiple_inherent_impl)]
+    inherent_impl_lint_scope: InherentImplLintScope = InherentImplLintScope::Crate,
+    /// A list of paths to types that should be ignored as overly large `Err`-variants in a
+    /// `Result` returned from a function
+    #[lints(result_large_err)]
+    large_error_ignored: Vec<String> = Vec::default(),
     /// The maximum size of the `Err`-variant in a `Result` returned from a function
     #[lints(result_large_err)]
     large_error_threshold: u64 = 128,
-    /// Whether collapsible `if` chains are linted if they contain comments inside the parts
+    /// Whether collapsible `if` and `else if` chains are linted if they contain comments inside the parts
     /// that would be collapsed.
-    #[lints(collapsible_if)]
+    #[lints(collapsible_else_if, collapsible_if)]
     lint_commented_code: bool = false,
     /// Whether to suggest reordering constructor fields when initializers are present.
     /// DEPRECATED CONFIGURATION: lint-inconsistent-struct-field-initializers
@@ -655,7 +738,8 @@ define_Conf! {
     /// be filtering for common types.
     #[lints(manual_let_else)]
     matches_for_let_else: MatchLintBehaviour = MatchLintBehaviour::WellKnownTypes,
-    /// The maximum number of bool parameters a function can have
+    /// The maximum number of bool parameters a function can have.
+    /// Use `0` to lint on any function with a bool parameter.
     #[lints(fn_params_excessive_bools)]
     max_fn_params_bools: u64 = 3,
     /// The maximum size of a file included via `include_bytes!()` or `include_str!()`, in bytes
@@ -675,6 +759,9 @@ define_Conf! {
     /// Minimum chars an ident can have, anything below or equal to this will be linted.
     #[lints(min_ident_chars)]
     min_ident_chars_threshold: u64 = 1,
+    /// Whether to allow fields starting with an underscore to skip documentation requirements
+    #[lints(missing_docs_in_private_items)]
+    missing_docs_allow_unused: bool = false,
     /// Whether to **only** check for missing documentation in items visible within the current
     /// crate. For example, `pub(crate)` items.
     #[lints(missing_docs_in_private_items)]
@@ -710,9 +797,11 @@ define_Conf! {
         from_over_into,
         if_then_some_else_none,
         index_refutable_slice,
+        inefficient_to_string,
         io_other_error,
         iter_kv_map,
         legacy_numeric_constants,
+        len_zero,
         lines_filter_map_ok,
         manual_abs_diff,
         manual_bits,
@@ -723,9 +812,12 @@ define_Conf! {
         manual_hash_one,
         manual_is_ascii_check,
         manual_is_power_of_two,
+        manual_is_variant_and,
+        manual_isolate_lowest_one,
         manual_let_else,
         manual_midpoint,
         manual_non_exhaustive,
+        manual_noop_waker,
         manual_option_as_slice,
         manual_pattern_char_comparison,
         manual_range_contains,
@@ -733,9 +825,11 @@ define_Conf! {
         manual_repeat_n,
         manual_retain,
         manual_slice_fill,
+        manual_slice_size_calculation,
         manual_split_once,
         manual_str_repeat,
         manual_strip,
+        manual_take,
         manual_try_fold,
         map_clone,
         map_unwrap_or,
@@ -747,7 +841,7 @@ define_Conf! {
         needless_borrow,
         non_std_lazy_statics,
         option_as_ref_deref,
-        option_map_unwrap_or,
+        or_fun_call,
         ptr_as_ptr,
         question_mark,
         redundant_field_names,
@@ -755,16 +849,18 @@ define_Conf! {
         repeat_vec_with_capacity,
         same_item_push,
         seek_from_current,
-        seek_rewind,
+        to_digit_is_some,
         transmute_ptr_to_ref,
         tuple_array_conversions,
         type_repetition_in_bounds,
-        unchecked_duration_subtraction,
+        unchecked_time_subtraction,
         uninlined_format_args,
         unnecessary_lazy_evaluations,
+        unnecessary_unwrap,
         unnested_or_patterns,
         unused_trait_names,
         use_self,
+        zero_ptr,
     )]
     msrv: Msrv = Msrv::default(),
     /// The minimum size (in bytes) to consider a type for passing by reference instead of by value.
@@ -774,6 +870,9 @@ define_Conf! {
     /// exported visibility, or whether they are marked as "pub".
     #[lints(pub_underscore_fields)]
     pub_underscore_fields_behavior: PubUnderscoreFieldsBehaviour = PubUnderscoreFieldsBehaviour::PubliclyExported,
+    /// Whether the type itself in a struct or enum should be replaced with `Self` when encountering recursive types.
+    #[lints(use_self)]
+    recursive_self_in_type_definitions: bool = true,
     /// Whether to lint only if it's multiline.
     #[lints(semicolon_inside_block)]
     semicolon_inside_block_ignore_singleline: bool = false,
@@ -820,7 +919,7 @@ define_Conf! {
     trait_assoc_item_kinds_order: SourceItemOrderingTraitAssocItemKinds = DEFAULT_TRAIT_ASSOC_ITEM_KINDS_ORDER.into(),
     /// The maximum size (in bytes) to consider a `Copy` type for passing by value instead of by
     /// reference.
-    #[default_text = "target_pointer_width * 2"]
+    #[default_text = "target_pointer_width"]
     #[lints(trivially_copy_pass_by_ref)]
     trivial_copy_size_limit: Option<u64> = None,
     /// The maximum complexity a type can have
@@ -1178,7 +1277,7 @@ mod tests {
 
         for entry in toml_files {
             let file = fs::read_to_string(entry.path()).unwrap();
-            #[allow(clippy::zero_sized_map_values)]
+            #[expect(clippy::zero_sized_map_values)]
             if let Ok(map) = toml::from_str::<HashMap<String, IgnoredAny>>(&file) {
                 for name in map.keys() {
                     names.remove(name.as_str());

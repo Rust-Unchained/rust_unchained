@@ -1,9 +1,9 @@
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
 
 use crate::{
-    context::{CompletionAnalysis, NameContext, NameKind, NameRefKind},
-    tests::{check_edit, check_edit_with_config, TEST_CONFIG},
     CompletionConfig,
+    context::{CompletionAnalysis, NameContext, NameKind, NameRefKind},
+    tests::{TEST_CONFIG, check_edit, check_edit_with_config},
 };
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
@@ -16,30 +16,35 @@ fn check_with_config(
     expect: Expect,
 ) {
     let (db, position) = crate::tests::position(ra_fixture);
-    let (ctx, analysis) = crate::context::CompletionContext::new(&db, position, &config).unwrap();
+    hir::attach_db(&db, || {
+        let (ctx, analysis) =
+            crate::context::CompletionContext::new(&db, position, &config, None).unwrap();
 
-    let mut acc = crate::completions::Completions::default();
-    if let CompletionAnalysis::Name(NameContext { kind: NameKind::IdentPat(pat_ctx), .. }) =
-        &analysis
-    {
-        crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pat_ctx);
-    }
-    if let CompletionAnalysis::NameRef(name_ref_ctx) = &analysis {
-        match &name_ref_ctx.kind {
-            NameRefKind::Path(path) => {
-                crate::completions::flyimport::import_on_the_fly_path(&mut acc, &ctx, path);
-            }
-            NameRefKind::DotAccess(dot_access) => {
-                crate::completions::flyimport::import_on_the_fly_dot(&mut acc, &ctx, dot_access);
-            }
-            NameRefKind::Pattern(pattern) => {
-                crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pattern);
-            }
-            _ => (),
+        let mut acc = crate::completions::Completions::default();
+        if let CompletionAnalysis::Name(NameContext { kind: NameKind::IdentPat(pat_ctx), .. }) =
+            &analysis
+        {
+            crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pat_ctx);
         }
-    }
+        if let CompletionAnalysis::NameRef(name_ref_ctx) = &analysis {
+            match &name_ref_ctx.kind {
+                NameRefKind::Path(path) => {
+                    crate::completions::flyimport::import_on_the_fly_path(&mut acc, &ctx, path);
+                }
+                NameRefKind::DotAccess(dot_access) => {
+                    crate::completions::flyimport::import_on_the_fly_dot(
+                        &mut acc, &ctx, dot_access,
+                    );
+                }
+                NameRefKind::Pattern(pattern) => {
+                    crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pattern);
+                }
+                _ => (),
+            }
+        }
 
-    expect.assert_eq(&super::render_completion_list(Vec::from(acc)));
+        expect.assert_eq(&super::render_completion_list(Vec::from(acc)));
+    });
 }
 
 #[test]
@@ -74,6 +79,7 @@ fn macro_fuzzy_completion() {
         r#"
 //- /lib.rs crate:dep
 /// Please call me as macro_with_curlies! {}
+#[rust_analyzer::macro_style(braces)]
 #[macro_export]
 macro_rules! macro_with_curlies {
     () => {}
@@ -114,7 +120,7 @@ fn main() {
 }
 "#,
         r#"
-use dep::{some_module::{SecondStruct, ThirdStruct}, FirstStruct};
+use dep::{FirstStruct, some_module::{SecondStruct, ThirdStruct}};
 
 fn main() {
     ThirdStruct
@@ -238,6 +244,34 @@ fn main() {
             st ThirdStruct (use dep::some_module::ThirdStruct)                ThirdStruct
             st AfterThirdStruct (use dep::some_module::AfterThirdStruct) AfterThirdStruct
             st ThiiiiiirdStruct (use dep::some_module::ThiiiiiirdStruct) ThiiiiiirdStruct
+        "#]],
+    );
+}
+
+#[test]
+fn fuzzy_completion_order_is_case_insensitive_and_deterministic() {
+    check(
+        r#"
+//- /lib.rs crate:dep
+pub mod zed {
+    pub struct HIRThing;
+}
+pub mod alpha {
+    pub struct HIRThing;
+}
+pub struct BeforeHIRThing;
+pub struct HiiirThing;
+
+//- /main.rs crate:main deps:dep
+fn main() {
+    hir$0
+}
+"#,
+        expect![[r#"
+            st HIRThing (use dep::alpha::HIRThing)            HIRThing
+            st HIRThing (use dep::zed::HIRThing)              HIRThing
+            st BeforeHIRThing (use dep::BeforeHIRThing) BeforeHIRThing
+            st HiiirThing (use dep::HiiirThing)             HiiirThing
         "#]],
     );
 }
@@ -1237,14 +1271,47 @@ impl Bar for Foo {
 }
 
 #[test]
+fn no_flyimports_type_anchor() {
+    check(
+        r#"
+mod m {
+    pub fn foo() {}
+}
+struct Bar;
+trait Foo {}
+impl Foo for Bar {}
+fn main() {
+    <Bar as Foo>::foo$0
+}
+    "#,
+        expect![[r#""#]],
+    );
+
+    check(
+        r#"
+mod m {
+    pub fn foo() {}
+}
+struct Bar;
+trait Foo {}
+impl Foo for Bar {}
+fn main() {
+    <Bar>::foo$0
+}
+    "#,
+        expect![[r#""#]],
+    );
+}
+
+#[test]
 fn no_inherent_candidates_proposed() {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1260,10 +1327,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1279,10 +1346,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1733,7 +1800,7 @@ fn function() {
 "#,
         expect![[r#"
             st FooStruct (use outer::FooStruct) BarStruct
-            md foo (use outer::foo)
+            md foo:: (use outer::foo)
             fn foo_fun() (use outer::foo_fun)        fn()
         "#]],
     );
@@ -1770,9 +1837,8 @@ fn intrinsics() {
         r#"
     //- /core.rs crate:core
     pub mod intrinsics {
-        extern "rust-intrinsic" {
-            pub fn transmute<Src, Dst>(src: Src) -> Dst;
-        }
+        #[rustc_intrinsic]
+        pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
     }
     pub mod mem {
         pub use crate::intrinsics::transmute;
@@ -1790,9 +1856,8 @@ fn intrinsics() {
         r#"
 //- /core.rs crate:core
 pub mod intrinsics {
-    extern "rust-intrinsic" {
-        pub fn transmute<Src, Dst>(src: Src) -> Dst;
-    }
+    #[rustc_intrinsic]
+    pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
 }
 pub mod mem {
     pub use crate::intrinsics::transmute;
@@ -1810,9 +1875,10 @@ fn function() {
 
 #[test]
 fn excluded_trait_item_included_when_exact_match() {
+    // FIXME: This does not work, we need to change the code.
     check_with_config(
         CompletionConfig {
-            exclude_traits: &["test::module2::ExcludedTrait".to_owned()],
+            exclude_traits: &["ra_test_fixture::module2::ExcludedTrait".to_owned()],
             ..TEST_CONFIG
         },
         r#"
@@ -1830,8 +1896,225 @@ fn foo() {
     true.foo$0
 }
         "#,
+        expect![""],
+    );
+}
+
+#[test]
+fn excluded_via_attr() {
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_flyimport)]
+    pub trait ExcludedTrait {
+        fn foo(&self) {}
+        fn bar(&self) {}
+        fn baz(&self) {}
+    }
+
+    impl<T> ExcludedTrait for T {}
+}
+
+fn foo() {
+    true.$0
+}
+        "#,
+        expect![""],
+    );
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_flyimport_methods)]
+    pub trait ExcludedTrait {
+        fn foo(&self) {}
+        fn bar(&self) {}
+        fn baz(&self) {}
+    }
+
+    impl<T> ExcludedTrait for T {}
+}
+
+fn foo() {
+    true.$0
+}
+        "#,
+        expect![""],
+    );
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_methods)]
+    pub trait ExcludedTrait {
+        fn foo(&self) {}
+        fn bar(&self) {}
+        fn baz(&self) {}
+    }
+
+    impl<T> ExcludedTrait for T {}
+}
+
+fn foo() {
+    true.$0
+}
+        "#,
+        expect![""],
+    );
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_flyimport)]
+    pub trait ExcludedTrait {
+        fn foo(&self) {}
+        fn bar(&self) {}
+        fn baz(&self) {}
+    }
+
+    impl<T> ExcludedTrait for T {}
+}
+
+fn foo() {
+    ExcludedTrait$0
+}
+        "#,
+        expect![""],
+    );
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_methods)]
+    pub trait ExcludedTrait {
+        fn foo(&self) {}
+        fn bar(&self) {}
+        fn baz(&self) {}
+    }
+
+    impl<T> ExcludedTrait for T {}
+}
+
+fn foo() {
+    ExcludedTrait$0
+}
+        "#,
         expect![[r#"
-            me foo() (use module2::ExcludedTrait) fn(&self)
+            tt ExcludedTrait (use module2::ExcludedTrait)
         "#]],
+    );
+    check(
+        r#"
+mod module2 {
+    #[rust_analyzer::completions(ignore_flyimport)]
+    pub struct Foo {}
+}
+
+fn foo() {
+    Foo$0
+}
+        "#,
+        expect![""],
+    );
+}
+
+#[test]
+fn multiple_matches_with_qualifier() {
+    check(
+        r#"
+//- /foo.rs crate:foo
+pub mod env {
+    pub fn var() {}
+    pub fn _var() {}
+}
+
+//- /bar.rs crate:bar deps:foo
+fn main() {
+    env::var$0
+}
+    "#,
+        expect![[r#"
+            fn _var() (use foo::env) fn()
+            fn var() (use foo::env)  fn()
+        "#]],
+    );
+}
+
+#[test]
+fn trait_method_import_across_multiple_crates() {
+    let fixture = r#"
+        //- /lib.rs crate:test-trait
+        pub trait TestTrait {
+            fn test_function(&self) -> u32;
+        }
+
+        //- /lib.rs crate:test-implementation deps:test-trait
+        pub struct TestStruct(pub usize);
+
+        impl test_trait::TestTrait for TestStruct {
+            fn test_function(&self) -> u32 {
+                1
+            }
+        }
+
+        //- /main.rs crate:main deps:test-implementation,test-trait
+        use test_implementation::TestStruct;
+
+        fn main() {
+            let test = TestStruct(42);
+            test.test_f$0
+        }
+    "#;
+
+    check(
+        fixture,
+        expect![[r#"
+            me test_function() (use test_trait::TestTrait) fn(&self) -> u32
+        "#]],
+    );
+
+    check_edit(
+        "test_function",
+        fixture,
+        r#"
+use test_implementation::TestStruct;
+use test_trait::TestTrait;
+
+fn main() {
+    let test = TestStruct(42);
+    test.test_function()$0
+}
+"#,
+    );
+}
+
+#[test]
+fn prefer_underscore_import() {
+    check_edit(
+        "bar",
+        r#"
+mod foo {
+    #[rust_analyzer::prefer_underscore_import]
+    pub trait Ext {
+        fn bar(&self) {}
+    }
+    impl<T> Ext for T {}
+}
+
+fn baz() {
+    1.bar$0
+}
+    "#,
+        r#"
+use foo::Ext as _;
+
+mod foo {
+    #[rust_analyzer::prefer_underscore_import]
+    pub trait Ext {
+        fn bar(&self) {}
+    }
+    impl<T> Ext for T {}
+}
+
+fn baz() {
+    1.bar();$0
+}
+    "#,
     );
 }

@@ -7,6 +7,7 @@ use rustc_middle::mir::{Body, Local, UnwindTerminateReason, traversal};
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, HasTypingEnv, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
 use rustc_middle::{bug, mir, span_bug};
+use rustc_span::ErrorGuaranteed;
 use rustc_target::callconv::{FnAbi, PassMode};
 use tracing::{debug, instrument};
 
@@ -20,12 +21,14 @@ mod coverageinfo;
 pub mod debuginfo;
 mod intrinsic;
 mod locals;
-mod naked_asm;
+pub mod naked_asm;
 pub mod operand;
 pub mod place;
+mod retag;
 mod rvalue;
 mod statement;
 
+pub use self::block::store_cast;
 use self::debuginfo::{FunctionDebugContext, PerLocalVarDebugInfo};
 use self::operand::{OperandRef, OperandValue};
 use self::place::PlaceRef;
@@ -89,12 +92,17 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
     /// Cached unreachable block
     unreachable_block: Option<Bx::BasicBlock>,
 
-    /// Cached terminate upon unwinding block and its reason
-    terminate_block: Option<(Bx::BasicBlock, UnwindTerminateReason)>,
+    /// Cached terminate upon unwinding block and its reason. For non-wasm
+    /// targets, there is at most one such block per function, stored at index
+    /// `START_BLOCK`. For wasm targets, each funclet needs its own terminate
+    /// block, indexed by the cleanup block that is the funclet's head.
+    terminate_blocks: IndexVec<mir::BasicBlock, Option<(Bx::BasicBlock, UnwindTerminateReason)>>,
 
     /// A bool flag for each basic block indicating whether it is a cold block.
     /// A cold block is a block that is unlikely to be executed at runtime.
     cold_blocks: IndexVec<mir::BasicBlock, bool>,
+
+    nop_landing_pads: DenseBitSet<mir::BasicBlock>,
 
     /// The location where each MIR arg/var/tmp/ret is stored. This is
     /// usually an `PlaceRef` representing an alloca, but not always:
@@ -130,7 +138,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         self.instance.instantiate_mir_and_normalize_erasing_regions(
             self.cx.tcx(),
             self.cx.typing_env(),
-            ty::EarlyBinder::bind(value),
+            ty::EarlyBinder::bind(self.cx.tcx(), value),
         )
     }
 }
@@ -139,13 +147,41 @@ enum LocalRef<'tcx, V> {
     Place(PlaceRef<'tcx, V>),
     /// `UnsizedPlace(p)`: `p` itself is a thin pointer (indirect place).
     /// `*p` is the wide pointer that references the actual unsized place.
-    /// Every time it is initialized, we have to reallocate the place
-    /// and update the wide pointer. That's the reason why it is indirect.
+    ///
+    /// MIR only supports unsized args, not dynamically-sized locals, so
+    /// new unsized temps don't exist and we must reuse the referred-to place.
+    ///
+    /// FIXME: Since the removal of unsized locals in <https://github.com/rust-lang/rust/pull/142911>,
+    /// can we maybe use `Place` here? Or refactor it in another way? There are quite a few
+    /// `UnsizedPlace => bug` branches now.
     UnsizedPlace(PlaceRef<'tcx, V>),
     /// The backend [`OperandValue`] has already been generated.
     Operand(OperandRef<'tcx, V>),
     /// Will be a `Self::Operand` once we get to its definition.
     PendingOperand,
+}
+
+pub enum IntrinsicResult<'tcx, V> {
+    /// This intrinsic created an operand without using the `result_place` argument.
+    ///
+    /// `codegen_call_terminator` will handle writing the result into the place,
+    /// if doing so is needed.
+    ///
+    /// The vast majority of intrinsics can do this, see MCP#970
+    Operand(OperandValue<V>),
+
+    /// The intrinsic wrote its result into the `result_place` argument.
+    ///
+    /// Most things don't need to do this, but there are some: `volatile_load`
+    /// of a non-scalar type, for example, has to.
+    WroteIntoPlace,
+
+    /// Another instance should be called instead. This is used to invoke intrinsic
+    /// default bodies in case an intrinsic is not implemented by the backend.
+    Fallback(ty::Instance<'tcx>),
+
+    /// Arguably this shouldn't exist, per MCP#620, but a bunch do it.
+    Err(ErrorGuaranteed),
 }
 
 impl<'tcx, V: CodegenObject> LocalRef<'tcx, V> {
@@ -174,37 +210,43 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let llfn = cx.get_fn(instance);
 
     let mut mir = tcx.instance_mir(instance.def);
+    // Note that the ABI logic has deduced facts about the functions' parameters based on the MIR we
+    // got here (`deduce_param_attrs`). That means we can *not* apply arbitrary further MIR
+    // transforms as that may invalidate those deduced facts!
 
     let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
     debug!("fn_abi: {:?}", fn_abi);
 
-    if tcx.codegen_fn_attrs(instance.def_id()).flags.contains(CodegenFnAttrFlags::NAKED) {
-        crate::mir::naked_asm::codegen_naked_asm::<Bx>(cx, &mir, instance);
-        return;
-    }
+    let nop_landing_pads = rustc_mir_transform::remove_noop_landing_pads::find_noop_landing_pads(
+        mir,
+        Some(rustc_mir_transform::remove_noop_landing_pads::ExtraInfo {
+            tcx,
+            instance,
+            typing_env: cx.typing_env(),
+        }),
+    );
 
     if tcx.features().ergonomic_clones() {
         let monomorphized_mir = instance.instantiate_mir_and_normalize_erasing_regions(
             tcx,
             ty::TypingEnv::fully_monomorphized(),
-            ty::EarlyBinder::bind(mir.clone()),
+            ty::EarlyBinder::bind(tcx, mir.clone()),
         );
         mir = tcx.arena.alloc(optimize_use_clone::<Bx>(cx, monomorphized_mir));
     }
 
-    let debug_context = cx.create_function_debug_context(instance, fn_abi, llfn, &mir);
-
     let start_llbb = Bx::append_block(cx, llfn, "start");
     let mut start_bx = Bx::build(cx, start_llbb);
 
-    if mir.basic_blocks.iter().any(|bb| {
-        bb.is_cleanup || matches!(bb.terminator().unwind(), Some(mir::UnwindAction::Terminate(_)))
+    if mir::traversal::mono_reachable(&mir, tcx, instance).any(|(bb, block)| {
+        (block.is_cleanup && !nop_landing_pads.contains(bb))
+            || matches!(block.terminator().unwind(), Some(mir::UnwindAction::Terminate(_)))
     }) {
         start_bx.set_personality_fn(cx.eh_personality());
     }
 
-    let cleanup_kinds =
-        base::wants_new_eh_instructions(tcx.sess).then(|| analyze::cleanup_kinds(&mir));
+    let cleanup_kinds = base::wants_new_eh_instructions(tcx.sess)
+        .then(|| analyze::cleanup_kinds(&mir, &nop_landing_pads));
 
     let cached_llbbs: IndexVec<mir::BasicBlock, CachedLlbb<Bx::BasicBlock>> =
         mir.basic_blocks
@@ -223,15 +265,16 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         personality_slot: None,
         cached_llbbs,
         unreachable_block: None,
-        terminate_block: None,
+        terminate_blocks: IndexVec::from_elem(None, &mir.basic_blocks),
         cleanup_kinds,
         landing_pads: IndexVec::from_elem(None, &mir.basic_blocks),
         funclets: IndexVec::from_fn_n(|_| None, mir.basic_blocks.len()),
         cold_blocks: find_cold_blocks(tcx, mir),
         locals: locals::Locals::empty(),
-        debug_context,
+        debug_context: None,
         per_local_var_debug_info: None,
         caller_location: None,
+        nop_landing_pads,
     };
 
     // It may seem like we should iterate over `required_consts` to ensure they all successfully
@@ -239,11 +282,44 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // monomorphization, and if there is an error during collection then codegen never starts -- so
     // we don't have to do it again.
 
+    fx.fill_function_debug_context(&mut start_bx);
+
     let (per_local_var_debug_info, consts_debug_info) =
         fx.compute_per_local_var_debug_info(&mut start_bx).unzip();
     fx.per_local_var_debug_info = per_local_var_debug_info;
 
-    let traversal_order = traversal::mono_reachable_reverse_postorder(mir, tcx, instance);
+    let mut traversal_order = traversal::mono_reachable_reverse_postorder(mir, tcx, instance);
+
+    // Filter out blocks that won't be codegen'd because of nop_landing_pads optimization.
+    // FIXME: We might want to integrate the nop_landing_pads analysis into mono reachability.
+    {
+        let mut reachable = DenseBitSet::new_empty(mir.basic_blocks.len());
+        let mut to_visit = vec![mir::START_BLOCK];
+        while let Some(next) = to_visit.pop() {
+            if !reachable.insert(next) {
+                continue;
+            }
+
+            let block = &mir.basic_blocks[next];
+            let successors = block.mono_successors(tcx, instance);
+
+            if let Some(mir::UnwindAction::Cleanup(target)) = block.terminator().unwind()
+                && fx.nop_landing_pads.contains(*target)
+            {
+                // This edge will not be followed when we actually codegen, so skip generating it here.
+                //
+                // It's guaranteed that the cleanup block (`target`) occurs only in
+                // UnwindAction::Cleanup(...) -- i.e., we can't incorrectly filter too much here --
+                // because cleanup transitions must happen via UnwindAction::Cleanup.
+                to_visit.extend(successors.filter(|s| s != target));
+            } else {
+                to_visit.extend(successors);
+            }
+        }
+
+        traversal_order.retain(|bb| reachable.contains(*bb));
+    }
+
     let memory_locals = analyze::non_ssa_locals(&fx, &traversal_order);
 
     // Allocate variable and temp allocas
@@ -264,7 +340,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                     }
                     PassMode::Cast { ref cast, .. } => {
                         debug!("alloc: {:?} (return place) -> place", local);
-                        let size = cast.size(&start_bx);
+                        let size = cast.size(&start_bx).max(layout.size);
                         return LocalRef::Place(PlaceRef::alloca_size(&mut start_bx, size, layout));
                     }
                     _ => {}
@@ -295,10 +371,6 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // Apply debuginfo to the newly allocated locals.
     fx.debug_introduce_locals(&mut start_bx, consts_debug_info.unwrap_or_default());
 
-    // If the backend supports coverage, and coverage is enabled for this function,
-    // do any necessary start-of-function codegen (e.g. locals for MC/DC bitmaps).
-    start_bx.init_coverage(instance);
-
     // The builders will be created separately for each basic block at `codegen_block`.
     // So drop the builder of `start_llbb` to avoid having two at the same time.
     drop(start_bx);
@@ -320,6 +392,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 }
 
+/// Replace `clone` calls that come from `use` statements with direct copies if possible.
 // FIXME: Move this function to mir::transform when post-mono MIR passes land.
 fn optimize_use_clone<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     cx: &'a Bx::CodegenCx,
@@ -358,15 +431,18 @@ fn optimize_use_clone<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             let destination_block = target.unwrap();
 
-            bb.statements.push(mir::Statement {
-                source_info: bb.terminator().source_info,
-                kind: mir::StatementKind::Assign(Box::new((
+            bb.statements.push(mir::Statement::new(
+                bb.terminator().source_info,
+                mir::StatementKind::Assign(Box::new((
                     *destination,
-                    mir::Rvalue::Use(mir::Operand::Copy(
-                        arg_place.project_deeper(&[mir::ProjectionElem::Deref], tcx),
-                    )),
+                    mir::Rvalue::Use(
+                        mir::Operand::Copy(
+                            arg_place.project_deeper(&[mir::ProjectionElem::Deref], tcx),
+                        ),
+                        mir::WithRetag::Yes,
+                    ),
                 ))),
-            });
+            ));
 
             bb.terminator_mut().kind = mir::TerminatorKind::Goto { target: destination_block };
         }
@@ -389,19 +465,19 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
     let mut num_untupled = None;
 
-    let codegen_fn_attrs = bx.tcx().codegen_fn_attrs(fx.instance.def_id());
-    let naked = codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::NAKED);
-    if naked {
+    let codegen_fn_attrs = bx.tcx().codegen_instance_attrs(fx.instance.def);
+    if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::NAKED) {
         return vec![];
     }
 
-    let args = mir
+    let mut args = mir
         .args_iter()
         .enumerate()
         .map(|(arg_index, local)| {
             let arg_decl = &mir.local_decls[local];
             let arg_ty = fx.monomorphize(arg_decl.ty);
 
+            // FIXME(splat): re-tuple splatted arguments that were un-tupled in the ABI
             if Some(local) == mir.spread_arg {
                 // This argument (e.g., the last argument in the "rust-call" ABI)
                 // is a tuple that was spread at the ABI level and now we have
@@ -434,7 +510,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 assert_eq!(
                     None,
                     num_untupled.replace(tupled_arg_tys.len()),
-                    "Replaced existing num_tupled"
+                    "Replaced existing num_untupled"
                 );
 
                 return LocalRef::Place(place);
@@ -442,6 +518,10 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             if fx.fn_abi.c_variadic && arg_index == fx.fn_abi.args.len() {
                 let va_list = PlaceRef::alloca(bx, bx.layout_of(arg_ty));
+
+                // Explicitly start the lifetime of the `va_list`, improves LLVM codegen.
+                bx.lifetime_start(va_list.val.llval, va_list.layout.size);
+
                 bx.va_start(va_list.val.llval);
 
                 return LocalRef::Place(va_list);
@@ -465,9 +545,12 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                     PassMode::Direct(_) => {
                         let llarg = bx.get_param(llarg_idx);
                         llarg_idx += 1;
-                        return local(OperandRef::from_immediate_or_packed_pair(
-                            bx, llarg, arg.layout,
-                        ));
+                        debug_assert!(arg.layout.backend_repr.is_scalar_or_simd());
+                        return local(OperandRef {
+                            val: OperandValue::Immediate(llarg),
+                            layout: arg.layout,
+                            move_annotation: None,
+                        });
                     }
                     PassMode::Pair(..) => {
                         let (a, b) = (bx.get_param(llarg_idx), bx.get_param(llarg_idx + 1));
@@ -476,6 +559,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                         return local(OperandRef {
                             val: OperandValue::Pair(a, b),
                             layout: arg.layout,
+                            move_annotation: None,
                         });
                     }
                     _ => {}
@@ -502,7 +586,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                         LocalRef::Place(PlaceRef::new_sized(llarg, arg.layout))
                     }
                 }
-                // Unsized indirect qrguments
+                // Unsized indirect arguments
                 PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
                     // As the storage for the indirect argument lives during
                     // the whole function call, we just copy the wide pointer.
@@ -524,6 +608,32 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             }
         })
         .collect::<Vec<_>>();
+    if bx.tcx().sess.opts.unstable_opts.codegen_emit_retag.is_some() {
+        args = args
+            .iter()
+            .map(|arg| match arg {
+                &LocalRef::Place(place_ref) => {
+                    fx.codegen_retag_place(bx, place_ref, true);
+                    LocalRef::Place(place_ref)
+                }
+                &LocalRef::UnsizedPlace(place_ref) => {
+                    let operand = bx.load_operand(place_ref);
+                    let retagged = fx.codegen_retag_operand(bx, operand, true);
+                    assert!(matches!(retagged.val, OperandValue::Pair(_, _)));
+                    retagged.val.store(bx, place_ref);
+                    LocalRef::UnsizedPlace(place_ref)
+                }
+                &LocalRef::Operand(operand_ref) => {
+                    let retagged = fx.codegen_retag_operand(bx, operand_ref, true);
+                    LocalRef::Operand(retagged)
+                }
+                LocalRef::PendingOperand => LocalRef::PendingOperand,
+            })
+            .collect::<Vec<_>>();
+        // If we branched during retagging, then we need to update the
+        // start block to the new location.
+        fx.cached_llbbs[mir::START_BLOCK] = CachedLlbb::Some(bx.llbb());
+    }
 
     if fx.instance.def.requires_caller_location(bx.tcx()) {
         let mir_args = if let Some(num_untupled) = num_untupled {
@@ -548,6 +658,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         fx.caller_location = Some(OperandRef {
             val: OperandValue::Immediate(bx.get_param(llarg_idx)),
             layout: arg.layout,
+            move_annotation: None,
         });
     }
 

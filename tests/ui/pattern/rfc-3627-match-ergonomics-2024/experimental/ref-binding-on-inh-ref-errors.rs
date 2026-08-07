@@ -4,6 +4,8 @@
 //@[structural2021] edition: 2021
 //@[classic2024] edition: 2024
 //@[structural2024] edition: 2024
+//@ dont-require-annotations: NOTE
+
 //! Tests for errors from binding with `ref x` under a by-ref default binding mode in edition 2024.
 //! These can't be in the same body as tests for other errors, since they're emitted during THIR
 //! construction. The errors on stable edition 2021 Rust are unrelated.
@@ -15,22 +17,22 @@
 /// The eat-outer variant eats the inherited reference, so binding with `ref` isn't a problem.
 fn errors_from_eating_the_real_reference() {
     let [&ref x] = &[&0];
-    //[structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
     #[cfg(classic2024)] let _: &&u32 = x;
 
     let [&ref x] = &mut [&0];
-    //[structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
     #[cfg(classic2024)] let _: &&u32 = x;
 
     let [&mut ref x] = &mut [&mut 0];
-    //[structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
     #[cfg(classic2024)] let _: &&mut u32 = x;
 
     let [&mut ref mut x] = &mut [&mut 0];
-    //[structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &mut u32 = x;
     #[cfg(classic2024)] let _: &mut &mut u32 = x;
 }
@@ -40,15 +42,15 @@ fn errors_from_eating_the_real_reference() {
 fn errors_from_eating_the_real_reference_caught_in_hir_typeck_on_stable() {
     let [&ref x] = &[&mut 0];
     //[stable2021]~^ ERROR: mismatched types
-    //[stable2021]~| types differ in mutability
-    //[structural2024]~^^^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[stable2021]~| NOTE types differ in mutability
+    //[structural2024]~^^^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(classic2021, structural2021))] let _: &u32 = x;
     #[cfg(classic2024)] let _: &&mut u32 = x;
 
     let [&ref x] = &mut [&mut 0];
     //[stable2021]~^ ERROR: mismatched types
-    //[stable2021]~| types differ in mutability
-    //[structural2024]~^^^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[stable2021]~| NOTE types differ in mutability
+    //[structural2024]~^^^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(classic2021, structural2021))] let _: &u32 = x;
     #[cfg(classic2024)] let _: &&mut u32 = x;
 }
@@ -57,8 +59,8 @@ fn errors_from_eating_the_real_reference_caught_in_hir_typeck_on_stable() {
 fn errors_dependent_on_eating_order_caught_in_hir_typeck_when_eating_outer() {
     let [&mut ref x] = &[&mut 0];
     //[classic2024]~^ ERROR: mismatched types
-    //[classic2024]~| cannot match inherited `&` with `&mut` pattern
-    //[structural2024]~^^^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[classic2024]~| NOTE cannot match inherited `&` with `&mut` pattern
+    //[structural2024]~^^^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
 }
 
@@ -70,21 +72,21 @@ fn errors_dependent_on_eating_order_caught_in_hir_typeck_when_eating_outer() {
 fn borrowck_errors_in_old_editions() {
     let [ref mut x] = &[0];
     //~^ ERROR: cannot borrow data in a `&` reference as mutable
-    //[classic2024,structural2024]~| ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[classic2024,structural2024]~| ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
 }
 
 /// The remaining tests are purely for testing `ref` bindings in the presence of an inherited
 /// reference. These should always fail on edition 2024 and succeed on edition 2021.
 pub fn main() {
     let [ref x] = &[0];
-    //[classic2024,structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[classic2024,structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
 
     let [ref x] = &mut [0];
-    //[classic2024,structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[classic2024,structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &u32 = x;
 
     let [ref mut x] = &mut [0];
-    //[classic2024,structural2024]~^ ERROR: binding modifiers may only be written when the default binding mode is `move`
+    //[classic2024,structural2024]~^ ERROR: cannot explicitly borrow within an implicitly-borrowing pattern
     #[cfg(any(stable2021, classic2021, structural2021))] let _: &mut u32 = x;
 }

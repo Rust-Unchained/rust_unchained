@@ -3,9 +3,11 @@
 //@ only-unix
 //@ needs-subprocess
 //@ ignore-fuchsia no fork
+//@ ignore-tvos fork is prohibited
+//@ ignore-watchos fork is prohibited
+//@ ignore-backends: gcc
 
 #![feature(rustc_private)]
-#![feature(never_type)]
 #![feature(panic_always_abort)]
 
 #![allow(invalid_from_utf8)]
@@ -140,7 +142,7 @@ fn main() {
         let mut status: c_int = 0;
         let got = unsafe { libc::waitpid(child, &mut status, 0) };
         assert_eq!(got, child);
-        let status = ExitStatus::from_raw(status.into());
+        let status = ExitStatus::from_raw(status);
         status
     }
 

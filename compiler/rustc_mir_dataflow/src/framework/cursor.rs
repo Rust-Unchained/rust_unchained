@@ -1,7 +1,7 @@
 //! Random access inspection of the results of a dataflow analysis.
 
 use std::cmp::Ordering;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 #[cfg(debug_assertions)]
 use rustc_index::bit_set::DenseBitSet;
@@ -9,38 +9,20 @@ use rustc_middle::mir::{self, BasicBlock, Location};
 
 use super::{Analysis, Direction, Effect, EffectIndex, Results};
 
-/// Some `ResultsCursor`s want to own a `Results`, and some want to borrow a `Results`, either
-/// mutable or immutably. This type allows all of the above. It's similar to `Cow`.
-pub enum ResultsHandle<'a, 'tcx, A>
-where
-    A: Analysis<'tcx>,
-{
-    BorrowedMut(&'a mut Results<'tcx, A>),
-    Owned(Results<'tcx, A>),
+/// This is like `Cow`, but it lacks the `T: ToOwned` bound and doesn't support
+/// `to_owned`/`into_owned`.
+enum SimpleCow<'a, T> {
+    Borrowed(&'a T),
+    Owned(T),
 }
 
-impl<'tcx, A> Deref for ResultsHandle<'_, 'tcx, A>
-where
-    A: Analysis<'tcx>,
-{
-    type Target = Results<'tcx, A>;
+impl<T> Deref for SimpleCow<'_, T> {
+    type Target = T;
 
-    fn deref(&self) -> &Results<'tcx, A> {
+    fn deref(&self) -> &T {
         match self {
-            ResultsHandle::BorrowedMut(borrowed) => borrowed,
-            ResultsHandle::Owned(owned) => owned,
-        }
-    }
-}
-
-impl<'tcx, A> DerefMut for ResultsHandle<'_, 'tcx, A>
-where
-    A: Analysis<'tcx>,
-{
-    fn deref_mut(&mut self) -> &mut Results<'tcx, A> {
-        match self {
-            ResultsHandle::BorrowedMut(borrowed) => borrowed,
-            ResultsHandle::Owned(owned) => owned,
+            SimpleCow::Borrowed(borrowed) => borrowed,
+            SimpleCow::Owned(owned) => owned,
         }
     }
 }
@@ -60,7 +42,7 @@ where
     A: Analysis<'tcx>,
 {
     body: &'mir mir::Body<'tcx>,
-    results: ResultsHandle<'mir, 'tcx, A>,
+    results: SimpleCow<'mir, Results<'tcx, A>>,
     state: A::Domain,
 
     pos: CursorPosition,
@@ -88,8 +70,7 @@ where
         self.body
     }
 
-    /// Returns a new cursor that can inspect `results`.
-    pub fn new(body: &'mir mir::Body<'tcx>, results: ResultsHandle<'mir, 'tcx, A>) -> Self {
+    fn new(body: &'mir mir::Body<'tcx>, results: SimpleCow<'mir, Results<'tcx, A>>) -> Self {
         let bottom_value = results.analysis.bottom_value(body);
         ResultsCursor {
             body,
@@ -105,6 +86,16 @@ where
             #[cfg(debug_assertions)]
             reachable_blocks: mir::traversal::reachable_as_bitset(body),
         }
+    }
+
+    /// Returns a new cursor that takes ownership of and inspects analysis results.
+    pub fn new_owning(body: &'mir mir::Body<'tcx>, results: Results<'tcx, A>) -> Self {
+        Self::new(body, SimpleCow::Owned(results))
+    }
+
+    /// Returns a new cursor that borrows and inspects analysis results.
+    pub fn new_borrowing(body: &'mir mir::Body<'tcx>, results: &'mir Results<'tcx, A>) -> Self {
+        Self::new(body, SimpleCow::Borrowed(results))
     }
 
     /// Allows inspection of unreachable basic blocks even with `debug_assertions` enabled.
@@ -128,7 +119,7 @@ where
         #[cfg(debug_assertions)]
         assert!(self.reachable_blocks.contains(block));
 
-        self.state.clone_from(self.results.entry_set_for_block(block));
+        self.state.clone_from(&self.results.entry_states[block]);
         self.pos = CursorPosition::block_entry(block);
         self.state_needs_reset = false;
     }
@@ -204,28 +195,20 @@ where
         debug_assert_eq!(target.block, self.pos.block);
 
         let block_data = &self.body[target.block];
-        #[rustfmt::skip]
-        let next_effect = if A::Direction::IS_FORWARD {
-            self.pos.curr_effect_index.map_or_else(
-                || Effect::Early.at_index(0),
-                EffectIndex::next_in_forward_order,
-            )
-        } else {
-            self.pos.curr_effect_index.map_or_else(
-                || Effect::Early.at_index(block_data.statements.len()),
-                EffectIndex::next_in_backward_order,
-            )
-        };
-
+        let next_effect = self.pos.curr_effect_index.map_or_else(
+            || A::Direction::first_index(block_data),
+            |idx| A::Direction::next_index(idx),
+        );
         let target_effect_index = effect.at_index(target.statement_index);
 
-        A::Direction::apply_effects_in_range(
-            &mut self.results.analysis,
-            &mut self.state,
-            target.block,
-            block_data,
-            next_effect..=target_effect_index,
-        );
+        let mut idx = next_effect;
+        loop {
+            self.results.analysis.apply_effect(&mut self.state, target.block, block_data, idx);
+            if idx == target_effect_index {
+                break;
+            }
+            idx = A::Direction::next_index(idx);
+        }
 
         self.pos =
             CursorPosition { block: target.block, curr_effect_index: Some(target_effect_index) };
@@ -235,8 +218,8 @@ where
     ///
     /// This can be used, e.g., to apply the call return effect directly to the cursor without
     /// creating an extra copy of the dataflow state.
-    pub fn apply_custom_effect(&mut self, f: impl FnOnce(&mut A, &mut A::Domain)) {
-        f(&mut self.results.analysis, &mut self.state);
+    pub fn apply_custom_effect(&mut self, f: impl FnOnce(&A, &mut A::Domain)) {
+        f(&self.results.analysis, &mut self.state);
         self.state_needs_reset = true;
     }
 }

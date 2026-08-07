@@ -1,4 +1,4 @@
-#![crate_type="lib"]
+#![crate_type = "lib"]
 
 struct S<N>;
 //~^ ERROR type parameter `N` is never used

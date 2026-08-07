@@ -1,7 +1,7 @@
 use hir::HasCrate;
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: inline_const_as_literal
 //
@@ -22,7 +22,10 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 //     "Hello, World!"
 // }
 // ```
-pub(crate) fn inline_const_as_literal(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn inline_const_as_literal(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     let variable = ctx.find_node_at_offset::<ast::PathExpr>()?;
 
     if let hir::PathResolution::Def(hir::ModuleDef::Const(konst)) =
@@ -44,7 +47,7 @@ pub(crate) fn inline_const_as_literal(acc: &mut Assists, ctx: &AssistContext<'_>
             .ok()?
             .render(ctx.sema.db, konst.krate(ctx.sema.db).to_display_target(ctx.sema.db));
 
-        let id = AssistId("inline_const_as_literal", AssistKind::RefactorInline);
+        let id = AssistId::refactor_inline("inline_const_as_literal");
 
         let label = "Inline const as literal".to_owned();
         let target = variable.syntax().text_range();
@@ -57,8 +60,8 @@ pub(crate) fn inline_const_as_literal(acc: &mut Assists, ctx: &AssistContext<'_>
 }
 
 fn validate_type_recursively(
-    ctx: &AssistContext<'_>,
-    ty_hir: Option<&hir::Type>,
+    ctx: &AssistContext<'_, '_>,
+    ty_hir: Option<&hir::Type<'_>>,
     refed: bool,
     fuel: i32,
 ) -> Option<()> {

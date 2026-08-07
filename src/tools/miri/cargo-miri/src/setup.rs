@@ -24,11 +24,9 @@ pub fn setup(
     let ask_user = !only_setup;
     let print_sysroot = only_setup && has_arg_flag("--print-sysroot"); // whether we just print the sysroot path
     let show_setup = only_setup && !print_sysroot;
-    if !only_setup {
-        if let Some(sysroot) = std::env::var_os("MIRI_SYSROOT") {
-            // Skip setup step if MIRI_SYSROOT is explicitly set, *unless* we are `cargo miri setup`.
-            return sysroot.into();
-        }
+    if !only_setup && let Some(sysroot) = std::env::var_os("MIRI_SYSROOT") {
+        // Skip setup step if MIRI_SYSROOT is explicitly set, *unless* we are `cargo miri setup`.
+        return sysroot.into();
     }
 
     // Determine where the rust sources are located.  The env var trumps auto-detection.
@@ -85,11 +83,13 @@ pub fn setup(
         SysrootConfig::NoStd
     } else {
         SysrootConfig::WithStd {
-            std_features: ["panic_unwind", "backtrace"].into_iter().map(Into::into).collect(),
+            std_features: ["panic-unwind", "backtrace"].into_iter().map(Into::into).collect(),
         }
     };
     let cargo_cmd = {
         let mut command = cargo();
+        // Allow JSON targets since users do not have a good way to set this flag otherwise.
+        command.arg("-Zjson-target-spec");
         // Use Miri as rustc to build a libstd compatible with us (and use the right flags).
         // We set ourselves (`cargo-miri`) instead of Miri directly to be able to patch the flags
         // for `libpanic_abort` (usually this is done by bootstrap but we have to do it ourselves).
@@ -162,7 +162,7 @@ pub fn setup(
 
     // Do the build.
     let status = SysrootBuilder::new(&sysroot_dir, target)
-        .build_mode(BuildMode::Check)
+        .build_mode(BuildMode::Build) // not a real build, since we use dummy codegen
         .rustc_version(rustc_version.clone())
         .sysroot_config(sysroot_config)
         .rustflags(rustflags)

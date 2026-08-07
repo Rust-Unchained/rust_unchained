@@ -1,14 +1,15 @@
 use std::time::Instant;
 
-use expect_test::{expect_file, ExpectFile};
-use ide_db::SymbolKind;
+use expect_test::{ExpectFile, expect_file};
+use ide_db::{SymbolKind, ra_fixture::RaFixtureConfig};
 use span::Edition;
-use test_utils::{bench, bench_fixture, skip_slow_tests, AssertLinear};
+use test_utils::{AssertLinear, bench, bench_fixture, skip_slow_tests};
 
-use crate::{fixture, FileRange, HighlightConfig, HlTag, TextRange};
+use crate::{FileRange, HighlightConfig, HlTag, TextRange, fixture};
 
-const HL_CONFIG: HighlightConfig = HighlightConfig {
+const HL_CONFIG: HighlightConfig<'_> = HighlightConfig {
     strings: true,
+    comments: true,
     punctuation: true,
     specialize_punctuation: true,
     specialize_operator: true,
@@ -16,6 +17,7 @@ const HL_CONFIG: HighlightConfig = HighlightConfig {
     inject_doc_comment: true,
     macro_bang: true,
     syntactic_name_ref_highlighting: false,
+    ra_fixture: RaFixtureConfig::default(),
 };
 
 #[test]
@@ -37,10 +39,18 @@ fn attributes() {
 // This is another normal comment
 #[derive(Copy, Unresolved)]
 // The reason for these being here is to test AttrIds
+#[default]
 enum Foo {
     #[default]
-    Bar
+    Bar {
+        #[default]
+        field: i32
+    }
 }
+
+#[derive(Default)]
+#[default]
+struct Bar(#[default] i32);
 "#,
         expect_file!["./test_data/highlight_attributes.html"],
         false,
@@ -53,8 +63,9 @@ fn macros() {
         r#"
 //- proc_macros: mirror, identity, derive_identity
 //- minicore: fmt, include, concat
-//- /lib.rs crate:lib
+//- /lib.rs crate:lib deps:pm
 use proc_macros::{mirror, identity, DeriveIdentity};
+use pm::proc_macro;
 
 mirror! {
     {
@@ -124,6 +135,11 @@ fn main() {
 //- /foo/foo.rs crate:foo
 mod foo {}
 use self::foo as bar;
+//- /pm.rs crate:pm
+#![crate_type = "proc-macro"]
+
+#[proc_macro_attribute]
+pub fn proc_macro() {}
 "#,
         expect_file!["./test_data/highlight_macros.html"],
         false,
@@ -202,7 +218,7 @@ fn never() -> ! {
     loop {}
 }
 
-fn const_param<const FOO: usize>() -> usize {
+fn const_param<const FOO: usize>() -> usize where [(); FOO]: Sized {
     const_param::<{ FOO }>();
     FOO
 }
@@ -431,7 +447,24 @@ macro_rules! void_2024 {
 }
 
 "#,
-        expect_file![format!("./test_data/highlight_keywords_macros.html")],
+        expect_file!["./test_data/highlight_keywords_macros.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_raw_string_format_specifiers() {
+    check_highlighting(
+        r####"
+//- minicore: fmt
+fn main() {
+    let here = 1;
+    format_args!(r"backslash \{here} arg");
+    format_args!(r#"hashed \{here} arg"#);
+    format_args!("plain {here} arg");
+}
+"####,
+        expect_file!["./test_data/highlight_raw_string_format_specifiers.html"],
         false,
     );
 }
@@ -739,14 +772,13 @@ fn test_highlight_doc_comment() {
 //! fn test() {}
 //! ```
 
+//! Syntactic name ref highlighting testing
 //! ```rust
 //! extern crate self;
-//! extern crate std;
+//! extern crate other as otter;
 //! extern crate core;
-//! extern crate alloc;
-//! extern crate proc_macro;
-//! extern crate test;
-//! extern crate Krate;
+//! trait T { type Assoc; }
+//! fn f<Arg>() -> use<Arg> where (): T<Assoc = ()> {}
 //! ```
 mod outline_module;
 
@@ -1017,14 +1049,46 @@ impl t for foo {
 }
 
 #[test]
-fn test_injection() {
+fn test_injection_2() {
     check_highlighting(
         r##"
 fn fixture(#[rust_analyzer::rust_fixture] ra_fixture: &str) {}
 
 fn main() {
     fixture(r#"
-trait Foo {
+@@- /main.rs crate:main deps:other_crate
+fn test() {
+    let x = other_crate::foo::S::thing();
+    x;
+} //^ i128
+
+@@- /lib.rs crate:other_crate
+pub mod foo {
+    pub struct S;
+    impl S {
+        pub fn thing() -> i128 { 0 }
+    }
+}
+    "#);
+}
+"##,
+        expect_file!["./test_data/highlight_injection_2.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_injection() {
+    check_highlighting(
+        r##"
+fn fixture(#[rust_analyzer::rust_fixture] ra_fixture: &str) {}
+
+fn non_fixture(#[rust_analyzer] ra_fixture: &str) {}
+
+fn main() {
+    fixture(r#"
+@@- minicore: sized
+trait Foo: Sized {
     fn foo() {
         println!("2 + 2 = {}", 4);
     }
@@ -1037,6 +1101,8 @@ fn foo() {
     }\$0)
 }"
     );
+
+    non_fixture(r"@@- ");
 }
 "##,
         expect_file!["./test_data/highlight_injection.html"],
@@ -1152,7 +1218,7 @@ fn main() {
         foo!(Bar);
         fn func(_: y::Bar) {
             mod inner {
-                struct Innerest<const C: usize> { field: [(); {C}] }
+                struct Innerest<const C: usize> { field: [u32; {C}], field2: &Innerest }
             }
         }
     }
@@ -1221,14 +1287,23 @@ fn foo(x: &fn(&dyn Trait)) {}
 /// Highlights the code given by the `ra_fixture` argument, renders the
 /// result as HTML, and compares it with the HTML file given as `snapshot`.
 /// Note that the `snapshot` file is overwritten by the rendered HTML.
+fn check_highlighting_with_config(
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    config: HighlightConfig<'_>,
+    expect: ExpectFile,
+    rainbow: bool,
+) {
+    let (analysis, file_id) = fixture::file(ra_fixture.trim());
+    let actual_html = &analysis.highlight_as_html_with_config(config, file_id, rainbow).unwrap();
+    expect.assert_eq(actual_html)
+}
+
 fn check_highlighting(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     expect: ExpectFile,
     rainbow: bool,
 ) {
-    let (analysis, file_id) = fixture::file(ra_fixture.trim());
-    let actual_html = &analysis.highlight_as_html(file_id, rainbow).unwrap();
-    expect.assert_eq(actual_html)
+    check_highlighting_with_config(ra_fixture, HL_CONFIG, expect, rainbow)
 }
 
 #[test]
@@ -1302,7 +1377,7 @@ fn benchmark_syntax_highlighting_parser() {
             })
             .count()
     };
-    assert_eq!(hash, 1167);
+    assert_eq!(hash, 1644);
 }
 
 #[test]
@@ -1418,6 +1493,176 @@ fn main() {
 fn template() {}
 "#,
         expect_file!["./test_data/highlight_issue_18089.html"],
+        false,
+    );
+}
+
+#[test]
+fn issue_19357() {
+    check_highlighting(
+        r#"
+//- /foo.rs
+fn main() {
+    let x = &raw mut 5;
+}
+//- /main.rs
+"#,
+        expect_file!["./test_data/highlight_issue_19357.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_comment_highlighting_disabled() {
+    // Test that comments are not highlighted when disabled
+    check_highlighting_with_config(
+        r#"
+// This is a regular comment
+/// This is a doc comment
+fn main() {
+    // Another comment
+    println!("Hello, world!");
+}
+"#,
+        HighlightConfig {
+            comments: false, // Disable comment highlighting
+            ..HL_CONFIG
+        },
+        expect_file!["./test_data/highlight_comments_disabled.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_strings_highlighting_disabled() {
+    // Test that comments are not highlighted when disabled
+    check_highlighting_with_config(
+        r#"
+//- minicore: fmt
+fn main() {
+    format_args!("foo\nbar");
+    format_args!("foo\invalid");
+}
+"#,
+        HighlightConfig { strings: false, ..HL_CONFIG },
+        expect_file!["./test_data/highlight_strings_disabled.html"],
+        false,
+    );
+}
+
+#[test]
+fn regression_20952() {
+    check_highlighting(
+        r#"
+//- minicore: fmt
+fn main() {
+    format_args!("{} {}, {} (подозрение на спам: {:.2}%)"б);
+}
+"#,
+        expect_file!["./test_data/regression_20952.html"],
+        false,
+    );
+}
+
+#[test]
+fn test_deprecated_highlighting() {
+    check_highlighting(
+        r#"
+//- /foo.rs crate:foo deps:bar
+#![deprecated]
+use crate as _;
+extern crate bar;
+#[deprecated]
+macro_rules! macro_ {
+    () => {};
+}
+#[deprecated]
+mod mod_ {}
+#[deprecated]
+fn func() {}
+#[deprecated]
+struct Struct {
+    #[deprecated]
+    field: u32
+}
+#[deprecated]
+enum Enum {
+    #[deprecated]
+    Variant
+}
+#[deprecated]
+const CONST: () = ();
+#[deprecated]
+trait Trait {}
+#[deprecated]
+type Alias = ();
+#[deprecated]
+static STATIC: () = ();
+//- /bar.rs crate:bar
+#![deprecated]
+        "#,
+        expect_file!["./test_data/highlight_deprecated.html"],
+        false,
+    );
+}
+
+#[test]
+fn async_fn_non_mut_param() {
+    check_highlighting(
+        r#"
+async fn get_double_async(num: u32) -> u32 {
+    num
+}
+        "#,
+        expect_file!["./test_data/async_fn_non_mut_param.html"],
+        false,
+    );
+}
+
+#[test]
+fn private_multi_namespace() {
+    check_highlighting(
+        r#"
+//- /bar.rs crate:bar deps:foo
+use foo::foo;
+
+//- /foo.rs crate:foo
+struct foo;
+
+#[macro_export]
+macro_rules! foo {
+    () => {};
+}
+    "#,
+        expect_file!["./test_data/private_multi_namespace.html"],
+        false,
+    );
+}
+
+#[test]
+fn mod_and_macro_name_conflict() {
+    check_highlighting(
+        r#"
+//- /main.rs crate:main deps:foo
+use foo::bar;
+
+fn main() {
+    bar!()
+}
+
+//- /foo.rs crate:foo
+mod bar {
+    fn random() {}
+}
+
+#[macro_export]
+macro_rules! bar {
+    () => {
+        println!("Hello");
+    };
+}
+"#,
+        expect_file!["./test_data/highlight_module_macro_conflict.html"],
         false,
     );
 }

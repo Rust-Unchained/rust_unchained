@@ -2,7 +2,8 @@ macro_rules! int_module {
     ($T:ident, $U:ident) => {
         use core::num::ParseIntError;
         use core::ops::{BitAnd, BitOr, BitXor, Not, Shl, Shr};
-        use core::$T::*;
+        const MAX: $T = $T::MAX;
+        const MIN: $T = $T::MIN;
 
         const UMAX: $U = $U::MAX;
 
@@ -194,7 +195,7 @@ macro_rules! int_module {
         }
 
         #[test]
-        fn test_isolate_most_significant_one() {
+        fn test_isolate_highest_one() {
             const BITS: $T = -1;
             const MOST_SIG_ONE: $T = 1 << (<$T>::BITS - 1);
 
@@ -203,15 +204,15 @@ macro_rules! int_module {
             let mut i = 0;
             while i < <$T>::BITS {
                 assert_eq!(
-                    (BITS >> i).isolate_most_significant_one(),
-                    (MOST_SIG_ONE >> i).isolate_most_significant_one()
+                    (BITS >> i).isolate_highest_one(),
+                    (MOST_SIG_ONE >> i).isolate_highest_one()
                 );
                 i += 1;
             }
         }
 
         #[test]
-        fn test_isolate_least_significant_one() {
+        fn test_isolate_lowest_one() {
             const BITS: $T = -1;
             const LEAST_SIG_ONE: $T = 1;
 
@@ -220,10 +221,50 @@ macro_rules! int_module {
             let mut i = 0;
             while i < <$T>::BITS {
                 assert_eq!(
-                    (BITS << i).isolate_least_significant_one(),
-                    (LEAST_SIG_ONE << i).isolate_least_significant_one()
+                    (BITS << i).isolate_lowest_one(),
+                    (LEAST_SIG_ONE << i).isolate_lowest_one()
                 );
                 i += 1;
+            }
+        }
+
+        #[test]
+        fn test_highest_one() {
+            const ZERO: $T = 0;
+            const ONE: $T = 1;
+            const MINUS_ONE: $T = -1;
+
+            assert_eq!(ZERO.highest_one(), None);
+
+            for i in 0..<$T>::BITS {
+                // Set single bit.
+                assert_eq!((ONE << i).highest_one(), Some(i));
+                if i != <$T>::BITS - 1 {
+                    // Set lowest bits.
+                    assert_eq!((<$T>::MAX >> i).highest_one(), Some(<$T>::BITS - i - 2));
+                }
+                // Set highest bits.
+                assert_eq!((MINUS_ONE << i).highest_one(), Some(<$T>::BITS - 1));
+            }
+        }
+
+        #[test]
+        fn test_lowest_one() {
+            const ZERO: $T = 0;
+            const ONE: $T = 1;
+            const MINUS_ONE: $T = -1;
+
+            assert_eq!(ZERO.lowest_one(), None);
+
+            for i in 0..<$T>::BITS {
+                // Set single bit.
+                assert_eq!((ONE << i).lowest_one(), Some(i));
+                if i != <$T>::BITS - 1 {
+                    // Set lowest bits.
+                    assert_eq!((<$T>::MAX >> i).lowest_one(), Some(0));
+                }
+                // Set highest bits.
+                assert_eq!((MINUS_ONE << i).lowest_one(), Some(i));
             }
         }
 
@@ -277,49 +318,290 @@ macro_rules! int_module {
 
             fn test_pow() {
                 {
-                    const R: $T = 2;
-                    assert_eq_const_safe!($T: R.pow(2), 4 as $T);
-                    assert_eq_const_safe!($T: R.pow(0), 1 as $T);
-                    assert_eq_const_safe!($T: R.wrapping_pow(2), 4 as $T);
+                    const R: $T = 0;
                     assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
-                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(4 as $T));
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), 0 as $T);
+
                     assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
-                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (4 as $T, false));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), Some(0 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), Some(0 as $T));
+
                     assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
-                    assert_eq_const_safe!($T: R.saturating_pow(2), 4 as $T);
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (0 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (0 as $T, false));
+
                     assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), 0 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), 0 as $T);
                 }
 
                 {
-                    const R: $T = MAX;
-                    // use `^` to represent .pow() with no overflow.
-                    // if itest::MAX == 2^j-1, then itest is a `j` bit int,
-                    // so that `itest::MAX*itest::MAX == 2^(2*j)-2^(j+1)+1`,
-                    // thussaturating_pow the overflowing result is exactly 1.
+                    const R: $T = 1;
+                    assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), 1 as $T);
                     assert_eq_const_safe!($T: R.wrapping_pow(2), 1 as $T);
-                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), None);
-                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (1 as $T, true));
-                    assert_eq_const_safe!($T: R.saturating_pow(2), MAX);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), 1 as $T);
+
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), Some(1 as $T));
+
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (1 as $T, false));
+
+                    assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), 1 as $T);
                 }
 
                 {
-                    // test for negative exponent.
-                    const R: $T = -2;
-                    assert_eq_const_safe!($T: R.pow(2), 4 as $T);
-                    assert_eq_const_safe!($T: R.pow(3), -8 as $T);
-                    assert_eq_const_safe!($T: R.pow(0), 1 as $T);
-                    assert_eq_const_safe!($T: R.wrapping_pow(2), 4 as $T);
-                    assert_eq_const_safe!($T: R.wrapping_pow(3), -8 as $T);
+                    const R: $T = -1;
                     assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
-                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(4 as $T));
-                    assert_eq_const_safe!(Option<$T>: R.checked_pow(3), Some(-8 as $T));
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), -1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), -1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), -1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), -1 as $T);
+
                     assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
-                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (4 as $T, false));
-                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(3), (-8 as $T, false));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(-1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), Some(-1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), Some(-1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), Some(-1 as $T));
+
                     assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
-                    assert_eq_const_safe!($T: R.saturating_pow(2), 4 as $T);
-                    assert_eq_const_safe!($T: R.saturating_pow(3), -8 as $T);
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (-1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), (-1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (-1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (-1 as $T, false));
+
                     assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), -1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), -1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), -1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), -1 as $T);
+                }
+
+                {
+                    const R: $T = 2;
+                    assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), 2 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 4 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), 0 as $T);
+
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(2 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(4 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), None);
+
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (2 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (4 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), ($T::MIN, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (0 as $T, true));
+
+                    assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), 2 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), 4 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), $T::MAX);
+                }
+
+                {
+                    const R: $T = -2;
+                    assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), -2 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 4 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), 0 as $T);
+
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(-2 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), Some(4 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), Some($T::MIN));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), None);
+
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (-2 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (4 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), ($T::MIN, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (0 as $T, true));
+
+                    assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), -2 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), 4 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), $T::MIN);
+                }
+
+                // Overflow in the shift caclculation should result in the final
+                // result being 0 rather than accidentally succeeding due to a
+                // shift within the word size.
+                // eg `4 ** 0x8000_0000` should give 0 rather than 1 << 0
+                {
+                    const R: $T = 4;
+                    const HALF: u32 = u32::MAX / 2 + 1;
+                    assert_eq_const_safe!($T: R.wrapping_pow(HALF), 0 as $T);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(HALF), None);
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(HALF), (0 as $T, true));
+                    assert_eq_const_safe!($T: R.saturating_pow(HALF), $T::MAX);
+                }
+
+                {
+                    const R: $T = -4;
+                    const HALF: u32 = u32::MAX / 2 + 1;
+                    assert_eq_const_safe!($T: R.wrapping_pow(HALF), 0 as $T);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(HALF), None);
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(HALF), (0 as $T, true));
+                    assert_eq_const_safe!($T: R.saturating_pow(HALF), $T::MAX);
+                }
+
+                {
+                    const R: $T = $T::MAX;
+                    assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), R as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 1 as $T);
+
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), R as $T);
+
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(R as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), None);
+
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (R as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (1 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (1 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (R as $T, true));
+
+                    assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), R as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), $T::MAX);
+                }
+
+                {
+                    const R: $T = $T::MIN;
+                    assert_eq_const_safe!($T: R.wrapping_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(1), R as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(2), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS - 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow($T::BITS + 1), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(128), 0 as $T);
+                    assert_eq_const_safe!($T: R.wrapping_pow(129), 0 as $T);
+
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(0), Some(1 as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(1), Some(R as $T));
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(2), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS - 1), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow($T::BITS + 1), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(128), None);
+                    assert_eq_const_safe!(Option<$T>: R.checked_pow(129), None);
+
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(0), (1 as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(1), (R as $T, false));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(2), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS - 1), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow($T::BITS + 1), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(128), (0 as $T, true));
+                    assert_eq_const_safe!(($T, bool): R.overflowing_pow(129), (0 as $T, true));
+
+                    assert_eq_const_safe!($T: R.saturating_pow(0), 1 as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(1), R as $T);
+                    assert_eq_const_safe!($T: R.saturating_pow(2), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS - 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow($T::BITS + 1), $T::MIN);
+                    assert_eq_const_safe!($T: R.saturating_pow(128), $T::MAX);
+                    assert_eq_const_safe!($T: R.saturating_pow(129), $T::MIN);
                 }
             }
 
@@ -390,12 +672,6 @@ macro_rules! int_module {
                 assert_eq_const_safe!(($T, bool): MAX.borrowing_sub(-1, true), (MAX, false)); // no intermediate overflow
                 assert_eq_const_safe!(($T, bool): (0 as $T).borrowing_sub(MIN, false), (MIN, true));
                 assert_eq_const_safe!(($T, bool): (0 as $T).borrowing_sub(MIN, true), (MAX, false));
-            }
-
-            fn test_widening_mul() {
-                assert_eq_const_safe!(($U, $T): MAX.widening_mul(MAX), (1, MAX / 2));
-                assert_eq_const_safe!(($U, $T): MIN.widening_mul(MAX), (MIN as $U, MIN / 2));
-                assert_eq_const_safe!(($U, $T): MIN.widening_mul(MIN), (0, MAX / 2 + 1));
             }
 
             fn test_carrying_mul() {
@@ -681,6 +957,45 @@ macro_rules! int_module {
                 assert_eq_const_safe!($T: <$T>::unbounded_shr(17, SHIFT_AMOUNT_OVERFLOW), 0);
                 assert_eq_const_safe!($T: <$T>::unbounded_shr(17, SHIFT_AMOUNT_OVERFLOW2), 0);
                 assert_eq_const_safe!($T: <$T>::unbounded_shr(17, SHIFT_AMOUNT_OVERFLOW3), 0);
+            }
+        }
+
+        const DIV_EXACT_SUCCESS_DIVIDEND1: $T = 42;
+        const DIV_EXACT_SUCCESS_DIVISOR1: $T = 6;
+        const DIV_EXACT_SUCCESS_QUOTIENT1: $T = 7;
+        const DIV_EXACT_SUCCESS_DIVIDEND2: $T = 18;
+        const DIV_EXACT_SUCCESS_DIVISOR2: $T = 3;
+        const DIV_EXACT_SUCCESS_QUOTIENT2: $T = 6;
+        const DIV_EXACT_SUCCESS_DIVIDEND3: $T = -91;
+        const DIV_EXACT_SUCCESS_DIVISOR3: $T = 13;
+        const DIV_EXACT_SUCCESS_QUOTIENT3: $T = -7;
+        const DIV_EXACT_SUCCESS_DIVIDEND4: $T = -57;
+        const DIV_EXACT_SUCCESS_DIVISOR4: $T = -3;
+        const DIV_EXACT_SUCCESS_QUOTIENT4: $T = 19;
+
+        test_runtime_and_compiletime! {
+            fn test_div_exact() {
+                // 42 / 6
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(DIV_EXACT_SUCCESS_DIVIDEND1, DIV_EXACT_SUCCESS_DIVISOR1), Some(DIV_EXACT_SUCCESS_QUOTIENT1));
+                assert_eq_const_safe!(Option<$T>: <$T>::div_exact(DIV_EXACT_SUCCESS_DIVIDEND1, DIV_EXACT_SUCCESS_DIVISOR1), Some(DIV_EXACT_SUCCESS_QUOTIENT1));
+
+                // 18 / 3
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(DIV_EXACT_SUCCESS_DIVIDEND2, DIV_EXACT_SUCCESS_DIVISOR2), Some(DIV_EXACT_SUCCESS_QUOTIENT2));
+                assert_eq_const_safe!(Option<$T>: <$T>::div_exact(DIV_EXACT_SUCCESS_DIVIDEND2, DIV_EXACT_SUCCESS_DIVISOR2), Some(DIV_EXACT_SUCCESS_QUOTIENT2));
+
+                // -91 / 13
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(DIV_EXACT_SUCCESS_DIVIDEND3, DIV_EXACT_SUCCESS_DIVISOR3), Some(DIV_EXACT_SUCCESS_QUOTIENT3));
+                assert_eq_const_safe!(Option<$T>: <$T>::div_exact(DIV_EXACT_SUCCESS_DIVIDEND3, DIV_EXACT_SUCCESS_DIVISOR3), Some(DIV_EXACT_SUCCESS_QUOTIENT3));
+
+                // -57 / -3
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(DIV_EXACT_SUCCESS_DIVIDEND4, DIV_EXACT_SUCCESS_DIVISOR4), Some(DIV_EXACT_SUCCESS_QUOTIENT4));
+                assert_eq_const_safe!(Option<$T>: <$T>::div_exact(DIV_EXACT_SUCCESS_DIVIDEND4, DIV_EXACT_SUCCESS_DIVISOR4), Some(DIV_EXACT_SUCCESS_QUOTIENT4));
+
+                // failures
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(1, 2), None);
+                assert_eq_const_safe!(Option<$T>: <$T>::div_exact(1, 2), None);
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(<$T>::MIN, -1), None);
+                assert_eq_const_safe!(Option<$T>: <$T>::checked_div_exact(0, 0), None);
             }
         }
     };

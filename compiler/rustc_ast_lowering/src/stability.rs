@@ -3,7 +3,7 @@ use std::fmt;
 use rustc_abi::ExternAbi;
 use rustc_feature::Features;
 use rustc_session::Session;
-use rustc_session::parse::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
@@ -29,7 +29,6 @@ pub(crate) fn extern_abi_enabled(
     })
 }
 
-#[allow(rustc::untranslatable_diagnostic)]
 pub(crate) fn gate_unstable_abi(sess: &Session, features: &Features, span: Span, abi: ExternAbi) {
     match extern_abi_enabled(features, span, abi) {
         Ok(_) => (),
@@ -96,6 +95,17 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
         ExternAbi::RustCold => {
             Err(UnstableAbi { abi, feature: sym::rust_cold_cc, explain: GateReason::Experimental })
         }
+        ExternAbi::RustPreserveNone => Err(UnstableAbi {
+            abi,
+            feature: sym::rust_preserve_none_cc,
+            explain: GateReason::Experimental,
+        }),
+        ExternAbi::RustTail => {
+            Err(UnstableAbi { abi, feature: sym::rust_tail_cc, explain: GateReason::Experimental })
+        }
+        ExternAbi::RustInvalid => {
+            Err(UnstableAbi { abi, feature: sym::rustc_attrs, explain: GateReason::ImplDetail })
+        }
         ExternAbi::GpuKernel => Err(UnstableAbi {
             abi,
             feature: sym::abi_gpu_kernel,
@@ -124,15 +134,21 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
             feature: sym::abi_riscv_interrupt,
             explain: GateReason::Experimental,
         }),
-        ExternAbi::CCmseNonSecureCall => Err(UnstableAbi {
+        ExternAbi::CmseNonSecureCall => Err(UnstableAbi {
             abi,
-            feature: sym::abi_c_cmse_nonsecure_call,
+            feature: sym::abi_cmse_nonsecure_call,
             explain: GateReason::Experimental,
         }),
-        ExternAbi::CCmseNonSecureEntry => Err(UnstableAbi {
+        ExternAbi::CmseNonSecureEntry => Err(UnstableAbi {
             abi,
             feature: sym::cmse_nonsecure_entry,
             explain: GateReason::Experimental,
         }),
+        ExternAbi::Custom => {
+            Err(UnstableAbi { abi, feature: sym::abi_custom, explain: GateReason::Experimental })
+        }
+        ExternAbi::Swift => {
+            Err(UnstableAbi { abi, feature: sym::abi_swift, explain: GateReason::Experimental })
+        }
     }
 }

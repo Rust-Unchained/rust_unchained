@@ -7,8 +7,16 @@
 //@ only-linux
 //@ no-prefer-dynamic
 //@ compile-flags: -Ctarget-feature=+crt-static -Crpath=no -Crelocation-model=static
+//@ ignore-backends: gcc
+// aarch64-unknown-linux-pauthtest requires dynamic linking, which makes use of file descriptors.
+// Setting RLIMIT_NOFILE would result in the binary failing even before main is reached.
+//@ ignore-pauthtest
+
 #![feature(exit_status_error)]
 #![feature(rustc_private)]
+// on aarch64, "Using 'getaddrinfo' in statically linked applications requires at runtime the shared
+// libraries from the glibc version used for linking"
+#![allow(linker_messages)]
 extern crate libc;
 
 use std::os::unix::process::CommandExt;

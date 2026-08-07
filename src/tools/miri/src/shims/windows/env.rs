@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 
 use rustc_data_structures::fx::FxHashMap;
+use rustc_target::spec::Os;
 
 use self::helpers::windows_check_buffer_size;
 use crate::*;
@@ -45,7 +46,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // ^ Returns DWORD (u32 on Windows)
 
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "GetEnvironmentVariableW");
+        this.assert_target_os(Os::Windows, "GetEnvironmentVariableW");
 
         let name_ptr = this.read_pointer(name_op)?;
         let buf_ptr = this.read_pointer(buf_op)?;
@@ -73,7 +74,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #[allow(non_snake_case)]
     fn GetEnvironmentStringsW(&mut self) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "GetEnvironmentStringsW");
+        this.assert_target_os(Os::Windows, "GetEnvironmentStringsW");
 
         // Info on layout of environment blocks in Windows:
         // https://docs.microsoft.com/en-us/windows/win32/procthread/environment-variables
@@ -95,7 +96,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #[allow(non_snake_case)]
     fn FreeEnvironmentStringsW(&mut self, env_block_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "FreeEnvironmentStringsW");
+        this.assert_target_os(Os::Windows, "FreeEnvironmentStringsW");
 
         let env_block_ptr = this.read_pointer(env_block_op)?;
         this.deallocate_ptr(env_block_ptr, None, MiriMemoryKind::Runtime.into())?;
@@ -110,7 +111,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         value_op: &OpTy<'tcx>, // LPCWSTR
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "SetEnvironmentVariableW");
+        this.assert_target_os(Os::Windows, "SetEnvironmentVariableW");
 
         let name_ptr = this.read_pointer(name_op)?;
         let value_ptr = this.read_pointer(value_op)?;
@@ -143,7 +144,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         buf_op: &OpTy<'tcx>,  // LPTSTR
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "GetCurrentDirectoryW");
+        this.assert_target_os(Os::Windows, "GetCurrentDirectoryW");
 
         let size = u64::from(this.read_scalar(size_op)?.to_u32()?);
         let buf = this.read_pointer(buf_op)?;
@@ -176,7 +177,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // ^ Returns BOOL (i32 on Windows)
 
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "SetCurrentDirectoryW");
+        this.assert_target_os(Os::Windows, "SetCurrentDirectoryW");
 
         let path = this.read_path_from_wide_str(this.read_pointer(path_op)?)?;
 
@@ -199,7 +200,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #[allow(non_snake_case)]
     fn GetCurrentProcessId(&mut self) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "GetCurrentProcessId");
+        this.assert_target_os(Os::Windows, "GetCurrentProcessId");
 
         interp_ok(Scalar::from_u32(this.get_pid()))
     }
@@ -213,7 +214,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Scalar> // returns BOOL
     {
         let this = self.eval_context_mut();
-        this.assert_target_os("windows", "GetUserProfileDirectoryW");
+        this.assert_target_os(Os::Windows, "GetUserProfileDirectoryW");
         this.check_no_isolation("`GetUserProfileDirectoryW`")?;
 
         let token = this.read_target_isize(token)?;
@@ -230,7 +231,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(match directories::UserDirs::new() {
             Some(dirs) => {
                 let home = dirs.home_dir();
-                let size_avail = if this.ptr_is_null(size.ptr())? {
+                let size_avail = if this.ptr_is_null(buf)? {
                     0 // if the buf pointer is null, we can't write to it; `size` will be updated to the required length
                 } else {
                     this.read_scalar(&size)?.to_u32()?
@@ -238,8 +239,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Of course we cannot use `windows_check_buffer_size` here since this uses
                 // a different method for dealing with a too-small buffer than the other functions...
                 let (success, len) = this.write_path_to_wide_str(home, buf, size_avail.into())?;
-                // The Windows docs just say that this is written on failure. But std
-                // seems to rely on it always being written.
+                // As per <https://github.com/MicrosoftDocs/sdk-api/pull/1810>, the size is always
+                // written, not just on failure.
                 this.write_scalar(Scalar::from_u32(len.try_into().unwrap()), &size)?;
                 if success {
                     Scalar::from_i32(1) // return TRUE
@@ -254,5 +255,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 Scalar::from_i32(0) // return FALSE
             }
         })
+    }
+
+    #[allow(non_snake_case)]
+    fn GetTempPathW(
+        &mut self,
+        buflen: &OpTy<'tcx>, // DWORD
+        buf: &OpTy<'tcx>,    // LPWSTR
+    ) -> InterpResult<'tcx, Scalar> // returns DWORD
+    {
+        let this = self.eval_context_mut();
+        this.assert_target_os(Os::Windows, "GetTempPathW");
+        this.check_no_isolation("`GetTempPathW`")?;
+
+        let buflen = this.read_scalar(buflen)?.to_u32()?;
+        let buf = this.read_pointer(buf)?;
+
+        let temp_dir = env::temp_dir();
+
+        return interp_ok(Scalar::from_u32(windows_check_buffer_size(
+            this.write_path_to_wide_str(&temp_dir, buf, buflen.into())?,
+        )));
     }
 }

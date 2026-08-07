@@ -3,9 +3,11 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use rustc_mir_dataflow::{Analysis, ResultsCursor};
 use tracing::{debug, instrument};
 
-use crate::ssa::SsaLocals;
+use crate::PassPolicy;
+use crate::ssa::{MaybeUninitializedLocals, SsaLocals};
 
 /// Unify locals that copy each other.
 ///
@@ -16,12 +18,12 @@ use crate::ssa::SsaLocals;
 ///   _d = move? _c
 /// where each of the locals is only assigned once.
 ///
-/// We want to replace all those locals by `_a`, either copied or moved.
+/// We want to replace all those locals by `_a` (the "head"), either copied or moved.
 pub(super) struct CopyProp;
 
 impl<'tcx> crate::MirPass<'tcx> for CopyProp {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 1
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        PassPolicy::optimization(sess.mir_opt_level() >= 1)
     }
 
     #[instrument(level = "trace", skip(self, tcx, body))]
@@ -31,78 +33,77 @@ impl<'tcx> crate::MirPass<'tcx> for CopyProp {
         let typing_env = body.typing_env(tcx);
         let ssa = SsaLocals::new(tcx, body, typing_env);
 
-        let fully_moved = fully_moved_locals(&ssa, body);
-        debug!(?fully_moved);
+        debug!(borrowed_locals = ?ssa.borrowed_locals());
+        debug!(copy_classes = ?ssa.copy_classes());
 
-        let mut storage_to_remove = DenseBitSet::new_empty(fully_moved.domain_size());
+        let mut any_replacement = false;
+        // Locals that participate in copy propagation either as a source or a destination.
+        let mut unified = DenseBitSet::new_empty(body.local_decls.len());
+
         for (local, &head) in ssa.copy_classes().iter_enumerated() {
             if local != head {
-                storage_to_remove.insert(head);
+                any_replacement = true;
+                unified.insert(head);
+                unified.insert(local);
             }
         }
 
-        let any_replacement = ssa.copy_classes().iter_enumerated().any(|(l, &h)| l != h);
-
-        Replacer {
-            tcx,
-            copy_classes: ssa.copy_classes(),
-            fully_moved,
-            borrowed_locals: ssa.borrowed_locals(),
-            storage_to_remove,
+        if !any_replacement {
+            return;
         }
-        .visit_body_preserves_cfg(body);
 
-        if any_replacement {
-            crate::simplify::remove_unused_definitions(body);
-        }
-    }
+        // When emitting storage statements, we want to retain the head locals' storage statements,
+        // as this enables better optimizations. For each local use location, we mark the head for storage removal
+        // only if the head might be uninitialized at that point, or if the local is borrowed
+        // (since we cannot easily determine when it's used).
+        let storage_to_remove = if tcx.sess.emit_lifetime_markers() {
+            let mut storage_to_remove = DenseBitSet::new_empty(body.local_decls.len());
 
-    fn is_required(&self) -> bool {
-        false
-    }
-}
+            // If the local is borrowed, we cannot easily determine if it is used, so we have to remove the storage statements.
+            let borrowed_locals = ssa.borrowed_locals();
 
-/// `SsaLocals` computed equivalence classes between locals considering copy/move assignments.
-///
-/// This function also returns whether all the `move?` in the pattern are `move` and not copies.
-/// A local which is in the bitset can be replaced by `move _a`. Otherwise, it must be
-/// replaced by `copy _a`, as we cannot move multiple times from `_a`.
-///
-/// If an operand copies `_c`, it must happen before the assignment `_d = _c`, otherwise it is UB.
-/// This means that replacing it by a copy of `_a` if ok, since this copy happens before `_c` is
-/// moved, and therefore that `_d` is moved.
-#[instrument(level = "trace", skip(ssa, body))]
-fn fully_moved_locals(ssa: &SsaLocals, body: &Body<'_>) -> DenseBitSet<Local> {
-    let mut fully_moved = DenseBitSet::new_filled(body.local_decls.len());
+            for (local, &head) in ssa.copy_classes().iter_enumerated() {
+                if local != head && borrowed_locals.contains(local) {
+                    storage_to_remove.insert(head);
+                }
+            }
 
-    for (_, rvalue, _) in ssa.assignments(body) {
-        let (Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
-        | Rvalue::CopyForDeref(place)) = rvalue
-        else {
-            continue;
+            let maybe_uninit = MaybeUninitializedLocals
+                .iterate_to_fixpoint(tcx, body, Some("mir_opt::copy_prop"))
+                .into_results_cursor(body);
+
+            let mut storage_checker = StorageChecker {
+                maybe_uninit,
+                copy_classes: ssa.copy_classes(),
+                storage_to_remove,
+            };
+
+            for (bb, data) in traversal::reachable(body) {
+                storage_checker.visit_basic_block_data(bb, data);
+            }
+
+            Some(storage_checker.storage_to_remove)
+        } else {
+            None
         };
 
-        let Some(rhs) = place.as_local() else { continue };
-        if !ssa.is_ssa(rhs) {
-            continue;
-        }
+        // If None, remove the storage statements of all the unified locals.
+        let storage_to_remove = storage_to_remove.as_ref().unwrap_or(&unified);
+        debug!(?storage_to_remove);
 
-        if let Rvalue::Use(Operand::Copy(_)) | Rvalue::CopyForDeref(_) = rvalue {
-            fully_moved.remove(rhs);
-        }
+        Replacer { tcx, copy_classes: ssa.copy_classes(), unified: &unified, storage_to_remove }
+            .visit_body_preserves_cfg(body);
+
+        crate::simplify::remove_unused_definitions(body);
     }
-
-    ssa.meet_copy_equivalence(&mut fully_moved);
-
-    fully_moved
 }
 
-/// Utility to help performing substitution of `*pattern` by `target`.
+/// Utility to help performing substitution: for all key-value pairs in `copy_classes`,
+/// all occurrences of the key get replaced by the value.
 struct Replacer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    fully_moved: DenseBitSet<Local>,
-    storage_to_remove: DenseBitSet<Local>,
-    borrowed_locals: &'a DenseBitSet<Local>,
+    unified: &'a DenseBitSet<Local>,
+    storage_to_remove: &'a DenseBitSet<Local>,
     copy_classes: &'a IndexSlice<Local, Local>,
 }
 
@@ -111,64 +112,83 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'_, 'tcx> {
         self.tcx
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn visit_local(&mut self, local: &mut Local, ctxt: PlaceContext, _: Location) {
         let new_local = self.copy_classes[*local];
-        // We must not unify two locals that are borrowed. But this is fine if one is borrowed and
-        // the other is not. We chose to check the original local, and not the target. That way, if
-        // the original local is borrowed and the target is not, we do not pessimize the whole class.
-        if self.borrowed_locals.contains(*local) {
-            return;
-        }
         match ctxt {
             // Do not modify the local in storage statements.
             PlaceContext::NonUse(NonUseContext::StorageLive | NonUseContext::StorageDead) => {}
-            // The local should have been marked as non-SSA.
-            PlaceContext::MutatingUse(_) => assert_eq!(*local, new_local),
             // We access the value.
             _ => *local = new_local,
         }
     }
 
-    fn visit_place(&mut self, place: &mut Place<'tcx>, _: PlaceContext, loc: Location) {
-        if let Some(new_projection) = self.process_projection(place.projection, loc) {
-            place.projection = self.tcx().mk_place_elems(&new_projection);
-        }
-
-        // Any non-mutating use context is ok.
-        let ctxt = PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy);
-        self.visit_local(&mut place.local, ctxt, loc)
-    }
-
+    #[tracing::instrument(level = "trace", skip(self))]
     fn visit_operand(&mut self, operand: &mut Operand<'tcx>, loc: Location) {
         if let Operand::Move(place) = *operand
             // A move out of a projection of a copy is equivalent to a copy of the original
             // projection.
             && !place.is_indirect_first_projection()
-            && !self.fully_moved.contains(place.local)
+            && self.unified.contains(place.local)
         {
             *operand = Operand::Copy(place);
         }
         self.super_operand(operand, loc);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn visit_statement(&mut self, stmt: &mut Statement<'tcx>, loc: Location) {
         // When removing storage statements, we need to remove both (#107511).
         if let StatementKind::StorageLive(l) | StatementKind::StorageDead(l) = stmt.kind
             && self.storage_to_remove.contains(l)
         {
-            stmt.make_nop();
-            return;
+            stmt.make_nop(true);
         }
 
         self.super_statement(stmt, loc);
 
         // Do not leave tautological assignments around.
-        if let StatementKind::Assign(box (lhs, ref rhs)) = stmt.kind
-            && let Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs) =
-                *rhs
+        if let StatementKind::Assign((lhs, ref rhs)) = stmt.kind
+            && let Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), _) = *rhs
             && lhs == rhs
         {
-            stmt.make_nop();
+            stmt.make_nop(true);
+        }
+    }
+}
+
+// Marks heads of copy classes that are maybe uninitialized at the location of a local
+// as needing storage statement removal.
+struct StorageChecker<'a, 'tcx> {
+    maybe_uninit: ResultsCursor<'a, 'tcx, MaybeUninitializedLocals>,
+    copy_classes: &'a IndexSlice<Local, Local>,
+    storage_to_remove: DenseBitSet<Local>,
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for StorageChecker<'a, 'tcx> {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, loc: Location) {
+        if !context.is_use() {
+            return;
+        }
+
+        let head = self.copy_classes[local];
+
+        // If the local is the head, or if we already marked it for deletion, we do not need to check it.
+        if head == local || self.storage_to_remove.contains(head) {
+            return;
+        }
+
+        self.maybe_uninit.seek_before_primary_effect(loc);
+
+        if self.maybe_uninit.get().contains(head) {
+            debug!(
+                ?loc,
+                ?context,
+                ?local,
+                ?head,
+                "local's head is maybe uninit at this location, marking head for storage statement removal"
+            );
+            self.storage_to_remove.insert(head);
         }
     }
 }

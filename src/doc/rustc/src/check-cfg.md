@@ -53,7 +53,7 @@ To check for the _none_ value (ie `#[cfg(foo)]`) one can use the `none()` predic
 `values()`: `values(none())`. It can be followed or preceded by any number of `"value"`.
 
 To enable checking of values, but to provide an *none*/empty set of expected values
-(ie. expect `#[cfg(name)]`), use these forms:
+(i.e. expect `#[cfg(name)]`), use these forms:
 
 ```bash
 rustc --check-cfg 'cfg(name)'
@@ -99,7 +99,7 @@ the need to specify them manually.
 Well known names and values are implicitly added as long as at least one `--check-cfg` argument
 is present.
 
-As of `2025-01-02T`, the list of known names is as follows:
+As of `2026-05-15T`, the list of known names is as follows:
 
 <!--- See CheckCfg::fill_well_known in compiler/rustc_session/src/config.rs -->
 
@@ -122,19 +122,21 @@ As of `2025-01-02T`, the list of known names is as follows:
  - `target_endian`
  - `target_env`
  - `target_family`
+ - `target_object_format`
  - `target_feature`
  - `target_has_atomic`
- - `target_has_atomic_equal_alignment`
+ - `target_has_atomic_primitive_alignment`
  - `target_has_atomic_load_store`
  - `target_os`
  - `target_pointer_width`
  - `target_thread_local`
  - `target_vendor`
  - `ub_checks`
+ - `contract_checks`
  - `unix`
  - `windows`
 
-> Starting with 1.85.0, the `test` cfg is consider to be a "userspace" config
+> Starting with 1.85.0, the `test` cfg is considered to be a "userspace" config
 > despite being also set by `rustc` and should be managed by the build system itself.
 
 Like with `values(any())`, well known names checking can be disabled by passing `cfg(any())`

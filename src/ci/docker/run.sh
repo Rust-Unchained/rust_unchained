@@ -97,9 +97,8 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
     docker --version
 
     REGISTRY=ghcr.io
-    # Hardcode username to reuse cache between auto and pr jobs
-    # FIXME: should be changed after move from rust-lang-ci
-    REGISTRY_USERNAME=rust-lang-ci
+    # Default to `rust-lang` to allow reusing the cache for local builds
+    REGISTRY_USERNAME=${GITHUB_REPOSITORY_OWNER:-rust-lang}
     # Tag used to push the final Docker image, so that it can be pulled by e.g. rustup
     IMAGE_TAG=${REGISTRY}/${REGISTRY_USERNAME}/rust-ci:${cksum}
     # Tag used to cache the Docker build
@@ -114,14 +113,6 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
         "-f" "$dockerfile"
         "$context"
     )
-
-    # If the environment variable DOCKER_SCRIPT is defined,
-    # set the build argument SCRIPT_ARG to DOCKER_SCRIPT.
-    # In this way, we run the script defined in CI,
-    # instead of the one defined in the Dockerfile.
-    if [ -n "${DOCKER_SCRIPT+x}" ]; then
-      build_args+=("--build-arg" "SCRIPT_ARG=${DOCKER_SCRIPT}")
-    fi
 
     GHCR_BUILDKIT_IMAGE="ghcr.io/rust-lang/buildkit:buildx-stable-1"
     # On non-CI jobs, we try to download a pre-built image from the rust-lang-ci
@@ -158,25 +149,39 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
             --username ${REGISTRY_USERNAME} \
             --password-stdin
 
-        # Enable a new Docker driver so that --cache-from/to works with a registry backend
-        # Use a custom image to avoid DockerHub rate limits
-        docker buildx create --use --driver docker-container \
-          --driver-opt image=${GHCR_BUILDKIT_IMAGE}
+        # If we find an image with the same hash, then simply download it, and do not even
+        # attempt the build. This will prevent needless pushing of the locally built image back to
+        # the registry when nothing changed. It also avoid Docker cache thrashing, where the final
+        # image is actually built in the image registry, but if we attempt a local rebuild, the
+        # intermediate caches might be missing, which unnecessarily causes a rebuild.
+        if docker pull "${IMAGE_TAG}"; then
+            echo "Downloaded Docker image ${IMAGE_TAG} from CI, image did not change"
+            docker tag "${IMAGE_TAG}" rust-ci
+        else
+            # Rebuild the image from scratch, while using additional caching.
 
-        # Build the image using registry caching backend
-        retry docker \
-          buildx \
-          "${build_args[@]}" \
-          --cache-from type=registry,ref=${CACHE_IMAGE_TAG} \
-          --cache-to type=registry,ref=${CACHE_IMAGE_TAG},compression=zstd \
-          --output=type=docker
+            # Enable a new Docker driver so that --cache-from/to works with a registry backend
+            # Use a custom image to avoid DockerHub rate limits
+            docker buildx create --use --driver docker-container \
+              --driver-opt image=${GHCR_BUILDKIT_IMAGE}
 
-        # Print images for debugging purposes
-        docker images
+            # Build the image using registry caching backend
+            retry docker \
+              buildx \
+              "${build_args[@]}" \
+              --cache-from type=registry,ref=${CACHE_IMAGE_TAG} \
+              --cache-to type=registry,ref=${CACHE_IMAGE_TAG},compression=zstd \
+              --output=type=docker
 
-        # Tag the built image and push it to the registry
-        docker tag rust-ci "${IMAGE_TAG}"
-        docker push "${IMAGE_TAG}"
+            # Print images for debugging purposes
+            docker images
+
+            # Tag the built image and push it to the registry
+            docker tag rust-ci "${IMAGE_TAG}"
+            docker push "${IMAGE_TAG}"
+
+            echo "To download the image, run docker pull ${IMAGE_TAG}"
+        fi
 
         # Record the container registry tag/url for reuse, e.g. by rustup.rs builds
         # It should be possible to run `docker pull <$IMAGE_TAG>` to download the image
@@ -184,8 +189,6 @@ if [ -f "$docker_dir/$image/Dockerfile" ]; then
         mkdir -p "$dist"
         echo "${IMAGE_TAG}" > "$info"
         cat "$info"
-
-        echo "To download the image, run docker pull ${IMAGE_TAG}"
     fi
     echo "::endgroup::"
 elif [ -f "$docker_dir/disabled/$image/Dockerfile" ]; then
@@ -321,16 +324,6 @@ else
   command=(/checkout/src/ci/run.sh)
 fi
 
-if isCI; then
-  # Get some needed information for $BASE_COMMIT
-  #
-  # This command gets the last merge commit which we'll use as base to list
-  # deleted files since then.
-  BASE_COMMIT="$(git log --author=bors@rust-lang.org -n 2 --pretty=format:%H | tail -n 1)"
-else
-  BASE_COMMIT=""
-fi
-
 SUMMARY_FILE=github-summary.md
 touch $objdir/${SUMMARY_FILE}
 
@@ -340,6 +333,10 @@ if [ "$ENABLE_GCC_CODEGEN" = "1" ]; then
   # Fix rustc_codegen_gcc lto issues.
   extra_env="$extra_env --env GCC_EXEC_PREFIX=/usr/lib/gcc/"
   echo "Setting extra environment values for docker: $extra_env"
+fi
+
+if [ -n "${DOCKER_SCRIPT}" ]; then
+  extra_env="$extra_env --env SCRIPT=\"/scripts/${DOCKER_SCRIPT}\""
 fi
 
 docker \
@@ -352,6 +349,7 @@ docker \
   --env DEPLOY \
   --env DEPLOY_ALT \
   --env CI \
+  --env GIT_DISCOVERY_ACROSS_FILESYSTEM=1 \
   --env GITHUB_ACTIONS \
   --env GITHUB_REF \
   --env GITHUB_STEP_SUMMARY="/checkout/obj/${SUMMARY_FILE}" \
@@ -362,24 +360,24 @@ docker \
   --env TOOLSTATE_REPO \
   --env TOOLSTATE_PUBLISH \
   --env RUST_CI_OVERRIDE_RELEASE_CHANNEL \
-  --env CI_JOB_NAME="${CI_JOB_NAME-$IMAGE}" \
+  --env CI_JOB_NAME="${CI_JOB_NAME-$image}" \
   --env CI_JOB_DOC_URL="${CI_JOB_DOC_URL}" \
-  --env BASE_COMMIT="$BASE_COMMIT" \
   --env DIST_TRY_BUILD \
   --env PR_CI_JOB \
   --env OBJDIR_ON_HOST="$objdir" \
   --env CODEGEN_BACKENDS \
+  --env LLVM_VERSION \
   --env DISABLE_CI_RUSTC_IF_INCOMPATIBLE="$DISABLE_CI_RUSTC_IF_INCOMPATIBLE" \
   --init \
   --rm \
   rust-ci \
   "${command[@]}"
 
-if isCI; then
-    cat $objdir/${SUMMARY_FILE} >> "${GITHUB_STEP_SUMMARY}"
-fi
-
 if [ -f /.dockerenv ]; then
   rm -rf $objdir
   docker cp checkout:/checkout/obj $objdir
+fi
+
+if isCI; then
+    cat $objdir/${SUMMARY_FILE} >> "${GITHUB_STEP_SUMMARY}"
 fi

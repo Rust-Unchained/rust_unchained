@@ -1,8 +1,8 @@
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::{DefId, DefIdMap};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
-use rustc_span::sym;
+use rustc_hir::find_attr;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 
 use crate::error::StrictCoherenceNeedsNegativeCoherence;
 use crate::ty::fast_reject::SimplifiedType;
@@ -23,7 +23,7 @@ use crate::ty::{self, TyCtxt, TypeVisitableExt};
 ///   parents of a given specializing impl, which is needed for extracting
 ///   default items amongst other things. In the simple "chain" rule, every impl
 ///   has at most one parent.
-#[derive(TyEncodable, TyDecodable, HashStable, Debug)]
+#[derive(TyEncodable, TyDecodable, StableHash, Debug)]
 pub struct Graph {
     /// All impls have a parent; the "root" impls have as their parent the `def_id`
     /// of the trait.
@@ -48,7 +48,7 @@ impl Graph {
 
 /// What kind of overlap check are we doing -- this exists just for testing and feature-gating
 /// purposes.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable, Debug, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash, Debug, TyEncodable, TyDecodable)]
 pub enum OverlapMode {
     /// The 1.0 rules (either types fail to unify, or where clauses are not implemented for crate-local types)
     Stable,
@@ -61,23 +61,15 @@ pub enum OverlapMode {
 impl OverlapMode {
     pub fn get(tcx: TyCtxt<'_>, trait_id: DefId) -> OverlapMode {
         let with_negative_coherence = tcx.features().with_negative_coherence();
-        let strict_coherence = tcx.has_attr(trait_id, sym::rustc_strict_coherence);
+        let strict_coherence = find_attr!(tcx, trait_id, RustcStrictCoherence(span) => *span);
 
         if with_negative_coherence {
-            if strict_coherence { OverlapMode::Strict } else { OverlapMode::WithNegative }
+            if strict_coherence.is_some() { OverlapMode::Strict } else { OverlapMode::WithNegative }
         } else {
-            if strict_coherence {
-                let attr_span = trait_id
-                    .as_local()
-                    .into_iter()
-                    .flat_map(|local_def_id| {
-                        tcx.hir_attrs(tcx.local_def_id_to_hir_id(local_def_id))
-                    })
-                    .find(|attr| attr.has_name(sym::rustc_strict_coherence))
-                    .map(|attr| attr.span());
+            if let Some(span) = strict_coherence {
                 tcx.dcx().emit_err(StrictCoherenceNeedsNegativeCoherence {
                     span: tcx.def_span(trait_id),
-                    attr_span,
+                    attr_span: span,
                 });
             }
             OverlapMode::Stable
@@ -95,7 +87,7 @@ impl OverlapMode {
 
 /// Children of a given impl, grouped into blanket/non-blanket varieties as is
 /// done in `TraitDef`.
-#[derive(Default, TyEncodable, TyDecodable, Debug, HashStable)]
+#[derive(Default, TyEncodable, TyDecodable, Debug, StableHash)]
 pub struct Children {
     // Impls of a trait (or specializations of a given impl). To allow for
     // quicker lookup, the impls are indexed by a simplified version of their
@@ -152,6 +144,7 @@ impl Node {
 
 #[derive(Copy, Clone)]
 pub struct Ancestors<'tcx> {
+    tcx: TyCtxt<'tcx>,
     trait_def_id: DefId,
     specialization_graph: &'tcx Graph,
     current_source: Option<Node>,
@@ -162,7 +155,14 @@ impl Iterator for Ancestors<'_> {
     fn next(&mut self) -> Option<Node> {
         let cur = self.current_source.take();
         if let Some(Node::Impl(cur_impl)) = cur {
-            let parent = self.specialization_graph.parent(cur_impl);
+            // Graph construction may skip foreign impls, so resolve a foreign impl's
+            // parent from crate metadata instead; recorded foreign impls use the same
+            // value (see `record_impl_from_cstore`).
+            let parent = if cur_impl.is_local() {
+                self.specialization_graph.parent(cur_impl)
+            } else {
+                self.tcx.impl_parent(cur_impl).unwrap_or(self.trait_def_id)
+            };
 
             self.current_source = if parent == self.trait_def_id {
                 Some(Node::Trait(parent))
@@ -183,7 +183,7 @@ pub struct LeafDef {
     /// The node in the specialization graph containing the definition of `item`.
     pub defining_node: Node,
 
-    /// The "top-most" (ie. least specialized) specialization graph node that finalized the
+    /// The "top-most" (i.e. least specialized) specialization graph node that finalized the
     /// definition of `item`.
     ///
     /// Example:
@@ -218,7 +218,7 @@ impl LeafDef {
 }
 
 impl<'tcx> Ancestors<'tcx> {
-    /// Finds the bottom-most (ie. most specialized) definition of an associated
+    /// Finds the bottom-most (i.e. most specialized) definition of an associated
     /// item.
     pub fn leaf_def(mut self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<LeafDef> {
         let mut finalizing_node = None;
@@ -256,10 +256,13 @@ pub fn ancestors(
 ) -> Result<Ancestors<'_>, ErrorGuaranteed> {
     let specialization_graph = tcx.specialization_graph_of(trait_def_id)?;
 
-    if let Err(reported) = tcx.type_of(start_from_impl).instantiate_identity().error_reported() {
+    if let Err(reported) =
+        tcx.type_of(start_from_impl).instantiate_identity().skip_normalization().error_reported()
+    {
         Err(reported)
     } else {
         Ok(Ancestors {
+            tcx,
             trait_def_id,
             specialization_graph,
             current_source: Some(Node::Impl(start_from_impl)),

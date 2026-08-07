@@ -1,10 +1,12 @@
 use std::fmt::Debug;
 
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{Ty, TyCtxt};
 use tracing::trace;
 
 use super::simplify::simplify_cfg;
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 /// This pass optimizes something like
@@ -93,8 +95,8 @@ use crate::patch::MirPatch;
 pub(super) struct EarlyOtherwiseBranch;
 
 impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        PassPolicy::optimization(sess.mir_opt_level() >= 2)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -117,26 +119,17 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
                 unreachable!()
             };
             // Always correct since we can only switch on `Copy` types
-            let parent_op = match parent_op {
-                Operand::Move(x) => Operand::Copy(*x),
-                Operand::Copy(x) => Operand::Copy(*x),
-                Operand::Constant(x) => Operand::Constant(x.clone()),
-            };
+            let parent_op = parent_op.to_copy();
             let parent_ty = parent_op.ty(body.local_decls(), tcx);
             let statements_before = bbs[parent].statements.len();
             let parent_end = Location { block: parent, statement_index: statements_before };
 
             let mut patch = MirPatch::new(body);
 
-            let (second_discriminant_temp, second_operand) = if opt_data.need_hoist_discriminant {
+            let second_operand = if opt_data.need_hoist_discriminant {
                 // create temp to store second discriminant in, `_s` in example above
                 let second_discriminant_temp =
                     patch.new_temp(opt_data.child_ty, opt_data.child_source.span);
-
-                patch.add_statement(
-                    parent_end,
-                    StatementKind::StorageLive(second_discriminant_temp),
-                );
 
                 // create assignment of discriminant
                 patch.add_assign(
@@ -144,12 +137,9 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
                     Place::from(second_discriminant_temp),
                     Rvalue::Discriminant(opt_data.child_place),
                 );
-                (
-                    Some(second_discriminant_temp),
-                    Operand::Move(Place::from(second_discriminant_temp)),
-                )
+                Operand::Move(Place::from(second_discriminant_temp))
             } else {
-                (None, Operand::Copy(opt_data.child_place))
+                Operand::Copy(opt_data.child_place)
             };
 
             // create temp to store inequality comparison between the two discriminants, `_t` in
@@ -157,7 +147,6 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
             let nequal = BinOp::Ne;
             let comp_res_type = nequal.ty(tcx, parent_ty, opt_data.child_ty);
             let comp_temp = patch.new_temp(comp_res_type, opt_data.child_source.span);
-            patch.add_statement(parent_end, StatementKind::StorageLive(comp_temp));
 
             // create inequality comparison
             let comp_rvalue =
@@ -186,6 +175,7 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
                         discr: parent_op,
                         targets: eq_targets,
                     },
+                    attributes: ThinVec::new(),
                 }),
                 bbs[parent].is_cleanup,
             );
@@ -200,23 +190,6 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
                 TerminatorKind::if_(Operand::Move(Place::from(comp_temp)), true_case, false_case),
             );
 
-            if let Some(second_discriminant_temp) = second_discriminant_temp {
-                // generate StorageDead for the second_discriminant_temp not in use anymore
-                patch.add_statement(
-                    parent_end,
-                    StatementKind::StorageDead(second_discriminant_temp),
-                );
-            }
-
-            // Generate a StorageDead for comp_temp in each of the targets, since we moved it into
-            // the switch
-            for bb in [false_case, true_case].iter() {
-                patch.add_statement(
-                    Location { block: *bb, statement_index: 0 },
-                    StatementKind::StorageDead(comp_temp),
-                );
-            }
-
             patch.apply(body);
         }
 
@@ -225,10 +198,6 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
         if should_cleanup {
             simplify_cfg(tcx, body);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -261,6 +230,7 @@ fn evaluate_candidate<'tcx>(
     let Terminator {
         kind: TerminatorKind::SwitchInt { targets: child_targets, discr: child_discr },
         source_info,
+        attributes: _,
     } = bbs[child].terminator()
     else {
         return None;
@@ -270,7 +240,7 @@ fn evaluate_candidate<'tcx>(
         return None;
     }
 
-    // We only handle:
+    // For now, we only handle:
     // ```
     // bb4: {
     //     _8 = discriminant((_3.1: Enum1));
@@ -289,41 +259,8 @@ fn evaluate_candidate<'tcx>(
 
     // When thie BB has exactly one statement, this statement should be discriminant.
     let need_hoist_discriminant = bbs[child].statements.len() == 1;
+    let otherwise_is_empty_unreachable = bbs[targets.otherwise()].is_empty_unreachable();
     let child_place = if need_hoist_discriminant {
-        if !bbs[targets.otherwise()].is_empty_unreachable() {
-            // Someone could write code like this:
-            // ```rust
-            // let Q = val;
-            // if discriminant(P) == otherwise {
-            //     let ptr = &mut Q as *mut _ as *mut u8;
-            //     // It may be difficult for us to effectively determine whether values are valid.
-            //     // Invalid values can come from all sorts of corners.
-            //     unsafe { *ptr = 10; }
-            // }
-            //
-            // match P {
-            //    A => match Q {
-            //        A => {
-            //            // code
-            //        }
-            //        _ => {
-            //            // don't use Q
-            //        }
-            //    }
-            //    _ => {
-            //        // don't use Q
-            //    }
-            // };
-            // ```
-            //
-            // Hoisting the `discriminant(Q)` out of the `A` arm causes us to compute the discriminant of an
-            // invalid value, which is UB.
-            // In order to fix this, **we would either need to show that the discriminant computation of
-            // `place` is computed in all branches**.
-            // FIXME(#95162) For the moment, we adopt a conservative approach and
-            // consider only the `otherwise` branch has no statements and an unreachable terminator.
-            return None;
-        }
         // Handle:
         // ```
         // bb4: {
@@ -333,8 +270,7 @@ fn evaluate_candidate<'tcx>(
         // ```
         let [
             Statement {
-                kind: StatementKind::Assign(box (_, Rvalue::Discriminant(child_place))),
-                ..
+                kind: StatementKind::Assign((_, Rvalue::Discriminant(child_place))), ..
             },
         ] = bbs[child].statements.as_slice()
         else {
@@ -353,8 +289,7 @@ fn evaluate_candidate<'tcx>(
         };
         *child_place
     };
-    let destination = if need_hoist_discriminant || bbs[targets.otherwise()].is_empty_unreachable()
-    {
+    let destination = if otherwise_is_empty_unreachable {
         child_targets.otherwise()
     } else {
         targets.otherwise()
@@ -368,6 +303,7 @@ fn evaluate_candidate<'tcx>(
             child_place,
             destination,
             need_hoist_discriminant,
+            otherwise_is_empty_unreachable,
         ) {
             return None;
         }
@@ -387,19 +323,74 @@ fn verify_candidate_branch<'tcx>(
     place: Place<'tcx>,
     destination: BasicBlock,
     need_hoist_discriminant: bool,
+    otherwise_is_empty_unreachable: bool,
 ) -> bool {
     // In order for the optimization to be correct, the terminator must be a `SwitchInt`.
     let TerminatorKind::SwitchInt { discr: switch_op, targets } = &branch.terminator().kind else {
         return false;
     };
+    if !otherwise_is_empty_unreachable {
+        // Someone could write code like this:
+        // ```rust
+        // let Q = val;
+        // if discriminant(P) == otherwise {
+        //     let ptr = &mut Q as *mut _ as *mut u8;
+        //     // It may be difficult for us to effectively determine whether values are valid.
+        //     // Invalid values can come from all sorts of corners.
+        //     unsafe { *ptr = 10; }
+        // }
+        //
+        // match P {
+        //    A => match Q {
+        //        A => {
+        //            // code
+        //        }
+        //        _ => {
+        //            // don't use Q
+        //        }
+        //    }
+        //    _ => {
+        //        // don't use Q
+        //    }
+        // };
+        // ```
+        //
+        // Hoisting the `discriminant(Q)` out of the `A` arm causes us to compute the discriminant of an
+        // invalid value, which is UB.
+        // In order to fix this, **we would either need to show that the discriminant computation of
+        // `place` is computed in all branches**.
+        // For <https://github.com/rust-lang/rust/issues/95162>, we adopt a conservative approach and
+        // consider only the `otherwise` branch has no statements and an unreachable terminator.
+        if need_hoist_discriminant {
+            return false;
+        }
+        // For <https://github.com/rust-lang/rust/issues/159591>:
+        // ```
+        // bb0: {
+        //     switchInt(copy _1) -> [1: bb1, 2: bb2, otherwise: bb5];
+        // }
+        // bb1: {
+        //     switchInt(copy (*_2)) -> [1: bb3, otherwise: bb5];
+        // }
+        // bb2: {
+        //     switchInt(copy (*_2)) -> [2: bb4, otherwise: bb5];
+        // }
+        // ```
+        // We cannot hoist the dereference of `_2` to `bb0`,
+        // because execution can reach `bb5` without dereferencing `_2`.
+        if let Some(place) = switch_op.place()
+            && !place.is_stable_offset()
+        {
+            return false;
+        }
+    }
     if need_hoist_discriminant {
         // If we need hoist discriminant, the branch must have exactly one statement.
         let [statement] = branch.statements.as_slice() else {
             return false;
         };
         // The statement must assign the discriminant of `place`.
-        let StatementKind::Assign(box (discr_place, Rvalue::Discriminant(from_place))) =
-            statement.kind
+        let StatementKind::Assign((discr_place, Rvalue::Discriminant(from_place))) = statement.kind
         else {
             return false;
         };

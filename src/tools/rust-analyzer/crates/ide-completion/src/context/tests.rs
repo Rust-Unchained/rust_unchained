@@ -1,19 +1,24 @@
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
 use hir::HirDisplay;
 
 use crate::{
     context::CompletionContext,
-    tests::{position, TEST_CONFIG},
+    tests::{TEST_CONFIG, position},
 };
 
 fn check_expected_type_and_name(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, pos) = position(ra_fixture);
     let config = TEST_CONFIG;
-    let (completion_context, _analysis) = CompletionContext::new(&db, pos, &config).unwrap();
+    let (completion_context, _analysis) =
+        hir::attach_db(&db, || CompletionContext::new(&db, pos, &config, None).unwrap());
 
     let ty = completion_context
         .expected_type
-        .map(|t| t.display_test(&db, completion_context.krate.to_display_target(&db)).to_string())
+        .map(|t| {
+            hir::attach_db(&db, || {
+                t.display_test(&db, completion_context.krate.to_display_target(&db)).to_string()
+            })
+        })
         .unwrap_or("?".to_owned());
 
     let name =
@@ -85,6 +90,20 @@ fn bar(x: u32) {}
 "#,
         expect![[r#"ty: u32, name: x"#]],
     );
+    check_expected_type_and_name(
+        r#"
+fn foo() { bar(, $0); }
+fn bar(x: u32, y: i32) {}
+"#,
+        expect![[r#"ty: i32, name: y"#]],
+    );
+    check_expected_type_and_name(
+        r#"
+fn foo() { bar(, c$0); }
+fn bar(x: u32, y: i32) {}
+"#,
+        expect![[r#"ty: i32, name: y"#]],
+    );
 }
 
 #[test]
@@ -124,6 +143,18 @@ fn foo() { bar(&c$0); }
 fn bar(x: &u32) {}
         "#,
         expect![[r#"ty: u32, name: x"#]],
+    );
+}
+
+#[test]
+fn expected_type_fn_param_deref() {
+    cov_mark::check!(expected_type_fn_param_deref);
+    check_expected_type_and_name(
+        r#"
+fn foo() { bar(*$0); }
+fn bar(x: &u32) {}
+"#,
+        expect!["ty: &'_ &'_ u32, name: x"],
     );
 }
 
@@ -226,6 +257,22 @@ fn foo() -> Foo {
 }
 
 #[test]
+fn expected_type_match_arm_block_body_without_leading_char() {
+    cov_mark::check!(expected_type_match_arm_body_without_leading_char);
+    cov_mark::check!(expected_type_match_arm_body_with_leading_char);
+    check_expected_type_and_name(
+        r#"
+struct Foo;
+enum E { X }
+fn foo() -> Foo {
+    match E::X { Foo::X => { $0 } }
+}
+"#,
+        expect![[r#"ty: Foo, name: ?"#]],
+    );
+}
+
+#[test]
 fn expected_type_match_body_arm_with_leading_char() {
     cov_mark::check!(expected_type_match_arm_body_with_leading_char);
     check_expected_type_and_name(
@@ -237,6 +284,71 @@ fn foo() -> Foo {
 }
 "#,
         expect![[r#"ty: Foo, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_tuple_struct_pat() {
+    check_expected_type_and_name(
+        r#"
+//- minicore: option
+struct Foo(Option<i32>);
+fn foo(x: Foo) -> Foo {
+   match x { Foo($0) => () }
+}
+"#,
+        expect![[r#"ty: Option<i32>, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+struct Foo(i32, u32, f32);
+fn foo(x: Foo) -> Foo {
+   match x { Foo($0) => () }
+}
+"#,
+        expect![[r#"ty: i32, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+struct Foo(i32, u32, f32);
+fn foo(x: Foo) -> Foo {
+   match x { Foo(num,$0) => () }
+}
+"#,
+        expect![[r#"ty: u32, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+struct Foo(i32, u32, f32);
+fn foo(x: Foo) -> Foo {
+   match x { Foo(num,$0,float) => () }
+}
+"#,
+        expect![[r#"ty: u32, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+//- minicore: option
+struct Foo<T>(T);
+fn foo(x: Foo<Option<i32>>) -> Foo {
+   match x { Foo($0) => () }
+}
+"#,
+        expect![[r#"ty: Option<i32>, name: ?"#]],
+    );
+    check_expected_type_and_name(
+        r#"
+//- minicore: option
+enum Foo<T> { Var(T) };
+fn foo(x: Foo<Option<i32>>) -> Foo {
+   match x { Foo::Var($0) => () }
+}
+"#,
+        expect![[r#"ty: Option<i32>, name: ?"#]],
     );
 }
 
@@ -270,6 +382,77 @@ fn foo() {
 "#,
         expect![[r#"ty: Foo, name: ?"#]],
     )
+}
+
+#[test]
+fn expected_type_if_let_chain_bool() {
+    check_expected_type_and_name(
+        r#"
+fn foo() {
+    let f = Foo::Quux;
+    if let c = f && $0 { }
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_if_condition() {
+    check_expected_type_and_name(
+        r#"
+fn foo() {
+    if a$0 { }
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_guard_condition() {
+    check_expected_type_and_name(
+        r#"
+enum E { V }
+fn foo() {
+    match E::V {
+        _ if a$0 => {}
+    }
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_if_body() {
+    check_expected_type_and_name(
+        r#"
+enum Foo { Bar, Baz, Quux }
+
+fn foo() {
+    let _: Foo = if true {
+        $0
+    };
+}
+"#,
+        expect![[r#"ty: Foo, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+enum Foo { Bar, Baz, Quux }
+
+fn foo() {
+    let _: Foo = if true {
+        Foo::Bar
+    } else {
+        $0
+    };
+}
+"#,
+        expect![[r#"ty: Foo, name: ?"#]],
+    );
 }
 
 #[test]
@@ -312,12 +495,23 @@ fn foo() -> u32 {
 
 #[test]
 fn expected_type_closure_param_return() {
-    // FIXME: make this work with `|| $0`
     check_expected_type_and_name(
         r#"
 //- minicore: fn
 fn foo() {
     bar(|| a$0);
+}
+
+fn bar(f: impl FnOnce() -> u32) {}
+"#,
+        expect![[r#"ty: u32, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+//- minicore: fn
+fn foo() {
+    bar(|| $0);
 }
 
 fn bar(f: impl FnOnce() -> u32) {}
@@ -371,6 +565,17 @@ fn foo() {
 "#,
         expect![[r#"ty: Foo, name: ?"#]],
     );
+    check_expected_type_and_name(
+        r#"
+struct Foo { field: u32 }
+fn foo() {
+    Foo {
+        ..self::$0
+    }
+}
+"#,
+        expect!["ty: ?, name: ?"],
+    );
 }
 
 #[test]
@@ -421,5 +626,223 @@ fn f(thing: u32) -> &u32 {
 }
 "#,
         expect!["ty: u32, name: ?"],
+    );
+}
+
+#[test]
+fn expected_type_assign() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let x: &mut State = &mut State::Stop;
+    x = $0;
+}
+"#,
+        expect![[r#"ty: &'_ mut State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_deref_assign() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let x: &mut State = &mut State::Stop;
+    match x {
+        State::Stop => {
+            *x = $0;
+        },
+    }
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_deref_assign_at_block_end() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let x: &mut State = &mut State::Stop;
+    match x {
+        State::Stop => {
+            *x = $0
+        },
+    }
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_return_expr() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() -> State {
+    let _: i32 = if true {
+        8
+    } else {
+        return $0;
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_return_expr_in_closure() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _f: fn() -> State = || {
+        let _: i32 = if true {
+            8
+        } else {
+            return $0;
+        };
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_break_expr_in_loop() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = loop {
+        {
+            break State::Stop;
+            break $0;
+        }
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = 'a: loop {
+        {
+            break State::Stop;
+            break $0;
+        }
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = 'a: loop {
+        while true {
+            break $0;
+        }
+    };
+}
+"#,
+        expect![[r#"ty: (), name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_break_expr_in_labeled_loop() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = 'a: loop {
+        let _y: i32 = loop {
+            {
+                break 'a State::Stop;
+                break 'a $0;
+            }
+        };
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = 'a: loop {
+        let _y: i32 = loop {
+            while true {
+                break 'a State::Stop;
+                break 'a $0;
+            }
+        };
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    'a: while true {
+        let _x: State = loop {
+            break State::Stop;
+            break 'a $0;
+        };
+    }
+}
+"#,
+        expect![[r#"ty: (), name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_break_expr_in_labeled_block() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _x: State = 'a: {
+        let _y: i32 = 'b: {
+            {
+                break 'a State::Stop;
+                break 'a $0;
+            };
+        };
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_logic_op() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    true && $0;
+}
+"#,
+        expect![[r#"ty: bool, name: ?"#]],
     );
 }

@@ -1,14 +1,20 @@
-use crate::spec::{CodeModel, SanitizerSet, StackProbeType, Target, TargetMetadata, base};
+use crate::spec::{
+    Arch, CodeModel, LlvmAbi, SanitizerSet, StackProbeType, Target, TargetMetadata, base,
+};
 
 pub(crate) fn target() -> Target {
     let mut base = base::fuchsia::opts();
     base.code_model = Some(CodeModel::Medium);
     base.cpu = "generic-rv64".into();
-    base.features = "+m,+a,+f,+d,+c,+zicsr,+zifencei".into();
-    base.llvm_abiname = "lp64d".into();
+    base.features = "+m,+a,+f,+d,+c,+v,+zicsr,+zifencei".into();
+    base.llvm_abiname = LlvmAbi::Lp64d;
     base.max_atomic_width = Some(64);
     base.stack_probes = StackProbeType::Inline;
-    base.supported_sanitizers = SanitizerSet::SHADOWCALLSTACK;
+    base.supported_sanitizers = SanitizerSet::ADDRESS
+        | SanitizerSet::CFI
+        | SanitizerSet::LEAK
+        | SanitizerSet::SHADOWCALLSTACK;
+    base.default_sanitizers = SanitizerSet::SHADOWCALLSTACK;
     base.supports_xray = true;
 
     Target {
@@ -21,7 +27,7 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 64,
         data_layout: "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128".into(),
-        arch: "riscv64".into(),
+        arch: Arch::RiscV64,
         options: base,
     }
 }

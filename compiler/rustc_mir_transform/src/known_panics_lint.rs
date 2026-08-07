@@ -6,23 +6,25 @@ use std::fmt::Debug;
 
 use rustc_abi::{BackendRepr, FieldIdx, HasDataLayout, Size, TargetDataLayout, VariantIdx};
 use rustc_const_eval::const_eval::DummyMachine;
-use rustc_const_eval::interpret::{
-    ImmTy, InterpCx, InterpResult, Projectable, Scalar, format_interp_error, interp_ok,
-};
+use rustc_const_eval::interpret::{ImmTy, InterpCx, InterpResult, Projectable, Scalar, interp_ok};
 use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
+use rustc_hir::{HirId, find_attr};
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::{self, ConstInt, ScalarInt, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, ConstInt, GenericArgKind, GenericParamDefKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
+    Unnormalized,
+};
+use rustc_session::lint::builtin::UNCONDITIONAL_PANIC;
 use rustc_span::Span;
 use tracing::{debug, instrument, trace};
 
-use crate::errors::{AssertLint, AssertLintKind};
+use crate::diagnostics::{AssertLint, AssertLintKind, ConstNIsZero};
 
 pub(super) struct KnownPanicsLint;
 
@@ -35,7 +37,7 @@ impl<'tcx> crate::MirLint<'tcx> for KnownPanicsLint {
         let def_id = body.source.def_id().expect_local();
         let def_kind = tcx.def_kind(def_id);
         let is_fn_like = def_kind.is_fn_like();
-        let is_assoc_const = def_kind == DefKind::AssocConst;
+        let is_assoc_const = matches!(def_kind, DefKind::AssocConst { .. });
 
         // Only run const prop on functions, methods, closures and associated constants
         if !is_fn_like && !is_assoc_const {
@@ -233,7 +235,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         F: FnOnce(&mut Self) -> InterpResult<'tcx, T>,
     {
         f(self)
-            .map_err_info(|err| {
+            .inspect_err_info(|err| {
                 trace!("InterpCx operation failed: {:?}", err);
                 // Some errors shouldn't come up because creating them causes
                 // an allocation, which we should avoid. When that happens,
@@ -241,9 +243,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 assert!(
                     !err.kind().formatted_string(),
                     "known panics lint encountered formatting error: {}",
-                    format_interp_error(self.ecx.tcx.dcx(), err),
+                    err.to_string(),
                 );
-                err
             })
             .discard_err()
     }
@@ -261,7 +262,10 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         // that the `PostAnalysisNormalize` pass has happened and that the body's consts
         // are normalized, so any call to resolve before that needs to be
         // manually normalized.
-        let val = self.tcx.try_normalize_erasing_regions(self.typing_env, c.const_).ok()?;
+        let val = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(c.const_))
+            .ok()?;
 
         self.use_ecx(|this| this.ecx.eval_mir_constant(&val, c.span, None))?
             .as_mplace_or_imm()
@@ -282,6 +286,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     /// or `eval_place`, depending on the variant of `Operand` used.
     fn eval_operand(&mut self, op: &Operand<'tcx>) -> Option<ImmTy<'tcx>> {
         match *op {
+            Operand::RuntimeChecks(_) => None,
             Operand::Constant(ref c) => self.eval_constant(c),
             Operand::Move(place) | Operand::Copy(place) => self.eval_place(place),
         }
@@ -411,14 +416,14 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 trace!("checking UnaryOp(op = {:?}, arg = {:?})", op, arg);
                 self.check_unary_op(*op, arg, location)?;
             }
-            Rvalue::BinaryOp(op, box (left, right)) => {
+            Rvalue::BinaryOp(op, (left, right)) => {
                 trace!("checking BinaryOp(op = {:?}, left = {:?}, right = {:?})", op, left, right);
                 self.check_binary_op(*op, left, right, location)?;
             }
 
             // Do not try creating references (#67862)
-            Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) => {
-                trace!("skipping RawPtr | Ref for {:?}", place);
+            Rvalue::RawPtr(_, place) | Rvalue::Ref(_, _, place) | Rvalue::Reborrow(_, _, place) => {
+                trace!("skipping RawPtr | Ref | Reborrow for {:?}", place);
 
                 // This may be creating mutable references or immutable references to cells.
                 // If that happens, the pointed to value could be mutated via that reference.
@@ -441,11 +446,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             | Rvalue::Use(..)
             | Rvalue::CopyForDeref(..)
             | Rvalue::Repeat(..)
-            | Rvalue::Len(..)
             | Rvalue::Cast(..)
-            | Rvalue::ShallowInitBox(..)
             | Rvalue::Discriminant(..)
-            | Rvalue::NullaryOp(..)
             | Rvalue::WrapUnsafeBinder(..) => {}
         }
 
@@ -548,13 +550,13 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let val: Value<'_> = match *rvalue {
             ThreadLocalRef(_) => return None,
 
-            Use(ref operand) | WrapUnsafeBinder(ref operand, _) => {
+            Use(ref operand, _) | WrapUnsafeBinder(ref operand, _) => {
                 self.eval_operand(operand)?.into()
             }
 
-            CopyForDeref(place) => self.eval_place(place)?.into(),
+            CopyForDeref(place) | Reborrow(_, _, place) => self.eval_place(place)?.into(),
 
-            BinaryOp(bin_op, box (ref left, ref right)) => {
+            BinaryOp(bin_op, (ref left, ref right)) => {
                 let left = self.eval_operand(left)?;
                 let left = self.use_ecx(|this| this.ecx.read_immediate(&left))?;
 
@@ -562,7 +564,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 let right = self.use_ecx(|this| this.ecx.read_immediate(&right))?;
 
                 let val = self.use_ecx(|this| this.ecx.binary_op(bin_op, &left, &right))?;
-                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair(..)) {
+                if matches!(val.layout.backend_repr, BackendRepr::ScalarPair { .. }) {
                     // FIXME `Value` should properly support pairs in `Immediate`... but currently
                     // it does not.
                     let (val, overflow) = val.to_pair(&self.ecx);
@@ -604,38 +606,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 return None;
             }
 
-            Len(place) => {
-                let len = if let ty::Array(_, n) = place.ty(self.local_decls(), self.tcx).ty.kind()
-                {
-                    n.try_to_target_usize(self.tcx)?
-                } else {
-                    match self.get_const(place)? {
-                        Value::Immediate(src) => src.len(&self.ecx).discard_err()?,
-                        Value::Aggregate { fields, .. } => fields.len() as u64,
-                        Value::Uninit => return None,
-                    }
-                };
-                ImmTy::from_scalar(Scalar::from_target_usize(len, self), layout).into()
-            }
-
             Ref(..) | RawPtr(..) => return None,
-
-            NullaryOp(ref null_op, ty) => {
-                let op_layout = self.ecx.layout_of(ty).ok()?;
-                let val = match null_op {
-                    NullOp::SizeOf => op_layout.size.bytes(),
-                    NullOp::AlignOf => op_layout.align.abi.bytes(),
-                    NullOp::OffsetOf(fields) => self
-                        .tcx
-                        .offset_of_subfield(self.typing_env, op_layout, fields.iter())
-                        .bytes(),
-                    NullOp::UbChecks => return None,
-                    NullOp::ContractChecks => return None,
-                };
-                ImmTy::from_scalar(Scalar::from_target_usize(val, self), layout).into()
-            }
-
-            ShallowInitBox(..) => return None,
 
             Cast(ref kind, ref value, to) => match kind {
                 CastKind::IntToInt | CastKind::IntToFloat => {
@@ -652,14 +623,14 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     let res = self.ecx.float_to_float_or_int(&value, to).discard_err()?;
                     res.into()
                 }
-                CastKind::Transmute => {
+                CastKind::Transmute | CastKind::Subtype => {
                     let value = self.eval_operand(value)?;
                     let to = self.ecx.layout_of(to).ok()?;
                     // `offset` for immediates only supports scalar/scalar-pair ABIs,
                     // so bail out if the target is not one.
                     match (value.layout.backend_repr, to.backend_repr) {
                         (BackendRepr::Scalar(..), BackendRepr::Scalar(..)) => {}
-                        (BackendRepr::ScalarPair(..), BackendRepr::ScalarPair(..)) => {}
+                        (BackendRepr::ScalarPair { .. }, BackendRepr::ScalarPair { .. }) => {}
                         _ => return None,
                     }
 
@@ -798,6 +769,38 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
                 }
                 // We failed to evaluate the discriminant, fallback to visiting all successors.
             }
+            TerminatorKind::Call { func, args: _, .. } => {
+                if let Some((def_id, generic_args)) = func.const_fn_def() {
+                    for (index, arg) in generic_args.iter().enumerate() {
+                        if let GenericArgKind::Const(ct) = arg.kind() {
+                            let generics = self.tcx.generics_of(def_id);
+                            let param_def = generics.param_at(index, self.tcx);
+
+                            if let GenericParamDefKind::Const { .. } = param_def.kind
+                                && find_attr!(self.tcx, param_def.def_id, RustcPanicsWhenZero)
+                                && let Some(0) = ct.try_to_target_usize(self.tcx)
+                            {
+                                // We managed to figure-out that the value of a
+                                // `#[rustc_panics_when_zero]` const-generic parameter is zero.
+                                //
+                                // Let's report it as an unconditional panic.
+                                let source_info = self.body.source_info(location);
+                                if let Some(lint_root) = self.lint_root(*source_info) {
+                                    self.tcx.emit_node_span_lint(
+                                        UNCONDITIONAL_PANIC,
+                                        lint_root,
+                                        source_info.span,
+                                        ConstNIsZero {
+                                            const_param_span: source_info.span,
+                                            const_param_name: param_def.name,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // None of these have Operands to const-propagate.
             TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
@@ -810,7 +813,6 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::Call { .. }
             | TerminatorKind::InlineAsm { .. } => {}
         }
 
@@ -934,7 +936,6 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
             // mutations of the same local via `Store`
             | MutatingUse(MutatingUseContext::Call)
             | MutatingUse(MutatingUseContext::AsmOutput)
-            | MutatingUse(MutatingUseContext::Deinit)
             // Actual store that can possibly even propagate a value
             | MutatingUse(MutatingUseContext::Store)
             | MutatingUse(MutatingUseContext::SetDiscriminant) => {
@@ -979,7 +980,9 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
                 self.can_const_prop[local] = ConstPropMode::NoPropagation;
             }
             MutatingUse(MutatingUseContext::Projection)
-            | NonMutatingUse(NonMutatingUseContext::Projection) => bug!("visit_place should not pass {context:?} for {local:?}"),
+            | NonMutatingUse(NonMutatingUseContext::Projection) => {
+                bug!("visit_place should not pass {context:?} for {local:?}")
+            }
         }
     }
 }

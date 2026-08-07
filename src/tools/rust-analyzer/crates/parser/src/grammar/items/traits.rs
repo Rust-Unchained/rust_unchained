@@ -20,7 +20,7 @@ pub(super) fn trait_(p: &mut Parser<'_>, m: Marker) {
         // trait Z<U> = where Self: T<U>;
         generic_params::opt_where_clause(p);
         p.expect(T![;]);
-        m.complete(p, TRAIT_ALIAS);
+        m.complete(p, TRAIT);
         return;
     }
 
@@ -54,12 +54,13 @@ pub(super) fn impl_(p: &mut Parser<'_>, m: Marker) {
     // impl const Send for S {}
     p.eat(T![const]);
 
-    // FIXME: never type
+    // test impl_item_never_type
     // impl ! {}
-
-    // test impl_item_neg
-    // impl !Send for S {}
-    p.eat(T![!]);
+    if p.at(T![!]) && !p.nth_at(1, T!['{']) {
+        // test impl_item_neg
+        // impl !Send for S {}
+        p.eat(T![!]);
+    }
     impl_type(p);
     if p.eat(T![for]) {
         impl_type(p);

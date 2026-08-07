@@ -1,6 +1,5 @@
 //@ test-mir-pass: MatchBranchSimplification
 
-#![feature(repr128)]
 #![feature(core_intrinsics)]
 #![feature(custom_mir)]
 #![allow(non_camel_case_types)]
@@ -80,6 +79,54 @@ fn match_nested_if() -> bool {
         _ => false,
     };
     val
+}
+
+// EMIT_MIR matches_reduce_branches.match_eq_bool.MatchBranchSimplification.diff
+fn match_eq_bool(i: i32) -> bool {
+    // CHECK-LABEL: fn match_eq_bool(
+    // CHECK: = Ne(
+    // CHECK-NOT: switchInt
+    // CHECK: return
+    let a;
+    match i {
+        7 => {
+            a = false;
+            ()
+        }
+        8 => {
+            a = true;
+            ()
+        }
+        _ => {
+            a = true;
+            ()
+        }
+    };
+    a
+}
+
+// EMIT_MIR matches_reduce_branches.match_eq_bool_2.MatchBranchSimplification.diff
+fn match_eq_bool_2(i: i32) -> bool {
+    // CHECK-LABEL: fn match_eq_bool_2(
+    // CHECK-NOT: = Ne(
+    // CHECK: switchInt
+    // CHECK: return
+    let a;
+    match i {
+        7 => {
+            a = false;
+            ()
+        }
+        8 => {
+            a = false;
+            ()
+        }
+        _ => {
+            a = true;
+            ()
+        }
+    };
+    a
 }
 
 // # Fold switchInt into IntToInt.
@@ -628,6 +675,118 @@ fn match_i128_u128(i: EnumAi128) -> u128 {
     }
 }
 
+// EMIT_MIR matches_reduce_branches.match_option.MatchBranchSimplification.diff
+fn match_option(i: &Option<i32>) -> Option<i32> {
+    // CHECK-LABEL: fn match_option(
+    // CHECK-NOT: switchInt
+    // CHECK: _0 = no_retag copy (*_1);
+    match i {
+        Some(_) => *i,
+        None => None,
+    }
+}
+
+enum Option2<T> {
+    None1,
+    None2,
+    Some(T),
+}
+
+// EMIT_MIR matches_reduce_branches.single_case.MatchBranchSimplification.diff
+#[custom_mir(dialect = "runtime")]
+fn single_case(i: Option<i32>) -> i32 {
+    // CHECK-LABEL: fn single_case(
+    // CHECK-NOT: switchInt
+    mir! {
+        {
+            let discr = Discriminant(i);
+            match discr {
+                0 => none,
+                _ => unreachable_bb,
+            }
+        }
+        none = {
+            RET = 1;
+            Return()
+        }
+        unreachable_bb = {
+            Unreachable()
+        }
+    }
+}
+
+// We cannot dereference `i` after the value has been changed.
+// EMIT_MIR matches_reduce_branches.match_option2_mut.MatchBranchSimplification.diff
+#[custom_mir(dialect = "runtime")]
+fn match_option2_mut(i: &mut Option2<i32>) -> Option2<i32> {
+    // CHECK-LABEL: fn match_option2_mut(
+    // CHECK: switchInt
+    // CHECK: return
+    mir! {
+        {
+            let discr = Discriminant(*i);
+            match discr {
+                0 => none1_bb,
+                1 => none2_bb,
+                2 => some_bb,
+                _ => unreachable_bb,
+            }
+        }
+        none1_bb = {
+            *i = Option2::None2;
+            RET = Option2::None1;
+            Goto(ret)
+        }
+        none2_bb = {
+            *i = Option2::None2;
+            RET = Option2::None2;
+            Goto(ret)
+        }
+        some_bb = {
+            *i = Option2::None2;
+            RET = *i;
+            Goto(ret)
+        }
+        unreachable_bb = {
+            Unreachable()
+        }
+        ret = {
+            Return()
+        }
+    }
+}
+
+// EMIT_MIR matches_reduce_branches.match_non_int_failed.MatchBranchSimplification.diff
+#[custom_mir(dialect = "runtime")]
+fn match_non_int_failed(i: char) -> u8 {
+    // CHECK-LABEL: fn match_non_int_failed(
+    // CHECK: switchInt
+    // CHECK: return
+    mir! {
+        {
+            match i {
+                'a' => bb1,
+                'b' => bb2,
+                _ => unreachable_bb,
+            }
+        }
+        bb1 = {
+            RET = 97;
+            Goto(ret)
+        }
+        bb2 = {
+            RET = 98;
+            Goto(ret)
+        }
+        unreachable_bb = {
+            Unreachable()
+        }
+        ret = {
+            Return()
+        }
+    }
+}
+
 fn main() {
     let _ = foo(None);
     let _ = foo(Some(()));
@@ -665,4 +824,7 @@ fn main() {
     let _ = match_i128_u128(EnumAi128::A);
 
     let _ = my_is_some(None);
+    let _ = match_non_int_failed('a');
+    let _ = match_option(&None);
+    let _ = match_option2_mut(&mut Option2::None1);
 }

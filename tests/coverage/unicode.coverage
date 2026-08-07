@@ -12,8 +12,8 @@
    LL|       |// points or bytes.
    LL|       |
    LL|      1|fn main() {
-   LL|     [0;35m33[0m|    for _İ in 'А'..='Я' { /* Я */ }
-                      ^32                ^32
+   LL|     [0;35m32[0m|    for _İ in 'А'..='Я' { /* Я */ }
+                             ^1
    LL|       |
    LL|      [0;35m1[0m|    if 申し訳ございません() && [0;41m申し訳ございません[0m() [0;41m{[0m
                                                       ^0
@@ -29,7 +29,7 @@
    LL|       |
    LL|       |macro_rules! macro_that_defines_a_function {
    LL|       |    (fn $名:ident () $体:tt) => {
-   LL|      0|        fn $名 () $体 [0;41mfn 他 () {}[0m
+   LL|      [0;35m0[0m|        fn $名 () $体 [0;41mfn 他 ()[0m {[0;41m}[0m
    LL|       |    }
    LL|       |}
    LL|       |

@@ -1,10 +1,9 @@
 // -Zpanic_abort_tests makes this test work on panic=abort targets and
 // it's a no-op on panic=unwind targets
 //@ compile-flags: --test -Zpanic_abort_tests
-// ignore-tidy-linelength
 //@ run-pass
 
-#![feature(core_intrinsics, generic_assert)]
+#![feature(generic_assert)]
 
 use std::fmt::{Debug, Formatter};
 
@@ -17,6 +16,7 @@ impl Debug for CopyDebug {
   }
 }
 
+// ignore-tidy-linelength
 #[should_panic(expected = "Assertion failed: copy_debug == CopyDebug(3)\nWith captures:\n  copy_debug = With great power comes great electricity bills\n")]
 #[test]
 fn test() {

@@ -1,6 +1,6 @@
-use std::char::MAX_LEN_UTF8;
+use std::char::{self, CharCase};
+use std::str;
 use std::str::FromStr;
-use std::{char, str};
 
 #[test]
 fn test_convert() {
@@ -21,7 +21,6 @@ fn test_convert() {
     assert!(char::try_from(0xFFFF_FFFF_u32).is_err());
 }
 
-/* FIXME(#110395)
 #[test]
 const fn test_convert_const() {
     assert!(u32::from('a') == 0x61);
@@ -31,7 +30,6 @@ const fn test_convert_const() {
     assert!(char::from(b'a') == 'a');
     assert!(char::from(b'\xFF') == '\u{FF}');
 }
-*/
 
 #[test]
 fn test_from_str() {
@@ -40,6 +38,30 @@ fn test_from_str() {
     assert_eq!(char::from_str("\u{D7FF}").unwrap(), '\u{d7FF}');
     assert!(char::from_str("").is_err());
     assert!(char::from_str("abc").is_err());
+}
+
+#[test]
+fn test_is_cased() {
+    assert!('a'.is_cased());
+    assert!('ö'.is_cased());
+    assert!('ß'.is_cased());
+    assert!('Ü'.is_cased());
+    assert!('P'.is_cased());
+    assert!('ª'.is_cased());
+    assert!(!'攂'.is_cased());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri is too slow
+fn test_char_case() {
+    for c in '\0'..='\u{10FFFF}' {
+        match c.case() {
+            None => assert!(!c.is_cased()),
+            Some(CharCase::Lower) => assert!(c.is_lowercase()),
+            Some(CharCase::Upper) => assert!(c.is_uppercase()),
+            Some(CharCase::Title) => assert!(c.is_titlecase()),
+        }
+    }
 }
 
 #[test]
@@ -52,12 +74,44 @@ fn test_is_lowercase() {
 }
 
 #[test]
+fn test_is_titlecase() {
+    assert!('ǅ'.is_titlecase());
+    assert!('ᾨ'.is_titlecase());
+    assert!(!'h'.is_titlecase());
+    assert!(!'ä'.is_titlecase());
+    assert!(!'ß'.is_titlecase());
+    assert!(!'Ö'.is_titlecase());
+    assert!(!'T'.is_titlecase());
+}
+
+#[test]
 fn test_is_uppercase() {
     assert!(!'h'.is_uppercase());
     assert!(!'ä'.is_uppercase());
     assert!(!'ß'.is_uppercase());
     assert!('Ö'.is_uppercase());
     assert!('T'.is_uppercase());
+}
+
+#[test]
+fn titlecase_fast_path() {
+    for c in '\0'..='\u{01C4}' {
+        assert!(!(c.is_cased() && !c.is_lowercase() && !c.is_uppercase()))
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri is too slow
+fn at_most_one_case() {
+    for c in '\0'..='\u{10FFFF}' {
+        assert_eq!(
+            !c.is_cased() as u8
+                + c.is_lowercase() as u8
+                + c.is_uppercase() as u8
+                + c.is_titlecase() as u8,
+            1
+        );
+    }
 }
 
 #[test]
@@ -159,6 +213,41 @@ fn test_to_uppercase() {
 }
 
 #[test]
+fn test_to_casefold_unnormalized() {
+    fn fold(c: char) -> String {
+        let to_casefold = c.to_casefold_unnormalized();
+        assert_eq!(to_casefold.len(), to_casefold.count());
+        let iter: String = c.to_casefold_unnormalized().collect();
+        let disp: String = c.to_casefold_unnormalized().to_string();
+        assert_eq!(iter, disp);
+        let iter_rev: String = c.to_casefold_unnormalized().rev().collect();
+        let disp_rev: String = disp.chars().rev().collect();
+        assert_eq!(iter_rev, disp_rev);
+        iter
+    }
+    assert_eq!(fold('A'), "a");
+    assert_eq!(fold('Ö'), "ö");
+    assert_eq!(fold('ß'), "ss");
+    assert_eq!(fold('ẞ'), "ss");
+    assert_eq!(fold('Ü'), "ü");
+    assert_eq!(fold('💩'), "💩");
+    assert_eq!(fold('Σ'), "σ");
+    assert_eq!(fold('ς'), "σ");
+    assert_eq!(fold('Τ'), "τ");
+    assert_eq!(fold('Ι'), "ι");
+    assert_eq!(fold('Γ'), "γ");
+    assert_eq!(fold('Μ'), "μ");
+    assert_eq!(fold('Α'), "α");
+    assert_eq!(fold('ǅ'), "ǆ");
+    assert_eq!(fold('ﬁ'), "fi");
+    assert_eq!(fold('İ'), "i\u{307}");
+    assert_eq!(fold('ꮿ'), "Ꮿ");
+    assert_eq!(fold('Ꮿ'), "Ꮿ");
+    assert_eq!(fold('ῲ'), "ὼι");
+    assert_eq!(fold('\u{0345}'), "ι");
+}
+
+#[test]
 fn test_is_control() {
     assert!('\u{0}'.is_control());
     assert!('\u{3}'.is_control());
@@ -210,6 +299,8 @@ fn test_escape_debug() {
     assert_eq!(string('\u{200b}'), "\\u{200b}"); // zero width space
     assert_eq!(string('\u{e000}'), "\\u{e000}"); // private use 1
     assert_eq!(string('\u{100000}'), "\\u{100000}"); // private use 2
+    assert_eq!(string('\u{ff9e}'), "\u{ff9e}"); // halfwidth dakuten
+    assert_eq!(string('\u{ff9f}'), "\u{ff9f}"); // halfwidth handakuten
 }
 
 #[test]
@@ -222,6 +313,7 @@ fn test_escape_default() {
     }
     assert_eq!(string('\n'), "\\n");
     assert_eq!(string('\r'), "\\r");
+    assert_eq!(string('\t'), "\\t");
     assert_eq!(string('\''), "\\'");
     assert_eq!(string('"'), "\\\"");
     assert_eq!(string(' '), " ");
@@ -260,10 +352,10 @@ fn test_escape_unicode() {
 #[test]
 fn test_encode_utf8() {
     fn check(input: char, expect: &[u8]) {
-        let mut buf = [0; MAX_LEN_UTF8];
+        let mut buf = [0; char::MAX_LEN_UTF8];
         let ptr = buf.as_ptr();
         let s = input.encode_utf8(&mut buf);
-        assert_eq!(s.as_ptr() as usize, ptr as usize);
+        assert_eq!(s.as_ptr(), ptr);
         assert!(str::from_utf8(s.as_bytes()).is_ok());
         assert_eq!(s.as_bytes(), expect);
     }
@@ -280,7 +372,7 @@ fn test_encode_utf16() {
         let mut buf = [0; 2];
         let ptr = buf.as_mut_ptr();
         let b = input.encode_utf16(&mut buf);
-        assert_eq!(b.as_mut_ptr() as usize, ptr as usize);
+        assert_eq!(b.as_mut_ptr(), ptr);
         assert_eq!(b, expect);
     }
 
@@ -418,4 +510,46 @@ fn eu_iterator_specializations() {
     check('\u{1234}');
     check('\u{12340}');
     check('\u{10FFFF}');
+}
+
+#[test]
+#[should_panic]
+fn test_from_digit_radix_too_high() {
+    let _ = char::from_digit(0, 37);
+}
+
+#[test]
+fn test_from_digit_invalid_radix() {
+    assert!(char::from_digit(10, 9).is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_to_digit_radix_too_low() {
+    let _ = 'a'.to_digit(1);
+}
+
+#[test]
+#[should_panic]
+fn test_to_digit_radix_too_high() {
+    let _ = 'a'.to_digit(37);
+}
+
+#[test]
+fn test_as_ascii_invalid() {
+    assert!('❤'.as_ascii().is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_encode_utf8_raw_buffer_too_small() {
+    let mut buf = [0u8; 1];
+    let _ = char::encode_utf8_raw('ß'.into(), &mut buf);
+}
+
+#[test]
+#[should_panic]
+fn test_encode_utf16_raw_buffer_too_small() {
+    let mut buf = [0u16; 1];
+    let _ = char::encode_utf16_raw('𐐷'.into(), &mut buf);
 }

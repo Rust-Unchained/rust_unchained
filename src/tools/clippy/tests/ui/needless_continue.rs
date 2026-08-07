@@ -1,5 +1,5 @@
 #![warn(clippy::needless_continue)]
-#![allow(clippy::uninlined_format_args)]
+#![expect(clippy::uninlined_format_args)]
 
 macro_rules! zero {
     ($x:expr) => {
@@ -242,5 +242,138 @@ mod issue_4077 {
 
     fn some_expr() -> bool {
         true
+    }
+}
+
+#[allow(clippy::let_unit_value)]
+mod issue14550 {
+    fn match_with_value(mut producer: impl Iterator<Item = Result<i32, u32>>) -> Result<u32, u32> {
+        let mut counter = 2;
+        loop {
+            match producer.next().unwrap() {
+                Ok(ok) => break Ok((ok + 1) as u32),
+                Err(12) => {
+                    counter -= 1;
+                    continue;
+                },
+                err => err?,
+            };
+        }
+    }
+
+    fn inside_macro() {
+        macro_rules! mac {
+            ($e:expr => $($rest:tt);*) => {
+                loop {
+                    match $e {
+                        1 => continue,
+                        2 => break,
+                        n => println!("{n}"),
+                    }
+                    $($rest;)*
+                }
+            };
+        }
+
+        mac!(2 => );
+        mac!(1 => {println!("foobar")});
+    }
+
+    mod partially_inside_macro {
+        macro_rules! select {
+            (
+                $expr:expr,
+                $( $pat:pat => $then:expr ),*
+            ) => {
+                fn foo() {
+                    loop {
+                        match $expr {
+                            $(
+                                $pat => $then,
+                            )*
+                        }
+                    }
+                }
+            };
+        }
+
+        select!(Some(1),
+            Some(1) => {
+                println!("one");
+                continue;
+            },
+            Some(2) => {},
+            None => break,
+            _ => ()
+        );
+
+        macro_rules! choose {
+            (
+            $expr:expr,
+            $case:expr
+        ) => {
+                fn bar() {
+                    loop {
+                        match $expr {
+                            $case => {
+                                println!("matched");
+                                continue;
+                            },
+                            _ => {
+                                println!("not matched");
+                                break;
+                            },
+                        }
+                    }
+                }
+            };
+        }
+
+        choose!(todo!(), 5);
+    }
+}
+
+fn issue15548() {
+    loop {
+        if todo!() {
+        } else {
+            //~^ needless_continue
+            continue;
+        }
+    }
+}
+
+fn issue16256() {
+    fn some_condition() -> bool {
+        true
+    }
+    fn another_condition() -> bool {
+        true
+    }
+
+    for _ in 0..5 {
+        if some_condition() {
+            // ...
+            continue;
+        }
+
+        if another_condition() {
+            // ...
+            // "this `continue` expression is redundant" is posted on
+            // the `continue` node.
+            #[expect(clippy::needless_continue)]
+            continue;
+        }
+    }
+
+    for _ in 0..5 {
+        // "This `else` block is redundant" is posted on the
+        // `else` node.
+        #[expect(clippy::needless_continue)]
+        if some_condition() {
+            // ...
+        } else {
+            continue;
+        }
     }
 }

@@ -1,30 +1,31 @@
 use std::sync::Arc;
 
 use rustc_ast::{self as ast, *};
-use rustc_hir::def::{DefKind, PartialRes, Res};
+use rustc_errors::StashKey;
+use rustc_hir::def::{DefKind, PartialRes, PerNS, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, GenericArg};
 use rustc_middle::{span_bug, ty};
-use rustc_session::parse::add_feature_diagnostics;
+use rustc_session::diagnostics::add_feature_diagnostics;
 use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Ident, Span, Symbol, sym};
-use smallvec::{SmallVec, smallvec};
+use smallvec::smallvec;
 use tracing::{debug, instrument};
 
-use super::errors::{
+use crate::diagnostics::{
     AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, BadReturnTypeNotation,
     GenericTypeWithParentheses, RTNSuggestion, UseAngleBrackets,
 };
-use super::{
+use crate::{
     AllowReturnTypeNotation, GenericArgsCtor, GenericArgsMode, ImplTraitContext, ImplTraitPosition,
-    LifetimeRes, LoweringContext, ParamMode, ResolverAstLoweringExt,
+    LifetimeRes, LoweringContext, ParamMode,
 };
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     #[instrument(level = "trace", skip(self))]
     pub(crate) fn lower_qpath(
         &mut self,
         id: NodeId,
-        qself: &Option<ptr::P<QSelf>>,
+        qself: &Option<Box<QSelf>>,
         p: &Path,
         param_mode: ParamMode,
         allow_return_type_notation: AllowReturnTypeNotation,
@@ -36,10 +37,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let qself = qself
             .as_ref()
             // Reject cases like `<impl Trait>::Assoc` and `<impl Trait as Trait>::Assoc`.
-            .map(|q| self.lower_ty(&q.ty, ImplTraitContext::Disallowed(ImplTraitPosition::Path)));
+            .map(|q| {
+                self.lower_ty_alloc(&q.ty, ImplTraitContext::Disallowed(ImplTraitPosition::Path))
+            });
 
-        let partial_res =
-            self.resolver.get_partial_res(id).unwrap_or_else(|| PartialRes::new(Res::Err));
+        let partial_res = self.get_partial_res(id).unwrap_or_else(|| PartialRes::new(Res::Err));
         let base_res = partial_res.base_res();
         let unresolved_segments = partial_res.unresolved_segments();
 
@@ -110,7 +112,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         }
                         // `a::b::Trait(Args)::TraitItem`
                         Res::Def(DefKind::AssocFn, _)
-                        | Res::Def(DefKind::AssocConst, _)
+                        | Res::Def(DefKind::AssocConst { .. }, _)
                         | Res::Def(DefKind::AssocTy, _)
                             if i + 2 == proj_start =>
                         {
@@ -226,11 +228,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
     pub(crate) fn lower_use_path(
         &mut self,
-        res: SmallVec<[Res; 3]>,
+        res: PerNS<Option<Res>>,
         p: &Path,
         param_mode: ParamMode,
     ) -> &'hir hir::UsePath<'hir> {
-        assert!((1..=3).contains(&res.len()));
+        assert!(!res.is_empty());
         self.arena.alloc(hir::UsePath {
             res,
             segments: self.arena.alloc_from_iter(p.segments.iter().map(|segment| {
@@ -296,7 +298,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                                 sym::return_type_notation,
                             );
                         }
-                        err.emit();
+                        err.stash(path_span, StashKey::ReturnTypeNotation);
                         (
                             GenericArgsCtor {
                                 args: Default::default(),
@@ -410,6 +412,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             } else {
                 Some(generic_args.into_generic_args(self))
             },
+            delegation_child_segment: false,
         }
     }
 
@@ -420,7 +423,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         segment_ident_span: Span,
         generic_args: &mut GenericArgsCtor<'hir>,
     ) {
-        let (start, end) = match self.resolver.get_lifetime_res(segment_id) {
+        let (start, end) = match self.owner.get_lifetime_res(segment_id) {
             Some(LifetimeRes::ElidedAnchor { start, end }) => (start, end),
             None => return,
             Some(res) => {
@@ -432,27 +435,31 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
         // Note: these spans are used for diagnostics when they can't be inferred.
         // See rustc_resolve::late::lifetimes::LifetimeContext::add_missing_lifetime_specifiers_label
-        let (elided_lifetime_span, with_angle_brackets) = if generic_args.span.is_empty() {
-            // If there are no brackets, use the identifier span.
+        let (elided_lifetime_span, angle_brackets) = if generic_args.span.is_empty() {
+            // No brackets, e.g. `Path`: use an empty span just past the end of the identifier.
             // HACK: we use find_ancestor_inside to properly suggest elided spans in paths
             // originating from macros, since the segment's span might be from a macro arg.
-            (segment_ident_span.find_ancestor_inside(path_span).unwrap_or(path_span), false)
-        } else if generic_args.is_empty() {
-            // If there are brackets, but not generic arguments, then use the opening bracket
-            (generic_args.span.with_hi(generic_args.span.lo() + BytePos(1)), true)
+            (
+                segment_ident_span.find_ancestor_inside(path_span).unwrap_or(path_span),
+                hir::AngleBrackets::Missing,
+            )
         } else {
-            // Else use an empty span right after the opening bracket.
-            (generic_args.span.with_lo(generic_args.span.lo() + BytePos(1)).shrink_to_lo(), true)
+            // Brackets, e.g. `Path<>` or `Path<T>`: use an empty span just after the `<`.
+            (
+                generic_args.span.with_lo(generic_args.span.lo() + BytePos(1)).shrink_to_lo(),
+                if generic_args.is_empty() {
+                    hir::AngleBrackets::Empty
+                } else {
+                    hir::AngleBrackets::Full
+                },
+            )
         };
 
         generic_args.args.insert_many(
             0,
             (start..end).map(|id| {
-                let l = self.lower_lifetime_hidden_in_path(
-                    id,
-                    elided_lifetime_span,
-                    with_angle_brackets,
-                );
+                let l =
+                    self.lower_lifetime_hidden_in_path(id, elided_lifetime_span, angle_brackets);
                 GenericArg::Lifetime(l)
             }),
         );
@@ -506,7 +513,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // we generally don't permit such things (see #51008).
         let ParenthesizedArgs { span, inputs, inputs_span, output } = data;
         let inputs = self.arena.alloc_from_iter(inputs.iter().map(|ty| {
-            self.lower_ty_direct(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
+            self.lower_ty(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
         }));
         let output_ty = match output {
             // Only allow `impl Trait` in return position. i.e.:
@@ -516,9 +523,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             // ```
             FnRetTy::Ty(ty) if matches!(itctx, ImplTraitContext::OpaqueTy { .. }) => {
                 if self.tcx.features().impl_trait_in_fn_trait_return() {
-                    self.lower_ty(ty, itctx)
+                    self.lower_ty_alloc(ty, itctx)
                 } else {
-                    self.lower_ty(
+                    self.lower_ty_alloc(
                         ty,
                         ImplTraitContext::FeatureGated(
                             ImplTraitPosition::FnTraitReturn,
@@ -527,9 +534,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     )
                 }
             }
-            FnRetTy::Ty(ty) => {
-                self.lower_ty(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitReturn))
-            }
+            FnRetTy::Ty(ty) => self
+                .lower_ty_alloc(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitReturn)),
             FnRetTy::Default(_) => self.arena.alloc(self.ty_tup(*span, &[])),
         };
         let args = smallvec![GenericArg::Type(

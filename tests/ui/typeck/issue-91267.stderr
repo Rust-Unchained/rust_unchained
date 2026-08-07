@@ -1,4 +1,4 @@
-error[E0412]: cannot find type `e` in this scope
+error[E0425]: cannot find type `e` in this scope
   --> $DIR/issue-91267.rs:4:30
    |
 LL |     type_ascribe!(0, u8<e<5>=e>)
@@ -17,10 +17,8 @@ LL | fn main() {
    |          - expected `()` because of default return type
 LL |     type_ascribe!(0, u8<e<5>=e>)
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `()`, found `u8`
-   |
-   = note: this error originates in the macro `type_ascribe` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: aborting due to 3 previous errors
 
-Some errors have detailed explanations: E0229, E0308, E0412.
+Some errors have detailed explanations: E0229, E0308, E0425.
 For more information about an error, try `rustc --explain E0229`.

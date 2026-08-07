@@ -1,19 +1,19 @@
 //! Completion for derives
 use hir::ScopeDef;
-use ide_db::{documentation::HasDocs, SymbolKind};
+use ide_db::{SymbolKind, documentation::HasDocs};
 use itertools::Itertools;
 use syntax::{SmolStr, ToSmolStr};
 
 use crate::{
+    Completions,
     context::{CompletionContext, ExistingDerives, PathCompletionCtx, Qualified},
     item::CompletionItem,
-    Completions,
 };
 
 pub(crate) fn complete_derive_path(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     existing_derives: &ExistingDerives,
 ) {
     let core = ctx.famous_defs().core();
@@ -56,7 +56,7 @@ pub(crate) fn complete_derive_path(
                     _ => return,
                 };
 
-                match (core, mac.module(ctx.db).krate()) {
+                match (core, mac.module(ctx.db).krate(ctx.db)) {
                     // show derive dependencies for `core`/`std` derives
                     (Some(core), mac_krate) if core == mac_krate => {}
                     _ => return acc.add_macro(ctx, path_ctx, mac, name),
@@ -107,7 +107,7 @@ struct DeriveDependencies {
 }
 
 /// Standard Rust derives that have dependencies
-/// (the dependencies are needed so that the main derive don't break the compilation when added)
+/// (the dependencies are needed so that the main derive doesn't break the compilation when added)
 const DEFAULT_DERIVE_DEPENDENCIES: &[DeriveDependencies] = &[
     DeriveDependencies { label: "Copy", dependencies: &["Clone"] },
     DeriveDependencies { label: "Eq", dependencies: &["PartialEq"] },

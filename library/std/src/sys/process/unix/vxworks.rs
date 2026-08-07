@@ -4,8 +4,8 @@ use libc::{self, RTP_ID, c_char, c_int};
 use super::common::*;
 use crate::io::{self, ErrorKind};
 use crate::num::NonZero;
-use crate::sys::cvt;
-use crate::sys::pal::thread;
+use crate::process::StdioPipes;
+use crate::sys::{cvt, thread};
 use crate::{fmt, sys};
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -25,6 +25,12 @@ impl Command {
             return Err(io::const_error!(
                 ErrorKind::InvalidInput,
                 "nul byte found in provided data",
+            ));
+        }
+        if self.get_chroot().is_some() {
+            return Err(io::const_error!(
+                ErrorKind::Unsupported,
+                "chroot not supported by vxworks",
             ));
         }
         let (ours, theirs) = self.setup_io(default, needs_stdin)?;
@@ -112,18 +118,23 @@ impl Command {
         }
     }
 
-    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-        let (proc, pipes) = self.spawn(Stdio::MakePipe, false)?;
-        crate::sys_common::process::wait_with_output(proc, pipes)
-    }
-
     pub fn exec(&mut self, default: Stdio) -> io::Error {
         let ret = Command::spawn(self, default, false);
         match ret {
             Ok(t) => unsafe {
                 let mut status = 0 as c_int;
                 libc::waitpid(t.0.pid, &mut status, 0);
-                libc::exit(0);
+                // If the task was killed by a signal, terminate the same way by
+                // restoring the default disposition and resending it to ourselves.
+                if libc::WIFSIGNALED(status) {
+                    let signal = libc::WTERMSIG(status);
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::kill(libc::getpid(), signal);
+                    // The signal should have already terminated us; abort if it
+                    // was blocked or ignored.
+                    libc::abort();
+                }
+                libc::exit(libc::WEXITSTATUS(status));
             },
             Err(e) => e,
         }
@@ -145,15 +156,24 @@ impl Process {
         self.pid as u32
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
-        // If we've already waited on this process then the pid can be recycled
-        // and used for another process, and we probably shouldn't be killing
+    pub fn kill(&self) -> io::Result<()> {
+        self.send_signal(libc::SIGKILL)
+    }
+
+    pub fn send_signal(&self, signal: i32) -> io::Result<()> {
+        // If we've already waited on this process then the pid can be recycled and
+        // used for another process, and we probably shouldn't be sending signals to
         // random processes, so return Ok because the process has exited already.
         if self.status.is_some() {
             Ok(())
         } else {
-            cvt(unsafe { libc::kill(self.pid, libc::SIGKILL) }).map(drop)
+            cvt(unsafe { libc::kill(self.pid, signal) }).map(drop)
         }
+    }
+
+    pub fn send_process_group_signal(&self, _signal: i32) -> io::Result<()> {
+        // VxWorks doesn't have process groups
+        unimplemented!()
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -198,7 +218,7 @@ impl ExitStatus {
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
         // This assumes that WIFEXITED(status) && WEXITSTATUS==0 corresponds to status==0. This is
         // true on all actual versions of Unix, is widely assumed, and is specified in SuS
-        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html. If it is not
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/wait.html. If it is not
         // true for a platform pretending to be Unix, the tests (our doctests, and also
         // unix/tests.rs) will spot it. `ExitStatusError::code` assumes this too.
         match NonZero::try_from(self.0) {

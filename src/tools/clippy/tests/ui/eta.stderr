@@ -214,5 +214,65 @@ error: redundant closure
 LL |         let _field = bind.or_else(|| get_default()).unwrap();
    |                                   ^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `get_default`
 
-error: aborting due to 35 previous errors
+error: redundant closure
+  --> tests/ui/eta.rs:589:16
+   |
+LL |     accepts_fn(|| f());
+   |                ^^^^^^ help: replace the closure with the function itself: `**f`
+
+error: redundant closure
+  --> tests/ui/eta.rs:593:16
+   |
+LL |     accepts_fn(|| g());
+   |                ^^^^^^ help: replace the closure with the function itself: `g`
+
+error: redundant closure
+  --> tests/ui/eta.rs:606:16
+   |
+LL |     accepts_fn(|| b());
+   |                ^^^^^^ help: replace the closure with the function itself: `***b`
+
+error: redundant closure
+  --> tests/ui/eta.rs:630:14
+   |
+LL |         .map(|n| MyError::A(n))
+   |              ^^^^^^^^^^^^^^^^^ help: replace the closure with the tuple variant itself: `MyError::A`
+
+error: redundant closure
+  --> tests/ui/eta.rs:627:14
+   |
+LL |         .map(|n| S(n))
+   |              ^^^^^^^^ help: replace the closure with the tuple struct itself: `S`
+
+error: redundant closure
+  --> tests/ui/eta.rs:624:14
+   |
+LL |         .map(|n| g(n))
+   |              ^^^^^^^^ help: replace the closure with the function itself: `g`
+
+error: redundant closure
+  --> tests/ui/eta.rs:621:14
+   |
+LL |         .map(|n| f(n))
+   |              ^^^^^^^^ help: replace the closure with the function itself: `f`
+
+error: redundant closure
+  --> tests/ui/eta.rs:648:31
+   |
+LL |         array.iter().for_each(|item| item.method());
+   |                               ^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the method itself: `Self::method`
+
+error: redundant closure
+  --> tests/ui/eta.rs:658:38
+   |
+LL |     (0..10).flat_map(|x| (0..10).map(|y| closure(y))).count();
+   |                                      ^^^^^^^^^^^^^^ help: replace the closure with the function itself: `&*closure`
+
+error: redundant closure
+  --> tests/ui/eta.rs:681:37
+   |
+LL | ...                   .reduce(|a, b| add(a, b))
+   |                               ^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `&add`
+
+error: aborting due to 45 previous errors
 

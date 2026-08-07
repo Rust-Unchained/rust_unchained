@@ -5,10 +5,9 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::UnordSet;
 use rustc_driver::USING_INTERNAL_FEATURES;
 use rustc_errors::TerminalUrl;
+use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::codes::*;
-use rustc_errors::emitter::{
-    DynEmitter, HumanEmitter, HumanReadableErrorType, OutputTheme, stderr_destination,
-};
+use rustc_errors::emitter::{DynEmitter, HumanReadableErrorType, OutputTheme, stderr_destination};
 use rustc_errors::json::JsonEmitter;
 use rustc_feature::UnstableFeatures;
 use rustc_hir::def::Res;
@@ -19,7 +18,7 @@ use rustc_lint::{MissingDoc, late_lint_mod};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
 use rustc_session::config::{
-    self, CrateType, ErrorOutputType, Input, OutFileName, OutputType, OutputTypes, ResolveDocLinks,
+    self, CrateType, ErrorOutputType, Input, OutputType, OutputTypes, ResolveDocLinks,
 };
 pub(crate) use rustc_session::config::{Options, UnstableOptions};
 use rustc_session::{Session, lint};
@@ -31,6 +30,7 @@ use crate::clean::inline::build_trait;
 use crate::clean::{self, ItemId};
 use crate::config::{Options as RustdocOptions, OutputFormat, RenderOptions};
 use crate::formats::cache::Cache;
+use crate::html::macro_expansion::{ExpandedCode, source_macro_expansion};
 use crate::passes;
 use crate::passes::Condition::*;
 use crate::passes::collect_intra_doc_links::LinkCollector;
@@ -56,20 +56,25 @@ pub(crate) struct DocContext<'tcx> {
     pub(crate) current_type_aliases: DefIdMap<usize>,
     /// Table synthetic type parameter for `impl Trait` in argument position -> bounds
     pub(crate) impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
-    /// Auto-trait or blanket impls processed so far, as `(self_ty, trait_def_id)`.
-    // FIXME(eddyb) make this a `ty::TraitRef<'tcx>` set.
-    pub(crate) generated_synthetics: FxHashSet<(Ty<'tcx>, DefId)>,
+
+    // FIXME: I'm pretty that the only reason we "need" these caches is because we also invoke
+    //        `synthesize_auto_trait_and_blanket_impls` on all impls(!) for primitive types
+    //        instead of calling it only once per primitive type (see also #97129).
+    //        Get rid of that jank and remove both caches!
+    //
+    /// The set of auto-trait impls generated so far; identified by `(self_ty, trait_def_id)`.
+    pub(crate) synthetic_auto_trait_impls: FxHashSet<(Ty<'tcx>, DefId)>,
+    /// The set of blanket impls generated so far; identified by `(self_ty, trait_def_id)`.
+    pub(crate) synthetic_blanket_impls: FxHashSet<(Ty<'tcx>, DefId)>,
+
+    /// All auto traits in the (visible) crate graph.
     pub(crate) auto_traits: Vec<DefId>,
-    /// The options given to rustdoc that could be relevant to a pass.
-    pub(crate) render_options: RenderOptions,
     /// This same cache is used throughout rustdoc, including in [`crate::html::render`].
     pub(crate) cache: Cache,
     /// Used by [`clean::inline`] to tell if an item has already been inlined.
     pub(crate) inlined: FxHashSet<ItemId>,
     /// Used by `calculate_doc_coverage`.
     pub(crate) output_format: OutputFormat,
-    /// Used by `strip_private`.
-    pub(crate) show_coverage: bool,
 }
 
 impl<'tcx> DocContext<'tcx> {
@@ -82,17 +87,22 @@ impl<'tcx> DocContext<'tcx> {
         def_id: DefId,
         f: F,
     ) -> T {
-        let old_param_env = mem::replace(&mut self.param_env, self.tcx.param_env(def_id));
+        self.with_exact_param_env(self.tcx.param_env(def_id), f)
+    }
+
+    pub(crate) fn with_exact_param_env<T, F: FnOnce(&mut Self) -> T>(
+        &mut self,
+        param_env: ParamEnv<'tcx>,
+        f: F,
+    ) -> T {
+        let old_param_env = mem::replace(&mut self.param_env, param_env);
         let ret = f(self);
         self.param_env = old_param_env;
         ret
     }
 
     pub(crate) fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        ty::TypingEnv {
-            typing_mode: ty::TypingMode::non_body_analysis(),
-            param_env: self.param_env,
-        }
+        ty::TypingEnv::new(self.param_env, ty::TypingMode::non_body_analysis())
     }
 
     /// Call the closure with the given parameters set as
@@ -135,7 +145,17 @@ impl<'tcx> DocContext<'tcx> {
     ///
     /// If another option like `--show-coverage` is enabled, it will return `false`.
     pub(crate) fn is_json_output(&self) -> bool {
-        self.output_format.is_json() && !self.show_coverage
+        self.output_format == OutputFormat::IrJson
+    }
+
+    /// If `--document-private-items` was passed to rustdoc.
+    pub(crate) fn document_private(&self) -> bool {
+        self.cache.document_private
+    }
+
+    /// If `--document-hidden-items` was passed to rustdoc.
+    pub(crate) fn document_hidden(&self) -> bool {
+        self.cache.document_hidden
     }
 }
 
@@ -149,27 +169,18 @@ pub(crate) fn new_dcx(
     diagnostic_width: Option<usize>,
     unstable_opts: &UnstableOptions,
 ) -> rustc_errors::DiagCtxt {
-    let fallback_bundle = rustc_errors::fallback_fluent_bundle(
-        rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
-        false,
-    );
     let emitter: Box<DynEmitter> = match error_format {
-        ErrorOutputType::HumanReadable { kind, color_config } => {
-            let short = kind.short();
-            Box::new(
-                HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
+        ErrorOutputType::HumanReadable { kind, color_config } => match kind {
+            HumanReadableErrorType { short, unicode } => Box::new(
+                AnnotateSnippetEmitter::new(stderr_destination(color_config))
                     .sm(source_map.map(|sm| sm as _))
                     .short_message(short)
                     .diagnostic_width(diagnostic_width)
                     .track_diagnostics(unstable_opts.track_diagnostics)
-                    .theme(if let HumanReadableErrorType::Unicode = kind {
-                        OutputTheme::Unicode
-                    } else {
-                        OutputTheme::Ascii
-                    })
+                    .theme(if unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
                     .ui_testing(unstable_opts.ui_testing),
-            )
-        }
+            ),
+        },
         ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             let source_map = source_map.unwrap_or_else(|| {
                 Arc::new(source_map::SourceMap::new(source_map::FilePathMapping::empty()))
@@ -178,7 +189,6 @@ pub(crate) fn new_dcx(
                 JsonEmitter::new(
                     Box::new(io::BufWriter::new(io::stderr())),
                     Some(source_map),
-                    fallback_bundle,
                     pretty,
                     json_rendered,
                     color_config,
@@ -215,8 +225,9 @@ pub(crate) fn create_config(
         describe_lints,
         lint_cap,
         scrape_examples_options,
-        expanded_args,
         remap_path_prefix,
+        remap_path_scope,
+        target_modifiers,
         ..
     }: RustdocOptions,
     render_options: &RenderOptions,
@@ -230,10 +241,14 @@ pub(crate) fn create_config(
         // it's unclear whether these should be part of rustdoc directly (#77364)
         rustc_lint::builtin::MISSING_DOCS.name.to_string(),
         rustc_lint::builtin::INVALID_DOC_ATTRIBUTES.name.to_string(),
+        rustc_lint::builtin::UNUSED_DOC_COMMENTS.name.to_string(),
         // these are definitely not part of rustdoc, but we want to warn on them anyway.
         rustc_lint::builtin::RENAMED_AND_REMOVED_LINTS.name.to_string(),
         rustc_lint::builtin::UNKNOWN_LINTS.name.to_string(),
         rustc_lint::builtin::UNEXPECTED_CFGS.name.to_string(),
+        rustc_lint::builtin::DUPLICATE_FEATURES.name.to_string(),
+        rustc_lint::builtin::UNUSED_FEATURES.name.to_string(),
+        rustc_lint::builtin::STABLE_FEATURES.name.to_string(),
         // this lint is needed to support `#[expect]` attributes
         rustc_lint::builtin::UNFULFILLED_LINT_EXPECTATIONS.name.to_string(),
     ];
@@ -272,14 +287,13 @@ pub(crate) fn create_config(
         crate_name,
         test,
         remap_path_prefix,
+        remap_path_scope,
         output_types: if let Some(file) = render_options.dep_info() {
-            OutputTypes::new(&[(
-                OutputType::DepInfo,
-                file.map(|f| OutFileName::Real(f.to_path_buf())),
-            )])
+            OutputTypes::new(&[(OutputType::DepInfo, file.cloned())])
         } else {
             OutputTypes::new(&[])
         },
+        target_modifiers,
         ..Options::default()
     };
 
@@ -289,44 +303,41 @@ pub(crate) fn create_config(
         crate_check_cfg: check_cfgs,
         input,
         output_file: None,
-        output_dir: None,
+        output_dir: if render_options.output_to_stdout {
+            None
+        } else {
+            Some(render_options.output.clone())
+        },
         file_loader: None,
-        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps,
         psess_created: None,
-        hash_untracked_state: None,
+        track_state: None,
         register_lints: Some(Box::new(crate::lint::register_lints)),
         override_queries: Some(|_sess, providers| {
             // We do not register late module lints, so this only runs `MissingDoc`.
             // Most lints will require typechecking, so just don't run them.
-            providers.lint_mod = |tcx, module_def_id| late_lint_mod(tcx, module_def_id, MissingDoc);
+            providers.queries.lint_mod =
+                |tcx, module_def_id| late_lint_mod(tcx, module_def_id, MissingDoc);
             // hack so that `used_trait_imports` won't try to call typeck
-            providers.used_trait_imports = |_, _| {
+            providers.queries.used_trait_imports = |_, _| {
                 static EMPTY_SET: LazyLock<UnordSet<LocalDefId>> = LazyLock::new(UnordSet::default);
                 &EMPTY_SET
             };
             // In case typeck does end up being called, don't ICE in case there were name resolution errors
-            providers.typeck = move |tcx, def_id| {
-                // Closures' tables come from their outermost function,
-                // as they are part of the same "inference environment".
-                // This avoids emitting errors for the parent twice (see similar code in `typeck_with_fallback`)
-                let typeck_root_def_id = tcx.typeck_root_def_id(def_id.to_def_id()).expect_local();
-                if typeck_root_def_id != def_id {
-                    return tcx.typeck(typeck_root_def_id);
-                }
+            providers.queries.typeck_root = move |tcx, def_id| {
+                // Panic before code below breaks in case of someone calls typeck_root directly
+                assert!(!tcx.is_typeck_child(def_id.to_def_id()));
 
                 let body = tcx.hir_body_owned_by(def_id);
                 debug!("visiting body for {def_id:?}");
                 EmitIgnoredResolutionErrors::new(tcx).visit_body(body);
-                (rustc_interface::DEFAULT_QUERY_PROVIDERS.typeck)(tcx, def_id)
+                (rustc_interface::DEFAULT_QUERY_PROVIDERS.queries.typeck_root)(tcx, def_id)
             };
         }),
         extra_symbols: Vec::new(),
         make_codegen_backend: None,
-        registry: rustc_driver::diagnostics_registry(),
         ice_file: None,
         using_internal_features: &USING_INTERNAL_FEATURES,
-        expanded_args,
     }
 }
 
@@ -335,19 +346,25 @@ pub(crate) fn run_global_ctxt(
     show_coverage: bool,
     render_options: RenderOptions,
     output_format: OutputFormat,
-) -> (clean::Crate, RenderOptions, Cache) {
+) -> (clean::Crate, RenderOptions, Cache, FxHashMap<rustc_span::BytePos, Vec<ExpandedCode>>) {
     // Certain queries assume that some checks were run elsewhere
     // (see https://github.com/rust-lang/rust/pull/73566#issuecomment-656954425),
     // so type-check everything other than function bodies in this crate before running lints.
+
+    let expanded_macros = {
+        // We need for these variables to be removed to ensure that the `Crate` won't be "stolen"
+        // anymore.
+        let krate = &*tcx.resolver_for_lowering().1.borrow();
+
+        source_macro_expansion(&krate, &render_options, output_format, tcx.sess.source_map())
+    };
 
     // NOTE: this does not call `tcx.analysis()` so that we won't
     // typeck function bodies or run the default rustc lints.
     // (see `override_queries` in the `config`)
 
     // NOTE: These are copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
-    let _ = tcx.sess.time("wf_checking", || {
-        tcx.try_par_hir_for_each_module(|module| tcx.ensure_ok().check_mod_type_wf(module))
-    });
+    tcx.sess.time("wf_checking", || tcx.ensure_ok().check_type_wf(()));
 
     tcx.dcx().abort_if_errors();
 
@@ -358,7 +375,7 @@ pub(crate) fn run_global_ctxt(
     rustc_passes::stability::check_unused_or_stable_features(tcx);
 
     let auto_traits =
-        tcx.all_traits().filter(|&trait_def_id| tcx.trait_is_auto(trait_def_id)).collect();
+        tcx.visible_traits().filter(|&trait_def_id| tcx.trait_is_auto(trait_def_id)).collect();
 
     let mut ctxt = DocContext {
         tcx,
@@ -368,13 +385,12 @@ pub(crate) fn run_global_ctxt(
         args: Default::default(),
         current_type_aliases: Default::default(),
         impl_trait_bounds: Default::default(),
-        generated_synthetics: Default::default(),
+        synthetic_auto_trait_impls: Default::default(),
+        synthetic_blanket_impls: Default::default(),
         auto_traits,
         cache: Cache::new(render_options.document_private, render_options.document_hidden),
         inlined: FxHashSet::default(),
         output_format,
-        render_options,
-        show_coverage,
     };
 
     for cnum in tcx.crates(()) {
@@ -389,8 +405,6 @@ pub(crate) fn run_global_ctxt(
         ctxt.external_traits.insert(sized_trait_did, sized_trait);
     }
 
-    debug!("crate: {:?}", tcx.hir_crate(()));
-
     let mut krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
 
     if krate.module.doc_value().is_empty() {
@@ -399,22 +413,17 @@ pub(crate) fn run_global_ctxt(
             {}/rustdoc/how-to-write-documentation.html",
             crate::DOC_RUST_LANG_ORG_VERSION
         );
-        tcx.node_lint(
+        tcx.emit_node_lint(
             crate::lint::MISSING_CRATE_LEVEL_DOCS,
             DocContext::as_local_hir_id(tcx, krate.module.item_id).unwrap(),
-            |lint| {
+            rustc_errors::DiagDecorator(|lint| {
+                if let Some(local_def_id) = krate.module.item_id.as_local_def_id() {
+                    lint.span(tcx.def_span(local_def_id));
+                }
                 lint.primary_message("no documentation found for this crate's top-level module");
                 lint.help(help);
-            },
+            }),
         );
-    }
-
-    // Process all of the crate attributes, extracting plugin metadata along
-    // with the passes which we are supposed to run.
-    for attr in krate.module.attrs.lists(sym::doc) {
-        if attr.is_word() && attr.has_name(sym::document_private_items) {
-            ctxt.render_options.document_private = true;
-        }
     }
 
     info!("Executing passes");
@@ -425,9 +434,9 @@ pub(crate) fn run_global_ctxt(
     for p in passes::defaults(show_coverage) {
         let run = match p.condition {
             Always => true,
-            WhenDocumentPrivate => ctxt.render_options.document_private,
-            WhenNotDocumentPrivate => !ctxt.render_options.document_private,
-            WhenNotDocumentHidden => !ctxt.render_options.document_hidden,
+            WhenDocumentPrivate => ctxt.document_private(),
+            WhenNotDocumentPrivate => !ctxt.document_private(),
+            WhenNotDocumentHidden => !ctxt.document_hidden(),
         };
         if run {
             debug!("running pass {}", p.pass.name);
@@ -443,9 +452,17 @@ pub(crate) fn run_global_ctxt(
         }
     }
 
+    if show_coverage
+        && let Err(error) = crate::calculate_doc_coverage::run(&krate, &mut ctxt, &render_options)
+    {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     tcx.sess.time("check_lint_expectations", || tcx.check_expectations(Some(sym::rustdoc)));
 
-    krate = tcx.sess.time("create_format_cache", || Cache::populate(&mut ctxt, krate));
+    krate =
+        tcx.sess.time("create_format_cache", || Cache::populate(&mut ctxt, krate, &render_options));
 
     let mut collector =
         LinkCollector { cx: &mut ctxt, visited_links: visited, ambiguous_links: ambiguous };
@@ -453,7 +470,7 @@ pub(crate) fn run_global_ctxt(
 
     tcx.dcx().abort_if_errors();
 
-    (krate, ctxt.render_options, ctxt.cache)
+    (krate, render_options, ctxt.cache, expanded_macros)
 }
 
 /// Due to <https://github.com/rust-lang/rust/pull/73566>,

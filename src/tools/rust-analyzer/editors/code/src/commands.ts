@@ -33,6 +33,7 @@ import { log } from "./util";
 import type { SyntaxElement } from "./syntax_tree_provider";
 
 export * from "./run";
+export { newProject } from "./new_project";
 
 export function analyzerStatus(ctx: CtxInit): Cmd {
     const tdcp = new (class implements vscode.TextDocumentContentProvider {
@@ -71,32 +72,9 @@ export function analyzerStatus(ctx: CtxInit): Cmd {
 }
 
 export function memoryUsage(ctx: CtxInit): Cmd {
-    const tdcp = new (class implements vscode.TextDocumentContentProvider {
-        readonly uri = vscode.Uri.parse("rust-analyzer-memory://memory");
-        readonly eventEmitter = new vscode.EventEmitter<vscode.Uri>();
-
-        provideTextDocumentContent(_uri: vscode.Uri): vscode.ProviderResult<string> {
-            if (!vscode.window.activeTextEditor) return "";
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return ctx.client.sendRequest(ra.memoryUsage).then((mem: any) => {
-                return "Per-query memory usage:\n" + mem + "\n(note: database has been cleared)";
-            });
-        }
-
-        get onDidChange(): vscode.Event<vscode.Uri> {
-            return this.eventEmitter.event;
-        }
-    })();
-
-    ctx.pushExtCleanup(
-        vscode.workspace.registerTextDocumentContentProvider("rust-analyzer-memory", tdcp),
-    );
-
     return async () => {
-        tdcp.eventEmitter.fire(tdcp.uri);
-        const document = await vscode.workspace.openTextDocument(tdcp.uri);
-        return vscode.window.showTextDocument(document, vscode.ViewColumn.Two, true);
+        const response = await ctx.client.sendRequest(ra.memoryUsage);
+        vscode.window.showInformationMessage(response);
     };
 }
 
@@ -238,6 +216,43 @@ export function parentModule(ctx: CtxInit): Cmd {
         const client = ctx.client;
 
         const locations = await client.sendRequest(ra.parentModule, {
+            textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(editor.document),
+            position: client.code2ProtocolConverter.asPosition(editor.selection.active),
+        });
+        if (!locations) return;
+
+        if (locations.length === 1) {
+            const loc = unwrapUndefinable(locations[0]);
+
+            const uri = client.protocol2CodeConverter.asUri(loc.targetUri);
+            const range = client.protocol2CodeConverter.asRange(loc.targetRange);
+
+            const doc = await vscode.workspace.openTextDocument(uri);
+            const e = await vscode.window.showTextDocument(doc);
+            e.selection = new vscode.Selection(range.start, range.start);
+            e.revealRange(range, vscode.TextEditorRevealType.InCenter);
+        } else {
+            const uri = editor.document.uri.toString();
+            const position = client.code2ProtocolConverter.asPosition(editor.selection.active);
+            await showReferencesImpl(
+                client,
+                uri,
+                position,
+                locations.map((loc) => lc.Location.create(loc.targetUri, loc.targetRange)),
+            );
+        }
+    };
+}
+
+export function childModules(ctx: CtxInit): Cmd {
+    return async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+        if (!(isRustDocument(editor.document) || isCargoTomlDocument(editor.document))) return;
+
+        const client = ctx.client;
+
+        const locations = await client.sendRequest(ra.childModules, {
             textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(editor.document),
             position: client.code2ProtocolConverter.asPosition(editor.selection.active),
         });
@@ -480,6 +495,102 @@ export function ssr(ctx: CtxInit): Cmd {
     };
 }
 
+const EVALUATE_PREDICATE_LAST_INPUT_KEY = "evaluatePredicate.lastInput";
+
+export function evaluatePredicate(ctx: CtxInit): Cmd {
+    return async () => {
+        const editor = ctx.activeRustEditor;
+        if (!editor) {
+            await vscode.window.showWarningMessage(
+                "rust-analyzer: evaluate predicate requires an active Rust editor",
+            );
+            return;
+        }
+
+        const client = ctx.client;
+        const textDocument = client.code2ProtocolConverter.asTextDocumentIdentifier(
+            editor.document,
+        );
+        const position = client.code2ProtocolConverter.asPosition(editor.selection.active);
+
+        const input = vscode.window.createInputBox();
+        input.value = ctx.extCtx.workspaceState.get<string>(
+            EVALUATE_PREDICATE_LAST_INPUT_KEY,
+            "Vec<u32>: Clone",
+        );
+        input.prompt = "Enter a Rust where-clause predicate";
+        input.placeholder = "Vec<u32>: Clone";
+
+        let requestId = 0;
+        let hidden = false;
+        const updatePredicateResult = async (text: string) => {
+            const currentRequestId = ++requestId;
+            await ctx.extCtx.workspaceState.update(EVALUATE_PREDICATE_LAST_INPUT_KEY, text);
+            if (text.trim() === "") {
+                input.validationMessage = undefined;
+                return;
+            }
+
+            try {
+                const result = await client.sendRequest(ra.evaluatePredicate, {
+                    text,
+                    textDocument,
+                    position,
+                });
+                if (!hidden && currentRequestId === requestId) {
+                    input.validationMessage = predicateEvaluationValidationMessage(result);
+                }
+            } catch (error) {
+                if (!hidden && currentRequestId === requestId) {
+                    input.validationMessage = {
+                        message: String(error),
+                        severity: vscode.InputBoxValidationSeverity.Error,
+                    };
+                }
+            }
+        };
+
+        await new Promise<void>((resolve) => {
+            input.onDidChangeValue((text) => void updatePredicateResult(text));
+            input.onDidAccept(() => input.hide());
+            input.onDidHide(() => {
+                hidden = true;
+                input.dispose();
+                resolve();
+            });
+            input.show();
+            void updatePredicateResult(input.value);
+        });
+    };
+}
+
+function predicateEvaluationValidationMessage(
+    result: ra.EvaluatePredicateResult,
+): vscode.InputBoxValidationMessage {
+    switch (result.status) {
+        case "holds":
+            return {
+                message: result.message,
+                severity: vscode.InputBoxValidationSeverity.Info,
+            };
+        case "notProven":
+            return {
+                message: result.message,
+                severity: vscode.InputBoxValidationSeverity.Warning,
+            };
+        case "invalid":
+            return {
+                message: result.message,
+                severity: vscode.InputBoxValidationSeverity.Error,
+            };
+        case "unsupported":
+            return {
+                message: result.message,
+                severity: vscode.InputBoxValidationSeverity.Warning,
+            };
+    }
+}
+
 export function serverVersion(ctx: CtxInit): Cmd {
     return async () => {
         if (!ctx.serverPath) {
@@ -583,6 +694,18 @@ export function viewHir(ctx: CtxInit): Cmd {
 // The contents of the file come from the `TextDocumentContentProvider`
 export function viewMir(ctx: CtxInit): Cmd {
     return viewHirOrMir(ctx, "mir");
+}
+
+export function getFailedObligations(ctx: CtxInit): Cmd {
+    const uri = `rust-analyzer-failed-obligations://getFailedObligations/failedObligations.rs`;
+    const scheme = `rust-analyzer-failed-obligations`;
+    return viewFileUsingTextDocumentContentProvider(
+        ctx,
+        ra.getFailedObligations,
+        uri,
+        scheme,
+        true,
+    );
 }
 
 // Opens the virtual file that will show the MIR of the function containing the cursor position
@@ -1077,11 +1200,11 @@ export function applySnippetWorkspaceEditCommand(_ctx: CtxInit): Cmd {
     };
 }
 
-export function run(ctx: CtxInit): Cmd {
+export function run(ctx: CtxInit, mode?: "cursor"): Cmd {
     let prevRunnable: RunnableQuickPick | undefined;
 
     return async () => {
-        const item = await selectRunnable(ctx, prevRunnable);
+        const item = await selectRunnable(ctx, prevRunnable, false, true, mode);
         if (!item) return;
 
         item.detail = "rerun";
@@ -1168,9 +1291,8 @@ export function runSingle(ctx: CtxInit): Cmd {
 }
 
 export function copyRunCommandLine(ctx: CtxInit) {
-    let prevRunnable: RunnableQuickPick | undefined;
     return async () => {
-        const item = await selectRunnable(ctx, prevRunnable);
+        const item = await selectRunnable(ctx, undefined);
         if (!item || !isCargoRunnableArgs(item.runnable.args)) return;
         const args = createCargoArgs(item.runnable.args);
         const commandLine = ["cargo", ...args].join(" ");

@@ -1,5 +1,5 @@
 #![warn(clippy::missing_const_for_fn)]
-#![allow(incomplete_features, clippy::let_and_return, clippy::missing_transmute_annotations)]
+#![expect(clippy::let_and_return)]
 #![feature(const_trait_impl)]
 
 use std::mem::transmute;
@@ -220,4 +220,67 @@ mod extern_fn {
 fn mut_add(x: &mut i32) {
     //~^ missing_const_for_fn
     *x += 1;
+}
+
+mod issue_15079 {
+    pub trait Trait {}
+
+    pub struct Struct<T: Trait> {
+        _t: Option<T>,
+    }
+
+    impl<T: Trait> Struct<T> {
+        #[clippy::msrv = "1.60"]
+        pub fn new_1_60() -> Self {
+            Self { _t: None }
+        }
+
+        #[clippy::msrv = "1.61"]
+        pub fn new_1_61() -> Self {
+            //~^ missing_const_for_fn
+            Self { _t: None }
+        }
+    }
+
+    pub struct S2<T> {
+        _t: Option<T>,
+    }
+
+    impl<T> S2<T> {
+        #[clippy::msrv = "1.60"]
+        pub fn new_1_60() -> Self {
+            //~^ missing_const_for_fn
+            Self { _t: None }
+        }
+
+        #[clippy::msrv = "1.61"]
+        pub fn new_1_61() -> Self {
+            //~^ missing_const_for_fn
+            Self { _t: None }
+        }
+    }
+
+    pub struct S3<T: ?Sized + 'static> {
+        _t: Option<&'static T>,
+    }
+
+    impl<T: ?Sized + 'static> S3<T> {
+        #[clippy::msrv = "1.60"]
+        pub fn new_1_60() -> Self {
+            //~^ missing_const_for_fn
+            Self { _t: None }
+        }
+
+        #[clippy::msrv = "1.61"]
+        pub fn new_1_61() -> Self {
+            //~^ missing_const_for_fn
+            Self { _t: None }
+        }
+    }
+}
+
+pub fn issue17119(s: &str) -> bool {
+    //~^ missing_const_for_fn
+    let [_] = s.as_bytes() else { return false };
+    true
 }

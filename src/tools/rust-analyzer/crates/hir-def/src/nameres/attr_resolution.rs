@@ -1,21 +1,19 @@
 //! Post-nameres attribute resolution.
 
-use base_db::CrateId;
+use base_db::{Crate, SourceDatabase};
 use hir_expand::{
+    AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},
     inert_attr_macro::find_builtin_attr_idx,
-    MacroCallId, MacroCallKind, MacroDefId,
+    mod_path::{ModPath, PathKind},
 };
-use span::SyntaxContextId;
+use span::SyntaxContext;
 use syntax::ast;
-use triomphe::Arc;
 
 use crate::{
-    db::DefDatabase,
+    AstIdWithPath, MacroId, ModuleId, UnresolvedMacro,
     item_scope::BuiltinShadowMode,
-    nameres::path_resolution::ResolveMode,
-    path::{self, ModPath, PathKind},
-    AstIdWithPath, LocalModuleId, MacroId, UnresolvedMacro,
+    nameres::{LocalDefMap, path_resolution::ResolveMode},
 };
 
 use super::{DefMap, MacroSubNs};
@@ -28,12 +26,15 @@ pub enum ResolvedAttr {
 }
 
 impl DefMap {
+    /// This cannot be used to resolve items that allow derives.
     pub(crate) fn resolve_attr_macro(
         &self,
-        db: &dyn DefDatabase,
-        original_module: LocalModuleId,
+        local_def_map: &LocalDefMap,
+        db: &dyn SourceDatabase,
+        original_module: ModuleId,
         ast_id: AstIdWithPath<ast::Item>,
         attr: &Attr,
+        attr_id: AttrId,
     ) -> Result<ResolvedAttr, UnresolvedMacro> {
         // NB: does not currently work for derive helpers as they aren't recorded in the `DefMap`
 
@@ -42,6 +43,7 @@ impl DefMap {
         }
 
         let resolved_res = self.resolve_path_fp_with_macro(
+            local_def_map,
             db,
             ResolveMode::Other,
             original_module,
@@ -59,15 +61,18 @@ impl DefMap {
                     return Ok(ResolvedAttr::Other);
                 }
             }
-            None => return Err(UnresolvedMacro { path: ast_id.path.as_ref().clone() }),
+            None => return Err(UnresolvedMacro { path: (*ast_id.path).clone() }),
         };
 
         Ok(ResolvedAttr::Macro(attr_macro_as_call_id(
             db,
             &ast_id,
             attr,
+            // There aren't any active attributes before this one, because attribute macros
+            // replace their input, and derive macros are not allowed in this function.
+            AttrMacroAttrIds::from_one(attr_id),
             self.krate,
-            db.macro_def(def),
+            def.definition(db),
         )))
     }
 
@@ -88,13 +93,8 @@ impl DefMap {
                 return true;
             }
 
-            if segments.len() == 1 {
-                if find_builtin_attr_idx(name).is_some() {
-                    return true;
-                }
-                if self.data.registered_attrs.iter().any(pred) {
-                    return true;
-                }
+            if segments.len() == 1 && find_builtin_attr_idx(name).is_some() {
+                return true;
             }
         }
         false
@@ -102,16 +102,17 @@ impl DefMap {
 }
 
 pub(super) fn attr_macro_as_call_id(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     item_attr: &AstIdWithPath<ast::Item>,
     macro_attr: &Attr,
-    krate: CrateId,
+    censored_attr_ids: AttrMacroAttrIds,
+    krate: Crate,
     def: MacroDefId,
 ) -> MacroCallId {
     let arg = match macro_attr.input.as_deref() {
         Some(AttrInput::TokenTree(tt)) => {
             let mut tt = tt.clone();
-            tt.top_subtree_delimiter_mut().kind = tt::DelimiterKind::Invisible;
+            tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
             Some(tt)
         }
 
@@ -119,32 +120,32 @@ pub(super) fn attr_macro_as_call_id(
     };
 
     def.make_call(
-        db.upcast(),
+        db,
         krate,
         MacroCallKind::Attr {
             ast_id: item_attr.ast_id,
-            attr_args: arg.map(Arc::new),
-            invoc_attr_index: macro_attr.id,
+            attr_args: arg.map(Box::new),
+            censored_attr_ids,
         },
         macro_attr.ctxt,
     )
 }
 
 pub(super) fn derive_macro_as_call_id(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     item_attr: &AstIdWithPath<ast::Adt>,
     derive_attr_index: AttrId,
     derive_pos: u32,
-    call_site: SyntaxContextId,
-    krate: CrateId,
-    resolver: impl Fn(&path::ModPath) -> Option<(MacroId, MacroDefId)>,
+    call_site: SyntaxContext,
+    krate: Crate,
+    resolver: impl Fn(&ModPath) -> Option<(MacroId, MacroDefId)>,
     derive_macro_id: MacroCallId,
 ) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
     let (macro_id, def_id) = resolver(&item_attr.path)
         .filter(|(_, def_id)| def_id.is_derive())
-        .ok_or_else(|| UnresolvedMacro { path: item_attr.path.as_ref().clone() })?;
+        .ok_or_else(|| UnresolvedMacro { path: (*item_attr.path).clone() })?;
     let call_id = def_id.make_call(
-        db.upcast(),
+        db,
         krate,
         MacroCallKind::Derive {
             ast_id: item_attr.ast_id,

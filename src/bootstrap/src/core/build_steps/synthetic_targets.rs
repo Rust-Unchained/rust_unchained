@@ -8,9 +8,8 @@
 //! that calls create_synthetic_target.
 
 use crate::Compiler;
-use crate::core::builder::{Builder, ShouldRun, Step};
+use crate::core::builder::{Builder, Step};
 use crate::core::config::TargetSelection;
-use crate::utils::exec::command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MirOptPanicAbortSyntheticTarget {
@@ -20,12 +19,6 @@ pub(crate) struct MirOptPanicAbortSyntheticTarget {
 
 impl Step for MirOptPanicAbortSyntheticTarget {
     type Output = TargetSelection;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = false;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         create_synthetic_target(builder, self.compiler, "miropt-abort", self.base, |spec| {
@@ -56,7 +49,7 @@ fn create_synthetic_target(
         return TargetSelection::create_synthetic(&name, path.to_str().unwrap());
     }
 
-    let mut cmd = command(builder.rustc(compiler));
+    let mut cmd = builder.rustc_cmd(compiler);
     cmd.arg("--target").arg(base.rustc_target_arg());
     cmd.args(["-Zunstable-options", "--print", "target-spec-json"]);
 

@@ -1,19 +1,18 @@
-use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::higher::VecArgs;
-use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr_without_closures;
+use clippy_utils::source::{snippet, snippet_indent};
 use rustc_ast::LitKind;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::Applicability;
-use rustc_hir::{ConstArgKind, ExprKind, Node};
+use rustc_hir::{ConstArgKind, Expr, ExprKind, LetStmt, LocalSource, Node};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{IsSuggestable, Ty};
 use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for array or vec initializations which call a function or method,
+    /// Checks for array or vec initializations which contain an expression with side effects,
     /// but which have a repeat count of zero.
     ///
     /// ### Why is this bad?
@@ -46,7 +45,7 @@ declare_clippy_lint! {
 declare_lint_pass!(ZeroRepeatSideEffects => [ZERO_REPEAT_SIDE_EFFECTS]);
 
 impl LateLintPass<'_> for ZeroRepeatSideEffects {
-    fn check_expr(&mut self, cx: &LateContext<'_>, expr: &rustc_hir::Expr<'_>) {
+    fn check_expr(&mut self, cx: &LateContext<'_>, expr: &Expr<'_>) {
         if let Some(args) = VecArgs::hir(cx, expr)
             && let VecArgs::Repeat(inner_expr, len) = args
             && let ExprKind::Lit(l) = len.kind
@@ -71,91 +70,106 @@ impl LateLintPass<'_> for ZeroRepeatSideEffects {
     }
 }
 
-fn inner_check(cx: &LateContext<'_>, expr: &'_ rustc_hir::Expr<'_>, inner_expr: &'_ rustc_hir::Expr<'_>, is_vec: bool) {
+fn inner_check(cx: &LateContext<'_>, expr: &'_ Expr<'_>, inner_expr: &'_ Expr<'_>, is_vec: bool) {
     // check if expr is a call or has a call inside it
-    if for_each_expr_without_closures(inner_expr, |x| {
-        if let ExprKind::Call(_, _) | ExprKind::MethodCall(_, _, _, _) = x.kind {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        }
-    })
-    .is_some()
-    {
+    if inner_expr.can_have_side_effects() {
         let parent_hir_node = cx.tcx.parent_hir_node(expr.hir_id);
+        let inner_expr_ty = cx.typeck_results().expr_ty(inner_expr);
         let return_type = cx.typeck_results().expr_ty(expr);
 
-        if let Node::LetStmt(l) = parent_hir_node {
-            array_span_lint(
-                cx,
-                l.span,
-                inner_expr.span,
-                l.pat.span,
-                Some(return_type),
-                is_vec,
-                false,
-            );
-        } else if let Node::Expr(x) = parent_hir_node
-            && let ExprKind::Assign(l, _, _) = x.kind
-        {
-            array_span_lint(cx, x.span, inner_expr.span, l.span, Some(return_type), is_vec, true);
-        } else {
-            span_lint_and_sugg(
-                cx,
-                ZERO_REPEAT_SIDE_EFFECTS,
-                expr.span.source_callsite(),
-                "function or method calls as the initial value in zero-sized array initializers may cause side effects",
-                "consider using",
+        let inner_expr = snippet(cx, inner_expr.span.source_callsite(), "..");
+        let indent = snippet_indent(cx, expr.span).unwrap_or_default();
+        let vec = if is_vec { "vec!" } else { "" };
+
+        let (span, sugg) = match parent_hir_node {
+            Node::LetStmt(l)
+                if matches!(l.source, LocalSource::AssignDesugar)
+                    && let mut parent_iter = cx.tcx.hir_parent_iter(l.hir_id)
+                    && let Some((_, Node::Stmt(_))) = parent_iter.next()
+                    && let Some((_, Node::Block(_))) = parent_iter.next()
+                    && let Some((_, Node::Expr(x))) = parent_iter.next() =>
+            {
+                (
+                    x.span,
+                    assign_expr_suggestion(cx, x, l.pat.span, &inner_expr, return_type, vec),
+                )
+            },
+            Node::LetStmt(l) => (l.span, let_stmt_suggestion(cx, l, &inner_expr, return_type, vec)),
+            Node::Expr(x) if let ExprKind::Assign(l, _, _) = x.kind => (
+                x.span,
+                assign_expr_suggestion(cx, x, l.span, &inner_expr, return_type, vec),
+            ),
+            // NOTE: don't use the stmt span to avoid touching the trailing semicolon
+            Node::Stmt(_) => (expr.span, format!("{inner_expr};\n{indent}{vec}[] as {return_type}")),
+            _ => (
+                expr.span,
                 format!(
-                    "{{ {}; {}[] as {return_type} }}",
-                    snippet(cx, inner_expr.span.source_callsite(), ".."),
-                    if is_vec { "vec!" } else { "" },
+                    "\
+{{
+{indent}    {inner_expr};
+{indent}    {vec}[] as {return_type}
+{indent}}}"
                 ),
-                Applicability::Unspecified,
-            );
-        }
+            ),
+        };
+        let span = span.source_callsite();
+        span_lint_and_then(
+            cx,
+            ZERO_REPEAT_SIDE_EFFECTS,
+            span,
+            "expression with side effects as the initial value in a zero-sized array initializer",
+            |diag| {
+                if (!inner_expr_ty.is_never() || cx.tcx.features().never_type())
+                    && return_type.is_suggestable(cx.tcx, true)
+                {
+                    diag.span_suggestion_verbose(
+                        span,
+                        "consider performing the side effect separately",
+                        sugg,
+                        Applicability::Unspecified,
+                    );
+                } else {
+                    diag.help("consider performing the side effect separately");
+                }
+            },
+        );
     }
 }
 
-fn array_span_lint(
+fn let_stmt_suggestion(
     cx: &LateContext<'_>,
-    expr_span: Span,
-    func_call_span: Span,
-    variable_name_span: Span,
-    expr_ty: Option<Ty<'_>>,
-    is_vec: bool,
-    is_assign: bool,
-) {
-    let has_ty = expr_ty.is_some();
+    let_stmt: &LetStmt<'_>,
+    inner_expr: &str,
+    return_type: Ty<'_>,
+    vec_str: &str,
+) -> String {
+    let indent = snippet_indent(cx, let_stmt.span).unwrap_or_default();
+    format!(
+        "{inner_expr};\n{}let {var_name}: {return_type} = {vec_str}[];",
+        indent,
+        var_name = snippet(cx, let_stmt.pat.span.source_callsite(), "..")
+    )
+}
 
-    span_lint_and_sugg(
-        cx,
-        ZERO_REPEAT_SIDE_EFFECTS,
-        expr_span.source_callsite(),
-        "function or method calls as the initial value in zero-sized array initializers may cause side effects",
-        "consider using",
-        format!(
-            "{}; {}{}{} = {}[]{}{}",
-            snippet(cx, func_call_span.source_callsite(), ".."),
-            if has_ty && !is_assign { "let " } else { "" },
-            snippet(cx, variable_name_span.source_callsite(), ".."),
-            if let Some(ty) = expr_ty
-                && !is_assign
-            {
-                format!(": {ty}")
-            } else {
-                String::new()
-            },
-            if is_vec { "vec!" } else { "" },
-            if let Some(ty) = expr_ty
-                && is_assign
-            {
-                format!(" as {ty}")
-            } else {
-                String::new()
-            },
-            if is_assign { "" } else { ";" }
-        ),
-        Applicability::Unspecified,
-    );
+fn assign_expr_suggestion(
+    cx: &LateContext<'_>,
+    outer_expr: &Expr<'_>,
+    assign_expr_span: Span,
+    inner_expr: &str,
+    return_type: Ty<'_>,
+    vec_str: &str,
+) -> String {
+    let mut parent_hir_node = cx.tcx.parent_hir_node(outer_expr.hir_id);
+    if let Node::Stmt(stmt) = parent_hir_node {
+        parent_hir_node = cx.tcx.parent_hir_node(stmt.hir_id);
+    }
+    let needs_curly = !matches!(parent_hir_node, Node::Block(_));
+
+    let indent = snippet_indent(cx, outer_expr.span).unwrap_or_default();
+    let var_name = snippet(cx, assign_expr_span.source_callsite(), "..");
+    if needs_curly {
+        format!("{{\n    {indent}{inner_expr};\n    {indent}{var_name} = {vec_str}[] as {return_type}\n{indent}}}")
+    } else {
+        format!("{inner_expr};\n{indent}{var_name} = {vec_str}[] as {return_type}")
+    }
 }

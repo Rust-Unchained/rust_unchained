@@ -39,6 +39,8 @@ declare_clippy_lint! {
     "capitalized acronyms are against the naming convention"
 }
 
+impl_lint_pass!(UpperCaseAcronyms => [UPPER_CASE_ACRONYMS]);
+
 pub struct UpperCaseAcronyms {
     avoid_breaking_exported_api: bool,
     upper_case_acronyms_aggressive: bool,
@@ -52,8 +54,6 @@ impl UpperCaseAcronyms {
         }
     }
 }
-
-impl_lint_pass!(UpperCaseAcronyms => [UPPER_CASE_ACRONYMS]);
 
 fn contains_acronym(s: &str) -> bool {
     let mut count = 0;
@@ -131,10 +131,10 @@ impl LateLintPass<'_> for UpperCaseAcronyms {
             return;
         }
         match it.kind {
-            ItemKind::TyAlias(ident, ..) | ItemKind::Struct(ident, ..) | ItemKind::Trait(_, _, ident, ..) => {
+            ItemKind::TyAlias(ident, ..) | ItemKind::Struct(ident, ..) | ItemKind::Trait { ident, .. } => {
                 check_ident(cx, &ident, it.hir_id(), self.upper_case_acronyms_aggressive);
             },
-            ItemKind::Enum(ident, ref enumdef, _) => {
+            ItemKind::Enum(ident, _, ref enumdef) => {
                 check_ident(cx, &ident, it.hir_id(), self.upper_case_acronyms_aggressive);
                 // check enum variants separately because again we only want to lint on private enums and
                 // the fn check_variant does not know about the vis of the enum of its variants

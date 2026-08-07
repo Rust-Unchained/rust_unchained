@@ -1,17 +1,17 @@
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, IndexEntry};
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir as hir;
-use rustc_infer::infer::region_constraints::{Constraint, RegionConstraintData};
+use rustc_infer::infer::region_constraints::{ConstraintKind, RegionConstraintData};
 use rustc_middle::bug;
 use rustc_middle::ty::{self, Region, Ty, fold_regions};
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::{Symbol, kw};
 use rustc_trait_selection::traits::auto_trait::{self, RegionTarget};
-use thin_vec::ThinVec;
 use tracing::{debug, instrument};
 
 use crate::clean::{
-    self, Lifetime, clean_generic_param_def, clean_middle_ty, clean_predicate,
-    clean_trait_ref_with_constraints, clean_ty_generics, simplify,
+    self, Lifetime, clean_clause, clean_generic_param_def, clean_middle_ty,
+    clean_trait_ref_with_constraints, clean_ty_generics_inner, simplify,
 };
 use crate::core::DocContext;
 
@@ -22,7 +22,7 @@ pub(crate) fn synthesize_auto_trait_impls<'tcx>(
 ) -> Vec<clean::Item> {
     let tcx = cx.tcx;
     let typing_env = ty::TypingEnv::non_body_analysis(tcx, item_def_id);
-    let ty = tcx.type_of(item_def_id).instantiate_identity();
+    let ty = tcx.type_of(item_def_id).instantiate_identity().skip_norm_wip();
 
     let finder = auto_trait::AutoTraitFinder::new(tcx);
     let mut auto_trait_impls: Vec<_> = cx
@@ -71,7 +71,7 @@ fn synthesize_auto_trait_impl<'tcx>(
 ) -> Option<clean::Item> {
     let tcx = cx.tcx;
     let trait_ref = ty::Binder::dummy(ty::TraitRef::new(tcx, trait_def_id, [ty]));
-    if !cx.generated_synthetics.insert((ty, trait_def_id)) {
+    if !cx.synthetic_auto_trait_impls.insert((ty, trait_def_id)) {
         debug!("already generated, aborting");
         return None;
     }
@@ -101,17 +101,20 @@ fn synthesize_auto_trait_impl<'tcx>(
             // Instead, we generate `impl !Send for Foo<T>`, which better
             // expresses the fact that `Foo<T>` never implements `Send`,
             // regardless of the choice of `T`.
-            let mut generics = clean_ty_generics(
+            let mut generics = clean_ty_generics_inner(
                 cx,
                 tcx.generics_of(item_def_id),
-                ty::GenericPredicates::default(),
+                ty::GenericClauses::default(),
             );
             generics.where_predicates.clear();
 
             (generics, ty::ImplPolarity::Negative)
         }
+        auto_trait::AutoTraitResult::NoImpl => return None,
         auto_trait::AutoTraitResult::ExplicitImpl => return None,
     };
+
+    super::inline::record_extern_trait(cx, trait_def_id);
 
     Some(clean::Item {
         inner: Box::new(clean::ItemInner {
@@ -126,6 +129,7 @@ fn synthesize_auto_trait_impl<'tcx>(
                 items: Vec::new(),
                 polarity,
                 kind: clean::ImplKind::Auto,
+                is_deprecated: false,
             })),
             item_id: clean::ItemId::Auto { trait_: trait_def_id, for_: item_def_id },
             cfg: None,
@@ -169,40 +173,41 @@ fn clean_param_env<'tcx>(
         .collect();
 
     // FIXME(#111101): Incorporate the explicit predicates of the item here...
-    let item_predicates: FxIndexSet<_> =
-        tcx.param_env(item_def_id).caller_bounds().iter().collect();
-    let where_predicates = param_env
-        .caller_bounds()
-        .iter()
-        // FIXME: ...which hopefully allows us to simplify this:
-        .filter(|pred| {
-            !item_predicates.contains(pred)
-                || pred
-                    .as_trait_clause()
-                    .is_some_and(|pred| tcx.lang_items().sized_trait() == Some(pred.def_id()))
-        })
-        .map(|pred| {
-            fold_regions(tcx, pred, |r, _| match r.kind() {
-                // FIXME: Don't `unwrap_or`, I think we should panic if we encounter an infer var that
-                // we can't map to a concrete region. However, `AutoTraitFinder` *does* leak those kinds
-                // of `ReVar`s for some reason at the time of writing. See `rustdoc-ui/` tests.
-                // This is in dire need of an investigation into `AutoTraitFinder`.
-                ty::ReVar(vid) => vid_to_region.get(&vid).copied().unwrap_or(r),
-                ty::ReEarlyParam(_) | ty::ReStatic | ty::ReBound(..) | ty::ReError(_) => r,
-                // FIXME(#120606): `AutoTraitFinder` can actually leak placeholder regions which feels
-                // incorrect. Needs investigation.
-                ty::ReLateParam(_) | ty::RePlaceholder(_) | ty::ReErased => {
-                    bug!("unexpected region kind: {r:?}")
-                }
+    let item_clauses: FxIndexSet<_> = tcx.param_env(item_def_id).caller_bounds().iter().collect();
+    let where_predicates = cx.with_exact_param_env(param_env, |cx| {
+        param_env
+            .caller_bounds()
+            .iter()
+            // FIXME: ...which hopefully allows us to simplify this:
+            .filter(|clause| {
+                !item_clauses.contains(clause)
+                    || clause.as_trait_clause().is_some_and(|clause| {
+                        tcx.lang_items().sized_trait() == Some(clause.def_id())
+                    })
             })
-        })
-        .flat_map(|pred| clean_predicate(pred, cx))
-        .chain(clean_region_outlives_constraints(&region_data, generics))
-        .collect();
+            .map(|clause| {
+                fold_regions(tcx, clause, |r, _| match r.kind() {
+                    // FIXME: Don't `unwrap_or`, I think we should panic if we encounter an infer var that
+                    // we can't map to a concrete region. However, `AutoTraitFinder` *does* leak those kinds
+                    // of `ReVar`s for some reason at the time of writing. See `rustdoc-ui/` tests.
+                    // This is in dire need of an investigation into `AutoTraitFinder`.
+                    ty::ReVar(vid) => vid_to_region.get(&vid).copied().unwrap_or(r),
+                    ty::ReEarlyParam(_) | ty::ReStatic | ty::ReBound(..) | ty::ReError(_) => r,
+                    // FIXME(#120606): `AutoTraitFinder` can actually leak placeholder regions which feels
+                    // incorrect. Needs investigation.
+                    ty::ReLateParam(_) | ty::RePlaceholder(_) | ty::ReErased => {
+                        bug!("unexpected region kind: {r:?}")
+                    }
+                })
+            })
+            .flat_map(|clause| clean_clause(clause, cx))
+            .chain(clean_region_outlives_constraints(&region_data, generics))
+            .collect()
+    });
 
     let mut generics = clean::Generics { params, where_predicates };
-    simplify::sized_bounds(cx, &mut generics);
-    generics.where_predicates = simplify::where_clauses(cx, generics.where_predicates);
+    simplify::sizedness_bounds(cx, &mut generics);
+    generics.where_predicates = simplify::where_clauses(cx.tcx, generics.where_predicates);
     generics
 }
 
@@ -233,32 +238,39 @@ fn clean_region_outlives_constraints<'tcx>(
     // Each `RegionTarget` (a `RegionVid` or a `Region`) maps to its smaller and larger regions.
     // Note that "larger" regions correspond to sub regions in the surface language.
     // E.g., in `'a: 'b`, `'a` is the larger region.
-    for (constraint, _) in &regions.constraints {
-        match *constraint {
-            Constraint::VarSubVar(vid1, vid2) => {
-                let deps1 = map.entry(RegionTarget::RegionVid(vid1)).or_default();
-                deps1.larger.insert(RegionTarget::RegionVid(vid2));
+    for c in regions.constraints.iter().flat_map(|(c, _)| c.iter_outlives()) {
+        match c.kind {
+            ConstraintKind::VarSubVar => {
+                let sub_vid = c.sub.as_var();
+                let sup_vid = c.sup.as_var();
+                let deps1 = map.entry(RegionTarget::RegionVid(sub_vid)).or_default();
+                deps1.larger.insert(RegionTarget::RegionVid(sup_vid));
 
-                let deps2 = map.entry(RegionTarget::RegionVid(vid2)).or_default();
-                deps2.smaller.insert(RegionTarget::RegionVid(vid1));
+                let deps2 = map.entry(RegionTarget::RegionVid(sup_vid)).or_default();
+                deps2.smaller.insert(RegionTarget::RegionVid(sub_vid));
             }
-            Constraint::RegSubVar(region, vid) => {
-                let deps = map.entry(RegionTarget::RegionVid(vid)).or_default();
-                deps.smaller.insert(RegionTarget::Region(region));
+            ConstraintKind::RegSubVar => {
+                let sup_vid = c.sup.as_var();
+                let deps = map.entry(RegionTarget::RegionVid(sup_vid)).or_default();
+                deps.smaller.insert(RegionTarget::Region(c.sub));
             }
-            Constraint::VarSubReg(vid, region) => {
-                let deps = map.entry(RegionTarget::RegionVid(vid)).or_default();
-                deps.larger.insert(RegionTarget::Region(region));
+            ConstraintKind::VarSubReg => {
+                let sub_vid = c.sub.as_var();
+                let deps = map.entry(RegionTarget::RegionVid(sub_vid)).or_default();
+                deps.larger.insert(RegionTarget::Region(c.sup));
             }
-            Constraint::RegSubReg(r1, r2) => {
+            ConstraintKind::RegSubReg => {
                 // The constraint is already in the form that we want, so we're done with it
                 // The desired order is [larger, smaller], so flip them.
-                if early_bound_region_name(r1) != early_bound_region_name(r2) {
+                if early_bound_region_name(c.sub) != early_bound_region_name(c.sup) {
                     outlives_predicates
-                        .entry(early_bound_region_name(r2).expect("no region_name found"))
+                        .entry(early_bound_region_name(c.sup).expect("no region_name found"))
                         .or_default()
-                        .push(r1);
+                        .push(c.sub);
                 }
+            }
+            ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+                unreachable!()
             }
         }
     }

@@ -1,3 +1,4 @@
+//@ edition:2015
 mod m1 {
     pub use ::E::V; //~ ERROR `V` is only public within the crate, and cannot be re-exported outside
 }
@@ -7,7 +8,7 @@ mod m2 {
 }
 
 mod m3 {
-    pub use ::E::V::{self}; //~ ERROR `V` is only public within the crate, and cannot be re-exported outside
+    pub use ::E::V::{self}; //~ ERROR unresolved import `E::V`
 }
 
 #[deny(unused_imports)]

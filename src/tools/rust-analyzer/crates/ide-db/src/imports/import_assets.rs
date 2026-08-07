@@ -1,23 +1,37 @@
 //! Look up accessible paths for items.
 
-use std::ops::ControlFlow;
+use std::{convert::Infallible, ops::ControlFlow};
 
 use hir::{
-    db::HirDatabase, AsAssocItem, AssocItem, AssocItemContainer, Crate, HasCrate, ImportPathConfig,
+    AsAssocItem, AssocItem, AssocItemContainer, Complete, Crate, FindPathConfig, HasCrate,
     ItemInNs, ModPath, Module, ModuleDef, Name, PathResolution, PrefixKind, ScopeDef, Semantics,
-    SemanticsScope, Trait, TyFingerprint, Type,
+    SemanticsScope, Trait, Type,
 };
 use itertools::Itertools;
+use parser::SyntaxKind;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
+use stdx::never;
 use syntax::{
-    ast::{self, make, HasName},
     AstNode, SyntaxNode,
+    ast::{self, HasName, make},
 };
 
 use crate::{
-    items_locator::{self, AssocSearchMode, DEFAULT_QUERY_SEARCH_LIMIT},
     FxIndexSet, RootDatabase,
+    items_locator::{self, AssocSearchMode, DEFAULT_QUERY_SEARCH_LIMIT},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub struct ImportPathConfig {
+    /// If true, prefer to unconditionally use imports of the `core` and `alloc` crate
+    /// over the std.
+    pub prefer_no_std: bool,
+    /// If true, prefer import paths containing a prelude module.
+    pub prefer_prelude: bool,
+    /// If true, prefer abs path (starting with `::`) where it is available.
+    pub prefer_absolute: bool,
+}
 
 /// A candidate for import, derived during various IDE activities:
 /// * completion with imports on the fly proposals
@@ -25,28 +39,127 @@ use crate::{
 /// * assists
 /// * etc.
 #[derive(Debug)]
-pub enum ImportCandidate {
+pub enum ImportCandidate<'db> {
     /// A path, qualified (`std::collections::HashMap`) or not (`HashMap`).
     Path(PathImportCandidate),
     /// A trait associated function (with no self parameter) or an associated constant.
     /// For 'test_mod::TestEnum::test_function', `ty` is the `test_mod::TestEnum` expression type
     /// and `name` is the `test_function`
-    TraitAssocItem(TraitImportCandidate),
+    TraitAssocItem(TraitImportCandidate<'db>),
     /// A trait method with self parameter.
     /// For 'test_enum.test_method()', `ty` is the `test_enum` expression type
     /// and `name` is the `test_method`
-    TraitMethod(TraitImportCandidate),
+    TraitMethod(TraitImportCandidate<'db>),
 }
 
 /// A trait import needed for a given associated item access.
 /// For `some::path::SomeStruct::ASSOC_`, contains the
 /// type of `some::path::SomeStruct` and `ASSOC_` as the item name.
 #[derive(Debug)]
-pub struct TraitImportCandidate {
+pub struct TraitImportCandidate<'db> {
     /// A type of the item that has the associated item accessed at.
-    pub receiver_ty: Type,
+    pub receiver_ty: Type<'db>,
     /// The associated item name that the trait to import should contain.
     pub assoc_item_name: NameToImport,
+}
+
+#[derive(Debug)]
+struct PathDefinitionKinds {
+    modules: bool,
+    bang_macros: bool,
+    // FIXME: Distinguish between attr and derive macros.
+    attr_macros: bool,
+    value_namespace: bool,
+    type_namespace: bool,
+    /// Unions, record structs and record enum variants. Note that unions and structs
+    /// can also be enabled by `type_namespace` (either works).
+    records: bool,
+    /// Tuple structs and tuple enum variants. Both are also controlled by `value_namespace`
+    /// (either works). Structs are also covered by `type_namespace`.
+    tuple_structs: bool,
+    /// Structs, enum variants and consts.
+    structs_and_consts: bool,
+}
+
+impl PathDefinitionKinds {
+    const ALL_DISABLED: Self = Self {
+        modules: false,
+        bang_macros: false,
+        attr_macros: false,
+        value_namespace: false,
+        type_namespace: false,
+        records: false,
+        tuple_structs: false,
+        structs_and_consts: false,
+    };
+    const ALL_ENABLED: Self = Self {
+        modules: true,
+        bang_macros: true,
+        attr_macros: true,
+        value_namespace: true,
+        type_namespace: true,
+        records: true,
+        tuple_structs: true,
+        structs_and_consts: true,
+    };
+    // While a path pattern only allows unit structs/enum variants, parentheses/braces may be written later.
+    const PATH_PAT_KINDS: PathDefinitionKinds =
+        Self { structs_and_consts: true, bang_macros: true, ..Self::ALL_DISABLED };
+
+    fn deduce_from_path(path: &ast::Path, exact: bool) -> Self {
+        let Some(parent) = path.syntax().parent() else {
+            return Self::ALL_ENABLED;
+        };
+        let mut result = match parent.kind() {
+            // When there are following segments, it can be a type (with a method) or a module.
+            // Technically, a type can only have up to 2 segments following (an associated type
+            // then a method), but most paths are shorter than 3 segments anyway, and we'll also
+            // validate that the following segment resolve.
+            SyntaxKind::PATH => Self { modules: true, type_namespace: true, ..Self::ALL_DISABLED },
+            SyntaxKind::MACRO_CALL => Self { bang_macros: true, ..Self::ALL_DISABLED },
+            SyntaxKind::PATH_META | SyntaxKind::KEY_VALUE_META | SyntaxKind::TOKEN_TREE_META => {
+                Self { attr_macros: true, ..Self::ALL_DISABLED }
+            }
+            SyntaxKind::USE_TREE => {
+                if ast::UseTree::cast(parent).unwrap().use_tree_list().is_some() {
+                    Self { modules: true, ..Self::ALL_DISABLED }
+                } else {
+                    Self::ALL_ENABLED
+                }
+            }
+            SyntaxKind::VISIBILITY => Self { modules: true, ..Self::ALL_DISABLED },
+            SyntaxKind::ASM_SYM => Self { value_namespace: true, ..Self::ALL_DISABLED },
+            // `bang_macros = true` because you can still type the `!`.
+            // `type_namespace = true` because you can type `::method()`.
+            SyntaxKind::PATH_EXPR => Self {
+                value_namespace: true,
+                bang_macros: true,
+                type_namespace: true,
+                ..Self::ALL_DISABLED
+            },
+            SyntaxKind::PATH_PAT => Self::PATH_PAT_KINDS,
+            SyntaxKind::TUPLE_STRUCT_PAT => {
+                Self { tuple_structs: true, bang_macros: true, ..Self::ALL_DISABLED }
+            }
+            SyntaxKind::RECORD_EXPR | SyntaxKind::RECORD_PAT => {
+                Self { records: true, bang_macros: true, ..Self::ALL_DISABLED }
+            }
+            SyntaxKind::PATH_TYPE => {
+                Self { type_namespace: true, bang_macros: true, ..Self::ALL_DISABLED }
+            }
+            SyntaxKind::ERROR => Self::ALL_ENABLED,
+            _ => {
+                never!("this match should cover all possible parents of paths\nparent={parent:#?}");
+                Self::ALL_ENABLED
+            }
+        };
+        if !exact {
+            // When the path is not required to be exact, there could be additional segments to be filled.
+            result.modules = true;
+            result.type_namespace = true;
+        }
+        result
+    }
 }
 
 /// Path import for a given name, qualified or not.
@@ -56,6 +169,10 @@ pub struct PathImportCandidate {
     pub qualifier: Vec<Name>,
     /// The name the item (struct, trait, enum, etc.) should have.
     pub name: NameToImport,
+    /// Potentially more segments that should resolve in the candidate.
+    pub after: Vec<Name>,
+    /// The kind of definitions that we can include.
+    definition_kinds: PathDefinitionKinds,
 }
 
 /// A name that will be used during item lookups.
@@ -100,16 +217,16 @@ impl NameToImport {
 
 /// A struct to find imports in the project, given a certain name (or its part) and the context.
 #[derive(Debug)]
-pub struct ImportAssets {
-    import_candidate: ImportCandidate,
+pub struct ImportAssets<'db> {
+    import_candidate: ImportCandidate<'db>,
     candidate_node: SyntaxNode,
     module_with_candidate: Module,
 }
 
-impl ImportAssets {
+impl<'db> ImportAssets<'db> {
     pub fn for_method_call(
         method_call: &ast::MethodCallExpr,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
     ) -> Option<Self> {
         let candidate_node = method_call.syntax().clone();
         Some(Self {
@@ -121,7 +238,7 @@ impl ImportAssets {
 
     pub fn for_exact_path(
         fully_qualified_path: &ast::Path,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
     ) -> Option<Self> {
         let candidate_node = fully_qualified_path.syntax().clone();
         if let Some(use_tree) = candidate_node.ancestors().find_map(ast::UseTree::cast) {
@@ -139,7 +256,7 @@ impl ImportAssets {
         })
     }
 
-    pub fn for_ident_pat(sema: &Semantics<'_, RootDatabase>, pat: &ast::IdentPat) -> Option<Self> {
+    pub fn for_ident_pat(sema: &Semantics<'db, RootDatabase>, pat: &ast::IdentPat) -> Option<Self> {
         if !pat.is_simple_ident() {
             return None;
         }
@@ -154,13 +271,14 @@ impl ImportAssets {
 
     pub fn for_fuzzy_path(
         module_with_candidate: Module,
+        path: Option<&ast::Path>,
         qualifier: Option<ast::Path>,
         fuzzy_name: String,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         candidate_node: SyntaxNode,
     ) -> Option<Self> {
         Some(Self {
-            import_candidate: ImportCandidate::for_fuzzy_path(qualifier, fuzzy_name, sema)?,
+            import_candidate: ImportCandidate::for_fuzzy_path(path, qualifier, fuzzy_name, sema)?,
             module_with_candidate,
             candidate_node,
         })
@@ -168,7 +286,7 @@ impl ImportAssets {
 
     pub fn for_fuzzy_method_call(
         module_with_method_call: Module,
-        receiver_ty: Type,
+        receiver_ty: Type<'db>,
         fuzzy_method_name: String,
         candidate_node: SyntaxNode,
     ) -> Option<Self> {
@@ -183,6 +301,9 @@ impl ImportAssets {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompleteInFlyimport(pub bool);
+
 /// An import (not necessary the only one) that corresponds a certain given [`PathImportCandidate`].
 /// (the structure is not entirely correct, since there can be situations requiring two imports, see FIXME below for the details)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -193,27 +314,47 @@ pub struct LocatedImport {
     pub item_to_import: ItemInNs,
     /// The path import candidate, resolved.
     ///
-    /// Not necessary matches the import:
+    /// Not necessarily matches the import:
     /// For any associated constant from the trait, we try to access as `some::path::SomeStruct::ASSOC_`
     /// the original item is the associated constant, but the import has to be a trait that
     /// defines this constant.
     pub original_item: ItemInNs,
+    /// The value of `#[rust_analyzer::completions(...)]`, if existing.
+    pub complete_in_flyimport: CompleteInFlyimport,
 }
 
 impl LocatedImport {
-    pub fn new(import_path: ModPath, item_to_import: ItemInNs, original_item: ItemInNs) -> Self {
-        Self { import_path, item_to_import, original_item }
+    pub fn new(
+        import_path: ModPath,
+        item_to_import: ItemInNs,
+        original_item: ItemInNs,
+        complete_in_flyimport: CompleteInFlyimport,
+    ) -> Self {
+        Self { import_path, item_to_import, original_item, complete_in_flyimport }
+    }
+
+    pub fn new_no_completion(
+        import_path: ModPath,
+        item_to_import: ItemInNs,
+        original_item: ItemInNs,
+    ) -> Self {
+        Self {
+            import_path,
+            item_to_import,
+            original_item,
+            complete_in_flyimport: CompleteInFlyimport(true),
+        }
     }
 }
 
-impl ImportAssets {
-    pub fn import_candidate(&self) -> &ImportCandidate {
+impl<'db> ImportAssets<'db> {
+    pub fn import_candidate(&self) -> &ImportCandidate<'db> {
         &self.import_candidate
     }
 
     pub fn search_for_imports(
         &self,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         cfg: ImportPathConfig,
         prefix_kind: PrefixKind,
     ) -> impl Iterator<Item = LocatedImport> {
@@ -224,7 +365,7 @@ impl ImportAssets {
     /// This may return non-absolute paths if a part of the returned path is already imported into scope.
     pub fn search_for_relative_paths(
         &self,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
         let _p = tracing::info_span!("ImportAssets::search_for_relative_paths").entered();
@@ -263,7 +404,7 @@ impl ImportAssets {
 
     fn search_for(
         &self,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         prefixed: Option<PrefixKind>,
         cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
@@ -273,12 +414,19 @@ impl ImportAssets {
             Some(it) => it,
             None => return <FxIndexSet<_>>::default().into_iter(),
         };
-        let krate = self.module_with_candidate.krate();
+        let cfg = FindPathConfig {
+            prefer_no_std: cfg.prefer_no_std,
+            prefer_prelude: cfg.prefer_prelude,
+            prefer_absolute: cfg.prefer_absolute,
+            allow_unstable: sema.is_nightly(scope.krate()),
+        };
+        let db = sema.db;
+        let krate = self.module_with_candidate.krate(sema.db);
         let scope_definitions = self.scope_definitions(sema);
         let mod_path = |item| {
             get_mod_path(
-                sema.db,
-                item_for_path_search(sema.db, item)?,
+                db,
+                item_for_path_search(db, item)?,
                 &self.module_with_candidate,
                 prefixed,
                 cfg,
@@ -288,7 +436,7 @@ impl ImportAssets {
 
         match &self.import_candidate {
             ImportCandidate::Path(path_candidate) => path_applicable_imports(
-                sema,
+                db,
                 &scope,
                 krate,
                 path_candidate,
@@ -297,7 +445,7 @@ impl ImportAssets {
             ),
             ImportCandidate::TraitAssocItem(trait_candidate)
             | ImportCandidate::TraitMethod(trait_candidate) => trait_applicable_items(
-                sema,
+                db,
                 krate,
                 &scope,
                 trait_candidate,
@@ -306,13 +454,14 @@ impl ImportAssets {
                 |trait_to_import| {
                     !scope_definitions
                         .contains(&ScopeDef::ModuleDef(ModuleDef::Trait(trait_to_import)))
+                        && !scope.can_use_trait_methods(trait_to_import)
                 },
             ),
         }
         .into_iter()
     }
 
-    fn scope_definitions(&self, sema: &Semantics<'_, RootDatabase>) -> FxHashSet<ScopeDef> {
+    fn scope_definitions<'a>(&self, sema: &Semantics<'a, RootDatabase>) -> FxHashSet<ScopeDef<'a>> {
         let _p = tracing::info_span!("ImportAssets::scope_definitions").entered();
         let mut scope_definitions = FxHashSet::default();
         if let Some(scope) = sema.scope(&self.candidate_node) {
@@ -325,7 +474,7 @@ impl ImportAssets {
 }
 
 fn path_applicable_imports(
-    sema: &Semantics<'_, RootDatabase>,
+    db: &RootDatabase,
     scope: &SemanticsScope<'_>,
     current_crate: Crate,
     path_candidate: &PathImportCandidate,
@@ -334,10 +483,10 @@ fn path_applicable_imports(
 ) -> FxIndexSet<LocatedImport> {
     let _p = tracing::info_span!("ImportAssets::path_applicable_imports").entered();
 
-    match &*path_candidate.qualifier {
+    let mut result = match &*path_candidate.qualifier {
         [] => {
             items_locator::items_with_name(
-                sema,
+                db,
                 current_crate,
                 path_candidate.name.clone(),
                 // FIXME: we could look up assoc items by the input and propose those in completion,
@@ -350,12 +499,20 @@ fn path_applicable_imports(
                 // see also an ignored test under FIXME comment in the qualify_path.rs module
                 AssocSearchMode::Exclude,
             )
-            .filter_map(|item| {
+            .filter(|(item, _)| {
+                filter_by_definition_kind(db, *item, &path_candidate.definition_kinds)
+            })
+            .filter_map(|(item, do_not_complete)| {
                 if !scope_filter(item) {
                     return None;
                 }
                 let mod_path = mod_path(item)?;
-                Some(LocatedImport::new(mod_path, item, item))
+                Some(LocatedImport::new(
+                    mod_path,
+                    item,
+                    item,
+                    CompleteInFlyimport(do_not_complete != Complete::IgnoreFlyimport),
+                ))
             })
             .take(DEFAULT_QUERY_SEARCH_LIMIT)
             .collect()
@@ -365,49 +522,160 @@ fn path_applicable_imports(
         // what follows
         // FIXME: This doesn't handle visibility
         [first_qsegment, qualifier_rest @ ..] => items_locator::items_with_name(
-            sema,
+            db,
             current_crate,
             NameToImport::Exact(first_qsegment.as_str().to_owned(), true),
             AssocSearchMode::Exclude,
         )
-        .filter_map(|item| {
+        .flat_map(|(item, do_not_complete)| {
             // we found imports for `first_qsegment`, now we need to filter these imports by whether
             // they result in resolving the rest of the path successfully
             validate_resolvable(
-                sema,
+                db,
                 scope,
                 mod_path,
                 scope_filter,
                 &path_candidate.name,
                 item,
                 qualifier_rest,
+                CompleteInFlyimport(do_not_complete != Complete::IgnoreFlyimport),
             )
         })
         .take(DEFAULT_QUERY_SEARCH_LIMIT)
         .collect(),
+    };
+
+    filter_candidates_by_after_path(db, scope, path_candidate, &mut result);
+
+    result
+}
+
+fn filter_by_definition_kind(
+    db: &RootDatabase,
+    item: ItemInNs,
+    allowed: &PathDefinitionKinds,
+) -> bool {
+    let item = item.into_module_def();
+    let struct_per_kind = |struct_kind| {
+        allowed.structs_and_consts
+            || match struct_kind {
+                hir::StructKind::Record => allowed.records,
+                hir::StructKind::Tuple => allowed.value_namespace || allowed.tuple_structs,
+                hir::StructKind::Unit => allowed.value_namespace,
+            }
+    };
+    match item {
+        ModuleDef::Module(_) => allowed.modules,
+        ModuleDef::Function(_) => allowed.value_namespace,
+        ModuleDef::Adt(hir::Adt::Struct(item)) => {
+            allowed.type_namespace || struct_per_kind(item.kind(db))
+        }
+        ModuleDef::Adt(hir::Adt::Enum(_)) => allowed.type_namespace,
+        ModuleDef::Adt(hir::Adt::Union(_)) => {
+            allowed.type_namespace || allowed.records || allowed.structs_and_consts
+        }
+        ModuleDef::EnumVariant(item) => struct_per_kind(item.kind(db)),
+        ModuleDef::Const(_) => allowed.value_namespace || allowed.structs_and_consts,
+        ModuleDef::Static(_) => allowed.value_namespace,
+        ModuleDef::Trait(_) => allowed.type_namespace,
+        ModuleDef::TypeAlias(_) => allowed.type_namespace,
+        ModuleDef::BuiltinType(_) => allowed.type_namespace,
+        ModuleDef::Macro(item) => {
+            if item.is_fn_like(db) {
+                allowed.bang_macros
+            } else {
+                allowed.attr_macros
+            }
+        }
+    }
+}
+
+fn filter_candidates_by_after_path(
+    db: &RootDatabase,
+    scope: &SemanticsScope<'_>,
+    path_candidate: &PathImportCandidate,
+    imports: &mut FxIndexSet<LocatedImport>,
+) {
+    if imports.len() <= 1 {
+        // Short-circuit, as even if it doesn't match fully we want it.
+        return;
+    }
+
+    let Some((last_after, after_except_last)) = path_candidate.after.split_last() else {
+        return;
+    };
+
+    let original_imports = imports.clone();
+
+    let traits_in_scope = scope.visible_traits();
+    imports.retain(|import| {
+        let items = if after_except_last.is_empty() {
+            smallvec![import.original_item]
+        } else {
+            let ItemInNs::Types(ModuleDef::Module(item)) = import.original_item else {
+                return false;
+            };
+            // FIXME: This doesn't consider visibilities.
+            item.resolve_mod_path(db, after_except_last.iter().cloned())
+                .into_iter()
+                .flatten()
+                .collect::<SmallVec<[_; 3]>>()
+        };
+        items.into_iter().any(|item| {
+            let has_last_method = |ty: hir::Type<'_>| {
+                ty.iterate_path_candidates(db, scope, &traits_in_scope, Some(last_after), |_| {
+                    Some(())
+                })
+                .is_some()
+            };
+            // FIXME: A trait can have an assoc type that has a function/const, that's two segments before last.
+            match item {
+                // A module? Can we resolve one more segment?
+                ItemInNs::Types(ModuleDef::Module(module)) => module
+                    .resolve_mod_path(db, [last_after.clone()])
+                    .is_some_and(|mut it| it.any(|_| true)),
+                // And ADT/Type Alias? That might be a method.
+                ItemInNs::Types(ModuleDef::Adt(it)) => has_last_method(it.ty(db)),
+                ItemInNs::Types(ModuleDef::BuiltinType(it)) => has_last_method(it.ty(db)),
+                ItemInNs::Types(ModuleDef::TypeAlias(it)) => has_last_method(it.ty(db)),
+                // A trait? Might have an associated item.
+                ItemInNs::Types(ModuleDef::Trait(it)) => it
+                    .items(db)
+                    .into_iter()
+                    .any(|assoc_item| assoc_item.name(db) == Some(last_after.clone())),
+                // Other items? can't resolve one more segment.
+                _ => false,
+            }
+        })
+    });
+
+    if imports.is_empty() {
+        // Better one half-match than zero full matches.
+        *imports = original_imports;
     }
 }
 
 /// Validates and builds an import for `resolved_qualifier` if the `unresolved_qualifier` appended
 /// to it resolves and there is a validate `candidate` after that.
 fn validate_resolvable(
-    sema: &Semantics<'_, RootDatabase>,
+    db: &RootDatabase,
     scope: &SemanticsScope<'_>,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath>,
     scope_filter: impl Fn(ItemInNs) -> bool,
     candidate: &NameToImport,
     resolved_qualifier: ItemInNs,
     unresolved_qualifier: &[Name],
-) -> Option<LocatedImport> {
+    complete_in_flyimport: CompleteInFlyimport,
+) -> SmallVec<[LocatedImport; 1]> {
     let _p = tracing::info_span!("ImportAssets::import_for_item").entered();
 
-    let qualifier = {
+    let qualifier = (|| {
         let mut adjusted_resolved_qualifier = resolved_qualifier;
         if !unresolved_qualifier.is_empty() {
             match resolved_qualifier {
                 ItemInNs::Types(ModuleDef::Module(module)) => {
-                    adjusted_resolved_qualifier = sema
-                        .resolve_mod_path_relative(module, unresolved_qualifier.iter().cloned())?
+                    adjusted_resolved_qualifier = module
+                        .resolve_mod_path(db, unresolved_qualifier.iter().cloned())?
                         .next()?;
                 }
                 // can't resolve multiple segments for non-module item path bases
@@ -416,40 +684,47 @@ fn validate_resolvable(
         }
 
         match adjusted_resolved_qualifier {
-            ItemInNs::Types(def) => def,
-            _ => return None,
+            ItemInNs::Types(def) => Some(def),
+            _ => None,
         }
-    };
-    let import_path_candidate = mod_path(resolved_qualifier)?;
+    })();
+    let Some(qualifier) = qualifier else { return SmallVec::new() };
+    let Some(import_path_candidate) = mod_path(resolved_qualifier) else { return SmallVec::new() };
+    let mut result = SmallVec::new();
     let ty = match qualifier {
         ModuleDef::Module(module) => {
-            return items_locator::items_with_name_in_module(
-                sema,
+            items_locator::items_with_name_in_module::<Infallible>(
+                db,
                 module,
                 candidate.clone(),
                 AssocSearchMode::Exclude,
-                |it| match scope_filter(it) {
-                    true => ControlFlow::Break(it),
-                    false => ControlFlow::Continue(()),
+                |item| {
+                    if scope_filter(item) {
+                        result.push(LocatedImport::new(
+                            import_path_candidate.clone(),
+                            resolved_qualifier,
+                            item,
+                            complete_in_flyimport,
+                        ));
+                    }
+                    ControlFlow::Continue(())
                 },
-            )
-            .map(|item| LocatedImport::new(import_path_candidate, resolved_qualifier, item))
+            );
+            return result;
         }
         // FIXME
-        ModuleDef::Trait(_) => return None,
-        // FIXME
-        ModuleDef::TraitAlias(_) => return None,
-        ModuleDef::TypeAlias(alias) => alias.ty(sema.db),
-        ModuleDef::BuiltinType(builtin) => builtin.ty(sema.db),
-        ModuleDef::Adt(adt) => adt.ty(sema.db),
-        _ => return None,
+        ModuleDef::Trait(_) => return SmallVec::new(),
+        ModuleDef::TypeAlias(alias) => alias.ty(db),
+        ModuleDef::BuiltinType(builtin) => builtin.ty(db),
+        ModuleDef::Adt(adt) => adt.ty(db),
+        _ => return SmallVec::new(),
     };
-    ty.iterate_path_candidates(sema.db, scope, &FxHashSet::default(), None, None, |assoc| {
+    ty.iterate_path_candidates::<Infallible>(db, scope, &FxHashSet::default(), None, |assoc| {
         // FIXME: Support extra trait imports
-        if assoc.container_or_implemented_trait(sema.db).is_some() {
+        if assoc.container_or_implemented_trait(db).is_some() {
             return None;
         }
-        let name = assoc.name(sema.db)?;
+        let name = assoc.name(db)?;
         let is_match = match candidate {
             NameToImport::Prefix(text, true) => name.as_str().starts_with(text),
             NameToImport::Prefix(text, false) => {
@@ -467,12 +742,15 @@ fn validate_resolvable(
         if !is_match {
             return None;
         }
-        Some(LocatedImport::new(
+        result.push(LocatedImport::new(
             import_path_candidate.clone(),
             resolved_qualifier,
             assoc_to_item(assoc),
-        ))
-    })
+            complete_in_flyimport,
+        ));
+        None
+    });
+    result
 }
 
 pub fn item_for_path_search(db: &RootDatabase, item: ItemInNs) -> Option<ItemInNs> {
@@ -494,32 +772,30 @@ fn item_for_path_search_assoc(db: &RootDatabase, assoc_item: AssocItem) -> Optio
     })
 }
 
-fn trait_applicable_items(
-    sema: &Semantics<'_, RootDatabase>,
+fn trait_applicable_items<'db>(
+    db: &'db RootDatabase,
     current_crate: Crate,
-    scope: &SemanticsScope<'_>,
-    trait_candidate: &TraitImportCandidate,
+    scope: &SemanticsScope<'db>,
+    trait_candidate: &TraitImportCandidate<'db>,
     trait_assoc_item: bool,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath>,
     scope_filter: impl Fn(hir::Trait) -> bool,
 ) -> FxIndexSet<LocatedImport> {
     let _p = tracing::info_span!("ImportAssets::trait_applicable_items").entered();
 
-    let db = sema.db;
-
     let inherent_traits = trait_candidate.receiver_ty.applicable_inherent_traits(db);
     let env_traits = trait_candidate.receiver_ty.env_traits(db);
     let related_traits = inherent_traits.chain(env_traits).collect::<FxHashSet<_>>();
 
-    let mut required_assoc_items = FxHashSet::default();
+    let mut required_assoc_items = FxHashMap::default();
     let mut trait_candidates: FxHashSet<_> = items_locator::items_with_name(
-        sema,
+        db,
         current_crate,
         trait_candidate.assoc_item_name.clone(),
         AssocSearchMode::AssocItemsOnly,
     )
-    .filter_map(|input| item_as_assoc(db, input))
-    .filter_map(|assoc| {
+    .filter_map(|(input, do_not_complete)| Some((item_as_assoc(db, input)?, do_not_complete)))
+    .filter_map(|(assoc, do_not_complete)| {
         if !trait_assoc_item && matches!(assoc, AssocItem::Const(_) | AssocItem::TypeAlias(_)) {
             return None;
         }
@@ -528,7 +804,8 @@ fn trait_applicable_items(
         if related_traits.contains(&assoc_item_trait) {
             return None;
         }
-        required_assoc_items.insert(assoc);
+        required_assoc_items
+            .insert(assoc, CompleteInFlyimport(do_not_complete != Complete::IgnoreFlyimport));
         Some(assoc_item_trait.into())
     })
     .collect();
@@ -537,13 +814,24 @@ fn trait_applicable_items(
         let mut deref_chain = trait_candidate.receiver_ty.autoderef(db).collect::<Vec<_>>();
         // As a last step, we can do array unsizing (that's the only unsizing that rustc does for method receivers!)
         if let Some((ty, _len)) = deref_chain.last().and_then(|ty| ty.as_array(db)) {
-            let slice = Type::new_slice(ty);
+            let slice = Type::new_slice(db, ty);
             deref_chain.push(slice);
         }
         deref_chain
             .into_iter()
-            .filter_map(|ty| Some((ty.krate(db).into(), ty.fingerprint_for_trait_impl()?)))
-            .sorted()
+            .flat_map(|ty| {
+                let fingerprint = ty.fingerprint_for_trait_impl(db)?;
+                let mut crates = vec![];
+
+                if let Some(adt) = ty.as_adt() {
+                    // Push crate where ADT was defined
+                    crates.push((adt.krate(db).into(), fingerprint));
+                }
+                // Always include environment crate
+                crates.push((ty.krate(db).into(), fingerprint));
+                Some(crates)
+            })
+            .flatten()
             .unique()
             .collect::<Vec<_>>()
     };
@@ -554,11 +842,11 @@ fn trait_applicable_items(
     }
 
     // in order to handle implied bounds through an associated type, keep all traits if any
-    // type in the deref chain matches `TyFingerprint::Unnameable`. This fingerprint
+    // type in the deref chain matches `SimplifiedType::Placeholder`. This fingerprint
     // won't be in `TraitImpls` anyways, as `TraitImpls` only contains actual implementations.
     if !autoderef_method_receiver
         .iter()
-        .any(|(_, fingerprint)| matches!(fingerprint, TyFingerprint::Unnameable))
+        .any(|(_, fingerprint)| matches!(fingerprint, hir::SimplifiedType::Placeholder))
     {
         trait_candidates.retain(|&candidate_trait_id| {
             // we care about the following cases:
@@ -570,17 +858,18 @@ fn trait_applicable_items(
             //    a. This is recursive for fundamental types
             let defining_crate_for_trait = Trait::from(candidate_trait_id).krate(db);
 
-            let trait_impls_in_crate = db.trait_impls_in_crate(defining_crate_for_trait.into());
+            let trait_impls_in_crate =
+                hir::TraitImpls::for_crate(db, defining_crate_for_trait.into());
             let definitions_exist_in_trait_crate =
-                autoderef_method_receiver.iter().any(|&(_, fingerprint)| {
+                autoderef_method_receiver.iter().any(|(_, fingerprint)| {
                     trait_impls_in_crate
                         .has_impls_for_trait_and_self_ty(candidate_trait_id, fingerprint)
                 });
             // this is a closure for laziness: if `definitions_exist_in_trait_crate` is true,
             // we can avoid a second db lookup.
             let definitions_exist_in_receiver_crate = || {
-                autoderef_method_receiver.iter().any(|&(krate, fingerprint)| {
-                    db.trait_impls_in_crate(krate)
+                autoderef_method_receiver.iter().any(|(krate, fingerprint)| {
+                    hir::TraitImpls::for_crate(db, *krate)
                         .has_impls_for_trait_and_self_ty(candidate_trait_id, fingerprint)
                 })
             };
@@ -598,9 +887,8 @@ fn trait_applicable_items(
             scope,
             &trait_candidates,
             None,
-            None,
             |assoc| {
-                if required_assoc_items.contains(&assoc) {
+                if let Some(&complete_in_flyimport) = required_assoc_items.get(&assoc) {
                     let located_trait = assoc.container_trait(db).filter(|&it| scope_filter(it))?;
                     let trait_item = ItemInNs::from(ModuleDef::from(located_trait));
                     let import_path = trait_import_paths
@@ -611,6 +899,7 @@ fn trait_applicable_items(
                         import_path,
                         trait_item,
                         assoc_to_item(assoc),
+                        complete_in_flyimport,
                     ));
                 }
                 None::<()>
@@ -622,10 +911,9 @@ fn trait_applicable_items(
             scope,
             &trait_candidates,
             None,
-            None,
             |function| {
                 let assoc = function.as_assoc_item(db)?;
-                if required_assoc_items.contains(&assoc) {
+                if let Some(&complete_in_flyimport) = required_assoc_items.get(&assoc) {
                     let located_trait = assoc.container_trait(db).filter(|&it| scope_filter(it))?;
                     let trait_item = ItemInNs::from(ModuleDef::from(located_trait));
                     let import_path = trait_import_paths
@@ -636,6 +924,7 @@ fn trait_applicable_items(
                         import_path,
                         trait_item,
                         assoc_to_item(assoc),
+                        complete_in_flyimport,
                     ));
                 }
                 None::<()>
@@ -660,7 +949,7 @@ fn get_mod_path(
     item_to_search: ItemInNs,
     module_with_candidate: &Module,
     prefixed: Option<PrefixKind>,
-    cfg: ImportPathConfig,
+    cfg: FindPathConfig,
 ) -> Option<ModPath> {
     if let Some(prefix_kind) = prefixed {
         module_with_candidate.find_use_path(db, item_to_search, prefix_kind, cfg)
@@ -669,9 +958,9 @@ fn get_mod_path(
     }
 }
 
-impl ImportCandidate {
+impl<'db> ImportCandidate<'db> {
     fn for_method_call(
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         method_call: &ast::MethodCallExpr,
     ) -> Option<Self> {
         match sema.resolve_method_call(method_call) {
@@ -685,21 +974,26 @@ impl ImportCandidate {
         }
     }
 
-    fn for_regular_path(sema: &Semantics<'_, RootDatabase>, path: &ast::Path) -> Option<Self> {
+    fn for_regular_path(sema: &Semantics<'db, RootDatabase>, path: &ast::Path) -> Option<Self> {
         if sema.resolve_path(path).is_some() {
             return None;
         }
+        let after = std::iter::successors(path.parent_path(), |it| it.parent_path())
+            .map(|seg| seg.segment()?.name_ref().map(|name| Name::new_root(name.text())))
+            .collect::<Option<_>>()?;
         path_import_candidate(
             sema,
+            Some(path),
             path.qualifier(),
             NameToImport::exact_case_sensitive(path.segment()?.name_ref()?.to_string()),
+            after,
         )
     }
 
-    fn for_name(sema: &Semantics<'_, RootDatabase>, name: &ast::Name) -> Option<Self> {
+    fn for_name(sema: &Semantics<'db, RootDatabase>, name: &ast::Name) -> Option<Self> {
         if sema
             .scope(name.syntax())?
-            .speculative_resolve(&make::ext::ident_path(&name.text()))
+            .speculative_resolve(&make::ext::ident_path(name.text()))
             .is_some()
         {
             return None;
@@ -707,32 +1001,46 @@ impl ImportCandidate {
         Some(ImportCandidate::Path(PathImportCandidate {
             qualifier: vec![],
             name: NameToImport::exact_case_sensitive(name.to_string()),
+            after: vec![],
+            definition_kinds: PathDefinitionKinds::PATH_PAT_KINDS,
         }))
     }
 
     fn for_fuzzy_path(
+        path: Option<&ast::Path>,
         qualifier: Option<ast::Path>,
         fuzzy_name: String,
-        sema: &Semantics<'_, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
     ) -> Option<Self> {
-        path_import_candidate(sema, qualifier, NameToImport::fuzzy(fuzzy_name))
+        // Assume a fuzzy match does not want the segments after. Because... I guess why not?
+        path_import_candidate(sema, path, qualifier, NameToImport::fuzzy(fuzzy_name), Vec::new())
     }
 }
 
-fn path_import_candidate(
-    sema: &Semantics<'_, RootDatabase>,
+fn path_import_candidate<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    path: Option<&ast::Path>,
     qualifier: Option<ast::Path>,
     name: NameToImport,
-) -> Option<ImportCandidate> {
+    after: Vec<Name>,
+) -> Option<ImportCandidate<'db>> {
+    let definition_kinds = path.map_or(PathDefinitionKinds::ALL_ENABLED, |path| {
+        PathDefinitionKinds::deduce_from_path(path, matches!(name, NameToImport::Exact(..)))
+    });
     Some(match qualifier {
         Some(qualifier) => match sema.resolve_path(&qualifier) {
             Some(PathResolution::Def(ModuleDef::BuiltinType(_))) | None => {
                 if qualifier.first_qualifier().is_none_or(|it| sema.resolve_path(&it).is_none()) {
                     let qualifier = qualifier
                         .segments()
-                        .map(|seg| seg.name_ref().map(|name| Name::new_root(&name.text())))
+                        .map(|seg| seg.name_ref().map(|name| Name::new_root(name.text())))
                         .collect::<Option<Vec<_>>>()?;
-                    ImportCandidate::Path(PathImportCandidate { qualifier, name })
+                    ImportCandidate::Path(PathImportCandidate {
+                        qualifier,
+                        name,
+                        after,
+                        definition_kinds,
+                    })
                 } else {
                     return None;
                 }
@@ -756,7 +1064,12 @@ fn path_import_candidate(
             }
             Some(_) => return None,
         },
-        None => ImportCandidate::Path(PathImportCandidate { qualifier: vec![], name }),
+        None => ImportCandidate::Path(PathImportCandidate {
+            qualifier: vec![],
+            name,
+            after,
+            definition_kinds,
+        }),
     })
 }
 

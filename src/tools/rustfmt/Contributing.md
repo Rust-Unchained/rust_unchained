@@ -2,9 +2,9 @@
 
 There are many ways to contribute to Rustfmt. This document lays out what they
 are and has information on how to get started. If you have any questions about
-contributing or need help with anything, please ask in the WG-Rustfmt channel
-on [Discord](https://discordapp.com/invite/rust-lang). Feel free to also ask questions
-on issues, or file new issues specifically to get help.
+contributing or need help with anything, please ask in the Rustfmt team [Zulip
+channel `#t-rustfmt`][rustfmt-zulip]. Feel free to also ask questions on issues,
+or file new issues specifically to get help.
 
 All contributors are expected to follow our [Code of
 Conduct](CODE_OF_CONDUCT.md).
@@ -23,7 +23,14 @@ to create regressions. Any tests you can add are very much appreciated.
 The tests can be run with `cargo test`. This does a number of things:
 * runs the unit tests for a number of internal functions;
 * makes sure that rustfmt run on every file in `./tests/source/` is equal to its
-  associated file in `./tests/target/`;
+  associated file in `./tests/target/`; this catches
+  * unexpected formatting differences from changes to rustfmt
+  * non-idempotency in formatting even when the file copy in `target/` is
+    already in the canonical expected format. That is, if `source_start` is
+    the starting formatting and `source_canonical` is the expected canonical
+    formatting, catch cases where there is a converging sequence
+    `source_start -> source_1 -> ... -> source_canonical` that takes multiple
+    rustfmt runs.
 * runs idempotence tests on the files in `./tests/target/`. These files should
   not be changed by rustfmt;
 * checks that rustfmt's code is not changed by running on itself. This ensures
@@ -109,6 +116,46 @@ If you want to test modified `cargo-fmt`, or run `rustfmt` on the whole project 
 RUSTFMT="./target/debug/rustfmt" cargo run --bin cargo-fmt -- --manifest-path path/to/project/you/want2test/Cargo.toml
 ```
 
+#### Running a binary directly
+
+You may want to run one of the built binaries directly, for example to connect
+it to a debugger. Since `rustfmt` uses `rustc_driver` it needs to be linked
+against the version of that library for the current toolchain, without
+configuring anything you are likely to run into errors like:
+
+```
+./target/debug/rustfmt: error while loading shared libraries: librustc_driver-63b8deb6c23747dd.so: cannot open shared object file: No such file or directory
+```
+
+This library will be in the sysroot of the current toolchain, which will be
+printed by `rustc --print sysroot`, so we'll need to include that in the
+system's dynamic library search path. On GNU/Linux this can be done by setting
+the `LD_LIBRARY_PATH` variable, e.g. using Bash:
+
+```
+LD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ./target/debug/rustfmt
+```
+
+On MacOS there is the `DYLD_LIBRARY_PATH` variable, e.g. using Bash:
+
+```
+DYLD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ./target/debug/rustfmt
+```
+
+And under Windows the `PATH` environment variable, e.g. using Bash:
+
+```
+PATH="$(rustc --print sysroot)/bin${PATH:+:${PATH}}"
+```
+
+Continuing the GNU/Linux example, you can invoke a debugger, e.g. `rust-gdb`,
+like:
+
+```
+LD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" rust-gdb --args ./target/debug/rustfmt --check some_file.rs
+
+```
+
 ### Gate formatting changes
 
 A change that introduces a different code-formatting must be gated on the
@@ -157,7 +204,7 @@ format.
 
 There are different nodes for every kind of item and expression in Rust. For
 more details see the source code in the compiler -
-[ast.rs](https://github.com/rust-lang/rust/blob/master/compiler/rustc_ast/src/ast.rs) - and/or the
+[ast.rs](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_ast/src/ast.rs) - and/or the
 [docs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_ast/ast/index.html).
 
 Many nodes in the AST (but not all, annoyingly) have a `Span`. A `Span` is a
@@ -268,3 +315,11 @@ the config struct and parse a config file, etc. Checking an option is done by
 accessing the correct field on the config struct, e.g., `config.max_width()`. Most
 functions have a `Config`, or one can be accessed via a visitor or context of
 some kind.
+
+## Subtree syncs
+
+Refer to [*Subtree sync procedure*](./Subtree%20sync%20procedure.md).
+
+
+[rustfmt-zulip]:
+    https://rust-lang.zulipchat.com/#narrow/channel/357797-t-rustfmt

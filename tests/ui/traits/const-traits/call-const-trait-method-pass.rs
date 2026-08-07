@@ -1,10 +1,9 @@
-//@ known-bug: #110395
-
-#![feature(const_trait_impl, const_ops)]
+#![feature(const_trait_impl, const_ops, const_cmp)]
+//@ check-pass
 
 struct Int(i32);
 
-impl const std::ops::Add for Int {
+const impl std::ops::Add for Int {
     type Output = Int;
 
     fn add(self, rhs: Self) -> Self {
@@ -12,7 +11,7 @@ impl const std::ops::Add for Int {
     }
 }
 
-impl const PartialEq for Int {
+const impl PartialEq for Int {
     fn eq(&self, rhs: &Self) -> bool {
         self.0 == rhs.0
     }
@@ -21,12 +20,11 @@ impl const PartialEq for Int {
     }
 }
 
-#[const_trait]
-pub trait Plus {
+pub const trait Plus {
     fn plus(self, rhs: Self) -> Self;
 }
 
-impl const Plus for i32 {
+const impl Plus for i32 {
     fn plus(self, rhs: Self) -> Self {
         self + rhs
     }

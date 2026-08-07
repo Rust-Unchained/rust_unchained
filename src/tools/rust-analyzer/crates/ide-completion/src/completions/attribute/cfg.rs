@@ -2,16 +2,16 @@
 
 use ide_db::SymbolKind;
 use itertools::Itertools;
-use syntax::{algo, ast::Ident, AstToken, Direction, NodeOrToken, SyntaxKind};
+use syntax::{AstToken, Direction, NodeOrToken, SmolStr, SyntaxKind, algo, ast::Ident};
 
-use crate::{completions::Completions, context::CompletionContext, CompletionItem};
+use crate::{CompletionItem, completions::Completions, context::CompletionContext};
 
-pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_, '_>) {
     let add_completion = |item: &str| {
         let mut completion =
             CompletionItem::new(SymbolKind::BuiltinAttr, ctx.source_range(), item, ctx.edition);
         completion.insert_text(format!(r#""{item}""#));
-        acc.add(completion.build(ctx.db));
+        completion.add_to(acc, ctx.db);
     };
 
     // FIXME: Move this into context/analysis.rs
@@ -39,7 +39,7 @@ pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
             "target_os" => KNOWN_OS.iter().copied().for_each(add_completion),
             "target_vendor" => KNOWN_VENDOR.iter().copied().for_each(add_completion),
             "target_endian" => ["little", "big"].into_iter().for_each(add_completion),
-            name => ctx.krate.potential_cfg(ctx.db).get_cfg_values(name).cloned().for_each(|s| {
+            name => ctx.krate.potential_cfg(ctx.db).get_cfg_values(name).for_each(|s| {
                 let s = s.as_str();
                 let insert_text = format!(r#""{s}""#);
                 let mut item = CompletionItem::new(
@@ -49,18 +49,45 @@ pub(crate) fn complete_cfg(acc: &mut Completions, ctx: &CompletionContext<'_>) {
                     ctx.edition,
                 );
                 item.insert_text(insert_text);
-
-                acc.add(item.build(ctx.db));
+                item.add_to(acc, ctx.db);
             }),
         },
-        None => ctx.krate.potential_cfg(ctx.db).get_cfg_keys().cloned().unique().for_each(|s| {
-            let s = s.as_str();
-            let item =
-                CompletionItem::new(SymbolKind::BuiltinAttr, ctx.source_range(), s, ctx.edition);
-            acc.add(item.build(ctx.db));
-        }),
+        None => ctx
+            .krate
+            .potential_cfg(ctx.db)
+            .into_iter()
+            .map(|x| match x {
+                hir::CfgAtom::Flag(key) => (key.as_str(), "".into()),
+                hir::CfgAtom::KeyValue { key, .. } => (
+                    key.as_str(),
+                    if ctx.config.snippet_cap.is_some() {
+                        SmolStr::from_iter([key.as_str(), " = $0"])
+                    } else {
+                        SmolStr::default()
+                    },
+                ),
+            })
+            .chain(CFG_CONDITION.iter().map(|&(k, snip)| (k, SmolStr::new_static(snip))))
+            .unique_by(|&(s, _)| s)
+            .for_each(|(s, snippet)| {
+                let mut item = CompletionItem::new(
+                    SymbolKind::BuiltinAttr,
+                    ctx.source_range(),
+                    s,
+                    ctx.edition,
+                );
+                if let Some(cap) = ctx.config.snippet_cap
+                    && !snippet.is_empty()
+                {
+                    item.insert_snippet(cap, snippet);
+                }
+                item.add_to(acc, ctx.db);
+            }),
     }
 }
+
+const CFG_CONDITION: &[(&str, &str)] =
+    &[("all", "all($0)"), ("any", "any($0)"), ("not", "not($0)")];
 
 const KNOWN_ARCH: [&str; 20] = [
     "aarch64",

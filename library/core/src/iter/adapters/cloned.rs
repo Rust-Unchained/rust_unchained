@@ -1,9 +1,8 @@
 use core::num::NonZero;
 
-use crate::cmp::Ordering;
 use crate::iter::adapters::zip::try_get_unchecked;
 use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
-use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen, UncheckedIterator};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
 use crate::ops::Try;
 
 /// An iterator that clones the elements of an underlying iterator.
@@ -21,7 +20,7 @@ pub struct Cloned<I> {
 }
 
 impl<I> Cloned<I> {
-    pub(in crate::iter) fn new(it: I) -> Cloned<I> {
+    pub(in crate::iter) const fn new(it: I) -> Cloned<I> {
         Cloned { it }
     }
 }
@@ -42,31 +41,13 @@ where
         self.it.next().cloned()
     }
 
-    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.it.size_hint()
     }
 
-    #[inline]
-    fn count(self) -> usize {
-        self.it.count()
-    }
-
-    fn last(self) -> Option<T> {
-        self.it.last().cloned()
-    }
-
-    #[inline]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.it.advance_by(n)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<T> {
-        self.it.nth(n).cloned()
-    }
-
     fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R
     where
+        Self: Sized,
         F: FnMut(B, Self::Item) -> R,
         R: Try<Output = B>,
     {
@@ -78,58 +59,6 @@ where
         F: FnMut(Acc, Self::Item) -> Acc,
     {
         self.it.map(T::clone).fold(init, f)
-    }
-
-    fn find<P>(&mut self, mut predicate: P) -> Option<Self::Item>
-    where
-        P: FnMut(&Self::Item) -> bool,
-    {
-        self.it.find(move |x| predicate(&x)).cloned()
-    }
-
-    fn max_by<F>(self, mut compare: F) -> Option<Self::Item>
-    where
-        F: FnMut(&Self::Item, &Self::Item) -> Ordering,
-    {
-        self.it.max_by(move |&x, &y| compare(x, y)).cloned()
-    }
-
-    fn min_by<F>(self, mut compare: F) -> Option<Self::Item>
-    where
-        F: FnMut(&Self::Item, &Self::Item) -> Ordering,
-    {
-        self.it.min_by(move |&x, &y| compare(x, y)).cloned()
-    }
-
-    fn cmp<O>(self, other: O) -> Ordering
-    where
-        O: IntoIterator<Item = Self::Item>,
-        Self::Item: Ord,
-    {
-        self.it.cmp_by(other, |x, y| x.cmp(&y))
-    }
-
-    fn partial_cmp<O>(self, other: O) -> Option<Ordering>
-    where
-        O: IntoIterator,
-        Self::Item: PartialOrd<O::Item>,
-    {
-        self.it.partial_cmp_by(other, |x, y| x.partial_cmp(&y))
-    }
-
-    fn eq<O>(self, other: O) -> bool
-    where
-        O: IntoIterator,
-        Self::Item: PartialEq<O::Item>,
-    {
-        self.it.eq_by(other, |x, y| x == &y)
-    }
-
-    fn is_sorted_by<F>(self, mut compare: F) -> bool
-    where
-        F: FnMut(&Self::Item, &Self::Item) -> bool,
-    {
-        self.it.is_sorted_by(move |&x, &y| compare(x, y))
     }
 
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> T
@@ -152,13 +81,9 @@ where
         self.it.next_back().cloned()
     }
 
-    #[inline]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.it.advance_back_by(n)
-    }
-
     fn try_rfold<B, F, R>(&mut self, init: B, f: F) -> R
     where
+        Self: Sized,
         F: FnMut(B, Self::Item) -> R,
         R: Try<Output = B>,
     {
@@ -171,13 +96,6 @@ where
     {
         self.it.map(T::clone).rfold(init, f)
     }
-
-    fn rfind<P>(&mut self, mut predicate: P) -> Option<Self::Item>
-    where
-        P: FnMut(&Self::Item) -> bool,
-    {
-        self.it.rfind(move |x| predicate(&x)).cloned()
-    }
 }
 
 #[stable(feature = "iter_cloned", since = "1.1.0")]
@@ -186,12 +104,10 @@ where
     I: ExactSizeIterator<Item = &'a T>,
     T: Clone,
 {
-    #[inline]
     fn len(&self) -> usize {
         self.it.len()
     }
 
-    #[inline]
     fn is_empty(&self) -> bool {
         self.it.is_empty()
     }
@@ -224,19 +140,6 @@ where
     I: TrustedLen<Item = &'a T>,
     T: Clone,
 {
-}
-
-impl<'a, I, T: 'a> UncheckedIterator for Cloned<I>
-where
-    I: UncheckedIterator<Item = &'a T>,
-    T: Clone,
-{
-    unsafe fn next_unchecked(&mut self) -> T {
-        // SAFETY: `Cloned` is 1:1 with the inner iterator, so if the caller promised
-        // that there's an element left, the inner iterator has one too.
-        let item = unsafe { self.it.next_unchecked() };
-        item.clone()
-    }
 }
 
 #[stable(feature = "default_iters", since = "1.70.0")]

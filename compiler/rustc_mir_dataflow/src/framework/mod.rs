@@ -32,14 +32,11 @@
 //!
 //! [gen-kill]: https://en.wikipedia.org/wiki/Data-flow_analysis#Bit_vector_problems
 
-use std::cmp::Ordering;
-
-use rustc_data_structures::work_queue::WorkQueue;
 use rustc_index::bit_set::{DenseBitSet, MixedBitSet};
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::bug;
 use rustc_middle::mir::{
-    self, BasicBlock, CallReturnPlaces, Location, SwitchTargetValue, TerminatorEdges, traversal,
+    self, BasicBlock, BasicBlockData, CallReturnPlaces, Location, TerminatorEdges,
 };
 use rustc_middle::ty::TyCtxt;
 use tracing::error;
@@ -127,6 +124,40 @@ pub trait Analysis<'tcx> {
     // `resume`). It's not obvious how to handle `yield` points in coroutines, however.
     fn initialize_start_block(&self, body: &mir::Body<'tcx>, state: &mut Self::Domain);
 
+    /// Given an `EffectIndex`, calls the appropriate `apply_*` method in the
+    /// {early,primary} x {statement,terminator} space.
+    ///
+    /// Do not override this; instead override one or more of the `apply_*` methods.
+    #[inline]
+    fn apply_effect<'mir>(
+        &self,
+        state: &mut Self::Domain,
+        block: BasicBlock,
+        block_data: &'mir BasicBlockData<'tcx>,
+        idx: EffectIndex,
+    ) {
+        let statement_index = idx.statement_index;
+        let terminator_index = block_data.statements.len();
+        let loc = Location { block, statement_index };
+        let is_terminator = statement_index == terminator_index;
+
+        if !is_terminator {
+            let statement = &block_data.statements[statement_index];
+            match idx.effect {
+                Effect::Early => self.apply_early_statement_effect(state, statement, loc),
+                Effect::Primary => self.apply_primary_statement_effect(state, statement, loc),
+            }
+        } else {
+            let terminator = block_data.terminator();
+            match idx.effect {
+                Effect::Early => self.apply_early_terminator_effect(state, terminator, loc),
+                Effect::Primary => {
+                    self.apply_primary_terminator_effect(state, terminator, loc);
+                }
+            }
+        }
+    }
+
     /// Updates the current dataflow state with an "early" effect, i.e. one
     /// that occurs immediately before the given statement.
     ///
@@ -135,7 +166,7 @@ pub trait Analysis<'tcx> {
     /// analyses should not implement this without also implementing
     /// `apply_primary_statement_effect`.
     fn apply_early_statement_effect(
-        &mut self,
+        &self,
         _state: &mut Self::Domain,
         _statement: &mir::Statement<'tcx>,
         _location: Location,
@@ -144,7 +175,7 @@ pub trait Analysis<'tcx> {
 
     /// Updates the current dataflow state with the effect of evaluating a statement.
     fn apply_primary_statement_effect(
-        &mut self,
+        &self,
         state: &mut Self::Domain,
         statement: &mir::Statement<'tcx>,
         location: Location,
@@ -158,11 +189,23 @@ pub trait Analysis<'tcx> {
     /// analyses should not implement this without also implementing
     /// `apply_primary_terminator_effect`.
     fn apply_early_terminator_effect(
-        &mut self,
+        &self,
         _state: &mut Self::Domain,
         _terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
+    }
+
+    /// Gets the terminator edges. Used by forward analyses only. Called *before*
+    /// `apply_primary_terminator_effect` is applied; this might seem strange but in practice
+    /// `MaybeInitializedPlaces` needs that ordering and other analyses work with either ordering.
+    fn get_terminator_edges<'mir>(
+        &self,
+        _state: &Self::Domain,
+        terminator: &'mir mir::Terminator<'tcx>,
+        _location: Location,
+    ) -> TerminatorEdges<'mir, 'tcx> {
+        terminator.edges()
     }
 
     /// Updates the current dataflow state with the effect of evaluating a terminator.
@@ -171,13 +214,12 @@ pub trait Analysis<'tcx> {
     /// in this function. That should go in `apply_call_return_effect`. For example, in the
     /// `InitializedPlaces` analyses, the return place for a function call is not marked as
     /// initialized here.
-    fn apply_primary_terminator_effect<'mir>(
-        &mut self,
+    fn apply_primary_terminator_effect(
+        &self,
         _state: &mut Self::Domain,
-        terminator: &'mir mir::Terminator<'tcx>,
+        _terminator: &mir::Terminator<'tcx>,
         _location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
-        terminator.edges()
+    ) {
     }
 
     /* Edge-specific effects */
@@ -188,7 +230,7 @@ pub trait Analysis<'tcx> {
     /// This is separate from `apply_primary_terminator_effect` to properly track state across
     /// unwind edges.
     fn apply_call_return_effect(
-        &mut self,
+        &self,
         _state: &mut Self::Domain,
         _block: BasicBlock,
         _return_places: CallReturnPlaces<'_, 'tcx>,
@@ -210,8 +252,9 @@ pub trait Analysis<'tcx> {
     /// engine doesn't need to clone the exit state for a block unless
     /// `get_switch_int_data` is actually called.
     fn get_switch_int_data(
-        &mut self,
+        &self,
         _block: mir::BasicBlock,
+        _targets: &mir::SwitchTargets,
         _discr: &mir::Operand<'tcx>,
     ) -> Option<Self::SwitchIntData> {
         None
@@ -219,10 +262,10 @@ pub trait Analysis<'tcx> {
 
     /// See comments on `get_switch_int_data`.
     fn apply_switch_int_edge_effect(
-        &mut self,
-        _data: &mut Self::SwitchIntData,
+        &self,
         _state: &mut Self::Domain,
-        _value: SwitchTargetValue,
+        _data: &mut Self::SwitchIntData,
+        _target_idx: SwitchTargetIndex,
     ) {
         unreachable!();
     }
@@ -243,7 +286,7 @@ pub trait Analysis<'tcx> {
     /// Without a `pass_name` to differentiates them, only the results for the latest run will be
     /// saved.
     fn iterate_to_fixpoint<'mir>(
-        mut self,
+        self,
         tcx: TyCtxt<'tcx>,
         body: &'mir mir::Body<'tcx>,
         pass_name: Option<&'static str>,
@@ -261,49 +304,87 @@ pub trait Analysis<'tcx> {
             bug!("`initialize_start_block` is not yet supported for backward dataflow analyses");
         }
 
-        let mut dirty_queue: WorkQueue<BasicBlock> = WorkQueue::with_none(body.basic_blocks.len());
+        // Forward analyses use a reverse postorder (`rpo`). Every reachable basic block has a
+        // *rank*: its position within `rpo`. Rank order is dataflow order: for every edge A -> B
+        // that is not a back edge, rank(A) < rank(B). This is independent of basic block numbering
+        // (which depends on the vagaries of CFG construction).
+        //
+        // The CFG traversal uses a "min-rank" algorithm. First, all reachable basic blocks are
+        // marked as dirty. The loop-head invariant is that `curr_rank` always points to the
+        // minimum-rank dirty block in `rpo`. Before processing that block we mark it as clean. If
+        // the processing dirties a block with a rank lower than or equal to `curr_rank` (via a
+        // back edge, which could be an edge-to-self) then `curr_rank` is set to that
+        // lower-or-equal rank. After the block is processed, if `curr_rank` doesn't point to a
+        // dirty block it is moved to the next dirty block, and we iterate again.
+        //
+        // This algorithm ensures each basic block is processed only after all its dirty
+        // predecessors (ignoring back edges). When a back edge dirties an earlier block we return
+        // to that earlier block immediately, which avoids processing later blocks with possibly
+        // soon-to-be-stale information. Loop-free code is processed in a single pass.
+        //
+        // Backward analyses: we want a postorder instead of a reverse postorder, but we also want
+        // to avoid the cost of adding a `postorder` field to `mir::basic_blocks::Cache`. We can
+        // fake a postorder traversal cheaply by using a reverse postorder and flipping the rank
+        // mapping. There is also one wrinkle involving unreachable blocks; see below.
 
-        if Self::Direction::IS_FORWARD {
-            for (bb, _) in traversal::reverse_postorder(body) {
-                dirty_queue.insert(bb);
-            }
-        } else {
-            // Reverse post-order on the reverse CFG may generate a better iteration order for
-            // backward dataflow analyses, but probably not enough to matter.
-            for (bb, _) in traversal::postorder(body) {
-                dirty_queue.insert(bb);
-            }
+        rustc_index::newtype_index! {
+            #[orderable]
+            #[debug_format = "bbr{}"]
+            struct BasicBlockRank {}
         }
 
-        // `state` is not actually used between iterations;
-        // this is just an optimization to avoid reallocating
-        // every iteration.
+        let rpo: &[BasicBlock] = body.basic_blocks.reverse_postorder();
+        let last = rpo.len() - 1;
+
+        let mut ranks: IndexVec<BasicBlock, Option<BasicBlockRank>> =
+            IndexVec::from_elem_n(None, body.basic_blocks.len());
+        for (i, &bb) in rpo.iter().enumerate() {
+            let rank = if Self::Direction::IS_FORWARD { i } else { last - i };
+            ranks[bb] = Some(BasicBlockRank::new(rank));
+        }
+
+        let mut dirty: DenseBitSet<BasicBlockRank> = DenseBitSet::new_filled(rpo.len());
+        let mut curr_rank = BasicBlockRank::ZERO;
+
+        // `state` is not actually used between iterations; this is just an optimization to avoid
+        // reallocating every iteration.
         let mut state = self.bottom_value(body);
-        while let Some(bb) = dirty_queue.pop() {
-            // Set the state to the entry state of the block.
-            // This is equivalent to `state = entry_states[bb].clone()`,
-            // but it saves an allocation, thus improving compile times.
-            state.clone_from(&entry_states[bb]);
 
-            Self::Direction::apply_effects_in_block(
-                &mut self,
-                body,
-                &mut state,
-                bb,
-                &body[bb],
-                |target: BasicBlock, state: &Self::Domain| {
-                    let set_changed = entry_states[target].join(state);
-                    if set_changed {
-                        dirty_queue.insert(target);
-                    }
-                },
-            );
+        loop {
+            let i = curr_rank.as_usize();
+            let bb = rpo[if Self::Direction::IS_FORWARD { i } else { last - i }];
+            debug_assert!(dirty.contains(curr_rank)); // check invariant
+            dirty.remove(curr_rank); // invariant temporarily broken
+
+            state.clone_from(&entry_states[bb]);
+            let prop = |target: BasicBlock, state: &Self::Domain| {
+                // A backward analysis may encounter an unreachable block, because a predecessor
+                // of a reachable block may be unreachable. Ignore any such block. (In contrast, in
+                // a forward analysis any successor of a reachable block must be reachable.)
+                let target_rank = ranks[target];
+                if Self::Direction::IS_BACKWARD && target_rank.is_none() {
+                    return;
+                }
+                let target_rank = target_rank.unwrap();
+
+                let set_changed = entry_states[target].join(state);
+                if set_changed {
+                    dirty.insert(target_rank);
+                    curr_rank = curr_rank.min(target_rank);
+                }
+            };
+            Self::Direction::apply_effects_in_block(&self, body, &mut state, bb, &body[bb], prop);
+
+            match dirty.first_set_at_or_after(curr_rank) {
+                Some(rank) => curr_rank = rank, // broken invariant re-established
+                None => break,                  // no more dirty blocks; finish
+            }
         }
 
-        let mut results = Results { analysis: self, entry_states };
+        let results = Results { analysis: self, entry_states };
 
         if tcx.sess.opts.unstable_opts.dump_mir_dataflow {
-            let res = write_graphviz_results(tcx, body, &mut results, pass_name);
+            let res = write_graphviz_results(tcx, body, &results, pass_name);
             if let Err(e) = res {
                 error!("Failed to write graphviz dataflow results: {}", e);
             }
@@ -311,6 +392,14 @@ pub trait Analysis<'tcx> {
 
         results
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SwitchTargetIndex {
+    // Index of a normal switch target.
+    Normal(usize),
+    // The final "otherwise" fallback target.
+    Otherwise,
 }
 
 /// The legal operations for a transfer function in a gen/kill problem.
@@ -394,42 +483,6 @@ impl Effect {
 pub struct EffectIndex {
     statement_index: usize,
     effect: Effect,
-}
-
-impl EffectIndex {
-    fn next_in_forward_order(self) -> Self {
-        match self.effect {
-            Effect::Early => Effect::Primary.at_index(self.statement_index),
-            Effect::Primary => Effect::Early.at_index(self.statement_index + 1),
-        }
-    }
-
-    fn next_in_backward_order(self) -> Self {
-        match self.effect {
-            Effect::Early => Effect::Primary.at_index(self.statement_index),
-            Effect::Primary => Effect::Early.at_index(self.statement_index - 1),
-        }
-    }
-
-    /// Returns `true` if the effect at `self` should be applied earlier than the effect at `other`
-    /// in forward order.
-    fn precedes_in_forward_order(self, other: Self) -> bool {
-        let ord = self
-            .statement_index
-            .cmp(&other.statement_index)
-            .then_with(|| self.effect.cmp(&other.effect));
-        ord == Ordering::Less
-    }
-
-    /// Returns `true` if the effect at `self` should be applied earlier than the effect at `other`
-    /// in backward order.
-    fn precedes_in_backward_order(self, other: Self) -> bool {
-        let ord = other
-            .statement_index
-            .cmp(&self.statement_index)
-            .then_with(|| self.effect.cmp(&other.effect));
-        ord == Ordering::Less
-    }
 }
 
 #[cfg(test)]

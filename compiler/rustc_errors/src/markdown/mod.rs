@@ -4,7 +4,6 @@
 
 use std::io;
 
-use termcolor::{Buffer, BufferWriter, ColorChoice};
 mod parse;
 mod term;
 
@@ -19,15 +18,20 @@ impl<'a> MdStream<'a> {
         parse::entrypoint(s)
     }
 
-    /// Write formatted output to a termcolor buffer
-    pub fn write_termcolor_buf(&self, buf: &mut Buffer) -> io::Result<()> {
-        term::entrypoint(self, buf)
+    /// Write formatted output to a stdout buffer, optionally with
+    /// a formatter for code blocks
+    pub fn write_anstream_buf(
+        &self,
+        buf: &mut Vec<u8>,
+        formatter: Option<&(dyn Fn(&str, &mut Vec<u8>) -> io::Result<()> + 'static)>,
+    ) -> io::Result<()> {
+        term::entrypoint(self, buf, formatter)
     }
 }
 
-/// Create a termcolor buffer with the `Always` color choice
-pub fn create_stdout_bufwtr() -> BufferWriter {
-    BufferWriter::stdout(ColorChoice::Always)
+/// Create an anstream buffer with the `Always` color choice
+pub fn create_stdout_bufwtr() -> anstream::Stdout {
+    anstream::Stdout::always(std::io::stdout())
 }
 
 /// A single tokentree within a Markdown document

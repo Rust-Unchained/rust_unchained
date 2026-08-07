@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step, crate_description};
+use crate::core::builder::{Builder, CommandLineStep, RunConfig, ShouldRun, crate_description};
 use crate::utils::build_stamp::BuildStamp;
 use crate::utils::helpers::t;
 use crate::{Build, Compiler, Kind, Mode, Subcommand};
@@ -17,9 +17,18 @@ use crate::{Build, Compiler, Kind, Mode, Subcommand};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CleanAll {}
 
-impl Step for CleanAll {
-    const DEFAULT: bool = true;
+impl CommandLineStep for CleanAll {
     type Output = ();
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        // Normally this step is invoked implicitly via `./x clean`, but all
+        // steps are required to register at least one explicit path/alias.
+        run.alias("default")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
+    }
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(CleanAll {})
@@ -36,10 +45,6 @@ impl Step for CleanAll {
 
         clean(builder.build, all, stage)
     }
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never() // handled by DEFAULT
-    }
 }
 
 macro_rules! clean_crate_tree {
@@ -50,12 +55,11 @@ macro_rules! clean_crate_tree {
             crates: Vec<String>,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                let crates = run.builder.in_tree_crates($root_crate, None);
-                run.crates(crates)
+                run.crate_or_deps($root_crate)
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -129,7 +133,7 @@ fn clean_specific_stage(build: &Build, stage: u32) {
 
         for entry in entries {
             let entry = t!(entry);
-            let stage_prefix = format!("stage{}", stage);
+            let stage_prefix = format!("stage{}", stage + 1);
 
             // if current entry is not related with the target stage, continue
             if !entry.file_name().to_str().unwrap_or("").contains(&stage_prefix) {
@@ -181,7 +185,7 @@ fn rm_rf(path: &Path) {
             panic!("failed to get metadata for file {}: {}", path.display(), e);
         }
         Ok(metadata) => {
-            if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            if !metadata.file_type().is_dir() {
                 do_op(path, "remove file", |p| match fs::remove_file(p) {
                     #[cfg(windows)]
                     Err(e)

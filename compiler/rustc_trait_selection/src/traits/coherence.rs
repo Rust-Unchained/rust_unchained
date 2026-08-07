@@ -8,10 +8,11 @@ use std::fmt::Debug;
 
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_errors::{Diag, EmissionGuarantee};
-use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
+use rustc_hir::find_attr;
 use rustc_infer::infer::{DefineOpaqueTypes, InferCtxt, TyCtxtInferExt};
 use rustc_infer::traits::PredicateObligations;
+use rustc_macros::{TypeFoldable, TypeVisitable};
 use rustc_middle::bug;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::traits::solve::{CandidateSource, Certainty, Goal};
@@ -19,16 +20,17 @@ use rustc_middle::traits::specialization_graph::OverlapMode;
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode,
+    Unnormalized,
 };
 pub use rustc_next_trait_solver::coherence::*;
 use rustc_next_trait_solver::solve::SolverDelegateEvalExt;
-use rustc_span::{DUMMY_SP, Span, sym};
+use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, instrument, warn};
 
 use super::ObligationCtxt;
 use crate::error_reporting::traits::suggest_new_overflow_limit;
 use crate::infer::InferOk;
-use crate::solve::inspect::{InspectGoal, ProofTreeInferCtxtExt, ProofTreeVisitor};
+use crate::solve::inspect::{InferCtxtProofTreeExt, InspectGoal, ProofTreeVisitor};
 use crate::solve::{SolverDelegate, deeply_normalize_for_diagnostics, inspect};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
 use crate::traits::select::IntercrateAmbiguityCause;
@@ -37,8 +39,19 @@ use crate::traits::{
     SelectionContext, SkipLeakCheck, util,
 };
 
+/// The "header" of an impl is everything outside the body: a Self type, a trait
+/// ref (in the case of a trait impl), and a set of predicates (from the
+/// bounds / where-clauses).
+#[derive(Clone, Debug, TypeFoldable, TypeVisitable)]
+pub struct ImplHeader<'tcx> {
+    pub impl_args: ty::GenericArgsRef<'tcx>,
+    pub self_ty: Ty<'tcx>,
+    pub trait_ref: Option<ty::TraitRef<'tcx>>,
+    pub predicates: Vec<ty::Predicate<'tcx>>,
+}
+
 pub struct OverlapResult<'tcx> {
-    pub impl_header: ty::ImplHeader<'tcx>,
+    pub impl_header: ImplHeader<'tcx>,
     pub intercrate_ambiguity_causes: FxIndexSet<IntercrateAmbiguityCause<'tcx>>,
 
     /// `true` if the overlap might've been permitted before the shift
@@ -87,7 +100,7 @@ impl TrackAmbiguityCauses {
 /// with a suitably-freshened `ImplHeader` with those types
 /// instantiated. Otherwise, returns `None`.
 #[instrument(skip(tcx, skip_leak_check), level = "debug")]
-pub fn overlapping_impls(
+pub fn overlapping_inherent_impls(
     tcx: TyCtxt<'_>,
     impl1_def_id: DefId,
     impl2_def_id: DefId,
@@ -97,18 +110,37 @@ pub fn overlapping_impls(
     // Before doing expensive operations like entering an inference context, do
     // a quick check via fast_reject to tell if the impl headers could possibly
     // unify.
-    let drcx = DeepRejectCtxt::relate_infer_infer(tcx);
-    let impl1_ref = tcx.impl_trait_ref(impl1_def_id);
-    let impl2_ref = tcx.impl_trait_ref(impl2_def_id);
-    let may_overlap = match (impl1_ref, impl2_ref) {
-        (Some(a), Some(b)) => drcx.args_may_unify(a.skip_binder().args, b.skip_binder().args),
-        (None, None) => {
-            let self_ty1 = tcx.type_of(impl1_def_id).skip_binder();
-            let self_ty2 = tcx.type_of(impl2_def_id).skip_binder();
-            drcx.types_may_unify(self_ty1, self_ty2)
-        }
-        _ => bug!("unexpected impls: {impl1_def_id:?} {impl2_def_id:?}"),
-    };
+    let self_ty1 = tcx.type_of(impl1_def_id).skip_binder();
+    let self_ty2 = tcx.type_of(impl2_def_id).skip_binder();
+    let may_overlap = DeepRejectCtxt::relate_infer_infer(tcx).types_may_unify(self_ty1, self_ty2);
+
+    if !may_overlap {
+        // Some types involved are definitely different, so the impls couldn't possibly overlap.
+        debug!("overlapping_inherent_impls: fast_reject early-exit");
+        return None;
+    }
+
+    overlapping_impls(tcx, impl1_def_id, impl2_def_id, skip_leak_check, overlap_mode, false)
+}
+
+/// If there are types that satisfy both impls, returns `Some`
+/// with a suitably-freshened `ImplHeader` with those types
+/// instantiated. Otherwise, returns `None`.
+#[instrument(skip(tcx, skip_leak_check), level = "debug")]
+pub fn overlapping_trait_impls(
+    tcx: TyCtxt<'_>,
+    impl1_def_id: DefId,
+    impl2_def_id: DefId,
+    skip_leak_check: SkipLeakCheck,
+    overlap_mode: OverlapMode,
+) -> Option<OverlapResult<'_>> {
+    // Before doing expensive operations like entering an inference context, do
+    // a quick check via fast_reject to tell if the impl headers could possibly
+    // unify.
+    let impl1_args = tcx.impl_trait_ref(impl1_def_id).skip_binder().args;
+    let impl2_args = tcx.impl_trait_ref(impl2_def_id).skip_binder().args;
+    let may_overlap =
+        DeepRejectCtxt::relate_infer_infer(tcx).args_may_unify(impl1_args, impl2_args);
 
     if !may_overlap {
         // Some types involved are definitely different, so the impls couldn't possibly overlap.
@@ -116,6 +148,17 @@ pub fn overlapping_impls(
         return None;
     }
 
+    overlapping_impls(tcx, impl1_def_id, impl2_def_id, skip_leak_check, overlap_mode, true)
+}
+
+fn overlapping_impls(
+    tcx: TyCtxt<'_>,
+    impl1_def_id: DefId,
+    impl2_def_id: DefId,
+    skip_leak_check: SkipLeakCheck,
+    overlap_mode: OverlapMode,
+    is_of_trait: bool,
+) -> Option<OverlapResult<'_>> {
     if tcx.next_trait_solver_in_coherence() {
         overlap(
             tcx,
@@ -124,6 +167,7 @@ pub fn overlapping_impls(
             impl1_def_id,
             impl2_def_id,
             overlap_mode,
+            is_of_trait,
         )
     } else {
         let _overlap_with_bad_diagnostics = overlap(
@@ -133,6 +177,7 @@ pub fn overlapping_impls(
             impl1_def_id,
             impl2_def_id,
             overlap_mode,
+            is_of_trait,
         )?;
 
         // In the case where we detect an error, run the check again, but
@@ -145,26 +190,31 @@ pub fn overlapping_impls(
             impl1_def_id,
             impl2_def_id,
             overlap_mode,
+            is_of_trait,
         )
         .unwrap();
         Some(overlap)
     }
 }
 
-fn fresh_impl_header<'tcx>(infcx: &InferCtxt<'tcx>, impl_def_id: DefId) -> ty::ImplHeader<'tcx> {
+fn fresh_impl_header<'tcx>(
+    infcx: &InferCtxt<'tcx>,
+    impl_def_id: DefId,
+    is_of_trait: bool,
+) -> ImplHeader<'tcx> {
     let tcx = infcx.tcx;
     let impl_args = infcx.fresh_args_for_item(DUMMY_SP, impl_def_id);
 
-    ty::ImplHeader {
-        impl_def_id,
+    ImplHeader {
         impl_args,
-        self_ty: tcx.type_of(impl_def_id).instantiate(tcx, impl_args),
-        trait_ref: tcx.impl_trait_ref(impl_def_id).map(|i| i.instantiate(tcx, impl_args)),
+        self_ty: tcx.type_of(impl_def_id).instantiate(tcx, impl_args).skip_norm_wip(),
+        trait_ref: is_of_trait
+            .then(|| tcx.impl_trait_ref(impl_def_id).instantiate(tcx, impl_args).skip_norm_wip()),
         predicates: tcx
-            .predicates_of(impl_def_id)
+            .clauses_of(impl_def_id)
             .instantiate(tcx, impl_args)
             .iter()
-            .map(|(c, _)| c.as_predicate())
+            .map(|(c, _)| c.skip_norm_wip().as_predicate())
             .collect(),
     }
 }
@@ -173,11 +223,12 @@ fn fresh_impl_header_normalized<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     impl_def_id: DefId,
-) -> ty::ImplHeader<'tcx> {
-    let header = fresh_impl_header(infcx, impl_def_id);
+    is_of_trait: bool,
+) -> ImplHeader<'tcx> {
+    let header = fresh_impl_header(infcx, impl_def_id, is_of_trait);
 
     let InferOk { value: mut header, obligations } =
-        infcx.at(&ObligationCause::dummy(), param_env).normalize(header);
+        infcx.at(&ObligationCause::dummy(), param_env).normalize(Unnormalized::new_wip(header));
 
     header.predicates.extend(obligations.into_iter().map(|o| o.predicate));
     header
@@ -193,10 +244,16 @@ fn overlap<'tcx>(
     impl1_def_id: DefId,
     impl2_def_id: DefId,
     overlap_mode: OverlapMode,
+    is_of_trait: bool,
 ) -> Option<OverlapResult<'tcx>> {
     if overlap_mode.use_negative_impl() {
-        if impl_intersection_has_negative_obligation(tcx, impl1_def_id, impl2_def_id)
-            || impl_intersection_has_negative_obligation(tcx, impl2_def_id, impl1_def_id)
+        if impl_intersection_has_negative_obligation(tcx, impl1_def_id, impl2_def_id, is_of_trait)
+            || impl_intersection_has_negative_obligation(
+                tcx,
+                impl2_def_id,
+                impl1_def_id,
+                is_of_trait,
+            )
         {
             return None;
         }
@@ -206,6 +263,7 @@ fn overlap<'tcx>(
         .infer_ctxt()
         .skip_leak_check(skip_leak_check.is_yes())
         .with_next_trait_solver(tcx.next_trait_solver_in_coherence())
+        .enable_next_solver_overflow_fcw(false)
         .build(TypingMode::Coherence);
     let selcx = &mut SelectionContext::new(&infcx);
     if track_ambiguity_causes.is_yes() {
@@ -218,8 +276,16 @@ fn overlap<'tcx>(
     // empty environment.
     let param_env = ty::ParamEnv::empty();
 
-    let impl1_header = fresh_impl_header_normalized(selcx.infcx, param_env, impl1_def_id);
-    let impl2_header = fresh_impl_header_normalized(selcx.infcx, param_env, impl2_def_id);
+    let impl1_header = if tcx.next_trait_solver_in_coherence() {
+        fresh_impl_header(selcx.infcx, impl1_def_id, is_of_trait)
+    } else {
+        fresh_impl_header_normalized(selcx.infcx, param_env, impl1_def_id, is_of_trait)
+    };
+    let impl2_header = if tcx.next_trait_solver_in_coherence() {
+        fresh_impl_header(selcx.infcx, impl2_def_id, is_of_trait)
+    } else {
+        fresh_impl_header_normalized(selcx.infcx, param_env, impl2_def_id, is_of_trait)
+    };
 
     // Equate the headers to find their intersection (the general type, with infer vars,
     // that may apply both impls).
@@ -287,8 +353,8 @@ fn overlap<'tcx>(
 fn equate_impl_headers<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-    impl1: &ty::ImplHeader<'tcx>,
-    impl2: &ty::ImplHeader<'tcx>,
+    impl1: &ImplHeader<'tcx>,
+    impl2: &ImplHeader<'tcx>,
 ) -> Option<PredicateObligations<'tcx>> {
     let result =
         match (impl1.trait_ref, impl2.trait_ref) {
@@ -356,29 +422,38 @@ fn impl_intersection_has_impossible_obligation<'a, 'cx, 'tcx>(
             return IntersectionHasImpossibleObligations::Yes;
         }
 
-        let ocx = ObligationCtxt::new_with_diagnostics(infcx);
+        let ocx = ObligationCtxt::new(infcx);
         ocx.register_obligations(obligations.iter().cloned());
-        let errors_and_ambiguities = ocx.select_all_or_error();
+        let hard_errors = ocx.try_evaluate_obligations();
+        if !hard_errors.is_empty() {
+            assert!(
+                hard_errors.iter().all(|e| e.is_true_error()),
+                "should not have detected ambiguity during first pass"
+            );
+            return IntersectionHasImpossibleObligations::Yes;
+        }
+
+        // Make a new `ObligationCtxt` and re-prove the ambiguities with a richer
+        // `FulfillmentError`. This is so that we can detect overflowing obligations
+        // without needing to run the `BestObligation` visitor on true errors.
+        let ambiguities = ocx.into_pending_obligations();
+        let ocx = ObligationCtxt::new_with_diagnostics(infcx);
+        ocx.register_obligations(ambiguities);
+        let errors_and_ambiguities = ocx.evaluate_obligations_error_on_ambiguity();
         // We only care about the obligations that are *definitely* true errors.
         // Ambiguities do not prove the disjointness of two impls.
         let (errors, ambiguities): (Vec<_>, Vec<_>) =
             errors_and_ambiguities.into_iter().partition(|error| error.is_true_error());
+        assert!(errors.is_empty(), "should not have ambiguities during second pass");
 
-        if errors.is_empty() {
-            IntersectionHasImpossibleObligations::No {
-                overflowing_predicates: ambiguities
-                    .into_iter()
-                    .filter(|error| {
-                        matches!(
-                            error.code,
-                            FulfillmentErrorCode::Ambiguity { overflow: Some(true) }
-                        )
-                    })
-                    .map(|e| infcx.resolve_vars_if_possible(e.obligation.predicate))
-                    .collect(),
-            }
-        } else {
-            IntersectionHasImpossibleObligations::Yes
+        IntersectionHasImpossibleObligations::No {
+            overflowing_predicates: ambiguities
+                .into_iter()
+                .filter(|error| {
+                    matches!(error.code, FulfillmentErrorCode::Ambiguity { overflow: Some(true) })
+                })
+                .map(|e| infcx.resolve_vars_if_possible(e.obligation.predicate))
+                .collect(),
         }
     } else {
         for obligation in obligations {
@@ -424,25 +499,27 @@ fn impl_intersection_has_negative_obligation(
     tcx: TyCtxt<'_>,
     impl1_def_id: DefId,
     impl2_def_id: DefId,
+    is_of_trait: bool,
 ) -> bool {
     debug!("negative_impl(impl1_def_id={:?}, impl2_def_id={:?})", impl1_def_id, impl2_def_id);
 
-    // N.B. We need to unify impl headers *with* intercrate mode, even if proving negative predicates
-    // do not need intercrate mode enabled.
-    let ref infcx = tcx.infer_ctxt().with_next_trait_solver(true).build(TypingMode::Coherence);
+    // N.B. We need to unify impl headers *with* `TypingMode::Coherence`,
+    // even if proving negative predicates doesn't need `TypingMode::Coherence`.
+    let ref infcx = tcx
+        .infer_ctxt()
+        .with_next_trait_solver(true)
+        .enable_next_solver_overflow_fcw(false)
+        .build(TypingMode::Coherence);
     let root_universe = infcx.universe();
     assert_eq!(root_universe, ty::UniverseIndex::ROOT);
 
-    let impl1_header = fresh_impl_header(infcx, impl1_def_id);
-    let param_env =
-        ty::EarlyBinder::bind(tcx.param_env(impl1_def_id)).instantiate(tcx, impl1_header.impl_args);
-
-    let impl2_header = fresh_impl_header(infcx, impl2_def_id);
+    let impl1_header = fresh_impl_header(infcx, impl1_def_id, is_of_trait);
+    let impl2_header = fresh_impl_header(infcx, impl2_def_id, is_of_trait);
 
     // Equate the headers to find their intersection (the general type, with infer vars,
     // that may apply both impls).
     let Some(equate_obligations) =
-        equate_impl_headers(infcx, param_env, &impl1_header, &impl2_header)
+        equate_impl_headers(infcx, ty::ParamEnv::empty(), &impl1_header, &impl2_header)
     else {
         return false;
     };
@@ -452,6 +529,7 @@ fn impl_intersection_has_negative_obligation(
     // requirements, when proving the negated where clauses below.
     drop(equate_obligations);
     drop(infcx.take_registered_region_obligations());
+    drop(infcx.take_registered_region_assumptions());
     drop(infcx.take_and_reset_region_constraints());
 
     plug_infer_with_placeholders(
@@ -459,10 +537,27 @@ fn impl_intersection_has_negative_obligation(
         root_universe,
         (impl1_header.impl_args, impl2_header.impl_args),
     );
-    let param_env = infcx.resolve_vars_if_possible(param_env);
 
-    util::elaborate(tcx, tcx.predicates_of(impl2_def_id).instantiate(tcx, impl2_header.impl_args))
-        .any(|(clause, _)| try_prove_negated_where_clause(infcx, clause, param_env))
+    // Right above we plug inference variables with placeholders,
+    // this gets us new impl1_header_args with the inference variables actually resolved
+    // to those placeholders.
+    let impl1_header_args = infcx.resolve_vars_if_possible(impl1_header.impl_args);
+    // So there are no infer variables left now, except regions which aren't resolved by `resolve_vars_if_possible`.
+    assert!(!impl1_header_args.has_non_region_infer());
+
+    let param_env = ty::EarlyBinder::bind(tcx, tcx.param_env(impl1_def_id))
+        .instantiate(tcx, impl1_header_args)
+        .skip_norm_wip();
+
+    util::elaborate(
+        tcx,
+        tcx.clauses_of(impl2_def_id)
+            .instantiate(tcx, impl2_header.impl_args)
+            .into_iter()
+            .map(|(c, s)| (c.skip_norm_wip(), s)),
+    )
+    .elaborate_sized()
+    .any(|(clause, _)| try_prove_negated_where_clause(infcx, clause, param_env))
 }
 
 fn plug_infer_with_placeholders<'tcx>(
@@ -495,13 +590,10 @@ fn plug_infer_with_placeholders<'tcx>(
                         ty,
                         Ty::new_placeholder(
                             self.infcx.tcx,
-                            ty::Placeholder {
-                                universe: self.universe,
-                                bound: ty::BoundTy {
-                                    var: self.next_var(),
-                                    kind: ty::BoundTyKind::Anon,
-                                },
-                            },
+                            ty::PlaceholderType::new(
+                                self.universe,
+                                ty::BoundTy { var: self.next_var(), kind: ty::BoundTyKind::Anon },
+                            ),
                         ),
                     )
                 else {
@@ -524,7 +616,10 @@ fn plug_infer_with_placeholders<'tcx>(
                         ct,
                         ty::Const::new_placeholder(
                             self.infcx.tcx,
-                            ty::Placeholder { universe: self.universe, bound: self.next_var() },
+                            ty::PlaceholderConst::new(
+                                self.universe,
+                                ty::BoundConst::new(self.next_var()),
+                            ),
                         ),
                     )
                 else {
@@ -552,13 +647,13 @@ fn plug_infer_with_placeholders<'tcx>(
                             r,
                             ty::Region::new_placeholder(
                                 self.infcx.tcx,
-                                ty::Placeholder {
-                                    universe: self.universe,
-                                    bound: ty::BoundRegion {
+                                ty::PlaceholderRegion::new(
+                                    self.universe,
+                                    ty::BoundRegion {
                                         var: self.next_var(),
                                         kind: ty::BoundRegionKind::Anon,
                                     },
-                                },
+                                ),
                             ),
                         )
                     else {
@@ -596,7 +691,7 @@ fn try_prove_negated_where_clause<'tcx>(
         param_env,
         negative_predicate,
     ));
-    if !ocx.select_all_or_error().is_empty() {
+    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
         return false;
     }
 
@@ -661,13 +756,11 @@ impl<'a, 'tcx> ProofTreeVisitor<'tcx> for AmbiguityCausesVisitor<'a, 'tcx> {
         // For bound predicates we simply call `infcx.enter_forall`
         // and then prove the resulting predicate as a nested goal.
         let Goal { param_env, predicate } = goal.goal();
-        let trait_ref = match predicate.kind().no_bound_vars() {
-            Some(ty::PredicateKind::Clause(ty::ClauseKind::Trait(tr))) => tr.trait_ref,
-            Some(ty::PredicateKind::Clause(ty::ClauseKind::Projection(proj)))
-                if matches!(
-                    infcx.tcx.def_kind(proj.projection_term.def_id),
-                    DefKind::AssocTy | DefKind::AssocConst
-                ) =>
+        let predicate_kind = goal.infcx().enter_forall_and_leak_universe(predicate.kind());
+        let trait_ref = match predicate_kind {
+            ty::PredicateKind::Clause(ty::ClauseKind::Trait(tr)) => tr.trait_ref,
+            ty::PredicateKind::Clause(ty::ClauseKind::Projection(proj))
+                if proj.projection_term.kind.is_trait_projection() =>
             {
                 proj.projection_term.trait_ref(infcx.tcx)
             }
@@ -684,15 +777,12 @@ impl<'a, 'tcx> ProofTreeVisitor<'tcx> for AmbiguityCausesVisitor<'a, 'tcx> {
                 source: CandidateSource::Impl(def_id),
                 result: Ok(_),
             } = cand.kind()
+                && let ty::ImplPolarity::Reservation = infcx.tcx.impl_polarity(def_id)
             {
-                if let ty::ImplPolarity::Reservation = infcx.tcx.impl_polarity(def_id) {
-                    let message = infcx
-                        .tcx
-                        .get_attr(def_id, sym::rustc_reservation_impl)
-                        .and_then(|a| a.value_str());
-                    if let Some(message) = message {
-                        self.causes.insert(IntercrateAmbiguityCause::ReservationImpl { message });
-                    }
+                if let Some(message) =
+                    find_attr!(infcx.tcx, def_id, RustcReservationImpl(message) => *message)
+                {
+                    self.causes.insert(IntercrateAmbiguityCause::ReservationImpl { message });
                 }
             }
         }
@@ -715,9 +805,13 @@ impl<'a, 'tcx> ProofTreeVisitor<'tcx> for AmbiguityCausesVisitor<'a, 'tcx> {
             if matches!(ty.kind(), ty::Alias(..)) {
                 let ocx = ObligationCtxt::new(infcx);
                 ty = ocx
-                    .structurally_normalize_ty(&ObligationCause::dummy(), param_env, ty)
+                    .structurally_normalize_ty(
+                        &ObligationCause::dummy(),
+                        param_env,
+                        Unnormalized::new_wip(ty),
+                    )
                     .map_err(|_| ())?;
-                if !ocx.select_where_possible().is_empty() {
+                if !ocx.try_evaluate_obligations().is_empty() {
                     return Err(());
                 }
             }

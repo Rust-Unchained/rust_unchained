@@ -1,6 +1,7 @@
 //@[new_precise] compile-flags: -Znext-solver
 //@[new_stock] compile-flags: -Znext-solver
 //@ revisions: new_stock old_stock new_precise old_precise
+//@ ignore-backends: gcc
 
 #![feature(const_trait_impl, const_destruct)]
 #![cfg_attr(any(new_precise, old_precise), feature(const_precise_live_drops))]
@@ -16,12 +17,13 @@ impl Drop for NonTrivialDrop {
 }
 
 struct ConstImplWithDropGlue(NonTrivialDrop);
+//~^ ERROR: `NonTrivialDrop` does not implement `[const] Destruct`
 
-impl const Drop for ConstImplWithDropGlue {
+const impl Drop for ConstImplWithDropGlue {
     fn drop(&mut self) {}
 }
 
-const fn check<T: ~const Destruct>(_: T) {}
+const fn check<T: [const] Destruct>(_: T) {}
 
 macro_rules! check_all {
     ($($exp:expr),*$(,)?) => {$(

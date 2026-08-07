@@ -1,8 +1,8 @@
 //! Renderer for macro invocations.
 
-use hir::HirDisplay;
-use ide_db::{documentation::Documentation, SymbolKind};
-use syntax::{format_smolstr, SmolStr, ToSmolStr};
+use hir::{HirDisplay, db::HirDatabase};
+use ide_db::{SymbolKind, documentation::Documentation};
+use syntax::{SmolStr, ToSmolStr, format_smolstr};
 
 use crate::{
     context::{PathCompletionCtx, PathKind, PatternContext},
@@ -11,8 +11,8 @@ use crate::{
 };
 
 pub(crate) fn render_macro(
-    ctx: RenderContext<'_>,
-    PathCompletionCtx { kind, has_macro_bang, has_call_parens, .. }: &PathCompletionCtx,
+    ctx: RenderContext<'_, '_>,
+    PathCompletionCtx { kind, has_macro_bang, has_call_parens, .. }: &PathCompletionCtx<'_>,
 
     name: hir::Name,
     macro_: hir::Macro,
@@ -22,7 +22,7 @@ pub(crate) fn render_macro(
 }
 
 pub(crate) fn render_macro_pat(
-    ctx: RenderContext<'_>,
+    ctx: RenderContext<'_, '_>,
     _pattern_ctx: &PatternContext,
     name: hir::Name,
     macro_: hir::Macro,
@@ -32,7 +32,7 @@ pub(crate) fn render_macro_pat(
 }
 
 fn render(
-    ctx @ RenderContext { completion, .. }: RenderContext<'_>,
+    ctx @ RenderContext { completion, .. }: RenderContext<'_, '_>,
     is_use_path: bool,
     has_macro_bang: bool,
     has_call_parens: bool,
@@ -49,9 +49,12 @@ fn render(
     let (name, escaped_name) =
         (name.as_str(), name.display(ctx.db(), completion.edition).to_smolstr());
     let docs = ctx.docs(macro_);
-    let docs_str = docs.as_ref().map(Documentation::as_str).unwrap_or_default();
     let is_fn_like = macro_.is_fn_like(completion.db);
-    let (bra, ket) = if is_fn_like { guess_macro_braces(name, docs_str) } else { ("", "") };
+    let (bra, ket) = if is_fn_like {
+        guess_macro_braces(ctx.db(), macro_, name, docs.as_ref())
+    } else {
+        ("", "")
+    };
 
     let needs_bang = is_fn_like && !is_use_path && !has_macro_bang;
 
@@ -61,7 +64,7 @@ fn render(
         label(&ctx, needs_bang, bra, ket, &name.to_smolstr()),
         completion.edition,
     );
-    item.set_deprecated(ctx.is_deprecated(macro_))
+    item.set_deprecated(ctx.is_deprecated(macro_, None /* macros can't be assoc items */))
         .detail(macro_.display(completion.db, completion.display_target).to_string())
         .set_documentation(docs)
         .set_relevance(ctx.completion_relevance());
@@ -88,7 +91,7 @@ fn render(
 }
 
 fn label(
-    ctx: &RenderContext<'_>,
+    ctx: &RenderContext<'_, '_>,
     needs_bang: bool,
     bra: &str,
     ket: &str,
@@ -109,9 +112,25 @@ fn banged_name(name: &str) -> SmolStr {
     SmolStr::from_iter([name, "!"])
 }
 
-fn guess_macro_braces(macro_name: &str, docs: &str) -> (&'static str, &'static str) {
+fn guess_macro_braces(
+    db: &dyn HirDatabase,
+    macro_: hir::Macro,
+    macro_name: &str,
+    docs: Option<&Documentation<'_>>,
+) -> (&'static str, &'static str) {
+    if let Some(style) = macro_.preferred_brace_style(db) {
+        return match style {
+            hir::MacroBraces::Braces => (" {", "}"),
+            hir::MacroBraces::Brackets => ("[", "]"),
+            hir::MacroBraces::Parentheses => ("(", ")"),
+        };
+    }
+
+    let orig_name = macro_.name(db);
+    let docs = docs.map(Documentation::as_str).unwrap_or_default();
+
     let mut votes = [0, 0, 0];
-    for (idx, s) in docs.match_indices(&macro_name) {
+    for (idx, s) in docs.match_indices(macro_name).chain(docs.match_indices(orig_name.as_str())) {
         let (before, after) = (&docs[..idx], &docs[idx + s.len()..]);
         // Ensure to match the full word
         if after.starts_with('!')
@@ -191,6 +210,57 @@ fn main() {
     }
 
     #[test]
+    fn preferred_macro_braces() {
+        check_edit(
+            "vec!",
+            r#"
+#[rust_analyzer::macro_style(brackets)]
+macro_rules! vec { () => {} }
+
+fn main() { v$0 }
+"#,
+            r#"
+#[rust_analyzer::macro_style(brackets)]
+macro_rules! vec { () => {} }
+
+fn main() { vec![$0] }
+"#,
+        );
+
+        check_edit(
+            "foo!",
+            r#"
+#[rust_analyzer::macro_style(braces)]
+macro_rules! foo { () => {} }
+fn main() { $0 }
+"#,
+            r#"
+#[rust_analyzer::macro_style(braces)]
+macro_rules! foo { () => {} }
+fn main() { foo! {$0} }
+"#,
+        );
+
+        check_edit(
+            "bar!",
+            r#"
+#[macro_export]
+#[rust_analyzer::macro_style(brackets)]
+macro_rules! foo { () => {} }
+pub use crate::foo as bar;
+fn main() { $0 }
+"#,
+            r#"
+#[macro_export]
+#[rust_analyzer::macro_style(brackets)]
+macro_rules! foo { () => {} }
+pub use crate::foo as bar;
+fn main() { bar![$0] }
+"#,
+        );
+    }
+
+    #[test]
     fn guesses_macro_braces() {
         check_edit(
             "vec!",
@@ -240,7 +310,25 @@ fn main() { $0 }
 macro_rules! foo { () => {} }
 fn main() { foo! {$0} }
 "#,
-        )
+        );
+
+        check_edit(
+            "bar!",
+            r#"
+/// `foo![]`
+#[macro_export]
+macro_rules! foo { () => {} }
+pub use crate::foo as bar;
+fn main() { $0 }
+"#,
+            r#"
+/// `foo![]`
+#[macro_export]
+macro_rules! foo { () => {} }
+pub use crate::foo as bar;
+fn main() { bar![$0] }
+"#,
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::marker::{ConstParamTy_, UnsizedConstParamTy};
+use crate::marker::ConstParamTy_;
 
 /// Marks that `Src` is transmutable into `Self`.
 ///
@@ -83,9 +83,10 @@ use crate::marker::{ConstParamTy_, UnsizedConstParamTy};
 /// Furthermore, stability does not imply portability. For example, the size of
 /// `usize` is stable, but not portable.
 #[unstable(feature = "transmutability", issue = "99571")]
+#[unstable_feature_bound(transmutability)]
 #[lang = "transmute_trait"]
 #[rustc_deny_explicit_impl]
-#[rustc_do_not_implement_via_object]
+#[rustc_dyn_incompatible_trait]
 #[rustc_coinductive]
 pub unsafe trait TransmuteFrom<Src, const ASSUME: Assume = { Assume::NOTHING }>
 where
@@ -288,9 +289,8 @@ pub struct Assume {
 }
 
 #[unstable(feature = "transmutability", issue = "99571")]
+#[unstable_feature_bound(transmutability)]
 impl ConstParamTy_ for Assume {}
-#[unstable(feature = "transmutability", issue = "99571")]
-impl UnsizedConstParamTy for Assume {}
 
 impl Assume {
     /// With this, [`TransmuteFrom`] does not assume you have ensured any safety

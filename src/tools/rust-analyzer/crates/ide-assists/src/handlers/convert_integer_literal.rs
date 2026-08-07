@@ -1,6 +1,6 @@
-use syntax::{ast, ast::Radix, AstToken};
+use syntax::{AstToken, ast, ast::Radix};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
+use crate::{AssistContext, AssistId, Assists, GroupLabel};
 
 // Assist: convert_integer_literal
 //
@@ -13,7 +13,13 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, GroupLabel};
 // ```
 // const _: i32 = 0b1010;
 // ```
-pub(crate) fn convert_integer_literal(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn convert_integer_literal(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
+    if !ctx.has_empty_selection() {
+        return None;
+    }
     let literal = ctx.find_node_at_offset::<ast::Literal>()?;
     let literal = match literal.kind() {
         ast::LiteralKind::IntNumber(it) => it,
@@ -47,7 +53,7 @@ pub(crate) fn convert_integer_literal(acc: &mut Assists, ctx: &AssistContext<'_>
 
         acc.add_group(
             &group_id,
-            AssistId("convert_integer_literal", AssistKind::RefactorInline),
+            AssistId::refactor_rewrite("convert_integer_literal"),
             label,
             range,
             |builder| builder.replace(range, converted),
@@ -264,5 +270,10 @@ mod tests {
         let before = "const _: i32 =
             111111111111111111111111111111111111111111111111111111111111111111111111$0;";
         check_assist_not_applicable(convert_integer_literal, before);
+    }
+
+    #[test]
+    fn convert_non_empty_selection_literal() {
+        check_assist_not_applicable(convert_integer_literal, "const _: i32 = $00b1010$0;");
     }
 }

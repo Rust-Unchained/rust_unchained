@@ -4,16 +4,16 @@ params: [
 body:
     Expr {
         ty: ()
-        temp_lifetime: TempLifetime { temp_lifetime: Some(Node(2)), backwards_incompatible: None }
+        temp_scope_id: 2
         span: $DIR/thir-tree.rs:4:15: 4:17 (#0)
         kind: 
             Scope {
                 region_scope: Node(2)
-                lint_level: Explicit(HirId(DefId(0:3 ~ thir_tree[7aaa]::main).2))
+                hir_id: HirId(DefId(0:3 ~ thir_tree[7aaa]::main).2)
                 value:
                     Expr {
                         ty: ()
-                        temp_lifetime: TempLifetime { temp_lifetime: Some(Node(2)), backwards_incompatible: None }
+                        temp_scope_id: 2
                         span: $DIR/thir-tree.rs:4:15: 4:17 (#0)
                         kind: 
                             Block {

@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::is_trait_method;
+use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
 use clippy_utils::ty::has_iter_method;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
@@ -10,24 +10,17 @@ use rustc_span::symbol::{Symbol, sym};
 
 use super::INTO_ITER_ON_REF;
 
-pub(super) fn check(
-    cx: &LateContext<'_>,
-    expr: &hir::Expr<'_>,
-    method_span: Span,
-    method_name: Symbol,
-    receiver: &hir::Expr<'_>,
-) {
+pub(super) fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, method_span: Span, receiver: &hir::Expr<'_>) {
     let self_ty = cx.typeck_results().expr_ty_adjusted(receiver);
     if let ty::Ref(..) = self_ty.kind()
-        && method_name == sym::into_iter
-        && is_trait_method(cx, expr, sym::IntoIterator)
+        && cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::IntoIterator)
         && let Some((kind, method_name)) = ty_has_iter_method(cx, self_ty)
     {
         span_lint_and_sugg(
             cx,
             INTO_ITER_ON_REF,
             method_span,
-            format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`",),
+            format!("this `.into_iter()` call is equivalent to `.{method_name}()` and will not consume the `{kind}`"),
             "call directly",
             method_name.to_string(),
             Applicability::MachineApplicable,

@@ -1,16 +1,16 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::macros::{PanicExpn, find_assert_args, root_macro_call_first_node};
+use clippy_utils::macros::{find_assert_args, root_macro_call_first_node};
+use clippy_utils::res::{MaybeDef, MaybeResPath};
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::ty::{has_debug_impl, is_copy, is_type_diagnostic_item};
+use clippy_utils::sym;
+use clippy_utils::ty::{has_debug_impl, is_copy};
 use clippy_utils::usage::local_used_after_expr;
-use clippy_utils::{is_expr_final_block_expr, path_res};
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
-use rustc_hir::{Expr, ExprKind};
+use rustc_hir::{Expr, ExprKind, Node};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, Ty};
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -52,43 +52,46 @@ impl<'tcx> LateLintPass<'tcx> for AssertionsOnResultStates {
         if let Some(macro_call) = root_macro_call_first_node(cx, e)
             && matches!(cx.tcx.get_diagnostic_name(macro_call.def_id), Some(sym::assert_macro))
             && let Some((condition, panic_expn)) = find_assert_args(cx, e, macro_call.expn)
-            && matches!(panic_expn, PanicExpn::Empty)
+            && panic_expn.is_default_message()
             && let ExprKind::MethodCall(method_segment, recv, [], _) = condition.kind
             && let result_type_with_refs = cx.typeck_results().expr_ty(recv)
             && let result_type = result_type_with_refs.peel_refs()
-            && is_type_diagnostic_item(cx, result_type, sym::Result)
+            && result_type.is_diag_item(cx, sym::Result)
             && let ty::Adt(_, args) = result_type.kind()
         {
             if !is_copy(cx, result_type) {
                 if result_type_with_refs != result_type {
                     return;
-                } else if let Res::Local(binding_id) = path_res(cx, recv)
+                } else if let Res::Local(binding_id) = *recv.basic_res()
                     && local_used_after_expr(cx, binding_id, recv)
                 {
                     return;
                 }
             }
-            let (message, replacement) = match method_segment.ident.as_str() {
-                "is_ok" if type_suitable_to_unwrap(cx, args.type_at(1)) => {
+            let (message, replacement) = match method_segment.ident.name {
+                sym::is_ok if type_suitable_to_unwrap(cx, args.type_at(1)) => {
                     ("called `assert!` with `Result::is_ok`", "unwrap")
                 },
-                "is_err" if type_suitable_to_unwrap(cx, args.type_at(0)) => {
+                sym::is_err if type_suitable_to_unwrap(cx, args.type_at(0)) => {
                     ("called `assert!` with `Result::is_err`", "unwrap_err")
                 },
                 _ => return,
             };
             span_lint_and_then(cx, ASSERTIONS_ON_RESULT_STATES, macro_call.span, message, |diag| {
-                let semicolon = if is_expr_final_block_expr(cx.tcx, e) { ";" } else { "" };
                 let mut app = Applicability::MachineApplicable;
-                diag.span_suggestion(
-                    macro_call.span,
-                    "replace with",
-                    format!(
-                        "{}.{replacement}(){semicolon}",
-                        snippet_with_context(cx, recv.span, condition.span.ctxt(), "..", &mut app).0
-                    ),
-                    app,
-                );
+                let recv = snippet_with_context(cx, recv.span, condition.span.ctxt(), "..", &mut app).0;
+
+                // `assert!` doesn't return anything, but `Result::unwrap(_err)` does, so we might need to add a
+                // semicolon to the suggestion to avoid leaking the type
+                let sugg = match cx.tcx.parent_hir_node(e.hir_id) {
+                    // trailing expr of a block
+                    Node::Block(..) => format!("{recv}.{replacement}();"),
+                    // already has a trailing semicolon
+                    Node::Stmt(..) => format!("{recv}.{replacement}()"),
+                    // this is the last-resort option, because it's rather verbose
+                    _ => format!("{{ {recv}.{replacement}(); }}"),
+                };
+                diag.span_suggestion(macro_call.span, "replace with", sugg, app);
             });
         }
     }

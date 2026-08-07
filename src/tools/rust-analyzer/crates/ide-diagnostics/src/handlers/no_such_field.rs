@@ -1,50 +1,57 @@
 use either::Either;
-use hir::{db::ExpandDatabase, HasSource, HirDisplay, HirFileIdExt, Semantics, VariantId};
+use hir::{HasSource, HirDisplay, InFile, Semantics, VariantId};
 use ide_db::text_edit::TextEdit;
-use ide_db::{source_change::SourceChange, EditionedFileId, RootDatabase};
+use ide_db::{
+    EditionedFileId, RootDatabase, helpers::is_editable_crate, source_change::SourceChange,
+};
 use syntax::{
-    ast::{self, edit::IndentLevel, make},
     AstNode,
+    ast::{self, edit::IndentLevel, make},
 };
 
-use crate::{fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{
+    Assist, Diagnostic, DiagnosticCode, DiagnosticsContext, fix,
+    handlers::private_field::field_is_private_fixes,
+};
 
 // Diagnostic: no-such-field
 //
 // This diagnostic is triggered if created structure does not have field provided in record.
-pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Diagnostic {
-    let node = d.field.map(Into::into);
-    if d.private {
-        // FIXME: quickfix to add required visibility
-        Diagnostic::new_with_syntax_node_ptr(
-            ctx,
-            DiagnosticCode::RustcHardError("E0451"),
-            "field is private",
-            node,
-        )
+pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Diagnostic {
+    let (code, message) = if d.private.is_some() {
+        ("E0451", "field is private")
+    } else if let VariantId::EnumVariantId(_) = d.variant {
+        ("E0559", "no such field")
     } else {
-        Diagnostic::new_with_syntax_node_ptr(
-            ctx,
-            match d.variant {
-                VariantId::EnumVariantId(_) => DiagnosticCode::RustcHardError("E0559"),
-                _ => DiagnosticCode::RustcHardError("E0560"),
-            },
-            "no such field",
-            node,
-        )
+        ("E0560", "no such field")
+    };
+
+    let node = d.field.map(Into::into);
+    Diagnostic::new_with_syntax_node_ptr(ctx, DiagnosticCode::RustcHardError(code), message, node)
+        .stable()
         .with_fixes(fixes(ctx, d))
-    }
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
     // FIXME: quickfix for pattern
-    let root = ctx.sema.db.parse_or_expand(d.field.file_id);
+    let root = d.field.file_id.parse_or_expand(ctx.sema.db);
     match &d.field.value.to_node(&root) {
-        Either::Left(node) => missing_record_expr_field_fixes(
-            &ctx.sema,
-            d.field.file_id.original_file(ctx.sema.db),
-            node,
-        ),
+        Either::Left(node) => {
+            if let Some(private_field) = d.private {
+                field_is_private_fixes(
+                    &ctx.sema,
+                    d.field.file_id.original_file(ctx.sema.db),
+                    private_field,
+                    ctx.sema.original_range(node.syntax()).range,
+                )
+            } else {
+                missing_record_expr_field_fixes(
+                    &ctx.sema,
+                    d.field.file_id.original_file(ctx.sema.db),
+                    node,
+                )
+            }
+        }
         _ => None,
     }
 }
@@ -59,20 +66,20 @@ fn missing_record_expr_field_fixes(
     let module;
     let def_file_id;
     let record_fields = match def_id {
-        hir::VariantDef::Struct(s) => {
+        hir::Variant::Struct(s) => {
             module = s.module(sema.db);
             let source = s.source(sema.db)?;
             def_file_id = source.file_id;
             let fields = source.value.field_list()?;
             record_field_list(fields)?
         }
-        hir::VariantDef::Union(u) => {
+        hir::Variant::Union(u) => {
             module = u.module(sema.db);
             let source = u.source(sema.db)?;
             def_file_id = source.file_id;
             source.value.record_field_list()?
         }
-        hir::VariantDef::Variant(e) => {
+        hir::Variant::EnumVariant(e) => {
             module = e.module(sema.db);
             let source = e.source(sema.db)?;
             def_file_id = source.file_id;
@@ -80,7 +87,10 @@ fn missing_record_expr_field_fixes(
             record_field_list(fields)?
         }
     };
-    let def_file_id = def_file_id.original_file(sema.db);
+
+    if !is_editable_crate(module.krate(sema.db), sema.db) {
+        return None;
+    }
 
     let new_field_type = sema.type_of_expr(&record_expr_field.expr()?)?.adjusted();
     if new_field_type.is_unknown() {
@@ -92,31 +102,42 @@ fn missing_record_expr_field_fixes(
         make::ty(&new_field_type.display_source_code(sema.db, module.into(), true).ok()?),
     );
 
-    let last_field = record_fields.fields().last()?;
-    let last_field_syntax = last_field.syntax();
-    let indent = IndentLevel::from_node(last_field_syntax);
+    let after = if let Some(last_field) = record_fields.fields().last() {
+        last_field.syntax().last_token()?
+    } else {
+        record_fields.l_curly_token()?
+    };
+    let hir::FileRange { file_id, range } =
+        InFile::new(def_file_id, after.text_range()).original_node_file_range_opt(sema.db)?.0;
+    let origin = sema.parse(file_id).syntax().covering_element(range);
+    let indent = IndentLevel::from_element(&origin);
 
-    let mut new_field = new_field.to_string();
-    if usage_file_id != def_file_id {
-        new_field = format!("pub(crate) {new_field}");
-    }
-    new_field = format!("\n{indent}{new_field}");
+    let (comma, indent, postfix) = match after.kind() {
+        syntax::SyntaxKind::L_CURLY => {
+            let newline = !after.next_token().is_some_and(|it| it.text().contains('\n'));
+            ("", indent + 1, if newline { format!(",\n{indent}") } else { ",".into() })
+        }
+        _ => (",", indent, String::new()),
+    };
 
-    let needs_comma = !last_field_syntax.to_string().ends_with(',');
-    if needs_comma {
-        new_field = format!(",{new_field}");
-    }
+    // FIXME: check submodule instead of FileId
+    let vis = if usage_file_id != file_id && !matches!(def_id, hir::Variant::EnumVariant(_)) {
+        "pub(crate) "
+    } else {
+        ""
+    };
+    let new_field = format!("{comma}\n{indent}{vis}{new_field}{postfix}");
 
     let source_change = SourceChange::from_text_edit(
-        def_file_id,
-        TextEdit::insert(last_field_syntax.text_range().end(), new_field),
+        file_id.file_id(sema.db),
+        TextEdit::insert(range.end(), new_field),
     );
 
     return Some(vec![fix(
         "create_field",
         "Create field",
         source_change,
-        record_expr_field.syntax().text_range(),
+        sema.original_range(record_expr_field.syntax()).range,
     )]);
 
     fn record_field_list(field_def_list: ast::FieldList) -> Option<ast::RecordFieldList> {
@@ -135,6 +156,8 @@ mod tests {
     fn dont_work_for_field_with_disabled_cfg() {
         check_diagnostics(
             r#"
+#![allow(rust_analyzer::inactive_code)]
+
 struct Test {
     #[cfg(feature = "hello")]
     test: u32,
@@ -206,6 +229,8 @@ impl S {
         check_diagnostics(
             r#"
 //- /lib.rs crate:foo cfg:feature=foo
+#![allow(rust_analyzer::inactive_code)]
+
 struct MyStruct {
     my_val: usize,
     #[cfg(feature = "foo")]
@@ -231,6 +256,8 @@ impl MyStruct {
         check_diagnostics(
             r#"
 //- /lib.rs crate:foo cfg:feature=foo
+#![allow(rust_analyzer::inactive_code)]
+
 enum Foo {
     #[cfg(not(feature = "foo"))]
     Buz,
@@ -254,6 +281,8 @@ fn test_fn(f: Foo) {
         check_diagnostics(
             r#"
 //- /lib.rs crate:foo cfg:feature=foo
+#![allow(rust_analyzer::inactive_code)]
+
 struct S {
     #[cfg(feature = "foo")]
     foo: u32,
@@ -329,6 +358,44 @@ struct Foo {
     }
 
     #[test]
+    fn test_add_field_from_usage_with_empty_struct() {
+        check_fix(
+            r"
+fn main() {
+    Foo { bar$0: false };
+}
+struct Foo {}
+",
+            r"
+fn main() {
+    Foo { bar: false };
+}
+struct Foo {
+    bar: bool,
+}
+",
+        );
+
+        check_fix(
+            r"
+fn main() {
+    Foo { bar$0: false };
+}
+struct Foo {
+}
+",
+            r"
+fn main() {
+    Foo { bar: false };
+}
+struct Foo {
+    bar: bool,
+}
+",
+        );
+    }
+
+    #[test]
     fn test_add_field_in_other_file_from_usage() {
         check_fix(
             r#"
@@ -353,6 +420,34 @@ pub struct Foo {
     }
 
     #[test]
+    fn test_add_enum_variant_field_in_other_file_from_usage() {
+        check_fix(
+            r#"
+//- /main.rs
+mod foo;
+
+fn main() {
+    foo::Foo::Variant { bar: 3, $0baz: false};
+}
+//- /foo.rs
+pub enum Foo {
+    Variant {
+        bar: i32
+    }
+}
+"#,
+            r#"
+pub enum Foo {
+    Variant {
+        bar: i32,
+        baz: bool
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
     fn test_tuple_field_on_record_struct() {
         check_no_fix(
             r#"
@@ -362,6 +457,80 @@ fn main() {
         0$0: 0
     }
 }
+"#,
+        )
+    }
+
+    #[test]
+    fn test_add_field_macro_defined_struct() {
+        check_fix(
+            r#"
+macro_rules! identity { ($($t:tt)*) => { $($t)* }; }
+identity! {
+    struct S {
+        a: i32
+    }
+}
+fn f() { let _ = S { a: 1, b$0: false }; }
+"#,
+            r#"
+macro_rules! identity { ($($t:tt)*) => { $($t)* }; }
+identity! {
+    struct S {
+        a: i32,
+        b: bool
+    }
+}
+fn f() { let _ = S { a: 1, b: false }; }
+"#,
+        );
+    }
+
+    #[test]
+    fn test_add_field_macro_defined_struct_large_offset() {
+        // Regression test: we should handle macro definitions whose offset is larger than
+        // the max position in main.rs.
+        check_fix(
+            r#"
+//- /main.rs
+#[macro_use]
+mod m;
+make_items!();
+fn f() { let _ = S { a: 1, bbb$0: 2 }; }
+//- /m.rs
+macro_rules! make_items {
+    () => {
+        pub struct Padding {
+            pub p0: i32, pub p1: i32, pub p2: i32,
+            pub p3: i32, pub p4: i32, pub p5: i32,
+        }
+        pub struct S { pub a: i32 }
+    };
+}
+"#,
+            r#"
+macro_rules! make_items {
+    () => {
+        pub struct Padding {
+            pub p0: i32, pub p1: i32, pub p2: i32,
+            pub p3: i32, pub p4: i32, pub p5: i32,
+        }
+        pub struct S { pub a: i32,
+        pub(crate) bbb: i32 }
+    };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn no_such_field_no_fix_for_struct_in_library_crate() {
+        check_no_fix(
+            r#"
+//- /lib.rs crate:lib new_source_root:library
+pub struct S { pub a: i32 }
+//- /main.rs crate:main deps:lib new_source_root:local
+fn f() { let _ = lib::S { a: 1, b$0: false }; }
 "#,
         )
     }
@@ -385,19 +554,90 @@ fn f(s@m::Struct {
     // assignee expression
     m::Struct {
         field: 0,
-      //^^^^^^^^ error: field is private
+      //^^^^^^^^ 💡 error: field is private
         field2
-      //^^^^^^ error: field is private
+      //^^^^^^ 💡 error: field is private
     } = s;
     m::Struct {
         field: 0,
-      //^^^^^^^^ error: field is private
+      //^^^^^^^^ 💡 error: field is private
         field2
-      //^^^^^^ error: field is private
+      //^^^^^^ 💡 error: field is private
     };
 }
 "#,
         )
+    }
+
+    #[test]
+    fn test_struct_field_private_same_crate_fix() {
+        check_diagnostics(
+            r#"
+mod m {
+    pub struct Struct {
+        field: u32,
+    }
+}
+fn f() {
+    let _ = m::Struct {
+        field: 0,
+      //^^^^^^^^ 💡 error: field is private
+    };
+}
+"#,
+        );
+
+        check_fix(
+            r#"
+mod m {
+    pub struct Struct {
+        field: u32,
+    }
+}
+fn f() {
+    let _ = m::Struct {
+        field$0: 0,
+    };
+}
+"#,
+            r#"
+mod m {
+    pub struct Struct {
+        pub(crate) field: u32,
+    }
+}
+fn f() {
+    let _ = m::Struct {
+        field: 0,
+    };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_struct_field_private_other_crate_fix() {
+        check_fix(
+            r#"
+//- /lib.rs crate:another_crate
+pub struct Struct {
+    field: u32,
+}
+//- /lib.rs crate:this_crate deps:another_crate
+use another_crate;
+
+fn f() {
+    let _ = another_crate::Struct {
+        field$0: 0,
+    };
+}
+"#,
+            r#"
+pub struct Struct {
+    pub field: u32,
+}
+"#,
+        );
     }
 
     #[test]

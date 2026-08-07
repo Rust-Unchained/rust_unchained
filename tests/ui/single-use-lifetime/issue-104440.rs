@@ -1,3 +1,5 @@
+//@ check-pass
+
 #![feature(decl_macro, rustc_attrs)]
 #![deny(single_use_lifetimes)]
 
@@ -8,7 +10,7 @@ mod type_params {
         }
     }
 
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     macro n($T:ident) {
         fn g<$T: Clone>(t1: $T, t2: T) -> (T, $T) {
             (t1.clone(), t2.clone())
@@ -35,12 +37,12 @@ mod type_params {
 
 mod lifetime_params {
     macro m($a:lifetime) {
-        fn f<'b, 'c, $a: 'b, 'a: 'c>(t1: &$a(), t2: &'a ()) -> (&'b (), &'c ()) { //~ ERROR lifetime parameter `'a` only used once
+        fn f<'b, 'c, $a: 'b, 'a: 'c>(t1: &$a(), t2: &'a ()) -> (&'b (), &'c ()) {
             (t1, t2)
         }
     }
 
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     macro n($a:lifetime) {
         fn g<$a>(t1: &$a(), t2: &'a ()) -> (&'a (), &$a ()) {
             (t1, t2)
@@ -60,7 +62,7 @@ mod lifetime_params {
         }
     }
 
-    m!('a); //~ ERROR lifetime parameter `'a` only used once
+    m!('a);
     n!('a);
     p!('a);
 }
@@ -72,7 +74,7 @@ mod const_params {
         }
     }
 
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     macro n($C:ident) {
         fn g<const $C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); C], [(); $C]) {
             (t1, t2)

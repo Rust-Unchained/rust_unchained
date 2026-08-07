@@ -1,4 +1,5 @@
 use rustc_abi::{HasDataLayout, Size, TagEncoding, Variants};
+use rustc_const_eval::interpret::{Scalar, alloc_range};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::mir::interpret::AllocId;
 use rustc_middle::mir::*;
@@ -6,6 +7,7 @@ use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt};
 use rustc_session::Session;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 /// A pass that seeks to optimize unnecessary moves of large enum types, if there is a large
@@ -23,17 +25,20 @@ use crate::patch::MirPatch;
 ///
 /// In summary, what this does is at runtime determine which enum variant is active,
 /// and instead of copying all the bytes of the largest possible variant,
-/// copy only the bytes for the currently active variant.
+/// copy only the bytes for the currently active variant. The number of bytes to copy is determined
+/// by a lookup table: a discriminant-indexed array indicating the size of each variant.
 pub(super) struct EnumSizeOpt {
     pub(crate) discrepancy: u64,
 }
 
 impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
-    fn is_enabled(&self, sess: &Session) -> bool {
+    fn policy(&self, sess: &Session) -> PassPolicy {
         // There are some differences in behavior on wasm and ARM that are not properly
         // understood, so we conservatively treat this optimization as unsound:
-        // https://github.com/rust-lang/rust/pull/85158#issuecomment-1101836457
-        sess.opts.unstable_opts.unsound_mir_opts || sess.mir_opt_level() >= 3
+        // https://github.com/rust-lang/rust/issues/154413
+        PassPolicy::optimization(
+            sess.opts.unstable_opts.unsound_mir_opts && sess.mir_opt_level() >= 3,
+        )
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -47,9 +52,9 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
 
         for (block, data) in body.basic_blocks.as_mut().iter_enumerated_mut() {
             for (statement_index, st) in data.statements.iter_mut().enumerate() {
-                let StatementKind::Assign(box (
+                let StatementKind::Assign((
                     lhs,
-                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)),
+                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs), _),
                 )) = &st.kind
                 else {
                     continue;
@@ -81,7 +86,7 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                         tmp_ty,
                     ),
                 };
-                let rval = Rvalue::Use(Operand::Constant(Box::new(constant_vals)));
+                let rval = Rvalue::Use(Operand::Constant(Box::new(constant_vals)), WithRetag::No);
                 let const_assign = StatementKind::Assign(Box::new((place, rval)));
 
                 let discr_place =
@@ -98,10 +103,14 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                 let size_place = Place::from(patch.new_temp(tcx.types.usize, span));
                 let store_size = StatementKind::Assign(Box::new((
                     size_place,
-                    Rvalue::Use(Operand::Copy(Place {
-                        local: size_array_local,
-                        projection: tcx.mk_place_elems(&[PlaceElem::Index(discr_cast_place.local)]),
-                    })),
+                    Rvalue::Use(
+                        Operand::Copy(Place {
+                            local: size_array_local,
+                            projection: tcx
+                                .mk_place_elems(&[PlaceElem::Index(discr_cast_place.local)]),
+                        }),
+                        WithRetag::No,
+                    ),
                 )));
 
                 let dst = Place::from(patch.new_temp(Ty::new_mut_ptr(tcx, ty), span));
@@ -126,8 +135,6 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                     Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(src), src_cast_ty),
                 )));
 
-                let deinit_old = StatementKind::Deinit(Box::new(dst));
-
                 let copy_bytes = StatementKind::Intrinsic(Box::new(
                     NonDivergingIntrinsic::CopyNonOverlapping(CopyNonOverlapping {
                         src: Operand::Copy(src_cast_place),
@@ -148,7 +155,6 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                     dst_cast,
                     src_ptr,
                     src_cast,
-                    deinit_old,
                     copy_bytes,
                     store_dead,
                 ];
@@ -156,15 +162,11 @@ impl<'tcx> crate::MirPass<'tcx> for EnumSizeOpt {
                     patch.add_statement(location, stmt);
                 }
 
-                st.make_nop();
+                st.make_nop(true);
             }
         }
 
         patch.apply(body);
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -205,44 +207,23 @@ impl EnumSizeOpt {
             return Some((*adt_def, num_discrs, *alloc_id));
         }
 
+        // Construct an in-memory array mapping discriminant idx to variant size.
         let data_layout = tcx.data_layout();
-        let ptr_sized_int = data_layout.ptr_sized_integer();
-        let target_bytes = ptr_sized_int.size().bytes() as usize;
-        let mut data = vec![0; target_bytes * num_discrs];
-
-        // We use a macro because `$bytes` can be u32 or u64.
-        macro_rules! encode_store {
-            ($curr_idx: expr, $endian: expr, $bytes: expr) => {
-                let bytes = match $endian {
-                    rustc_abi::Endian::Little => $bytes.to_le_bytes(),
-                    rustc_abi::Endian::Big => $bytes.to_be_bytes(),
-                };
-                for (i, b) in bytes.into_iter().enumerate() {
-                    data[$curr_idx + i] = b;
-                }
-            };
-        }
-
-        for (var_idx, layout) in variants.iter_enumerated() {
-            let curr_idx =
-                target_bytes * adt_def.discriminant_for_variant(tcx, var_idx).val as usize;
-            let sz = layout.size;
-            match ptr_sized_int {
-                rustc_abi::Integer::I32 => {
-                    encode_store!(curr_idx, data_layout.endian, sz.bytes() as u32);
-                }
-                rustc_abi::Integer::I64 => {
-                    encode_store!(curr_idx, data_layout.endian, sz.bytes());
-                }
-                _ => unreachable!(),
-            };
-        }
-        let alloc = interpret::Allocation::from_bytes(
-            data,
+        let ptr_size = data_layout.pointer_size();
+        let mut alloc = interpret::Allocation::from_bytes(
+            vec![0; ptr_size.bytes_usize() * num_discrs],
             tcx.data_layout.ptr_sized_integer().align(&tcx.data_layout).abi,
-            Mutability::Not,
+            Mutability::Mut,
+            (),
         );
+        for (var_idx, layout) in variants.iter_enumerated() {
+            let curr_idx = ptr_size * adt_def.discriminant_for_variant(tcx, var_idx).val as u64;
+            let val = Scalar::from_target_usize(layout.size.bytes(), &tcx);
+            alloc.write_scalar(&tcx, alloc_range(curr_idx, val.size()), val).unwrap();
+        }
+        alloc.mutability = Mutability::Not;
         let alloc = tcx.reserve_and_set_memory_alloc(tcx.mk_const_alloc(alloc));
+
         Some((*adt_def, num_discrs, *alloc_cache.entry(ty).or_insert(alloc)))
     }
 }

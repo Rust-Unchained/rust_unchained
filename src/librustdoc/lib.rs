@@ -1,29 +1,23 @@
+// tidy-alphabetical-start
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/",
     html_playground_url = "https://play.rust-lang.org/"
 )]
-#![feature(rustc_private)]
-#![feature(assert_matches)]
-#![feature(box_patterns)]
-#![feature(debug_closure_helpers)]
+#![feature(ascii_char)]
+#![feature(ascii_char_variants)]
+#![feature(deref_patterns)]
 #![feature(file_buffered)]
-#![feature(format_args_nl)]
-#![feature(if_let_guard)]
-#![feature(impl_trait_in_assoc_type)]
+#![feature(formatting_options)]
 #![feature(iter_intersperse)]
-#![feature(let_chains)]
-#![feature(never_type)]
-#![feature(round_char_boundary)]
+#![feature(iter_order_by)]
+#![feature(rustc_private)]
 #![feature(test)]
-#![feature(type_alias_impl_trait)]
-#![feature(type_ascription)]
+#![feature(trim_prefix_suffix)]
+#![feature(variant_count)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
-#![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-
-extern crate thin_vec;
+#![warn(rustc::symbol_intern_string_literal)]
+// tidy-alphabetical-end
 
 // N.B. these need `extern crate` even in 2018 edition
 // because they're loaded implicitly from the sysroot.
@@ -33,7 +27,6 @@ extern crate thin_vec;
 //
 // Dependencies listed in Cargo.toml do not need `extern crate`.
 
-extern crate pulldown_cmark;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
@@ -41,7 +34,6 @@ extern crate rustc_attr_parsing;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
-extern crate rustc_expand;
 extern crate rustc_feature;
 extern crate rustc_hir;
 extern crate rustc_hir_analysis;
@@ -66,23 +58,25 @@ extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate test;
 
-// See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-// about jemalloc.
-#[cfg(feature = "jemalloc")]
-extern crate tikv_jemalloc_sys as jemalloc_sys;
-
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
-use std::process;
+use std::path::Path;
+use std::process::ExitCode;
 
+use rustc_ast::ast;
 use rustc_errors::DiagCtxtHandle;
+use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{ErrorOutputType, RustcOptGroup, make_crate_type_option};
+use rustc_session::config::{ErrorOutputType, Input, RustcOptGroup, make_crate_type_option};
 use rustc_session::{EarlyDiagCtxt, getopts};
+use rustc_span::{BytePos, Span, SyntaxContext};
 use tracing::info;
 
 use crate::clean::utils::DOC_RUST_LANG_ORG_VERSION;
+use crate::config::EmitType;
+use crate::error::Error;
+use crate::formats::cache::Cache;
 
 /// A macro to create a FxHashMap.
 ///
@@ -102,6 +96,7 @@ macro_rules! map {
     }}
 }
 
+mod calculate_doc_coverage;
 mod clean;
 mod config;
 mod core;
@@ -124,38 +119,7 @@ mod visit;
 mod visit_ast;
 mod visit_lib;
 
-pub fn main() {
-    // See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-    // about jemalloc.
-    #[cfg(feature = "jemalloc")]
-    {
-        use std::os::raw::{c_int, c_void};
-
-        #[used]
-        static _F1: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::calloc;
-        #[used]
-        static _F2: unsafe extern "C" fn(*mut *mut c_void, usize, usize) -> c_int =
-            jemalloc_sys::posix_memalign;
-        #[used]
-        static _F3: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::aligned_alloc;
-        #[used]
-        static _F4: unsafe extern "C" fn(usize) -> *mut c_void = jemalloc_sys::malloc;
-        #[used]
-        static _F5: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void = jemalloc_sys::realloc;
-        #[used]
-        static _F6: unsafe extern "C" fn(*mut c_void) = jemalloc_sys::free;
-
-        #[cfg(target_os = "macos")]
-        {
-            unsafe extern "C" {
-                fn _rjem_je_zone_register();
-            }
-
-            #[used]
-            static _F7: unsafe extern "C" fn() = _rjem_je_zone_register;
-        }
-    }
-
+pub fn main() -> ExitCode {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     rustc_driver::install_ice_hook(
@@ -170,18 +134,33 @@ pub fn main() {
     // NOTE: this compiles both versions of tracing unconditionally, because
     // - The compile time hit is not that bad, especially compared to rustdoc's incremental times, and
     // - Otherwise, there's no warning that logging is being ignored when `download-rustc` is enabled
-    // NOTE: The reason this doesn't show double logging when `download-rustc = false` and
-    // `debug_logging = true` is because all rustc logging goes to its version of tracing (the one
-    // in the sysroot), and all of rustdoc's logging goes to its version (the one in Cargo.toml).
 
-    init_logging(&early_dcx);
-    rustc_driver::init_logger(&early_dcx, rustc_log::LoggerConfig::from_env("RUSTDOC_LOG"));
+    crate::init_logging(&early_dcx);
+    match rustc_log::init_logger(rustc_log::LoggerConfig::from_env("RUSTDOC_LOG")) {
+        Ok(()) => {}
+        // With `download-rustc = true` there are definitely 2 distinct tracing crates in the
+        // dependency graph: one in the downloaded sysroot and one built just now as a dependency of
+        // rustdoc. So the sysroot's tracing is definitely not yet initialized here.
+        //
+        // But otherwise, depending on link style, there may or may not be 2 tracing crates in play.
+        // The one we just initialized in `crate::init_logging` above is rustdoc's direct dependency
+        // on tracing. When rustdoc is built by x.py using Cargo, rustc_driver's and rustc_log's
+        // tracing dependency is distinct from this one and also needs to be initialized (using the
+        // same RUSTDOC_LOG environment variable for both). Other build systems may use just a
+        // single tracing crate throughout the rustc and rustdoc build.
+        //
+        // The reason initializing 2 tracings does not show double logging when `download-rustc =
+        // false` and `debug_logging = true` is because all rustc logging goes only to its version
+        // of tracing (the one in the sysroot) and all of rustdoc's logging only goes to its version
+        // (the one in Cargo.toml).
+        Err(rustc_log::Error::AlreadyInit(_)) => {}
+        Err(error) => early_dcx.early_fatal(error.to_string()),
+    }
 
-    let exit_code = rustc_driver::catch_with_exit_code(|| {
+    rustc_driver::catch_with_exit_code(|| {
         let at_args = rustc_driver::args::raw_args(&early_dcx);
         main_args(&mut early_dcx, &at_args);
-    });
-    process::exit(exit_code);
+    })
 }
 
 fn init_logging(early_dcx: &EarlyDiagCtxt) {
@@ -472,6 +451,14 @@ fn opts() -> Vec<RustcOptGroup> {
                 By default, it is at `forbid` level.",
             "LEVEL",
         ),
+        opt(
+            Stable,
+            Multi,
+            "",
+            "remap-path-prefix",
+            "Remap source names in compiler messages",
+            "FROM=TO",
+        ),
         opt(Unstable, Opt, "", "index-page", "Markdown file to be used as index page", "PATH"),
         opt(
             Unstable,
@@ -548,21 +535,29 @@ fn opts() -> Vec<RustcOptGroup> {
             "",
         ),
         opt(
-            Unstable,
+            Stable,
             Multi,
             "",
             "emit",
             "Comma separated list of types of output for rustdoc to emit",
-            "[unversioned-shared-resources,toolchain-shared-resources,invocation-specific,dep-info]",
+            "[html-static-files,html-non-static-files,dep-info]",
         ),
         opt(Unstable, FlagMulti, "", "no-run", "Compile doctests without running them", ""),
         opt(
             Unstable,
-            Multi,
+            Opt,
             "",
-            "remap-path-prefix",
-            "Remap source names in compiler messages",
-            "FROM=TO",
+            "merge-doctests",
+            "Force all doctests to be compiled as a single binary, instead of one binary per test. If merging fails, rustdoc will emit a hard error.",
+            "yes|no|auto",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "remap-path-scope",
+            "Defines which scopes of paths should be remapped by `--remap-path-prefix`",
+            "[macro,diagnostics,debuginfo,coverage,object,all]",
         ),
         opt(
             Unstable,
@@ -572,7 +567,7 @@ fn opts() -> Vec<RustcOptGroup> {
             "Include the memory layout of types in the docs",
             "",
         ),
-        opt(Unstable, Flag, "", "nocapture", "Don't capture stdout and stderr of tests", ""),
+        opt(Unstable, Flag, "", "no-capture", "Don't capture stdout and stderr of tests", ""),
         opt(
             Unstable,
             Flag,
@@ -610,37 +605,50 @@ fn opts() -> Vec<RustcOptGroup> {
             Unstable,
             Opt,
             "",
-            "merge",
-            "Controls how rustdoc handles files from previously documented crates in the doc root\n\
-                none = Do not write cross-crate information to the --out-dir\n\
-                shared = Append current crate's info to files found in the --out-dir\n\
-                finalize = Write current crate's info and --include-parts-dir info to the --out-dir, overwriting conflicting files",
-            "none|shared|finalize",
+            "write-doc-meta-dir",
+            "Writes trait implementations and other info for the current crate to provided path",
+            "path/to/doc.meta",
+        ),
+        opt(
+            Unstable,
+            Multi,
+            "",
+            "read-doc-meta-dir",
+            "Includes trait implementations and other crate info from provided path",
+            "path/to/doc.meta",
         ),
         opt(
             Unstable,
             Opt,
             "",
             "parts-out-dir",
-            "Writes trait implementations and other info for the current crate to provided path. Only use with --merge=none",
-            "path/to/doc.parts/<crate-name>",
+            "Deprecated synonym of write-doc-meta-dir",
+            "path/to/doc.meta",
         ),
         opt(
             Unstable,
             Multi,
             "",
             "include-parts-dir",
-            "Includes trait implementations and other crate info from provided path. Only use with --merge=finalize",
-            "path/to/doc.parts/<crate-name>",
+            "Deprecated synonym of read-doc-meta-dir",
+            "path/to/doc.meta",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "merge",
+            "Deprecated option to specify read/write-doc-meta-dir mode",
+            "none, shared, finalize",
         ),
         opt(Unstable, Flag, "", "html-no-source", "Disable HTML source code pages generation", ""),
         opt(
             Unstable,
             Multi,
             "",
-            "doctest-compilation-args",
-            "",
-            "add arguments to be used when compiling doctests",
+            "doctest-build-arg",
+            "One argument (of possibly many) to be used when compiling doctests",
+            "ARG",
         ),
         opt(
             Unstable,
@@ -648,6 +656,14 @@ fn opts() -> Vec<RustcOptGroup> {
             "",
             "disable-minification",
             "disable the minification of CSS/JS files (perma-unstable, do not use with cached files)",
+            "",
+        ),
+        opt(
+            Unstable,
+            Flag,
+            "",
+            "generate-macro-expansion",
+            "Add possibility to expand macros in the HTML source code pages",
             "",
         ),
         // deprecated / removed options
@@ -713,20 +729,32 @@ pub(crate) fn wrap_return(dcx: DiagCtxtHandle<'_>, res: Result<(), String>) {
     }
 }
 
-fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
+fn run_renderer<
+    'tcx,
+    T: formats::FormatRenderer<'tcx>,
+    F: FnOnce(
+        clean::Crate,
+        config::RenderOptions,
+        Cache,
+        TyCtxt<'tcx>,
+    ) -> Result<(T, clean::Crate), Error>,
+>(
     krate: clean::Crate,
     renderopts: config::RenderOptions,
     cache: formats::cache::Cache,
     tcx: TyCtxt<'tcx>,
+    init: F,
 ) {
-    match formats::run_format::<T>(krate, renderopts, cache, tcx) {
+    match formats::run_format::<T, F>(krate, renderopts, cache, tcx, init) {
         Ok(_) => tcx.dcx().abort_if_errors(),
         Err(e) => {
             let mut msg =
                 tcx.dcx().struct_fatal(format!("couldn't generate documentation: {}", e.error));
             let file = e.file.display().to_string();
             if !file.is_empty() {
-                msg.note(format!("failed to create or modify \"{file}\""));
+                msg.note(format!("failed to create or modify {e}"));
+            } else {
+                msg.note(format!("failed to create or modify file: {e}"));
             }
             msg.emit();
         }
@@ -735,26 +763,41 @@ fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
 
 /// Renders and writes cross-crate info files, like the search index. This function exists so that
 /// we can run rustdoc without a crate root in the `--merge=finalize` mode. Cross-crate info files
-/// discovered via `--include-parts-dir` are combined and written to the doc root.
-fn run_merge_finalize(opt: config::RenderOptions) -> Result<(), error::Error> {
+/// discovered via `--read-doc-meta-dir` are combined and written to the doc root.
+fn run_merge_finalize(
+    render_options: config::RenderOptions,
+    compiler: &interface::Compiler,
+) -> Result<(), error::Error> {
     assert!(
-        opt.should_merge.write_rendered_cci,
+        render_options.should_merge.write_rendered_cci,
         "config.rs only allows us to return InputMode::NoInputMergeFinalize if --merge=finalize"
     );
     assert!(
-        !opt.should_merge.read_rendered_cci,
+        !render_options.should_merge.read_rendered_cci,
         "config.rs only allows us to return InputMode::NoInputMergeFinalize if --merge=finalize"
     );
-    let crates = html::render::CrateInfo::read_many(&opt.include_parts_dir)?;
-    let include_sources = !opt.html_no_source;
+    let crates = html::render::CrateInfo::read_many(&render_options.include_parts_dir)?;
+    let include_sources = !render_options.html_no_source;
+
     html::render::write_not_crate_specific(
         &crates,
-        &opt.output,
-        &opt,
-        &opt.themes,
-        opt.extension_css.as_deref(),
-        &opt.resource_suffix,
+        &render_options.output,
+        &render_options,
+        &render_options.themes,
+        render_options.extension_css.as_deref(),
+        &render_options.resource_suffix,
         include_sources,
+        &crate::html::layout::Layout {
+            logo: String::new(),
+            favicon: String::new(),
+            external_html: render_options.external_html.clone(),
+            default_settings: render_options.default_settings.clone(),
+            krate: String::new(),
+            krate_version: String::new(),
+            css_file_extension: render_options.extension_css.clone(),
+            scrape_examples_extension: false,
+        },
+        &compiler.sess,
     )?;
     Ok(())
 }
@@ -785,7 +828,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
 
     // Note that we discard any distinction between different non-zero exit
     // codes from `from_matches` here.
-    let (input, options, render_options) =
+    let (input, options, render_options, loaded_paths) =
         match config::Options::from_matches(early_dcx, &matches, args) {
             Some(opts) => opts,
             None => return,
@@ -798,10 +841,20 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
     let input = match input {
         config::InputMode::HasFile(input) => input,
         config::InputMode::NoInputMergeFinalize => {
+            let config = core::create_config(
+                Input::Str {
+                    name: rustc_span::FileName::Custom(String::new()),
+                    input: String::new(),
+                },
+                options,
+                &render_options,
+            );
             return wrap_return(
                 dcx,
-                run_merge_finalize(render_options)
-                    .map_err(|e| format!("could not write merged cross-crate info: {e}")),
+                interface::run_compiler(config, |compiler| {
+                    run_merge_finalize(render_options, compiler)
+                        .map_err(|e| format!("could not write merged cross-crate info: {e}"))
+                }),
             );
         }
     };
@@ -812,7 +865,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
         options.should_test || output_format == config::OutputFormat::Doctest,
         config::markdown_input(&input),
     ) {
-        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options)),
+        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options, dcx)),
         (true, None) => return doctest::run(dcx, input, options),
         (false, Some(md_input)) => {
             let md_input = md_input.to_owned();
@@ -824,8 +877,44 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
             // `run_compiler`.
             return wrap_return(
                 dcx,
-                interface::run_compiler(config, |_compiler| {
-                    markdown::render_and_write(&md_input, render_options, edition)
+                interface::run_compiler(config, |compiler| {
+                    // construct a phony "crate" without actually running the parser
+                    // allows us to use other compiler infrastructure like dep-info
+                    let file =
+                        compiler.sess.source_map().load_file(&md_input).map_err(|e| {
+                            format!("{md_input}: {e}", md_input = md_input.display())
+                        })?;
+                    let inner_span = Span::new(
+                        file.start_pos,
+                        BytePos(file.start_pos.0 + file.normalized_source_len.0),
+                        SyntaxContext::root(),
+                        None,
+                    );
+                    let krate = ast::Crate {
+                        attrs: Default::default(),
+                        items: Default::default(),
+                        spans: ast::ModSpans { inner_span, ..Default::default() },
+                        id: ast::DUMMY_NODE_ID,
+                        is_placeholder: false,
+                    };
+                    let (res, _incr_comp_session) =
+                        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                            let has_dep_info = render_options.dep_info().is_some();
+                            if render_options.emit.contains(&EmitType::HtmlNonStaticFiles) {
+                                markdown::render_and_write(file, render_options, edition)?;
+                            }
+                            if has_dep_info {
+                                // Register the loaded external files in the source map so they show up in depinfo.
+                                // We can't load them via the source map because it gets created after we process the options.
+                                for external_path in &loaded_paths {
+                                    let _ =
+                                        compiler.sess.source_map().load_binary_file(external_path);
+                                }
+                                rustc_interface::passes::write_dep_info(tcx);
+                            }
+                            Ok(())
+                        });
+                    res
                 }),
             );
         }
@@ -849,12 +938,19 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
     let scrape_examples_options = options.scrape_examples_options.clone();
     let bin_crate = options.bin_crate;
 
+    let output_format = options.output_format;
     let config = core::create_config(input, options, &render_options);
 
     let registered_lints = config.register_lints.is_some();
 
     interface::run_compiler(config, |compiler| {
         let sess = &compiler.sess;
+
+        // Register the loaded external files in the source map so they show up in depinfo.
+        // We can't load them via the source map because it gets created after we process the options.
+        for external_path in &loaded_paths {
+            let _ = sess.source_map().load_binary_file(external_path);
+        }
 
         if sess.opts.describe_lints {
             rustc_driver::describe_lints(sess, registered_lints);
@@ -867,16 +963,15 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                 sess.dcx().fatal("Compilation failed, aborting rustdoc");
             }
 
-            let (krate, render_opts, mut cache) = sess.time("run_global_ctxt", || {
-                core::run_global_ctxt(tcx, show_coverage, render_options, output_format)
-            });
+            let (krate, render_opts, mut cache, expanded_macros) = sess
+                .time("run_global_ctxt", || {
+                    core::run_global_ctxt(tcx, show_coverage, render_options, output_format)
+                });
             info!("finished with rustc");
 
             if let Some(options) = scrape_examples_options {
                 return scrape_examples::run(krate, render_opts, cache, tcx, options, bin_crate);
             }
-
-            cache.crate_version = crate_version;
 
             if show_coverage {
                 // if we ran coverage, bail early, we don't need to also generate docs at this point
@@ -884,8 +979,16 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                 return;
             }
 
+            cache.crate_version = crate_version;
+
+            rustc_interface::passes::emit_delayed_lints(tcx);
+
             if render_opts.dep_info().is_some() {
                 rustc_interface::passes::write_dep_info(tcx);
+            }
+
+            if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
+                dump_feature_usage_metrics(tcx, metrics_dir);
             }
 
             if run_check {
@@ -896,14 +999,43 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
             info!("going to format");
             match output_format {
                 config::OutputFormat::Html => sess.time("render_html", || {
-                    run_renderer::<html::render::Context<'_>>(krate, render_opts, cache, tcx)
+                    run_renderer(
+                        krate,
+                        render_opts,
+                        cache,
+                        tcx,
+                        |krate, render_opts, cache, tcx| {
+                            html::render::Context::init(
+                                krate,
+                                render_opts,
+                                cache,
+                                tcx,
+                                expanded_macros,
+                            )
+                        },
+                    )
                 }),
-                config::OutputFormat::Json => sess.time("render_json", || {
-                    run_renderer::<json::JsonRenderer<'_>>(krate, render_opts, cache, tcx)
+                config::OutputFormat::IrJson => sess.time("render_json", || {
+                    run_renderer(krate, render_opts, cache, tcx, json::JsonRenderer::init)
                 }),
-                // Already handled above with doctest runners.
-                config::OutputFormat::Doctest => unreachable!(),
+                // Already handled above with doctest runners or coverage early return
+                config::OutputFormat::Doctest | config::OutputFormat::CoverageJson => {
+                    unreachable!()
+                }
             }
-        })
+        });
     })
+}
+
+fn dump_feature_usage_metrics(tcx: TyCtxt<'_>, metrics_dir: &Path) {
+    let hash = tcx.crate_hash(LOCAL_CRATE);
+    let crate_name = tcx.crate_name(LOCAL_CRATE);
+    let metrics_file_name = format!("unstable_feature_usage_metrics-{crate_name}-{hash}.json");
+    let metrics_path = metrics_dir.join(metrics_file_name);
+    if let Err(error) = tcx.features().dump_feature_usage_metrics(metrics_path) {
+        // FIXME(yaahc): once metrics can be enabled by default we will want "failure to emit
+        // default metrics" to only produce a warning when metrics are enabled by default and emit
+        // an error only when the user manually enables metrics
+        tcx.dcx().err(format!("cannot emit feature usage metrics: {error}"));
+    }
 }

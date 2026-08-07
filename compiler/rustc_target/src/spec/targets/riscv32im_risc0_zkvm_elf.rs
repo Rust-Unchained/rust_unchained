@@ -1,5 +1,6 @@
 use crate::spec::{
-    Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions,
+    Arch, Cc, LinkerFlavor, Lld, LlvmAbi, Os, PanicStrategy, RelocModel, Target, TargetMetadata,
+    TargetOptions,
 };
 
 pub(crate) fn target() -> Target {
@@ -13,10 +14,10 @@ pub(crate) fn target() -> Target {
             std: None, // ?
         },
         pointer_width: 32,
-        arch: "riscv32".into(),
+        arch: Arch::RiscV32,
 
         options: TargetOptions {
-            os: "zkvm".into(),
+            os: Os::Zkvm,
             vendor: "risc0".into(),
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("rust-lld".into()),
@@ -31,7 +32,7 @@ pub(crate) fn target() -> Target {
             atomic_cas: true,
 
             features: "+m".into(),
-            llvm_abiname: "ilp32".into(),
+            llvm_abiname: LlvmAbi::Ilp32,
             executables: true,
             panic_strategy: PanicStrategy::Abort,
             relocation_model: RelocModel::Static,

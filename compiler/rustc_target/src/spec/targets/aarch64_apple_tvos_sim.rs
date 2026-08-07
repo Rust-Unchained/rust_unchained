@@ -1,13 +1,13 @@
-use crate::spec::base::apple::{Arch, TargetAbi, base};
-use crate::spec::{FramePointer, Target, TargetMetadata, TargetOptions};
+use crate::spec::base::apple::{Arch, TargetEnv, base};
+use crate::spec::{Os, Target, TargetMetadata, TargetOptions};
 
 pub(crate) fn target() -> Target {
-    let (opts, llvm_target, arch) = base("tvos", Arch::Arm64, TargetAbi::Simulator);
+    let (opts, llvm_target, arch) = base(Os::TvOs, Arch::Arm64, TargetEnv::Simulator);
     Target {
         llvm_target,
         metadata: TargetMetadata {
             description: Some("ARM64 Apple tvOS Simulator".into()),
-            tier: Some(3),
+            tier: Some(2),
             host_tools: Some(false),
             std: Some(true),
         },
@@ -16,9 +16,8 @@ pub(crate) fn target() -> Target {
             .into(),
         arch,
         options: TargetOptions {
-            features: "+neon,+fp-armv8,+apple-a7".into(),
+            features: "+neon,+apple-a7".into(),
             max_atomic_width: Some(128),
-            frame_pointer: FramePointer::NonLeaf,
             ..opts
         },
     }

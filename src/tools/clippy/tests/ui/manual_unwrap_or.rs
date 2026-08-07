@@ -1,10 +1,5 @@
-#![allow(dead_code)]
-#![allow(
-    unused_variables,
-    clippy::unnecessary_wraps,
-    clippy::unnecessary_literal_unwrap,
-    clippy::manual_unwrap_or_default
-)]
+#![warn(clippy::manual_unwrap_or)]
+#![allow(clippy::manual_unwrap_or_default, clippy::unnecessary_literal_unwrap)]
 
 fn option_unwrap_or() {
     // int case
@@ -327,6 +322,20 @@ fn allowed_manual_unwrap_or_zero() -> u32 {
     } else {
         0
     }
+}
+
+fn issue_15807() {
+    let uncopyable_res: Result<usize, String> = Ok(1);
+    let _ = if let Ok(v) = uncopyable_res { v } else { 2 };
+
+    let x = uncopyable_res;
+    let _ = if let Ok(v) = x { v } else { 2 };
+    //~^ manual_unwrap_or
+
+    let copyable_res: Result<usize, ()> = Ok(1);
+    let _ = if let Ok(v) = copyable_res { v } else { 2 };
+    //~^ manual_unwrap_or
+    let _ = copyable_res;
 }
 
 fn main() {}

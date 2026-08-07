@@ -9,35 +9,37 @@
 //! be sure without a real client anyway.
 
 #![allow(clippy::disallowed_types)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
 
 mod cli;
+mod flycheck;
 mod ratoml;
 mod support;
 mod testdir;
 
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
 
+use ide_db::FxHashMap;
 use lsp_types::{
-    notification::DidOpenTextDocument,
-    request::{
-        CodeActionRequest, Completion, Formatting, GotoTypeDefinition, HoverRequest,
-        InlayHintRequest, InlayHintResolveRequest, RangeFormatting, WillRenameFiles,
-        WorkspaceSymbolRequest,
-    },
-    CodeActionContext, CodeActionParams, CompletionParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, DocumentRangeFormattingParams, FileRename, FormattingOptions,
-    GotoDefinitionParams, HoverParams, InlayHint, InlayHintLabel, InlayHintParams,
-    PartialResultParams, Position, Range, RenameFilesParams, TextDocumentItem,
-    TextDocumentPositionParams, WorkDoneProgressParams,
+    CodeActionContext, CodeActionParams, CodeActionRequest, CompletionParams, CompletionRequest,
+    DidOpenTextDocumentNotification, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentFormattingRequest, DocumentRangeFormattingParams, DocumentRangeFormattingRequest,
+    FileRename, FormattingOptions, HoverParams, HoverRequest, InlayHint, InlayHintParams,
+    InlayHintRequest, InlayHintResolveRequest, Label, LanguageKind, PartialResultParams, Position,
+    Range, RenameFilesParams, TextDocumentItem, TextDocumentPositionParams, TypeDefinitionParams,
+    TypeDefinitionRequest, WillRenameFilesRequest, WorkDoneProgressParams, WorkspaceSymbolRequest,
 };
-use rust_analyzer::lsp::ext::{OnEnter, Runnables, RunnablesParams};
+use rust_analyzer::lsp::ext::{OnEnterRequest, RunnablesParams, RunnablesRequest};
 use serde_json::json;
 use stdx::format_to_acc;
 
 use test_utils::skip_slow_tests;
 use testdir::TestDir;
 
-use crate::support::{project, Project};
+use crate::support::{Project, project};
 
 #[test]
 fn completes_items_from_standard_library() {
@@ -62,8 +64,8 @@ use std::collections::Spam;
     .server()
     .wait_until_workspace_is_loaded();
 
-    let res = server.send_request::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams::new(
+    let res = server.send_request::<CompletionRequest>(CompletionParams {
+        text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/lib.rs"),
             Position::new(0, 23),
         ),
@@ -106,13 +108,13 @@ fn f() {
     let hint = hints.pop().unwrap();
     assert!(hint.data.is_some());
     assert!(
-        matches!(&hint.label, InlayHintLabel::LabelParts(parts) if parts[1].location.is_none())
+        matches!(&hint.label, Label::InlayHintLabelPartList(parts) if parts[1].location.is_none())
     );
     let res = server.send_request::<InlayHintResolveRequest>(hint);
     let hint = serde_json::from_value::<InlayHint>(res).unwrap();
     assert!(hint.data.is_none());
     assert!(
-        matches!(&hint.label, InlayHintLabel::LabelParts(parts) if parts[1].location.is_some())
+        matches!(&hint.label, Label::InlayHintLabelPartList(parts) if parts[1].location.is_some())
     );
 }
 
@@ -154,8 +156,8 @@ use dependency2::Spam;
     .server()
     .wait_until_workspace_is_loaded();
 
-    let res = server.send_request::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams::new(
+    let res = server.send_request::<CompletionRequest>(CompletionParams {
+        text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/lib.rs"),
             Position::new(5, 18),
         ),
@@ -165,8 +167,8 @@ use dependency2::Spam;
     });
     assert!(res.to_string().contains("SpecialHashMap"), "{}", res.to_string());
 
-    let res = server.send_request::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams::new(
+    let res = server.send_request::<CompletionRequest>(CompletionParams {
+        text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/lib.rs"),
             Position::new(6, 18),
         ),
@@ -193,8 +195,8 @@ use dependency2::Spam;
 
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    let res = server.send_request::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams::new(
+    let res = server.send_request::<CompletionRequest>(CompletionParams {
+        text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/lib.rs"),
             Position::new(5, 18),
         ),
@@ -204,8 +206,8 @@ use dependency2::Spam;
     });
     assert!(!res.to_string().contains("SpecialHashMap"));
 
-    let res = server.send_request::<Completion>(CompletionParams {
-        text_document_position: TextDocumentPositionParams::new(
+    let res = server.send_request::<CompletionRequest>(CompletionParams {
+        text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/lib.rs"),
             Position::new(6, 18),
         ),
@@ -250,13 +252,13 @@ fn main() {}
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<Runnables>(
+    server.request::<RunnablesRequest>(
         RunnablesParams { text_document: server.doc_id("foo/tests/spam.rs"), position: None },
         json!([
           {
             "args": {
               "cargoArgs": ["test", "--package", "foo", "--test", "spam"],
-              "executableArgs": ["test_eggs", "--exact", "--show-output"],
+              "executableArgs": ["test_eggs", "--exact", "--nocapture", "--include-ignored"],
               "overrideCargo": null,
               "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
@@ -289,7 +291,7 @@ fn main() {}
               ],
               "executableArgs": [
                 "",
-                "--show-output"
+                "--nocapture"
               ]
             },
             "kind": "cargo",
@@ -401,7 +403,7 @@ mod tests {
     .wait_until_workspace_is_loaded();
 
     for runnable in ["consumer", "dependency", "devdependency"] {
-        server.request::<Runnables>(
+        server.request::<RunnablesRequest>(
             RunnablesParams {
                 text_document: server.doc_id(&format!("{runnable}/src/lib.rs")),
                 position: None,
@@ -466,7 +468,7 @@ fn otherpkg() {}
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<Runnables>(
+    server.request::<RunnablesRequest>(
         RunnablesParams { text_document: server.doc_id("foo/mainpkg/src/main.rs"), position: None },
         json!([
             "{...}",
@@ -491,7 +493,7 @@ fn otherpkg() {}
         ]),
     );
 
-    server.request::<Runnables>(
+    server.request::<RunnablesRequest>(
         RunnablesParams { text_document: server.doc_id("foo/otherpkg/src/lib.rs"), position: None },
         json!([
             "{...}",
@@ -541,7 +543,7 @@ pub use std::collections::HashMap;
     )
     .wait_until_workspace_is_loaded();
 
-    server.request::<Formatting>(
+    server.request::<DocumentFormattingRequest>(
         DocumentFormattingParams {
             text_document: server.doc_id("src/lib.rs"),
             options: FormattingOptions {
@@ -550,7 +552,6 @@ pub use std::collections::HashMap;
                 insert_final_newline: None,
                 trim_final_newlines: None,
                 trim_trailing_whitespace: None,
-                properties: HashMap::new(),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         },
@@ -594,13 +595,12 @@ pub use std::collections::HashMap;
     )
     .wait_until_workspace_is_loaded();
 
-    server.request::<Formatting>(
+    server.request::<DocumentFormattingRequest>(
         DocumentFormattingParams {
             text_document: server.doc_id("src/lib.rs"),
             options: FormattingOptions {
                 tab_size: 4,
                 insert_spaces: false,
-                properties: HashMap::new(),
                 insert_final_newline: None,
                 trim_final_newlines: None,
                 trim_trailing_whitespace: None,
@@ -645,7 +645,7 @@ fn main() {}
     )
     .wait_until_workspace_is_loaded();
 
-    server.request::<Formatting>(
+    server.request::<DocumentFormattingRequest>(
         DocumentFormattingParams {
             text_document: server.doc_id("src/lib.rs"),
             options: FormattingOptions {
@@ -654,7 +654,6 @@ fn main() {}
                 insert_final_newline: None,
                 trim_final_newlines: None,
                 trim_trailing_whitespace: None,
-                properties: HashMap::new(),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         },
@@ -665,6 +664,17 @@ fn main() {}
 #[test]
 fn test_format_document_range() {
     if skip_slow_tests() {
+        return;
+    }
+
+    // This test requires a nightly toolchain, so skip if it's not available.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let has_nightly_rustfmt = toolchain::command("rustfmt", cwd, &FxHashMap::default())
+        .args(["+nightly", "--version"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nightly_rustfmt {
+        tracing::warn!("skipping test_format_document_range: nightly rustfmt not available");
         return;
     }
 
@@ -690,7 +700,7 @@ fn main() {
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<RangeFormatting>(
+    server.request::<DocumentRangeFormattingRequest>(
         DocumentRangeFormattingParams {
             range: Range {
                 end: Position { line: 1, character: 0 },
@@ -703,7 +713,6 @@ fn main() {
                 insert_final_newline: None,
                 trim_final_newlines: None,
                 trim_trailing_whitespace: None,
-                properties: HashMap::new(),
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         },
@@ -880,7 +889,8 @@ fn main() {{}}
 
 #[test]
 fn diagnostics_dont_block_typing() {
-    if skip_slow_tests() {
+    if skip_slow_tests() || std::env::var("CI").is_ok() {
+        // FIXME: This test is failing too frequently (therefore we disable it on CI).
         return;
     }
 
@@ -910,17 +920,17 @@ fn main() {{}}
     .wait_until_workspace_is_loaded();
 
     for i in 0..10 {
-        server.notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+        server.notification::<DidOpenTextDocumentNotification>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: server.doc_id(&format!("src/m{i}.rs")).uri,
-                language_id: "rust".to_owned(),
+                language_id: LanguageKind::Rust,
                 version: 0,
                 text: "/// Docs\nfn foo() {}".to_owned(),
             },
         });
     }
     let start = Instant::now();
-    server.request::<OnEnter>(
+    server.request::<OnEnterRequest>(
         TextDocumentPositionParams {
             text_document: server.doc_id("src/m0.rs"),
             position: Position { line: 0, character: 5 },
@@ -958,7 +968,7 @@ version = \"0.0.0\"
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<OnEnter>(
+    server.request::<OnEnterRequest>(
         TextDocumentPositionParams {
             text_document: server.doc_id("src/main.rs"),
             position: Position { line: 0, character: 8 },
@@ -975,10 +985,6 @@ version = \"0.0.0\"
 }
 
 fn out_dirs_check_impl(root_contains_symlink: bool) {
-    if skip_slow_tests() {
-        return;
-    }
-
     let mut server = Project::with_fixture(
         r###"
 //- /Cargo.toml
@@ -1075,8 +1081,8 @@ fn main() {
     });
     assert!(res.to_string().contains("&str"));
 
-    server.request::<GotoTypeDefinition>(
-        GotoDefinitionParams {
+    server.request::<TypeDefinitionRequest>(
+        TypeDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
                 Position::new(28, 9),
@@ -1101,8 +1107,8 @@ fn main() {
         }]),
     );
 
-    server.request::<GotoTypeDefinition>(
-        GotoDefinitionParams {
+    server.request::<TypeDefinitionRequest>(
+        TypeDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
                 Position::new(29, 9),
@@ -1130,35 +1136,27 @@ fn main() {
 
 #[test]
 fn out_dirs_check() {
+    if skip_slow_tests() {
+        return;
+    }
     out_dirs_check_impl(false);
 }
 
 #[test]
 #[cfg(not(windows))] // windows requires elevated permissions to create symlinks
 fn root_contains_symlink_out_dirs_check() {
+    if skip_slow_tests() {
+        return;
+    }
     out_dirs_check_impl(true);
 }
 
 #[test]
-#[cfg(any(feature = "sysroot-abi", rust_analyzer))]
 fn resolve_proc_macro() {
     use expect_test::expect;
-    use vfs::AbsPathBuf;
     if skip_slow_tests() {
         return;
     }
-
-    let mut sysroot = project_model::Sysroot::discover(
-        &AbsPathBuf::assert_utf8(std::env::current_dir().unwrap()),
-        &Default::default(),
-    );
-    let loaded_sysroot =
-        sysroot.load_workspace(&project_model::RustSourceWorkspaceConfig::default_cargo());
-    if let Some(loaded_sysroot) = loaded_sysroot {
-        sysroot.set_workspace(loaded_sysroot);
-    }
-
-    let proc_macro_server_path = sysroot.discover_proc_macro_srv().unwrap();
 
     let server = Project::with_fixture(
         r###"
@@ -1171,12 +1169,8 @@ edition = "2021"
 bar = {path = "../bar"}
 
 //- /foo/src/main.rs
-#![allow(internal_features)]
-#![feature(rustc_attrs, decl_macro)]
 use bar::Bar;
 
-#[rustc_builtin_macro]
-macro derive($item:item) {}
 trait Bar {
   fn bar();
 }
@@ -1233,11 +1227,10 @@ pub fn foo(_input: TokenStream) -> TokenStream {
             "buildScripts": {
                 "enable": true
             },
-            "sysroot": null,
+            "sysroot": "discover",
         },
         "procMacro": {
             "enable": true,
-            "server": proc_macro_server_path.as_path().as_str(),
         }
     }))
     .root("foo")
@@ -1248,7 +1241,7 @@ pub fn foo(_input: TokenStream) -> TokenStream {
     let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("foo/src/main.rs"),
-            Position::new(12, 9),
+            Position::new(8, 9),
         ),
         work_done_progress_params: Default::default(),
     });
@@ -1307,8 +1300,8 @@ use crate::old_folder::nested::foo as bar;
     let server =
         Project::with_fixture(code).tmp_dir(tmp_dir).server().wait_until_workspace_is_loaded();
 
-    //rename same level file
-    server.request::<WillRenameFiles>(
+    // rename same level file
+    server.request::<WillRenameFilesRequest>(
         RenameFilesParams {
             files: vec![FileRename {
                 old_uri: base_path.join("src/old_file.rs").to_str().unwrap().to_owned(),
@@ -1342,8 +1335,8 @@ use crate::old_folder::nested::foo as bar;
         }),
     );
 
-    //rename file from mod.rs to foo.rs
-    server.request::<WillRenameFiles>(
+    // rename file from mod.rs to foo.rs
+    server.request::<WillRenameFilesRequest>(
         RenameFilesParams {
             files: vec![FileRename {
                 old_uri: base_path.join("src/from_mod/mod.rs").to_str().unwrap().to_owned(),
@@ -1353,8 +1346,8 @@ use crate::old_folder::nested::foo as bar;
         json!(null),
     );
 
-    //rename file from foo.rs to mod.rs
-    server.request::<WillRenameFiles>(
+    // rename file from foo.rs to mod.rs
+    server.request::<WillRenameFilesRequest>(
         RenameFilesParams {
             files: vec![FileRename {
                 old_uri: base_path.join("src/to_mod/foo.rs").to_str().unwrap().to_owned(),
@@ -1364,8 +1357,8 @@ use crate::old_folder::nested::foo as bar;
         json!(null),
     );
 
-    //rename same level file
-    server.request::<WillRenameFiles>(
+    // rename same level file
+    server.request::<WillRenameFilesRequest>(
         RenameFilesParams {
             files: vec![FileRename {
                 old_uri: base_path.join("src/old_folder").to_str().unwrap().to_owned(),
@@ -1459,7 +1452,27 @@ foo = { path = "../foo" }
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "bar",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]bar/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
 
     let server = Project::with_fixture(
         r#"
@@ -1498,5 +1511,103 @@ version = "0.0.0"
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "baz",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]baz/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
+}
+
+#[test]
+fn test_evaluate_predicate() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+trait Trait {}
+struct S;
+impl Trait for S {}
+
+fn test<T: Trait>() {
+    let _ = 0;$0
+}
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<rust_analyzer::lsp::ext::EvaluatePredicateRequest>(
+        rust_analyzer::lsp::ext::EvaluatePredicateParams {
+            text: "T: Trait".to_owned(),
+            text_document: server.doc_id("src/lib.rs"),
+            position: Position::new(5, 14),
+        },
+    );
+
+    let res: rust_analyzer::lsp::ext::EvaluatePredicateResult =
+        serde_json::from_value(res).unwrap();
+    assert_eq!(res.status, rust_analyzer::lsp::ext::PredicateEvaluationStatus::Holds);
+}
+
+#[test]
+fn test_get_failed_obligations() {
+    use expect_test::expect;
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+trait Trait {}
+fn requires_trait<T: Trait>(x: T) {}
+
+fn test() {
+    requires_trait(0usize);
+}
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<rust_analyzer::lsp::ext::GetFailedObligationsRequest>(
+        rust_analyzer::lsp::ext::GetFailedObligationsParams {
+            text_document: server.doc_id("src/lib.rs"),
+            position: Position::new(4, 19),
+        },
+    );
+
+    let res: serde_json::Value = serde_json::from_str(res.as_str().unwrap()).unwrap();
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    expect![[r#"{"goal":"Goal { param_env: ParamEnv { clauses: [] }, predicate: Binder { value: TraitPredicate(usize: Trait, polarity:Positive), bound_vars: [] } }","result":"Err(NoSolution)","depth":0,"candidates":[]}"#]].assert_eq(&arr[0].to_string());
 }

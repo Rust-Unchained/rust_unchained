@@ -6,7 +6,7 @@ fn const_unchecked_layout() {
     const SIZE: usize = 0x2000;
     const ALIGN: usize = 0x1000;
     const LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(SIZE, ALIGN) };
-    const DANGLING: NonNull<u8> = LAYOUT.dangling();
+    const DANGLING: NonNull<u8> = LAYOUT.dangling_ptr();
     assert_eq!(LAYOUT.size(), SIZE);
     assert_eq!(LAYOUT.align(), ALIGN);
     assert_eq!(Some(DANGLING), NonNull::new(ptr::without_provenance_mut(ALIGN)));
@@ -53,6 +53,30 @@ fn layout_array_edge_cases() {
             assert_eq!(Layout::array::<T>(n).is_ok(), n * size_of::<T>() <= MAX_SIZE);
         }
     }
+}
+
+#[test]
+fn layout_errors() {
+    let layout = Layout::new::<[u8; 2]>();
+    // Should error if the alignment is not a power of two.
+    assert!(layout.align_to(3).is_err());
+
+    // The remaining assertions ensure that the methods error on arithmetic overflow as the
+    // alignment cannot overflow `isize`.
+    let size = layout.size();
+    let size_max = isize::MAX as usize;
+    let align_max = size_max / size;
+
+    assert!(layout.align_to(size_max + 1).is_err());
+
+    assert!(layout.repeat(align_max).is_ok());
+    assert!(layout.repeat(align_max + 1).is_err());
+
+    assert!(layout.repeat_packed(align_max).is_ok());
+    assert!(layout.repeat_packed(align_max + 1).is_err());
+
+    let next = Layout::from_size_align(size_max, 1).unwrap();
+    assert!(layout.extend(next).is_err());
 }
 
 #[test]

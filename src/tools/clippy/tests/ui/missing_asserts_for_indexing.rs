@@ -1,4 +1,4 @@
-#![allow(unused)]
+#![expect(clippy::manual_assert_eq)]
 #![warn(clippy::missing_asserts_for_indexing)]
 
 // ok
@@ -164,6 +164,20 @@ fn issue14255(v1: &[u8], v2: &[u8], v3: &[u8], v4: &[u8]) {
     //~^ missing_asserts_for_indexing
 
     let _ = v4[0] + v4[1] + v4[2];
+}
+
+mod issue15988 {
+    fn assert_eq_len(v: &[i32]) {
+        assert_eq!(v.len(), 2);
+        let _ = v[0] + v[1] + v[2];
+        //~^ missing_asserts_for_indexing
+    }
+
+    fn debug_assert_eq_len(v: &[i32]) {
+        debug_assert_eq!(v.len(), 2);
+        let _ = v[0] + v[1] + v[2];
+        //~^ missing_asserts_for_indexing
+    }
 }
 
 fn main() {}

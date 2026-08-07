@@ -4,21 +4,22 @@
 //! "preview2". This target in rustc uses the previous version of the proposal.
 //!
 //! This target uses the syscalls defined at
-//! <https://github.com/WebAssembly/WASI/tree/main/legacy/preview1>.
+//! <https://github.com/WebAssembly/WASI/tree/wasi-0.1/preview1>.
 //!
 //! Note that this target was historically called `wasm32-wasi` originally and
 //! was since renamed to `wasm32-wasip1` after the preview2 target was
 //! introduced.
 
 use crate::spec::{
-    Cc, LinkSelfContainedDefault, LinkerFlavor, Target, TargetMetadata, base, crt_objects,
+    Arch, Cc, Env, LinkSelfContainedDefault, LinkerFlavor, Os, Target, TargetMetadata, base,
+    crt_objects,
 };
 
 pub(crate) fn target() -> Target {
     let mut options = base::wasm::options();
 
-    options.os = "wasi".into();
-    options.env = "p1".into();
+    options.os = Os::Wasi;
+    options.env = Env::P1;
     options.add_pre_link_args(LinkerFlavor::WasmLld(Cc::Yes), &["--target=wasm32-wasip1"]);
 
     options.pre_link_objects_self_contained = crt_objects::pre_wasi_self_contained();
@@ -40,10 +41,6 @@ pub(crate) fn target() -> Target {
     // without a main function.
     options.crt_static_allows_dylibs = true;
 
-    // WASI's `sys::args::init` function ignores its arguments; instead,
-    // `args::args()` makes the WASI API calls itself.
-    options.main_needs_argc_argv = false;
-
     // And, WASI mangles the name of "main" to distinguish between different
     // signatures.
     options.entry_name = "__main_void".into();
@@ -58,7 +55,7 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20".into(),
-        arch: "wasm32".into(),
+        arch: Arch::Wasm32,
         options,
     }
 }

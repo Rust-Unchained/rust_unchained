@@ -1,6 +1,5 @@
 //@aux-build:proc_macros.rs
 //@aux-build:proc_macro_derive.rs
-#![allow(unused)]
 #![warn(clippy::allow_attributes)]
 #![no_main]
 
@@ -62,6 +61,11 @@ fn msrv_1_80() {
     #[allow(unused)]
     let x = 1;
 }
+
+#[rustfmt::skip]
+#[ allow ( dead_code ) ]
+//~^ allow_attributes
+struct Spaced;
 
 #[deny(clippy::allow_attributes)]
 fn deny_allow_attributes() -> Option<u8> {

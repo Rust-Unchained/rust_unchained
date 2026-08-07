@@ -1,13 +1,14 @@
 use crate::methods::TYPE_ID_ON_BOX;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
+use clippy_utils::sym;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
 use rustc_lint::LateContext;
-use rustc_middle::ty::adjustment::{Adjust, Adjustment};
+use rustc_middle::ty::adjustment::{Adjust, Adjustment, DerefAdjustKind};
 use rustc_middle::ty::print::with_forced_trimmed_paths;
-use rustc_middle::ty::{self, ExistentialPredicate, Ty};
-use rustc_span::{Span, sym};
+use rustc_middle::ty::{self, ExistentialPredicate, Ty, Unnormalized};
+use rustc_span::Span;
 
 /// Checks if the given type is `dyn Any`, or a trait object that has `Any` as a supertrait.
 /// Only in those cases will its vtable have a `type_id` method that returns the implementor's
@@ -24,8 +25,9 @@ fn is_subtrait_of_any(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
                 cx.tcx.is_diagnostic_item(sym::Any, tr.def_id)
                     || cx
                         .tcx
-                        .explicit_super_predicates_of(tr.def_id)
+                        .explicit_super_clauses_of(tr.def_id)
                         .iter_identity_copied()
+                        .map(Unnormalized::skip_norm_wip)
                         .any(|(clause, _)| {
                             matches!(clause.kind().skip_binder(), ty::ClauseKind::Trait(super_tr)
                             if cx.tcx.is_diagnostic_item(sym::Any, super_tr.def_id()))
@@ -58,7 +60,7 @@ pub(super) fn check(cx: &LateContext<'_>, receiver: &Expr<'_>, call_span: Span) 
             |diag| {
                 let derefs = recv_adjusts
                     .iter()
-                    .filter(|adj| matches!(adj.kind, Adjust::Deref(None)))
+                    .filter(|adj| matches!(adj.kind, Adjust::Deref(DerefAdjustKind::Builtin)))
                     .count();
 
                 diag.note(

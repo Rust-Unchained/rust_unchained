@@ -1,5 +1,7 @@
+use crate::macros::root_macro_call_first_node;
+use crate::res::MaybeResPath;
 use crate::visitors::{Descend, Visitable, for_each_expr, for_each_expr_without_closures};
-use crate::{self as utils, get_enclosing_loop_or_multi_call_closure};
+use crate::{self as utils, get_enclosing_loop_or_multi_call_closure, sym};
 use core::ops::ControlFlow;
 use hir::def::Res;
 use rustc_hir::intravisit::{self, Visitor};
@@ -140,6 +142,44 @@ impl<'tcx> Visitor<'tcx> for BindingUsageFinder<'_, 'tcx> {
     }
 }
 
+/// Checks if the given expression is a macro call to `todo!()` or `unimplemented!()`.
+pub fn is_todo_unimplemented_macro(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    root_macro_call_first_node(cx, expr)
+        .and_then(|macro_call| cx.tcx.get_diagnostic_name(macro_call.def_id))
+        .is_some_and(|macro_name| matches!(macro_name, sym::todo_macro | sym::unimplemented_macro))
+}
+
+/// Checks if the given expression is a stub, i.e., a `todo!()` or `unimplemented!()` expression,
+/// or a block whose last expression is a `todo!()` or `unimplemented!()`.
+pub fn is_todo_unimplemented_stub(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    if let ExprKind::Block(block, _) = expr.kind {
+        if let Some(last_expr) = block.expr {
+            return is_todo_unimplemented_macro(cx, last_expr);
+        }
+
+        return block.stmts.last().is_some_and(|stmt| {
+            if let hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) = stmt.kind {
+                return is_todo_unimplemented_macro(cx, expr);
+            }
+            false
+        });
+    }
+
+    is_todo_unimplemented_macro(cx, expr)
+}
+
+/// Checks if the given expression contains macro call to `todo!()` or `unimplemented!()`.
+pub fn contains_todo_unimplement_macro(cx: &LateContext<'_>, expr: &'_ Expr<'_>) -> bool {
+    for_each_expr_without_closures(expr, |e| {
+        if is_todo_unimplemented_macro(cx, e) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_some()
+}
+
 pub fn contains_return_break_continue_macro(expression: &Expr<'_>) -> bool {
     for_each_expr_without_closures(expression, |e| {
         match e.kind {
@@ -155,8 +195,8 @@ pub fn contains_return_break_continue_macro(expression: &Expr<'_>) -> bool {
 }
 
 pub fn local_used_in<'tcx>(cx: &LateContext<'tcx>, local_id: HirId, v: impl Visitable<'tcx>) -> bool {
-    for_each_expr(cx, v, |e| {
-        if utils::path_to_local_id(e, local_id) {
+    for_each_expr(cx.tcx, v, |e| {
+        if e.res_local_id() == Some(local_id) {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -180,9 +220,9 @@ pub fn local_used_after_expr(cx: &LateContext<'_>, local_id: HirId, after: &Expr
     let loop_start = get_enclosing_loop_or_multi_call_closure(cx, after).map(|e| e.hir_id);
 
     let mut past_expr = false;
-    for_each_expr(cx, block, |e| {
+    for_each_expr(cx.tcx, block, |e| {
         if past_expr {
-            if utils::path_to_local_id(e, local_id) {
+            if e.res_local_id() == Some(local_id) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(Descend::Yes)

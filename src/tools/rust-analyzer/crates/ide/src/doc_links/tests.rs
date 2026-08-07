@@ -1,18 +1,19 @@
-use std::iter;
+use std::{borrow::Cow, iter};
 
-use expect_test::{expect, Expect};
+use expect_test::{Expect, expect};
 use hir::Semantics;
 use ide_db::{
+    FilePosition, FileRange, RootDatabase,
     defs::Definition,
     documentation::{Documentation, HasDocs},
-    FilePosition, FileRange, RootDatabase,
 };
 use itertools::Itertools;
-use syntax::{ast, match_ast, AstNode, SyntaxNode};
+use syntax::{AstNode, SyntaxNode, ast, match_ast};
 
 use crate::{
+    TryToNav,
     doc_links::{extract_definitions_from_docs, resolve_doc_path_for_def, rewrite_links},
-    fixture, TryToNav,
+    fixture,
 };
 
 fn check_external_docs(
@@ -43,9 +44,10 @@ fn check_external_docs(
 
 fn check_rewrite(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (analysis, position) = fixture::position(ra_fixture);
-    let sema = &Semantics::new(&*analysis.db);
+    let sema = &Semantics::new(&analysis.db);
     let (cursor_def, docs) = def_under_cursor(sema, &position);
-    let res = rewrite_links(sema.db, docs.as_str(), cursor_def);
+    let res =
+        hir::attach_db(sema.db, || rewrite_links(sema.db, docs.docs(), cursor_def, Some(&docs)));
     expect.assert_eq(&res)
 }
 
@@ -54,30 +56,37 @@ fn check_doc_links(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
 
     let (analysis, position, mut expected) = fixture::annotations(ra_fixture);
     expected.sort_by_key(key_fn);
-    let sema = &Semantics::new(&*analysis.db);
-    let (cursor_def, docs) = def_under_cursor(sema, &position);
-    let defs = extract_definitions_from_docs(&docs);
-    let actual: Vec<_> = defs
-        .into_iter()
-        .flat_map(|(_, link, ns)| {
-            let def = resolve_doc_path_for_def(sema.db, cursor_def, &link, ns)
-                .unwrap_or_else(|| panic!("Failed to resolve {link}"));
-            def.try_to_nav(sema.db).unwrap().into_iter().zip(iter::repeat(link))
-        })
-        .map(|(nav_target, link)| {
-            let range =
-                FileRange { file_id: nav_target.file_id, range: nav_target.focus_or_full_range() };
-            (range, link)
-        })
-        .sorted_by_key(key_fn)
-        .collect();
-    assert_eq!(expected, actual);
+    let sema = &Semantics::new(&analysis.db);
+    hir::attach_db(sema.db, || {
+        let (cursor_def, docs) = def_under_cursor(sema, &position);
+        let defs = extract_definitions_from_docs(&Documentation::new_borrowed(docs.docs()));
+        let actual: Vec<_> = defs
+            .into_iter()
+            .flat_map(|(text_range, link, ns)| {
+                let attr = docs.find_ast_range(text_range);
+                let is_inner_attr =
+                    attr.map(|(_file, is_inner)| is_inner).unwrap_or(hir::IsInnerDoc::No);
+                let def = resolve_doc_path_for_def(sema.db, cursor_def, &link, ns, is_inner_attr)
+                    .unwrap_or_else(|| panic!("Failed to resolve {link}"));
+                def.try_to_nav(sema).unwrap().into_iter().zip(iter::repeat(link))
+            })
+            .map(|(nav_target, link)| {
+                let range = FileRange {
+                    file_id: nav_target.file_id,
+                    range: nav_target.focus_or_full_range(),
+                };
+                (range, link)
+            })
+            .sorted_by_key(key_fn)
+            .collect();
+        assert_eq!(expected, actual);
+    });
 }
 
-fn def_under_cursor(
-    sema: &Semantics<'_, RootDatabase>,
+fn def_under_cursor<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     position: &FilePosition,
-) -> (Definition, Documentation) {
+) -> (Definition<'db>, Cow<'db, hir::Docs>) {
     let (docs, def) = sema
         .parse_guess_edition(position.file_id)
         .syntax()
@@ -92,27 +101,27 @@ fn def_under_cursor(
     (def, docs)
 }
 
-fn node_to_def(
-    sema: &Semantics<'_, RootDatabase>,
+fn node_to_def<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     node: &SyntaxNode,
-) -> Option<Option<(Option<Documentation>, Definition)>> {
+) -> Option<Option<(Option<Cow<'db, hir::Docs>>, Definition<'db>)>> {
     Some(match_ast! {
         match node {
-            ast::SourceFile(it)  => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Module(def))),
-            ast::Module(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Module(def))),
-            ast::Fn(it)          => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Function(def))),
-            ast::Struct(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Struct(def)))),
-            ast::Union(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Union(def)))),
-            ast::Enum(it)        => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Adt(hir::Adt::Enum(def)))),
-            ast::Variant(it)     => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Variant(def))),
-            ast::Trait(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Trait(def))),
-            ast::Static(it)      => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Static(def))),
-            ast::Const(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Const(def))),
-            ast::TypeAlias(it)   => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::TypeAlias(def))),
-            ast::Impl(it)        => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::SelfType(def))),
-            ast::RecordField(it) => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Field(def))),
-            ast::TupleField(it)  => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Field(def))),
-            ast::Macro(it)       => sema.to_def(&it).map(|def| (def.docs(sema.db), Definition::Macro(def))),
+            ast::SourceFile(it)  => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Module(def))),
+            ast::Module(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Module(def))),
+            ast::Fn(it)          => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Function(def))),
+            ast::Struct(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Struct(def)))),
+            ast::Union(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Union(def)))),
+            ast::Enum(it)        => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Adt(hir::Adt::Enum(def)))),
+            ast::Variant(it)     => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::EnumVariant(def))),
+            ast::Trait(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Trait(def))),
+            ast::Static(it)      => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Static(def))),
+            ast::Const(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Const(def))),
+            ast::TypeAlias(it)   => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::TypeAlias(def))),
+            ast::Impl(it)        => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::SelfType(def))),
+            ast::RecordField(it) => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Field(def))),
+            ast::TupleField(it)  => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Field(def))),
+            ast::Macro(it)       => sema.to_def(&it).map(|def| (def.docs_with_rangemap(sema.db), Definition::Macro(def))),
             // ast::Use(it) => sema.to_def(&it).map(|def| (Box::new(it) as _, def.attrs(sema.db))),
             _ => return None,
         }
@@ -412,6 +421,30 @@ fn foo() {
 }
 
 #[test]
+fn external_docs_macro_export() {
+    check_external_docs(
+        r#"
+//- /lib.rs crate:foo
+pub mod inner {
+    #[macro_export]
+    macro_rules! my_macro {
+        () => {};
+    }
+}
+
+//- /main.rs crate:bar deps:foo
+fn main() {
+    foo::my_m$0acro!();
+}
+        "#,
+        Some("/home/user/project"),
+        Some(expect![[r#"https://docs.rs/foo/*/foo/macro.my_macro.html"#]]),
+        Some(expect![[r#"file:///home/user/project/doc/foo/macro.my_macro.html"#]]),
+        Some("/sysroot"),
+    );
+}
+
+#[test]
 fn doc_links_items_simple() {
     check_doc_links(
         r#"
@@ -575,12 +608,61 @@ struct S$0(i32);
 }
 
 #[test]
+fn doc_links_module() {
+    check_doc_links(
+        r#"
+/// [`M`]
+/// [`M::f`]
+mod M$0 {
+  //^ M
+  #![doc = "inner_item[`S`]"]
+
+    pub fn f() {}
+         //^ M::f
+    pub struct S;
+             //^ S
+}
+"#,
+    );
+
+    check_doc_links(
+        r#"
+mod M$0 {
+  //^ super::M
+    //! [`super::M`]
+    //! [`super::M::f`]
+    //! [`super::M::S`]
+    pub fn f() {}
+         //^ super::M::f
+    pub struct S;
+             //^ super::M::S
+}
+"#,
+    );
+}
+
+#[test]
 fn rewrite_html_root_url() {
     check_rewrite(
         r#"
 //- /main.rs crate:foo
 #![doc(arbitrary_attribute = "test", html_root_url = "https:/example.com", arbitrary_attribute2)]
 
+pub mod foo {
+    pub struct Foo;
+}
+/// [Foo](foo::Foo)
+pub struct B$0ar
+"#,
+        expect![[r#"[Foo](https://example.com/foo/foo/struct.Foo.html)"#]],
+    );
+}
+
+#[test]
+fn rewrite_html_root_url_using_crate_attr() {
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo crate-attr:doc(arbitrary_attribute="test",html_root_url="https:/example.com",arbitrary_attribute2)
 pub mod foo {
     pub struct Foo;
 }
@@ -657,7 +739,10 @@ pub struct $0Foo;
 /// [`foo`]: Foo
 pub struct $0Foo;
 "#,
-        expect![["[`foo`]"]],
+        expect![[r#"
+            [`foo`]
+
+            [`foo`]: https://docs.rs/foo/*/foo/struct.Foo.html"#]],
     );
 }
 
@@ -683,7 +768,32 @@ fn rewrite_intra_doc_link_with_anchor() {
         //! $0[PartialEq#derivable]
         fn main() {}
         "#,
-        expect!["[PartialEq#derivable](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html#derivable)"],
+        expect![
+            "[PartialEq#derivable](https://doc.rust-lang.org/stable/core/cmp/trait.PartialEq.html#derivable)"
+        ],
+    );
+}
+
+#[test]
+fn rewrite_module() {
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+/// [Foo]
+pub mod $0Foo{
+};
+"#,
+        expect![[r#"[Foo](https://docs.rs/foo/*/foo/Foo/index.html)"#]],
+    );
+
+    check_rewrite(
+        r#"
+//- /main.rs crate:foo
+pub mod $0Foo{
+    //! [super::Foo]
+};
+"#,
+        expect![[r#"[super::Foo](https://docs.rs/foo/*/foo/Foo/index.html)"#]],
     );
 }
 

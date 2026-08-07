@@ -21,7 +21,6 @@
 /// }
 ///
 /// #[test]
-//~^ test_attr_in_doctest
 /// fn should_be_linted_too() {
 ///     assert_eq!("#[test]", "
 ///     #[test]
@@ -47,3 +46,11 @@
 /// fn not_even_rust() { panic!("Ouch") }
 /// ```
 fn test_attr_in_doctests() {}
+
+/// ```test_harness
+/// #[test]
+/// fn foo() {
+///     panic!();
+/// }
+/// ```
+pub fn issue16447() {}

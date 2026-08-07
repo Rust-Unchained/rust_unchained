@@ -1,3 +1,6 @@
+//@revisions: edition2015 edition2024
+//@[edition2015] edition:2015
+//@[edition2024] edition:2024
 trait Trait<'a> {
     type Out;
     fn call(&'a self) -> Self::Out;

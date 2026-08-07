@@ -1,11 +1,12 @@
 #[cfg(feature = "master")]
 use gccjit::{FnAttribute, VarAttribute};
 use rustc_codegen_ssa::traits::PreDefineCodegenMethods;
+use rustc_hir::attrs::Linkage;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir::mono::{Linkage, Visibility};
+use rustc_middle::mono::Visibility;
 use rustc_middle::ty::layout::{FnAbiOf, HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, Instance, TypeVisitableExt};
 
@@ -14,9 +15,9 @@ use crate::type_of::LayoutGccExt;
 use crate::{attributes, base};
 
 impl<'gcc, 'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
-    #[cfg_attr(not(feature = "master"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "master"), expect(unused_variables))]
     fn predefine_static(
-        &self,
+        &mut self,
         def_id: DefId,
         _linkage: Linkage,
         visibility: Visibility,
@@ -36,13 +37,12 @@ impl<'gcc, 'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         #[cfg(feature = "master")]
         global.add_attribute(VarAttribute::Visibility(base::visibility_to_gcc(visibility)));
 
-        // TODO(antoyo): set linkage.
+        // FIXME(antoyo): set linkage.
         self.instances.borrow_mut().insert(instance, global);
     }
 
-    #[cfg_attr(not(feature = "master"), allow(unused_variables))]
     fn predefine_fn(
-        &self,
+        &mut self,
         instance: Instance<'tcx>,
         linkage: Linkage,
         visibility: Visibility,
@@ -53,7 +53,7 @@ impl<'gcc, 'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         self.linkage.set(base::linkage_to_gcc(linkage));
         let decl = self.declare_fn(symbol_name, fn_abi);
-        //let attrs = self.tcx.codegen_fn_attrs(instance.def_id());
+        //let attrs = self.tcx.codegen_instance_attrs(instance.def);
 
         attributes::from_fn_attrs(self, decl, instance);
 
@@ -64,14 +64,14 @@ impl<'gcc, 'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         if linkage != Linkage::Internal && self.tcx.is_compiler_builtins(LOCAL_CRATE) {
             #[cfg(feature = "master")]
             decl.add_attribute(FnAttribute::Visibility(gccjit::Visibility::Hidden));
-        } else {
+        } else if visibility != Visibility::Default {
             #[cfg(feature = "master")]
             decl.add_attribute(FnAttribute::Visibility(base::visibility_to_gcc(visibility)));
         }
 
-        // TODO(antoyo): call set_link_section() to allow initializing argc/argv.
-        // TODO(antoyo): set unique comdat.
-        // TODO(antoyo): use inline attribute from there in linkage.set() above.
+        // FIXME(antoyo): call set_link_section() to allow initializing argc/argv.
+        // FIXME(antoyo): set unique comdat.
+        // FIXME(antoyo): use inline attribute from there in linkage.set() above.
 
         self.functions.borrow_mut().insert(symbol_name.to_string(), decl);
         self.function_instances.borrow_mut().insert(instance, decl);

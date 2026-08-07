@@ -4,11 +4,12 @@ use ide_db::{
     syntax_helpers::node_ext::{for_each_tail_expr, walk_expr},
 };
 use syntax::{
-    ast::{self, syntax_factory::SyntaxFactory, HasArgList, HasGenericArgs},
-    match_ast, AstNode, NodeOrToken, SyntaxKind,
+    AstNode, NodeOrToken, SyntaxKind,
+    ast::{self, HasArgList, HasGenericArgs},
+    match_ast,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: unwrap_option_return_type
 //
@@ -36,7 +37,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // fn foo() -> i32 { 42i32 }
 // ```
 
-pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let ret_type = ctx.find_node_at_offset::<ast::RetType>()?;
     let parent = ret_type.syntax().parent()?;
     let body_expr = match_ast! {
@@ -65,26 +66,26 @@ pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
     let happy_type = extract_wrapped_type(type_ref)?;
 
     acc.add(kind.assist_id(), kind.label(), type_ref.syntax().text_range(), |builder| {
-        let mut editor = builder.make_editor(&parent);
-        let make = SyntaxFactory::new();
+        let editor = builder.make_editor(&parent);
+        let make = editor.make();
 
         let mut exprs_to_unwrap = Vec::new();
         let tail_cb = &mut |e: &_| tail_cb_impl(&mut exprs_to_unwrap, e);
         walk_expr(&body_expr, &mut |expr| {
-            if let ast::Expr::ReturnExpr(ret_expr) = expr {
-                if let Some(ret_expr_arg) = &ret_expr.expr() {
-                    for_each_tail_expr(ret_expr_arg, tail_cb);
-                }
+            if let ast::Expr::ReturnExpr(ret_expr) = expr
+                && let Some(ret_expr_arg) = &ret_expr.expr()
+            {
+                for_each_tail_expr(ret_expr_arg, tail_cb);
             }
         });
         for_each_tail_expr(&body_expr, tail_cb);
 
         let is_unit_type = is_unit_type(&happy_type);
         if is_unit_type {
-            if let Some(NodeOrToken::Token(token)) = ret_type.syntax().next_sibling_or_token() {
-                if token.kind() == SyntaxKind::WHITESPACE {
-                    editor.delete(token);
-                }
+            if let Some(NodeOrToken::Token(token)) = ret_type.syntax().next_sibling_or_token()
+                && token.kind() == SyntaxKind::WHITESPACE
+            {
+                editor.delete(token);
             }
 
             editor.delete(ret_type.syntax());
@@ -112,16 +113,21 @@ pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
 
                     let arg_list = call_expr.arg_list().unwrap();
                     if is_unit_type {
-                        let tail_parent = tail_expr
-                            .syntax()
-                            .parent()
-                            .and_then(Either::<ast::ReturnExpr, ast::StmtList>::cast)
-                            .unwrap();
+                        let tail_parent = tail_expr.syntax().parent().and_then(
+                            Either::<Either<ast::ReturnExpr, ast::BreakExpr>, ast::StmtList>::cast,
+                        );
                         match tail_parent {
-                            Either::Left(ret_expr) => {
-                                editor.replace(ret_expr.syntax(), make.expr_return(None).syntax())
+                            Some(Either::Left(_expr)) => {
+                                if let Some(ws) = tail_expr
+                                    .syntax()
+                                    .prev_sibling_or_token()
+                                    .filter(|e| e.kind() == SyntaxKind::WHITESPACE)
+                                {
+                                    editor.delete(ws);
+                                }
+                                editor.delete(tail_expr.syntax());
                             }
-                            Either::Right(stmt_list) => {
+                            Some(Either::Right(stmt_list)) => {
                                 let new_block = if stmt_list.statements().next().is_none() {
                                     make.expr_empty_block()
                                 } else {
@@ -131,6 +137,10 @@ pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
                                     stmt_list.syntax(),
                                     new_block.stmt_list().unwrap().syntax(),
                                 );
+                            }
+                            // Parent is a match arm or similar — replace with ()
+                            None => {
+                                editor.replace(tail_expr.syntax(), make.expr_unit().syntax());
                             }
                         }
                     } else if let Some(first_arg) = arg_list.args().next() {
@@ -161,14 +171,13 @@ pub(crate) fn unwrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
             }
         }
 
-        if let Some(cap) = ctx.config.snippet_cap {
-            if let Some(final_placeholder) = final_placeholder {
-                editor.add_annotation(final_placeholder.syntax(), builder.make_tabstop_after(cap));
-            }
+        if let Some(cap) = ctx.config.snippet_cap
+            && let Some(final_placeholder) = final_placeholder
+        {
+            editor.add_annotation(final_placeholder.syntax(), builder.make_tabstop_after(cap));
         }
 
-        editor.add_mappings(make.finish_with_mappings());
-        builder.add_file_edits(ctx.file_id(), editor);
+        builder.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
 
@@ -186,7 +195,7 @@ impl UnwrapperKind {
             UnwrapperKind::Result => "unwrap_result_return_type",
         };
 
-        AssistId(s, AssistKind::RefactorRewrite)
+        AssistId::refactor_rewrite(s)
     }
 
     fn label(&self) -> &'static str {
@@ -2239,6 +2248,102 @@ fn foo(the_field: u32) -> u32 {
         }
     }
     the_field
+}
+"#,
+            "Unwrap Result return type",
+        );
+    }
+
+    #[test]
+    fn unwrap_option_return_type_unit_type_match_arm() {
+        check_assist_by_label(
+            unwrap_return_type,
+            r#"
+//- minicore: option
+fn foo(flag: bool) -> Option<()$0> {
+    match flag {
+        true => Some(()),
+        false => None,
+    }
+}
+"#,
+            r#"
+fn foo(flag: bool) {
+    match flag {
+        true => (),
+        false => ${1:()}$0,
+    }
+}
+"#,
+            "Unwrap Option return type",
+        );
+    }
+
+    #[test]
+    fn unwrap_option_return_type_unit_type_break() {
+        check_assist_by_label(
+            unwrap_return_type,
+            r#"
+//- minicore: option
+fn foo() -> Option<()$0> {
+    loop {
+        break Some(());
+    }
+}
+"#,
+            r#"
+fn foo() {
+    loop {
+        break;
+    }
+}
+"#,
+            "Unwrap Option return type",
+        );
+    }
+
+    #[test]
+    fn unwrap_option_return_type_unit_type_break_with_label() {
+        check_assist_by_label(
+            unwrap_return_type,
+            r#"
+//- minicore: option
+fn foo() -> Option<()$0> {
+    'outer: loop {
+        break 'outer Some(());
+    }
+}
+"#,
+            r#"
+fn foo() {
+    'outer: loop {
+        break 'outer;
+    }
+}
+"#,
+            "Unwrap Option return type",
+        );
+    }
+
+    #[test]
+    fn unwrap_result_return_type_unit_type_match_arm() {
+        check_assist_by_label(
+            unwrap_return_type,
+            r#"
+//- minicore: result
+fn foo(flag: bool) -> Result<(), ()$0> {
+    match flag {
+        true => Ok(()),
+        false => Err(()),
+    }
+}
+"#,
+            r#"
+fn foo(flag: bool) {
+    match flag {
+        true => (),
+        false => (),
+    }
 }
 "#,
             "Unwrap Result return type",

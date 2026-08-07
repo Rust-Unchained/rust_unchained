@@ -5,21 +5,11 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(let_chains))]
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
-    test(attr(deny(warnings)))
-)]
-#![doc(rust_logo)]
-#![feature(array_windows)]
+#![doc(test(attr(deny(warnings), allow(internal_features))))]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
-#![feature(negative_impls)]
-#![feature(never_type)]
-#![feature(rustdoc_internals)]
-#![feature(stmt_expr_attributes)]
+#![feature(deref_patterns)]
+#![feature(iter_order_by)]
+#![feature(macro_metavar_expr)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
 
@@ -40,15 +30,9 @@ pub mod expand;
 pub mod format;
 pub mod mut_visit;
 pub mod node_id;
-pub mod ptr;
 pub mod token;
 pub mod tokenstream;
 pub mod visit;
 
 pub use self::ast::*;
-pub use self::ast_traits::{AstDeref, AstNodeWrapper, HasAttrs, HasNodeId, HasTokens};
-
-/// Requirements for a `StableHashingContext` to be used in this crate.
-/// This is a hack to allow using the `HashStable_Generic` derive macro
-/// instead of implementing everything in `rustc_middle`.
-pub trait HashStableContext: rustc_span::HashStableContext {}
+pub use self::ast_traits::{AstNodeWrapper, HasAttrs, HasNodeId, HasTokens};

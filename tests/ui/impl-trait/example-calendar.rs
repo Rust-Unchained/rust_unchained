@@ -1,7 +1,6 @@
 //@ run-pass
 
-#![feature(fn_traits,
-           step_trait,
+#![feature(step_trait,
            unboxed_closures,
 )]
 
@@ -164,7 +163,15 @@ impl std::iter::Step for NaiveDate {
         Some((0..n).fold(start, |x, _| x.succ()))
     }
 
+    fn forward_overflowing(start: Self, n: usize) -> (Self, bool) {
+        (Self::forward_checked(start, n).unwrap(), false)
+    }
+
     fn backward_checked(_: Self, _: usize) -> Option<Self> {
+        unimplemented!()
+    }
+
+    fn backward_overflowing(_: Self, _: usize) -> (Self, bool) {
         unimplemented!()
     }
 }

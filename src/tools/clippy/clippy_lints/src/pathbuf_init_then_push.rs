@@ -1,14 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::path_to_local_id;
-use clippy_utils::source::{SpanRangeExt, snippet};
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::source::{SpanExt, snippet};
+use clippy_utils::sym;
 use rustc_ast::{LitKind, StrStyle};
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
 use rustc_hir::{BindingMode, Block, Expr, ExprKind, HirId, LetStmt, PatKind, QPath, Stmt, StmtKind, TyKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_session::impl_lint_pass;
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -73,7 +73,7 @@ impl PathbufPushSearcher<'_> {
             && let Some(arg) = self.arg
             && let ExprKind::Lit(x) = arg.kind
             && let LitKind::Str(_, StrStyle::Cooked) = x.node
-            && let Some(s) = arg.span.get_source_text(cx)
+            && let Some(s) = arg.span.get_text(cx)
         {
             Some(format!(" = PathBuf::from({s});"))
         } else {
@@ -83,8 +83,8 @@ impl PathbufPushSearcher<'_> {
 
     fn gen_pathbuf_join(&self, cx: &LateContext<'_>) -> Option<String> {
         let arg = self.arg?;
-        let arg_str = arg.span.get_source_text(cx)?;
-        let init_val = self.init_val.span.get_source_text(cx)?;
+        let arg_str = arg.span.get_text(cx)?;
+        let init_val = self.init_val.span.get_text(cx)?;
         Some(format!(" = {init_val}.join({arg_str});"))
     }
 
@@ -137,7 +137,7 @@ impl<'tcx> LateLintPass<'tcx> for PathbufThenPush<'tcx> {
             && let PatKind::Binding(BindingMode::MUT, id, name, None) = local.pat.kind
             && !local.span.in_external_macro(cx.sess().source_map())
             && let ty = cx.typeck_results().pat_ty(local.pat)
-            && is_type_diagnostic_item(cx, ty, sym::PathBuf)
+            && ty.is_diag_item(cx, sym::PathBuf)
         {
             self.searcher = Some(PathbufPushSearcher {
                 local_id: id,
@@ -158,7 +158,7 @@ impl<'tcx> LateLintPass<'tcx> for PathbufThenPush<'tcx> {
             && let Res::Local(id) = path.res
             && !expr.span.in_external_macro(cx.sess().source_map())
             && let ty = cx.typeck_results().expr_ty(left)
-            && is_type_diagnostic_item(cx, ty, sym::PathBuf)
+            && ty.is_diag_item(cx, sym::PathBuf)
         {
             self.searcher = Some(PathbufPushSearcher {
                 local_id: id,
@@ -176,8 +176,8 @@ impl<'tcx> LateLintPass<'tcx> for PathbufThenPush<'tcx> {
         if let Some(mut searcher) = self.searcher.take()
             && let StmtKind::Expr(expr) | StmtKind::Semi(expr) = stmt.kind
             && let ExprKind::MethodCall(name, self_arg, [arg_expr], _) = expr.kind
-            && path_to_local_id(self_arg, searcher.local_id)
-            && name.ident.as_str() == "push"
+            && self_arg.res_local_id() == Some(searcher.local_id)
+            && name.ident.name == sym::push
         {
             searcher.err_span = searcher.err_span.to(stmt.span);
             searcher.arg = Some(*arg_expr);

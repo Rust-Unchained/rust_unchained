@@ -1,14 +1,14 @@
-//! See docs in build/expr/mod.rs
+//! See docs in builder/expr/mod.rs
 
 use rustc_abi::Size;
 use rustc_ast as ast;
 use rustc_hir::LangItem;
-use rustc_middle::mir::interpret::{Allocation, CTFE_ALLOC_SALT, LitToConstInput, Scalar};
+use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{
-    self, CanonicalUserType, CanonicalUserTypeAnnotation, Ty, TyCtxt, TypeVisitableExt as _,
-    UserTypeAnnotationIndex,
+    self, CanonicalUserType, CanonicalUserTypeAnnotation, LitToConstInput, Ty, TyCtxt,
+    TypeVisitableExt as _, UserTypeAnnotationIndex,
 };
 use rustc_middle::{bug, mir, span_bug};
 use tracing::{instrument, trace};
@@ -19,11 +19,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Compile `expr`, yielding a compile-time constant. Assumes that
     /// `expr` is a valid compile-time constant!
     pub(crate) fn as_constant(&mut self, expr: &Expr<'tcx>) -> ConstOperand<'tcx> {
-        let this = self;
+        let this = self; // See "LET_THIS_SELF".
         let tcx = this.tcx;
-        let Expr { ty, temp_lifetime: _, span, ref kind } = *expr;
+        let Expr { ty, temp_scope_id: _, span, ref kind } = *expr;
         match kind {
-            ExprKind::Scope { region_scope: _, lint_level: _, value } => {
+            ExprKind::Scope { region_scope: _, hir_id: _, value } => {
                 this.as_constant(&this.thir[*value])
             }
             _ => as_constant_inner(
@@ -46,10 +46,12 @@ pub(crate) fn as_constant_inner<'tcx>(
     push_cuta: impl FnMut(&Box<CanonicalUserType<'tcx>>) -> Option<UserTypeAnnotationIndex>,
     tcx: TyCtxt<'tcx>,
 ) -> ConstOperand<'tcx> {
-    let Expr { ty, temp_lifetime: _, span, ref kind } = *expr;
+    let Expr { ty, temp_scope_id: _, span, ref kind } = *expr;
+
     match *kind {
         ExprKind::Literal { lit, neg } => {
-            let const_ = lit_to_mir_constant(tcx, LitToConstInput { lit: &lit.node, ty, neg });
+            let const_ =
+                lit_to_mir_constant(tcx, LitToConstInput { lit: lit.node, ty: Some(ty), neg });
 
             ConstOperand { span, user_ty: None, const_ }
         }
@@ -69,6 +71,17 @@ pub(crate) fn as_constant_inner<'tcx>(
         }
         ExprKind::NamedConst { def_id, args, ref user_ty } => {
             let user_ty = user_ty.as_ref().and_then(push_cuta);
+            if tcx.is_type_const(def_id) {
+                let uneval = ty::AliasConst::new(
+                    tcx,
+                    ty::AliasConstKind::new_from_def_id(tcx, def_id),
+                    args,
+                );
+                let ct = ty::Const::new_alias(tcx, ty::IsRigid::No, uneval);
+
+                let const_ = Const::Ty(ty, ct);
+                return ConstOperand { span, user_ty, const_ };
+            }
 
             let uneval = mir::UnevaluatedConst::new(def_id, args);
             let const_ = Const::Unevaluated(uneval, ty);
@@ -101,6 +114,8 @@ pub(crate) fn as_constant_inner<'tcx>(
 fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>) -> Const<'tcx> {
     let LitToConstInput { lit, ty, neg } = lit_input;
 
+    let ty = ty.expect("type of literal must be known at this point");
+
     if let Err(guar) = ty.error_reported() {
         return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
     }
@@ -120,42 +135,46 @@ fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>
 
     let value = match (lit, lit_ty.kind()) {
         (ast::LitKind::Str(s, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_str() => {
-            let s = s.as_str();
-            let allocation = Allocation::from_bytes_byte_aligned_immutable(s.as_bytes());
-            let allocation = tcx.mk_const_alloc(allocation);
-            ConstValue::Slice { data: allocation, meta: allocation.inner().size().bytes() }
+            let s = s.as_str().as_bytes();
+            let len = s.len();
+            let allocation = tcx.allocate_bytes_dedup(s, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
         }
-        (ast::LitKind::ByteStr(data, _), ty::Ref(_, inner_ty, _))
+        (ast::LitKind::ByteStr(byte_sym, _), ty::Ref(_, inner_ty, _))
             if matches!(inner_ty.kind(), ty::Slice(_)) =>
         {
-            let allocation = Allocation::from_bytes_byte_aligned_immutable(data as &[u8]);
-            let allocation = tcx.mk_const_alloc(allocation);
-            ConstValue::Slice { data: allocation, meta: allocation.inner().size().bytes() }
+            let data = byte_sym.as_byte_str();
+            let len = data.len();
+            let allocation = tcx.allocate_bytes_dedup(data, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
         }
-        (ast::LitKind::ByteStr(data, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_array() => {
-            let id = tcx.allocate_bytes_dedup(data, CTFE_ALLOC_SALT);
+        (ast::LitKind::ByteStr(byte_sym, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_array() => {
+            let id = tcx.allocate_bytes_dedup(byte_sym.as_byte_str(), CTFE_ALLOC_SALT);
             ConstValue::Scalar(Scalar::from_pointer(id.into(), &tcx))
         }
-        (ast::LitKind::CStr(data, _), ty::Ref(_, inner_ty, _)) if matches!(inner_ty.kind(), ty::Adt(def, _) if tcx.is_lang_item(def.did(), LangItem::CStr)) =>
+        (ast::LitKind::CStr(byte_sym, _), ty::Ref(_, inner_ty, _)) if matches!(inner_ty.kind(), ty::Adt(def, _) if tcx.is_lang_item(def.did(), LangItem::CStr)) =>
         {
-            let allocation = Allocation::from_bytes_byte_aligned_immutable(data as &[u8]);
-            let allocation = tcx.mk_const_alloc(allocation);
-            ConstValue::Slice { data: allocation, meta: allocation.inner().size().bytes() }
+            let data = byte_sym.as_byte_str();
+            let len = data.len();
+            let allocation = tcx.allocate_bytes_dedup(data, CTFE_ALLOC_SALT);
+            ConstValue::Slice { alloc_id: allocation, meta: len.try_into().unwrap() }
         }
         (ast::LitKind::Byte(n), ty::Uint(ty::UintTy::U8)) => {
-            ConstValue::Scalar(Scalar::from_uint(*n, Size::from_bytes(1)))
+            ConstValue::Scalar(Scalar::from_uint(n, Size::from_bytes(1)))
         }
         (ast::LitKind::Int(n, _), ty::Uint(_)) if !neg => trunc(n.get()),
         (ast::LitKind::Int(n, _), ty::Int(_)) => {
-            trunc(if neg { (n.get() as i128).overflowing_neg().0 as u128 } else { n.get() })
+            // Unsigned "negation" has the same bitwise effect as signed negation,
+            // which gets the result we want without additional casts.
+            trunc(if neg { u128::wrapping_neg(n.get()) } else { n.get() })
         }
         (ast::LitKind::Float(n, _), ty::Float(fty)) => {
-            parse_float_into_constval(*n, *fty, neg).unwrap()
+            parse_float_into_constval(n, *fty, neg).unwrap()
         }
-        (ast::LitKind::Bool(b), ty::Bool) => ConstValue::Scalar(Scalar::from_bool(*b)),
-        (ast::LitKind::Char(c), ty::Char) => ConstValue::Scalar(Scalar::from_char(*c)),
+        (ast::LitKind::Bool(b), ty::Bool) => ConstValue::Scalar(Scalar::from_bool(b)),
+        (ast::LitKind::Char(c), ty::Char) => ConstValue::Scalar(Scalar::from_char(c)),
         (ast::LitKind::Err(guar), _) => {
-            return Const::Ty(Ty::new_error(tcx, *guar), ty::Const::new_error(tcx, *guar));
+            return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
         }
         _ => bug!("invalid lit/ty combination in `lit_to_mir_constant`: {lit:?}: {ty:?}"),
     };

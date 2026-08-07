@@ -1,6 +1,4 @@
 #![warn(clippy::match_single_binding)]
-#![allow(unused_variables)]
-#![allow(clippy::uninlined_format_args)]
 
 fn main() {
     // Lint (additional curly braces needed, see #6572)
@@ -11,7 +9,6 @@ fn main() {
         inner: Option<(I, <I as Iterator>::Item)>,
     }
 
-    #[allow(dead_code)]
     fn size_hint<I: Iterator>(iter: &AppendIter<I>) -> (usize, Option<usize>) {
         match &iter.inner {
             Some((iter, _item)) => match iter.size_hint() {
@@ -30,7 +27,7 @@ fn main() {
         Some((first, _second)) => {
             match get_tup() {
             //~^ match_single_binding
-                (a, b) => println!("a {:?} and b {:?}", a, b),
+                (a, b) => println!("a {a:?} and b {b:?}"),
             }
         },
         None => println!("nothing"),

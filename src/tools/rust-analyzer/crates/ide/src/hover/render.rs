@@ -1,41 +1,40 @@
 //! Logic for rendering the different hover messages
-use std::{env, mem, ops::Not};
+use std::{borrow::Cow, env, mem, ops::Not};
 
 use either::Either;
 use hir::{
-    db::ExpandDatabase, Adt, AsAssocItem, AsExternAssocItem, CaptureKind, DisplayTarget, DropGlue,
+    Adt, AsAssocItem, AsExternAssocItem, CaptureKind, DisplayTarget, DropGlue,
     DynCompatibilityViolation, HasCrate, HasSource, HirDisplay, Layout, LayoutError,
-    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, VariantDef,
+    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, Variant,
 };
 use ide_db::{
-    base_db::SourceDatabase,
-    defs::Definition,
-    documentation::HasDocs,
+    RootDatabase,
+    defs::{Definition, find_std_module},
+    documentation::{Documentation, HasDocs},
     famous_defs::FamousDefs,
     generated::lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
     syntax_helpers::prettify_macro_expansion,
-    RootDatabase,
 };
 use itertools::Itertools;
 use rustc_apfloat::{
-    ieee::{Half as f16, Quad as f128},
     Float,
+    ieee::{Half as f16, Quad as f128},
 };
-use span::Edition;
+use span::{Edition, TextSize};
 use stdx::format_to;
-use syntax::{algo, ast, match_ast, AstNode, AstToken, Direction, SyntaxToken, T};
+use syntax::{AstNode, AstToken, Direction, SyntaxToken, T, algo, ast, match_ast};
 
 use crate::{
-    doc_links::{remove_links, rewrite_links},
-    hover::{notable_traits, walk_and_push_ty, SubstTyLen},
-    interpret::render_const_eval_error,
     HoverAction, HoverConfig, HoverResult, Markup, MemoryLayoutHoverConfig,
     MemoryLayoutHoverRenderKind,
+    doc_links::{remove_links, rewrite_links},
+    hover::{SubstTyLen, notable_traits, walk_and_push_ty},
+    interpret::render_const_eval_error,
 };
 
 pub(super) fn type_info_of(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
+    _config: &HoverConfig<'_>,
     expr_or_pat: &Either<ast::Expr, ast::Pat>,
     edition: Edition,
     display_target: DisplayTarget,
@@ -49,7 +48,7 @@ pub(super) fn type_info_of(
 
 pub(super) fn closure_expr(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     c: ast::ClosureExpr,
     edition: Edition,
     display_target: DisplayTarget,
@@ -60,7 +59,7 @@ pub(super) fn closure_expr(
 
 pub(super) fn try_expr(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
+    _config: &HoverConfig<'_>,
     try_expr: &ast::TryExpr,
     edition: Edition,
     display_target: DisplayTarget,
@@ -74,7 +73,7 @@ pub(super) fn try_expr(
                 ast::Fn(fn_) => sema.to_def(&fn_)?.ret_type(sema.db),
                 ast::Item(__) => return None,
                 ast::ClosureExpr(closure) => sema.type_of_expr(&closure.body()?)?.original,
-                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try(_)| ast::BlockModifier::Const(_))) {
+                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try { .. } | ast::BlockModifier::Const(_))) {
                     sema.type_of_expr(&block_expr.into())?.original
                 } else {
                     continue;
@@ -95,23 +94,25 @@ pub(super) fn try_expr(
     if let Some((hir::Adt::Enum(inner), hir::Adt::Enum(body))) = adts {
         let famous_defs = FamousDefs(sema, sema.scope(try_expr.syntax())?.krate());
         // special case for two options, there is no value in showing them
-        if let Some(option_enum) = famous_defs.core_option_Option() {
-            if inner == option_enum && body == option_enum {
-                cov_mark::hit!(hover_try_expr_opt_opt);
-                return None;
-            }
+        if let Some(option_enum) = famous_defs.core_option_Option()
+            && inner == option_enum
+            && body == option_enum
+        {
+            cov_mark::hit!(hover_try_expr_opt_opt);
+            return None;
         }
 
         // special case two results to show the error variants only
-        if let Some(result_enum) = famous_defs.core_result_Result() {
-            if inner == result_enum && body == result_enum {
-                let error_type_args =
-                    inner_ty.type_arguments().nth(1).zip(body_ty.type_arguments().nth(1));
-                if let Some((inner, body)) = error_type_args {
-                    inner_ty = inner;
-                    body_ty = body;
-                    "Try Error".clone_into(&mut s);
-                }
+        if let Some(result_enum) = famous_defs.core_result_Result()
+            && inner == result_enum
+            && body == result_enum
+        {
+            let error_type_args =
+                inner_ty.type_arguments().nth(1).zip(body_ty.type_arguments().nth(1));
+            if let Some((inner, body)) = error_type_args {
+                inner_ty = inner;
+                body_ty = body;
+                "Try Error".clone_into(&mut s);
             }
         }
     }
@@ -126,7 +127,7 @@ pub(super) fn try_expr(
     };
     walk_and_push_ty(sema.db, &inner_ty, &mut push_new_def);
     walk_and_push_ty(sema.db, &body_ty, &mut push_new_def);
-    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets, edition) {
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema, targets, edition) {
         res.actions.push(actions);
     }
 
@@ -153,7 +154,7 @@ pub(super) fn try_expr(
 
 pub(super) fn deref_expr(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
+    _config: &HoverConfig<'_>,
     deref_expr: &ast::PrefixExpr,
     edition: Edition,
     display_target: DisplayTarget,
@@ -208,7 +209,7 @@ pub(super) fn deref_expr(
         )
         .into()
     };
-    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets, edition) {
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema, targets, edition) {
         res.actions.push(actions);
     }
 
@@ -217,7 +218,7 @@ pub(super) fn deref_expr(
 
 pub(super) fn underscore(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     token: &SyntaxToken,
     edition: Edition,
     display_target: DisplayTarget,
@@ -226,42 +227,19 @@ pub(super) fn underscore(
         return None;
     }
     let parent = token.parent()?;
-    let _it = match_ast! {
+    match_ast! {
         match parent {
-            ast::InferType(it) => it,
-            ast::UnderscoreExpr(it) => return type_info_of(sema, config, &Either::Left(ast::Expr::UnderscoreExpr(it)),edition, display_target),
-            ast::WildcardPat(it) => return type_info_of(sema, config, &Either::Right(ast::Pat::WildcardPat(it)),edition, display_target),
-            _ => return None,
+            ast::InferType(it) => type_info(sema, config, TypeInfo { original: sema.resolve_type(&ast::Type::InferType(it))?, adjusted: None}, edition, display_target),
+            ast::UnderscoreExpr(it) => type_info(sema, config, sema.type_of_expr(&ast::Expr::UnderscoreExpr(it))?, edition, display_target),
+            ast::WildcardPat(it) => type_info(sema, config, sema.type_of_pat(&ast::Pat::WildcardPat(it))?, edition, display_target),
+            _ => None,
         }
-    };
-    // let it = infer_type.syntax().parent()?;
-    // match_ast! {
-    //     match it {
-    //         ast::LetStmt(_it) => (),
-    //         ast::Param(_it) => (),
-    //         ast::RetType(_it) => (),
-    //         ast::TypeArg(_it) => (),
-
-    //         ast::CastExpr(_it) => (),
-    //         ast::ParenType(_it) => (),
-    //         ast::TupleType(_it) => (),
-    //         ast::PtrType(_it) => (),
-    //         ast::RefType(_it) => (),
-    //         ast::ArrayType(_it) => (),
-    //         ast::SliceType(_it) => (),
-    //         ast::ForType(_it) => (),
-    //         _ => return None,
-    //     }
-    // }
-
-    // FIXME: https://github.com/rust-lang/rust-analyzer/issues/11762, this currently always returns Unknown
-    // type_info(sema, config, sema.resolve_type(&ast::Type::InferType(it))?, None)
-    None
+    }
 }
 
 pub(super) fn keyword(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     token: &SyntaxToken,
     edition: Edition,
     display_target: DisplayTarget,
@@ -276,13 +254,10 @@ pub(super) fn keyword(
         keyword_hints(sema, token, parent, edition, display_target);
 
     let doc_owner = find_std_module(&famous_defs, &keyword_mod, edition)?;
-    let docs = doc_owner.docs(sema.db)?;
-    let markup = process_markup(
-        sema.db,
-        Definition::Module(doc_owner),
-        &markup(Some(docs.into()), description, None, None, String::new()),
-        config,
-    );
+    let docs = doc_owner.docs_with_rangemap(sema.db)?;
+    let (markup, range_map) =
+        markup(Some(Either::Left(docs)), description, None, None, String::new());
+    let markup = process_markup(sema.db, Definition::Module(doc_owner), &markup, range_map, config);
     Some(HoverResult { markup, actions })
 }
 
@@ -291,14 +266,14 @@ pub(super) fn keyword(
 /// i.e. `let S {a, ..} = S {a: 1, b: 2}`
 pub(super) fn struct_rest_pat(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
+    _config: &HoverConfig<'_>,
     pattern: &ast::RecordPat,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> HoverResult {
-    let missing_fields = sema.record_pattern_missing_fields(pattern);
+    let matched_fields = sema.record_pattern_matched_fields(pattern);
 
-    // if there are no missing fields, the end result is a hover that shows ".."
+    // if there are no matched fields, the end result is a hover that shows ".."
     // should be left in to indicate that there are no more fields in the pattern
     // example, S {a: 1, b: 2, ..} when struct S {a: u32, b: u32}
 
@@ -309,13 +284,13 @@ pub(super) fn struct_rest_pat(
             targets.push(item);
         }
     };
-    for (_, t) in &missing_fields {
+    for (_, t) in &matched_fields {
         walk_and_push_ty(sema.db, t, &mut push_new_def);
     }
 
     res.markup = {
         let mut s = String::from(".., ");
-        for (f, _) in &missing_fields {
+        for (f, _) in &matched_fields {
             s += f.display(sema.db, display_target).to_string().as_ref();
             s += ", ";
         }
@@ -324,7 +299,7 @@ pub(super) fn struct_rest_pat(
 
         Markup::fenced_block(&s)
     };
-    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets, edition) {
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema, targets, edition) {
         res.actions.push(actions);
     }
     res
@@ -346,62 +321,59 @@ pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<Hove
                 .is_some_and(|t| {
                     t.kind() == T![ident] && t.into_token().is_some_and(|t| t.text() == "clippy")
                 });
-            if is_clippy {
-                (true, CLIPPY_LINTS)
-            } else {
-                (false, DEFAULT_LINTS)
-            }
+            if is_clippy { (true, CLIPPY_LINTS) } else { (false, DEFAULT_LINTS) }
         }
         _ => return None,
     };
 
-    let tmp;
-    let needle = if is_clippy {
-        tmp = format!("clippy::{}", token.text());
-        &tmp
-    } else {
-        token.text()
-    };
+    let needle = if is_clippy { &format!("clippy::{}", token.text()) } else { token.text() };
 
     let lint =
         lints.binary_search_by_key(&needle, |lint| lint.label).ok().map(|idx| &lints[idx])?;
     Some(HoverResult {
-        markup: Markup::from(format!("```\n{}\n```\n___\n\n{}", lint.label, lint.description)),
+        markup: Markup::from(format!("```\n{}\n```\n---\n\n{}", lint.label, lint.description)),
         ..Default::default()
     })
 }
 
 pub(super) fn process_markup(
     db: &RootDatabase,
-    def: Definition,
+    def: Definition<'_>,
     markup: &Markup,
-    config: &HoverConfig,
+    markup_range_map: Option<hir::Docs>,
+    config: &HoverConfig<'_>,
 ) -> Markup {
     let markup = markup.as_str();
-    let markup =
-        if config.links_in_hover { rewrite_links(db, markup, def) } else { remove_links(markup) };
+    let markup = if config.links_in_hover {
+        rewrite_links(db, markup, def, markup_range_map.as_ref())
+    } else {
+        remove_links(markup)
+    };
     Markup::from(markup)
 }
 
-fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -> Option<String> {
+fn definition_owner_name(
+    db: &RootDatabase,
+    def: Definition<'_>,
+    edition: Edition,
+) -> Option<String> {
     match def {
         Definition::Field(f) => {
             let parent = f.parent_def(db);
             let parent_name = parent.name(db);
             let parent_name = parent_name.display(db, edition).to_string();
             return match parent {
-                VariantDef::Variant(variant) => {
+                Variant::EnumVariant(variant) => {
                     let enum_name = variant.parent_enum(db).name(db);
                     Some(format!("{}::{parent_name}", enum_name.display(db, edition)))
                 }
                 _ => Some(parent_name),
             };
         }
-        Definition::Variant(e) => Some(e.parent_enum(db).name(db)),
+        Definition::EnumVariant(e) => Some(e.parent_enum(db).name(db)),
         Definition::GenericParam(generic_param) => match generic_param.parent() {
             hir::GenericDef::Adt(it) => Some(it.name(db)),
             hir::GenericDef::Trait(it) => Some(it.name(db)),
-            hir::GenericDef::TraitAlias(it) => Some(it.name(db)),
             hir::GenericDef::TypeAlias(it) => Some(it.name(db)),
 
             hir::GenericDef::Impl(i) => i.self_ty(db).as_adt().map(|adt| adt.name(db)),
@@ -418,7 +390,7 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
                             "{}::{}",
                             name.display(db, edition),
                             it.name(db).display(db, edition)
-                        ))
+                        ));
                     }
                     None => Some(it.name(db)),
                 }
@@ -436,7 +408,7 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
                             "{}::{}",
                             name.display(db, edition),
                             it.name(db)?.display(db, edition)
-                        ))
+                        ));
                     }
                     None => it.name(db),
                 }
@@ -466,48 +438,49 @@ pub(super) fn path(
     item_name: Option<String>,
     edition: Edition,
 ) -> String {
-    let crate_name =
-        db.crate_graph()[module.krate().into()].display_name.as_ref().map(|it| it.to_string());
-    let module_path = module
-        .path_to_root(db)
-        .into_iter()
-        .rev()
-        .flat_map(|it| it.name(db).map(|name| name.display(db, edition).to_string()));
+    let crate_name = module.krate(db).display_name(db).as_ref().map(|it| it.to_string());
+    let module_path = module.path_segments(db).map(|it| it.display(db, edition).to_string());
     crate_name.into_iter().chain(module_path).chain(item_name).join("::")
 }
 
 pub(super) fn definition(
     db: &RootDatabase,
-    def: Definition,
+    def: Definition<'_>,
     famous_defs: Option<&FamousDefs<'_, '_>>,
-    notable_traits: &[(Trait, Vec<(Option<Type>, Name)>)],
+    notable_traits: &[(Trait, Vec<(Option<Type<'_>>, Name)>)],
     macro_arm: Option<u32>,
-    hovered_definition: bool,
-    subst_types: Option<&Vec<(Symbol, Type)>>,
-    config: &HoverConfig,
+    render_extras: bool,
+    render_private_fields: bool,
+    subst_types: Option<&Vec<(Symbol, Type<'_>)>>,
+    config: &HoverConfig<'_>,
     edition: Edition,
     display_target: DisplayTarget,
-) -> Markup {
+) -> (Markup, Option<hir::Docs>) {
     let mod_path = definition_path(db, &def, edition);
     let label = match def {
         Definition::Trait(trait_) => trait_
             .display_limited(db, config.max_trait_assoc_items_count, display_target)
+            .with_private_fields(render_private_fields)
             .to_string(),
-        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
-            adt.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::Variant(variant) => {
-            variant.display_limited(db, config.max_fields_count, display_target).to_string()
-        }
-        Definition::Adt(adt @ Adt::Enum(_)) => {
-            adt.display_limited(db, config.max_enum_variants_count, display_target).to_string()
-        }
+        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => adt
+            .display_limited(db, config.max_fields_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
+        Definition::EnumVariant(variant) => variant
+            .display_limited(db, config.max_fields_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
+        Definition::Adt(adt @ Adt::Enum(_)) => adt
+            .display_limited(db, config.max_enum_variants_count, display_target)
+            .with_private_fields(render_private_fields)
+            .to_string(),
         Definition::SelfType(impl_def) => {
             let self_ty = &impl_def.self_ty(db);
             match self_ty.as_adt() {
-                Some(adt) => {
-                    adt.display_limited(db, config.max_fields_count, display_target).to_string()
-                }
+                Some(adt) => adt
+                    .display_limited(db, config.max_fields_count, display_target)
+                    .with_private_fields(render_private_fields)
+                    .to_string(),
                 None => self_ty.display(db, display_target).to_string(),
             }
         }
@@ -523,16 +496,20 @@ pub(super) fn definition(
         }
         _ => def.label(db, display_target),
     };
-    let docs = def.docs(db, famous_defs, display_target);
+    let docs = if config.documentation {
+        def.docs_with_rangemap(db, famous_defs, display_target)
+    } else {
+        None
+    };
     let value = || match def {
-        Definition::Variant(it) => {
+        Definition::EnumVariant(it) => {
             if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
                     Ok(it) => {
                         Some(if it >= 10 { format!("{it} ({it:#X})") } else { format!("{it}") })
                     }
                     Err(err) => {
-                        let res = it.value(db).map(|it| format!("{it:?}"));
+                        let res = it.value(db).map(|it| it.to_string());
                         if env::var_os("RA_DEV").is_some() {
                             let res = res.as_deref().unwrap_or("");
                             Some(format!(
@@ -552,7 +529,8 @@ pub(super) fn definition(
             let body = it.eval(db);
             Some(match body {
                 Ok(it) => match it.render_debug(db) {
-                    Ok(it) => it,
+                    Ok(rendered) if rendered.is_empty() => it.render(db, display_target),
+                    Ok(rendered) => rendered,
                     Err(err) => {
                         let it = it.render(db, display_target);
                         if env::var_os("RA_DEV").is_some() {
@@ -569,8 +547,8 @@ pub(super) fn definition(
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
-                        let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        let span_map = macro_file.expansion_span_map(db);
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -584,7 +562,9 @@ pub(super) fn definition(
             let body = it.eval(db);
             Some(match body {
                 Ok(it) => match it.render_debug(db) {
-                    Ok(it) => it,
+                    Ok(rendered) if rendered.is_empty() => it.render(db, display_target),
+                    Ok(rendered) => rendered,
+
                     Err(err) => {
                         let it = it.render(db, display_target);
                         if env::var_os("RA_DEV").is_some() {
@@ -601,8 +581,8 @@ pub(super) fn definition(
                     let source = it.source(db)?;
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
-                        let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        let span_map = macro_file.expansion_span_map(db);
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -622,29 +602,65 @@ pub(super) fn definition(
             |_| {
                 let var_def = it.parent_def(db);
                 match var_def {
-                    hir::VariantDef::Struct(s) => {
+                    hir::Variant::Struct(s) => {
                         Adt::from(s).layout(db).ok().and_then(|layout| layout.field_offset(it))
                     }
                     _ => None,
                 }
             },
             |_| None,
+            |_| None,
         ),
-        Definition::Adt(it) => {
-            render_memory_layout(config.memory_layout, || it.layout(db), |_| None, |_| None)
-        }
-        Definition::Variant(it) => render_memory_layout(
+        Definition::Adt(it @ Adt::Struct(strukt)) => render_memory_layout(
             config.memory_layout,
             || it.layout(db),
             |_| None,
+            |layout| {
+                let mut field_size =
+                    |i: usize| Some(strukt.fields(db).get(i)?.layout(db).ok()?.size());
+                if strukt.repr(db).is_some_and(|it| it.inhibit_struct_field_reordering()) {
+                    Some(("tail padding", layout.tail_padding(&mut field_size)?))
+                } else {
+                    Some(("largest padding", layout.largest_padding(&mut field_size)?))
+                }
+            },
+            |_| None,
+        ),
+        Definition::Adt(it) => render_memory_layout(
+            config.memory_layout,
+            || it.layout(db),
+            |_| None,
+            |_| None,
+            |_| None,
+        ),
+        Definition::EnumVariant(it) => render_memory_layout(
+            config.memory_layout,
+            || it.layout(db),
+            |_| None,
+            |_| None,
             |layout| layout.enum_tag_size(),
         ),
-        Definition::TypeAlias(it) => {
-            render_memory_layout(config.memory_layout, || it.ty(db).layout(db), |_| None, |_| None)
-        }
-        Definition::Local(it) => {
-            render_memory_layout(config.memory_layout, || it.ty(db).layout(db), |_| None, |_| None)
-        }
+        Definition::TypeAlias(it) => render_memory_layout(
+            config.memory_layout,
+            || it.ty(db).layout(db),
+            |_| None,
+            |_| None,
+            |_| None,
+        ),
+        Definition::Local(it) => render_memory_layout(
+            config.memory_layout,
+            || it.ty(db).layout(db),
+            |_| None,
+            |_| None,
+            |_| None,
+        ),
+        Definition::SelfType(it) => render_memory_layout(
+            config.memory_layout,
+            || it.self_ty(db).layout(db),
+            |_| None,
+            |_| None,
+            |_| None,
+        ),
         _ => None,
     };
 
@@ -657,7 +673,7 @@ pub(super) fn definition(
                 DropInfo { drop_glue: field.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Adt(Adt::Struct(strukt)) => {
-                let struct_drop_glue = strukt.ty_placeholders(db).drop_glue(db);
+                let struct_drop_glue = strukt.ty(db).drop_glue(db);
                 let mut fields_drop_glue = strukt
                     .fields(db)
                     .iter()
@@ -678,10 +694,10 @@ pub(super) fn definition(
             // Unions cannot have fields with drop glue.
             Definition::Adt(Adt::Union(union)) => DropInfo {
                 drop_glue: DropGlue::None,
-                has_dtor: Some(union.ty_placeholders(db).drop_glue(db) != DropGlue::None),
+                has_dtor: Some(union.ty(db).drop_glue(db) != DropGlue::None),
             },
             Definition::Adt(Adt::Enum(enum_)) => {
-                let enum_drop_glue = enum_.ty_placeholders(db).drop_glue(db);
+                let enum_drop_glue = enum_.ty(db).drop_glue(db);
                 let fields_drop_glue = enum_
                     .variants(db)
                     .iter()
@@ -700,7 +716,7 @@ pub(super) fn definition(
                     has_dtor: Some(enum_drop_glue > fields_drop_glue),
                 }
             }
-            Definition::Variant(variant) => {
+            Definition::EnumVariant(variant) => {
                 let fields_drop_glue = variant
                     .fields(db)
                     .iter()
@@ -710,25 +726,24 @@ pub(super) fn definition(
                 DropInfo { drop_glue: fields_drop_glue, has_dtor: None }
             }
             Definition::TypeAlias(type_alias) => {
-                DropInfo { drop_glue: type_alias.ty_placeholders(db).drop_glue(db), has_dtor: None }
+                DropInfo { drop_glue: type_alias.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Local(local) => {
                 DropInfo { drop_glue: local.ty(db).drop_glue(db), has_dtor: None }
             }
             _ => return None,
         };
-        let rendered_drop_glue = match drop_info.drop_glue {
-            DropGlue::None => "does not contain types with destructors (drop glue)",
-            DropGlue::DependOnParams => {
-                "may contain types with destructors (drop glue) depending on type parameters"
+        let rendered_drop_glue = if drop_info.has_dtor == Some(true) {
+            "impl Drop"
+        } else {
+            match drop_info.drop_glue {
+                DropGlue::HasDropGlue => "needs Drop",
+                DropGlue::None => "no Drop",
+                DropGlue::DependOnParams => "type param may need Drop",
             }
-            DropGlue::HasDropGlue => "contain types with destructors (drop glue)",
         };
-        Some(match drop_info.has_dtor {
-            Some(true) => format!("{}; has a destructor", rendered_drop_glue),
-            Some(false) => format!("{}; doesn't have a destructor", rendered_drop_glue),
-            None => rendered_drop_glue.to_owned(),
-        })
+
+        Some(rendered_drop_glue.to_owned())
     };
 
     let dyn_compatibility_info = || match def {
@@ -746,7 +761,7 @@ pub(super) fn definition(
     };
 
     let mut extra = String::new();
-    if hovered_definition {
+    if render_extras {
         if let Some(notable_traits) =
             render_notable_trait(db, notable_traits, edition, display_target)
         {
@@ -760,14 +775,17 @@ pub(super) fn definition(
         if let Some(layout_info) = layout_info() {
             extra.push_str("\n___\n");
             extra.push_str(&layout_info);
+            if let Some(drop_info) = drop_info() {
+                extra.push_str(", ");
+                extra.push_str(&drop_info)
+            }
+        } else if let Some(drop_info) = drop_info() {
+            extra.push_str("\n___\n");
+            extra.push_str(&drop_info);
         }
         if let Some(dyn_compatibility_info) = dyn_compatibility_info() {
             extra.push_str("\n___\n");
             extra.push_str(&dyn_compatibility_info);
-        }
-        if let Some(drop_info) = drop_info() {
-            extra.push_str("\n___\n");
-            extra.push_str(&drop_info);
         }
     }
     let mut desc = String::new();
@@ -802,13 +820,7 @@ pub(super) fn definition(
         }
     };
 
-    markup(
-        docs.map(Into::into),
-        desc,
-        extra.is_empty().not().then_some(extra),
-        mod_path,
-        subst_types,
-    )
+    markup(docs, desc, extra.is_empty().not().then_some(extra), mod_path, subst_types)
 }
 
 #[derive(Debug)]
@@ -870,7 +882,7 @@ pub(super) fn literal(
     };
     let ty = ty.display(sema.db, display_target);
 
-    let mut s = format!("```rust\n{ty}\n```\n___\n\n");
+    let mut s = format!("```rust\n{ty}\n```\n---\n\n");
     match value {
         Ok(value) => {
             let backtick_len = value.chars().filter(|c| *c == '`').count();
@@ -898,7 +910,7 @@ pub(super) fn literal(
 
 fn render_notable_trait(
     db: &RootDatabase,
-    notable_traits: &[(Trait, Vec<(Option<Type>, Name)>)],
+    notable_traits: &[(Trait, Vec<(Option<Type<'_>>, Name)>)],
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<String> {
@@ -906,9 +918,9 @@ fn render_notable_trait(
     let mut needs_impl_header = true;
     for (trait_, assoc_types) in notable_traits {
         desc.push_str(if mem::take(&mut needs_impl_header) {
-            "Implements notable traits: "
+            "Implements notable traits: `"
         } else {
-            ", "
+            "`, `"
         });
         format_to!(desc, "{}", trait_.name(db).display(db, edition));
         if !assoc_types.is_empty() {
@@ -928,13 +940,18 @@ fn render_notable_trait(
             desc.push('>');
         }
     }
-    desc.is_empty().not().then_some(desc)
+    if desc.is_empty() {
+        None
+    } else {
+        desc.push('`');
+        Some(desc)
+    }
 }
 
 fn type_info(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
-    ty: TypeInfo,
+    config: &HoverConfig<'_>,
+    ty: TypeInfo<'_>,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<HoverResult> {
@@ -955,37 +972,12 @@ fn type_info(
     res.markup = if let Some(adjusted_ty) = adjusted {
         walk_and_push_ty(db, &adjusted_ty, &mut push_new_def);
 
-        let notable = {
-            let mut desc = String::new();
-            let mut needs_impl_header = true;
-            for (trait_, assoc_types) in notable_traits(db, &original) {
-                desc.push_str(if mem::take(&mut needs_impl_header) {
-                    "Implements Notable Traits: "
-                } else {
-                    ", "
-                });
-                format_to!(desc, "{}", trait_.name(db).display(db, edition));
-                if !assoc_types.is_empty() {
-                    desc.push('<');
-                    format_to!(
-                        desc,
-                        "{}",
-                        assoc_types.into_iter().format_with(", ", |(ty, name), f| {
-                            f(&name.display(db, edition))?;
-                            f(&" = ")?;
-                            match ty {
-                                Some(ty) => f(&ty.display(db, display_target)),
-                                None => f(&"?"),
-                            }
-                        })
-                    );
-                    desc.push('>');
-                }
-            }
-            if !desc.is_empty() {
-                desc.push('\n');
-            }
-            desc
+        let notable = if let Some(notable) =
+            render_notable_trait(db, &notable_traits(db, &original), edition, display_target)
+        {
+            format!("{notable}\n")
+        } else {
+            String::new()
         };
 
         let original = original.display(db, display_target).to_string();
@@ -1004,12 +996,12 @@ fn type_info(
         if let Some(extra) =
             render_notable_trait(db, &notable_traits(db, &original), edition, display_target)
         {
-            desc.push_str("\n___\n");
+            desc.push_str("\n---\n");
             desc.push_str(&extra);
         };
         desc.into()
     };
-    if let Some(actions) = HoverAction::goto_type_from_targets(db, targets, edition) {
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema, targets, edition) {
         res.actions.push(actions);
     }
     Some(res)
@@ -1017,14 +1009,15 @@ fn type_info(
 
 fn closure_ty(
     sema: &Semantics<'_, RootDatabase>,
-    config: &HoverConfig,
-    TypeInfo { original, adjusted }: &TypeInfo,
+    config: &HoverConfig<'_>,
+    TypeInfo { original, adjusted }: &TypeInfo<'_>,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<HoverResult> {
     let c = original.as_closure()?;
-    let mut captures_rendered = c.captured_items(sema.db)
-        .into_iter()
+    let captures = c.captured_items(sema.db);
+    let mut captures_rendered = captures
+        .iter()
         .map(|it| {
             let borrow_kind = match it.kind() {
                 CaptureKind::SharedRef => "immutable borrow",
@@ -1032,7 +1025,7 @@ fn closure_ty(
                 CaptureKind::MutableRef => "mutable borrow",
                 CaptureKind::Move => "move",
             };
-            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
+            format!("* `{}` by {}", it.display_place_source_code(sema.db, display_target.edition), borrow_kind)
         })
         .join("\n");
     if captures_rendered.trim().is_empty() {
@@ -1045,8 +1038,8 @@ fn closure_ty(
         }
     };
     walk_and_push_ty(sema.db, original, &mut push_new_def);
-    c.capture_types(sema.db).into_iter().for_each(|ty| {
-        walk_and_push_ty(sema.db, &ty, &mut push_new_def);
+    captures.iter().for_each(|capture| {
+        walk_and_push_ty(sema.db, &capture.ty(sema.db), &mut push_new_def);
     });
 
     let adjusted = if let Some(adjusted_ty) = adjusted {
@@ -1062,25 +1055,29 @@ fn closure_ty(
     };
     let mut markup = format!("```rust\n{}\n```", c.display_with_impl(sema.db, display_target));
 
-    if let Some(trait_) = c.fn_trait(sema.db).get_id(sema.db, original.krate(sema.db).into()) {
-        push_new_def(hir::Trait::from(trait_).into())
+    if let Some(trait_) = c.fn_trait(sema.db).get_id(sema.db, original.krate(sema.db)) {
+        push_new_def(trait_.into())
     }
-    if let Some(layout) =
-        render_memory_layout(config.memory_layout, || original.layout(sema.db), |_| None, |_| None)
-    {
-        format_to!(markup, "\n___\n{layout}");
+    if let Some(layout) = render_memory_layout(
+        config.memory_layout,
+        || original.layout(sema.db),
+        |_| None,
+        |_| None,
+        |_| None,
+    ) {
+        format_to!(markup, "\n---\n{layout}");
     }
     format_to!(markup, "{adjusted}\n\n## Captures\n{}", captures_rendered,);
 
     let mut res = HoverResult::default();
-    if let Some(actions) = HoverAction::goto_type_from_targets(sema.db, targets, edition) {
+    if let Some(actions) = HoverAction::goto_type_from_targets(sema, targets, edition) {
         res.actions.push(actions);
     }
     res.markup = markup.into();
     Some(res)
 }
 
-fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Option<String> {
+fn definition_path(db: &RootDatabase, &def: &Definition<'_>, edition: Edition) -> Option<String> {
     if matches!(
         def,
         Definition::TupleField(_)
@@ -1099,18 +1096,18 @@ fn definition_path(db: &RootDatabase, &def: &Definition, edition: Edition) -> Op
 }
 
 fn markup(
-    docs: Option<String>,
+    docs: Option<Either<Cow<'_, hir::Docs>, Documentation<'_>>>,
     rust: String,
     extra: Option<String>,
     mod_path: Option<String>,
     subst_types: String,
-) -> Markup {
+) -> (Markup, Option<hir::Docs>) {
     let mut buf = String::new();
 
-    if let Some(mod_path) = mod_path {
-        if !mod_path.is_empty() {
-            format_to!(buf, "```rust\n{}\n```\n\n", mod_path);
-        }
+    if let Some(mod_path) = mod_path
+        && !mod_path.is_empty()
+    {
+        format_to!(buf, "```rust\n{}\n```\n\n", mod_path);
     }
     format_to!(buf, "```rust\n{}\n```", rust);
 
@@ -1123,29 +1120,34 @@ fn markup(
     }
 
     if let Some(doc) = docs {
-        format_to!(buf, "\n___\n\n{}", doc);
+        format_to!(buf, "\n___\n\n");
+        let offset = TextSize::new(buf.len() as u32);
+        let docs_str = match &doc {
+            Either::Left(docs) => docs.docs(),
+            Either::Right(docs) => docs.as_str(),
+        };
+        format_to!(buf, "{}", docs_str);
+        let range_map = match doc {
+            Either::Left(range_map) => {
+                let mut range_map = range_map.into_owned();
+                range_map.shift_by(offset);
+                Some(range_map)
+            }
+            Either::Right(_) => None,
+        };
+
+        (buf.into(), range_map)
+    } else {
+        (buf.into(), None)
     }
-    buf.into()
 }
 
-fn find_std_module(
-    famous_defs: &FamousDefs<'_, '_>,
-    name: &str,
-    edition: Edition,
-) -> Option<hir::Module> {
-    let db = famous_defs.0.db;
-    let std_crate = famous_defs.std()?;
-    let std_root_module = std_crate.root_module();
-    std_root_module.children(db).find(|module| {
-        module.name(db).is_some_and(|module| module.display(db, edition).to_string() == name)
-    })
-}
-
-fn render_memory_layout(
+fn render_memory_layout<'db>(
     config: Option<MemoryLayoutHoverConfig>,
-    layout: impl FnOnce() -> Result<Layout, LayoutError>,
-    offset: impl FnOnce(&Layout) -> Option<u64>,
-    tag: impl FnOnce(&Layout) -> Option<usize>,
+    layout: impl FnOnce() -> Result<Layout<'db>, LayoutError>,
+    offset: impl FnOnce(&Layout<'db>) -> Option<u64>,
+    padding: impl for<'a> FnOnce(&'a Layout<'db>) -> Option<(&'a str, u64)>,
+    tag: impl FnOnce(&Layout<'db>) -> Option<usize>,
 ) -> Option<String> {
     let config = config?;
     let layout = layout().ok()?;
@@ -1185,38 +1187,55 @@ fn render_memory_layout(
         format_to!(label, ", ");
     }
 
-    if let Some(render) = config.offset {
-        if let Some(offset) = offset(&layout) {
-            format_to!(label, "offset = ");
-            match render {
-                MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{offset}"),
-                MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{offset:#X}"),
-                MemoryLayoutHoverRenderKind::Both if offset >= 10 => {
-                    format_to!(label, "{offset} ({offset:#X})")
-                }
-                MemoryLayoutHoverRenderKind::Both => {
-                    format_to!(label, "{offset}")
-                }
+    if let Some(render) = config.offset
+        && let Some(offset) = offset(&layout)
+    {
+        format_to!(label, "offset = ");
+        match render {
+            MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{offset}"),
+            MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{offset:#X}"),
+            MemoryLayoutHoverRenderKind::Both if offset >= 10 => {
+                format_to!(label, "{offset} ({offset:#X})")
             }
-            format_to!(label, ", ");
+            MemoryLayoutHoverRenderKind::Both => {
+                format_to!(label, "{offset}")
+            }
         }
+        format_to!(label, ", ");
     }
 
-    if config.niches {
-        if let Some(niches) = layout.niches() {
-            if niches > 1024 {
-                if niches.is_power_of_two() {
-                    format_to!(label, "niches = 2{}, ", pwr2_to_exponent(niches));
-                } else if is_pwr2plus1(niches) {
-                    format_to!(label, "niches = 2{} + 1, ", pwr2_to_exponent(niches - 1));
-                } else if is_pwr2minus1(niches) {
-                    format_to!(label, "niches = 2{} - 1, ", pwr2_to_exponent(niches + 1));
-                } else {
-                    format_to!(label, "niches = a lot, ");
-                }
-            } else {
-                format_to!(label, "niches = {niches}, ");
+    if let Some(render) = config.padding
+        && let Some((padding_name, padding)) = padding(&layout)
+    {
+        format_to!(label, "{padding_name} = ");
+        match render {
+            MemoryLayoutHoverRenderKind::Decimal => format_to!(label, "{padding}"),
+            MemoryLayoutHoverRenderKind::Hexadecimal => format_to!(label, "{padding:#X}"),
+            MemoryLayoutHoverRenderKind::Both if padding >= 10 => {
+                format_to!(label, "{padding} ({padding:#X})")
             }
+            MemoryLayoutHoverRenderKind::Both => {
+                format_to!(label, "{padding}")
+            }
+        }
+        format_to!(label, ", ");
+    }
+
+    if config.niches
+        && let Some(niches) = layout.niches()
+    {
+        if niches > 1024 {
+            if niches.is_power_of_two() {
+                format_to!(label, "niches = 2{}, ", pwr2_to_exponent(niches));
+            } else if is_pwr2plus1(niches) {
+                format_to!(label, "niches = 2{} + 1, ", pwr2_to_exponent(niches - 1));
+            } else if is_pwr2minus1(niches) {
+                format_to!(label, "niches = 2{} - 1, ", pwr2_to_exponent(niches + 1));
+            } else {
+                format_to!(label, "niches = a lot, ");
+            }
+        } else {
+            format_to!(label, "niches = {niches}, ");
         }
     }
     label.pop(); // ' '
@@ -1265,7 +1284,7 @@ fn keyword_hints(
                     KeywordHint {
                         description,
                         keyword_mod,
-                        actions: HoverAction::goto_type_from_targets(sema.db, targets, edition)
+                        actions: HoverAction::goto_type_from_targets(sema, targets, edition)
                             .into_iter()
                             .collect(),
                     }

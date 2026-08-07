@@ -1,8 +1,7 @@
 error: layout_of(Aligned1) = Layout {
            size: Size(8 bytes),
-           align: AbiAndPrefAlign {
+           align: AbiAlign {
                abi: Align(8 bytes),
-               pref: $PREF_ALIGN,
            },
            backend_repr: Memory {
                sized: true,
@@ -11,79 +10,42 @@ error: layout_of(Aligned1) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
            largest_niche: Some(
                Niche {
                    offset: Size(0 bytes),
-                   value: Int(
-                       I8,
-                       false,
-                   ),
+                   value: u8,
                    valid_range: 0..=1,
                },
            ),
            uninhabited: false,
            variants: Multiple {
-               tag: Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               tag: u8 is 0..=1,
                tag_encoding: Direct,
                tag_field: 0,
                variants: [
-                   Layout {
+                   VariantLayout {
                        size: Size(8 bytes),
-                       align: AbiAndPrefAlign {
-                           abi: Align(8 bytes),
-                           pref: $PREF_ALIGN,
-                       },
                        backend_repr: Memory {
                            sized: true,
                        },
-                       fields: Arbitrary {
-                           offsets: [],
-                           memory_index: [],
-                       },
+                       field_offsets: [],
+                       fields_in_memory_order: [],
                        largest_niche: None,
                        uninhabited: false,
-                       variants: Single {
-                           index: 0,
-                       },
-                       max_repr_align: Some(
-                           Align(8 bytes),
-                       ),
-                       unadjusted_abi_align: Align(1 bytes),
-                       randomization_seed: $SEED,
                    },
-                   Layout {
+                   VariantLayout {
                        size: Size(8 bytes),
-                       align: AbiAndPrefAlign {
-                           abi: Align(8 bytes),
-                           pref: $PREF_ALIGN,
-                       },
                        backend_repr: Memory {
                            sized: true,
                        },
-                       fields: Arbitrary {
-                           offsets: [],
-                           memory_index: [],
-                       },
+                       field_offsets: [],
+                       fields_in_memory_order: [],
                        largest_niche: None,
                        uninhabited: false,
-                       variants: Single {
-                           index: 1,
-                       },
-                       max_repr_align: Some(
-                           Align(8 bytes),
-                       ),
-                       unadjusted_abi_align: Align(1 bytes),
-                       randomization_seed: $SEED,
                    },
                ],
            },
@@ -100,96 +62,52 @@ LL | pub enum Aligned1 {
 
 error: layout_of(Aligned2) = Layout {
            size: Size(1 bytes),
-           align: AbiAndPrefAlign {
+           align: AbiAlign {
                abi: Align(1 bytes),
-               pref: $PREF_ALIGN,
            },
            backend_repr: Scalar(
-               Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               u8 is 0..=1,
            ),
            fields: Arbitrary {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
            largest_niche: Some(
                Niche {
                    offset: Size(0 bytes),
-                   value: Int(
-                       I8,
-                       false,
-                   ),
+                   value: u8,
                    valid_range: 0..=1,
                },
            ),
            uninhabited: false,
            variants: Multiple {
-               tag: Initialized {
-                   value: Int(
-                       I8,
-                       false,
-                   ),
-                   valid_range: 0..=1,
-               },
+               tag: u8 is 0..=1,
                tag_encoding: Direct,
                tag_field: 0,
                variants: [
-                   Layout {
+                   VariantLayout {
                        size: Size(1 bytes),
-                       align: AbiAndPrefAlign {
-                           abi: Align(1 bytes),
-                           pref: $PREF_ALIGN,
-                       },
                        backend_repr: Memory {
                            sized: true,
                        },
-                       fields: Arbitrary {
-                           offsets: [],
-                           memory_index: [],
-                       },
+                       field_offsets: [],
+                       fields_in_memory_order: [],
                        largest_niche: None,
                        uninhabited: false,
-                       variants: Single {
-                           index: 0,
-                       },
-                       max_repr_align: Some(
-                           Align(1 bytes),
-                       ),
-                       unadjusted_abi_align: Align(1 bytes),
-                       randomization_seed: $SEED,
                    },
-                   Layout {
+                   VariantLayout {
                        size: Size(1 bytes),
-                       align: AbiAndPrefAlign {
-                           abi: Align(1 bytes),
-                           pref: $PREF_ALIGN,
-                       },
                        backend_repr: Memory {
                            sized: true,
                        },
-                       fields: Arbitrary {
-                           offsets: [],
-                           memory_index: [],
-                       },
+                       field_offsets: [],
+                       fields_in_memory_order: [],
                        largest_niche: None,
                        uninhabited: false,
-                       variants: Single {
-                           index: 1,
-                       },
-                       max_repr_align: Some(
-                           Align(1 bytes),
-                       ),
-                       unadjusted_abi_align: Align(1 bytes),
-                       randomization_seed: $SEED,
                    },
                ],
            },

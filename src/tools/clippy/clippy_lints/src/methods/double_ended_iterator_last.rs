@@ -1,11 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
 use clippy_utils::ty::{has_non_owning_mutable_access, implements_trait};
-use clippy_utils::{is_mutable, is_trait_method, path_to_local};
+use clippy_utils::{is_mutable, path_to_local_with_projections, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, Node, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::Instance;
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 
 use super::DOUBLE_ENDED_ITERATOR_LAST;
 
@@ -13,7 +14,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &'_ Expr<'_>, self_expr: &'_ Exp
     let typeck = cx.typeck_results();
 
     // if the "last" method is that of Iterator
-    if is_trait_method(cx, expr, sym::Iterator)
+    if cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::Iterator)
         // if self implements DoubleEndedIterator
         && let Some(deiter_id) = cx.tcx.get_diagnostic_item(sym::DoubleEndedIterator)
         && let self_type = cx.typeck_results().expr_ty(self_expr)
@@ -24,7 +25,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &'_ Expr<'_>, self_expr: &'_ Exp
         && let Ok(Some(fn_def)) = Instance::try_resolve(cx.tcx, cx.typing_env(), id, args)
         // find the provided definition of Iterator::last
         && let Some(item) = cx.tcx.get_diagnostic_item(sym::Iterator)
-        && let Some(last_def) = cx.tcx.provided_trait_methods(item).find(|m| m.name().as_str() == "last")
+        && let Some(last_def) = cx.tcx.provided_trait_methods(item).find(|m| m.name() == sym::last)
         // if the resolved method is the same as the provided definition
         && fn_def.def_id() == last_def.def_id
         && let self_ty = cx.typeck_results().expr_ty(self_expr)
@@ -37,7 +38,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &'_ Expr<'_>, self_expr: &'_ Exp
         // TODO: Change this to lint only when the referred iterator is not used later. If it is used later,
         // changing to `next_back()` may change its behavior.
         if !(is_mutable(cx, self_expr) || self_type.is_ref()) {
-            if let Some(hir_id) = path_to_local(self_expr)
+            if let Some(hir_id) = path_to_local_with_projections(self_expr)
                 && let Node::Pat(pat) = cx.tcx.hir_node(hir_id)
                 && let PatKind::Binding(_, _, ident, _) = pat.kind
             {

@@ -4,36 +4,34 @@
 
 The `wasm32-wasip1` target is a WebAssembly compilation target which
 assumes that the [WASIp1] (aka "WASI preview1") set of "syscalls" are available
-for use in the standard library. Historically this target in the Rust compiler
-was one of the first for WebAssembly where Rust and C code are explicitly
-intended to interoperate as well.
+for use in the standard library. This target explicitly supports interop with
+non-Rust code such as C and C++.
 
-There's a bit of history to the target and current development which is also
-worth explaining before going much further. Historically this target was
-originally called `wasm32-wasi` in both rustc and Clang. This was first added
-to Rust in 2019. In the intervening years leading up to 2024 the WASI standard
-continued to be developed and was eventually "rebased" on top of the [Component
-Model]. This was a large change to the WASI specification and was released as
-0.2.0 ("WASIp2" colloquially) in January 2024. The previous target's name in
-rustc, `wasm32-wasi`, was then renamed to `wasm32-wasip1`, to avoid
-confusion with this new target to be added to rustc as `wasm32-wasip2`.
-Some more context can be found in these MCPs:
+The [WASIp1] set of syscalls is standard insofar as it was written down once by
+a set of folks and has not changed since then. Additionally the [WASIp1]
+syscalls have been adapted and adopted into a number of runtimes and embeddings.
+It is not standard in the sense that there are no formal semantics for each
+syscall and APIs are no longer receiving any maintenance (e.g. no new APIs, no
+new documentation, etc). After [WASIp1] was originally developed in 2019 the
+WASI standard effort has since been "rebased" on top of the [Component Model].
+This was a large change to the WASI specification and was released as 0.2.0
+("WASIp2" colloquially) in January 2024. Current standardization efforts are
+focused on the Component Model-based definition of WASI. At this point the
+`wasm32-wasip1` Rust target is intended for historical compatibility with
+[WASIp1] set of syscalls.
 
-* [Rename wasm32-wasi target to wasm32-wasip1](https://github.com/rust-lang/compiler-team/issues/607)
-* [Smooth the renaming transition of wasm32-wasi](https://github.com/rust-lang/compiler-team/issues/695)
-
-At this point the `wasm32-wasip1` target is intended for historical
-compatibility with the first version of the WASI standard. As of now (January
-2024) the 0.2.0 target of WASI ("WASIp2") is relatively new. The state of
-WASI will likely change in few years after which point this documentation will
-probably receive another update.
-
-[WASI Preview1]: https://github.com/WebAssembly/WASI/tree/main/legacy/preview1
+[WASIp1]: https://github.com/WebAssembly/WASI/tree/wasi-0.1/preview1
 [Component Model]: https://github.com/webassembly/component-model
 
 Today the `wasm32-wasip1` target will generate core WebAssembly modules
 which will import functions from the `wasi_snapshot_preview1` module for
 OS-related functionality (e.g. printing).
+
+> **Note**: Prior to March 2024 this target was known as `wasm32-wasi` with some
+> historical context found in old MCPs:
+>
+> * [Rename wasm32-wasi target to wasm32-wasip1](https://github.com/rust-lang/compiler-team/issues/607)
+> * [Smooth the renaming transition of wasm32-wasi](https://github.com/rust-lang/compiler-team/issues/695)
 
 ## Target maintainers
 
@@ -44,6 +42,7 @@ said since when this document was last updated those interested in maintaining
 this target are:
 
 [@alexcrichton](https://github.com/alexcrichton)
+[@loganek](https://github.com/loganek)
 
 ## Requirements
 
@@ -71,17 +70,16 @@ be used instead.
 
 [`wasi-libc`]: https://github.com/WebAssembly/wasi-libc
 
-## Building the target
+## Building the target in rustc
 
-To build this target first acquire a copy of
-[`wasi-sdk`](https://github.com/WebAssembly/wasi-sdk/). At this time version 22
-is the minimum needed.
+To build this target first acquire a copy of [`wasi-sdk`]. At this time version
+33 is the minimum needed.
 
 Next configure the `WASI_SDK_PATH` environment variable to point to where this
 is installed. For example:
 
 ```text
-export WASI_SDK_PATH=/path/to/wasi-sdk-22.0
+export WASI_SDK_PATH=/path/to/wasi-sdk-33.0
 ```
 
 Next be sure to enable LLD when building Rust from source as LLVM's `wasm-ld`
@@ -103,6 +101,16 @@ Rust programs can be built for that target:
 ```text
 rustc --target wasm32-wasip1 your-code.rs
 ```
+
+The `wasm32-wasip1` toolchain comes with a self-contained sysroot meaning that
+no external compiler is required when building for this target. Users which
+build a `staticlib`, however, or use an external `-Clinker`, are recommended to
+use [`wasi-sdk`]. The minimum version required of [`wasi-sdk`] will change over
+time as it's updated in Rust and Rust relies on newer features that [`wasi-sdk`]
+has. See the documentation above about building the target in rustc for the
+minimum known working version.
+
+[`wasi-sdk`]: https://github.com/WebAssembly/wasi-sdk
 
 ## Cross-compilation
 
@@ -134,3 +142,9 @@ to Rust 1.80 the `target_env` condition was not set.
 The default set of WebAssembly features enabled for compilation is currently the
 same as [`wasm32-unknown-unknown`](./wasm32-unknown-unknown.md). See the
 documentation there for more information.
+
+## Unwinding
+
+This target is compiled with `-Cpanic=abort` by default. For information on
+using `-Cpanic=unwind` see the [documentation about unwinding for
+`wasm32-unknown-unknown`](./wasm32-unknown-unknown.md#unwinding).

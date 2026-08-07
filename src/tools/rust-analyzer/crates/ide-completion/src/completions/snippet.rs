@@ -1,18 +1,18 @@
 //! This file provides snippet completions, like `pd` => `eprintln!(...)`.
 
-use ide_db::{documentation::Documentation, imports::insert_use::ImportScope, SnippetCap};
+use ide_db::{SnippetCap, documentation::Documentation, imports::insert_use::ImportScope};
 
 use crate::{
+    CompletionContext, CompletionItem, CompletionItemKind, Completions, SnippetScope,
     context::{ItemListKind, PathCompletionCtx, PathExprCtx, Qualified},
     item::Builder,
-    CompletionContext, CompletionItem, CompletionItemKind, Completions, SnippetScope,
 };
 
 pub(crate) fn complete_expr_snippet(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx: &PathCompletionCtx,
-    &PathExprCtx { in_block_expr, .. }: &PathExprCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx: &PathCompletionCtx<'_>,
+    &PathExprCtx { in_block_expr, .. }: &PathExprCtx<'_>,
 ) {
     if !matches!(path_ctx.qualified, Qualified::No) {
         return;
@@ -50,8 +50,8 @@ macro_rules! $1 {
 
 pub(crate) fn complete_item_snippet(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
-    path_ctx: &PathCompletionCtx,
+    ctx: &CompletionContext<'_, '_>,
+    path_ctx: &PathCompletionCtx<'_>,
     kind: &ItemListKind,
 ) {
     if !matches!(path_ctx.qualified, Qualified::No) {
@@ -117,7 +117,12 @@ macro_rules! $1 {
     }
 }
 
-fn snippet(ctx: &CompletionContext<'_>, cap: SnippetCap, label: &str, snippet: &str) -> Builder {
+fn snippet(
+    ctx: &CompletionContext<'_, '_>,
+    cap: SnippetCap,
+    label: &str,
+    snippet: &str,
+) -> Builder {
     let mut item =
         CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label, ctx.edition);
     item.insert_snippet(cap, snippet);
@@ -126,7 +131,7 @@ fn snippet(ctx: &CompletionContext<'_>, cap: SnippetCap, label: &str, snippet: &
 
 fn add_custom_completions(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     cap: SnippetCap,
     scope: SnippetScope,
 ) -> Option<()> {
@@ -139,7 +144,7 @@ fn add_custom_completions(
             };
             let body = snip.snippet();
             let mut builder = snippet(ctx, cap, trigger, &body);
-            builder.documentation(Documentation::new(format!("```rust\n{body}\n```")));
+            builder.documentation(Documentation::new_owned(format!("```rust\n{body}\n```")));
             for import in imports.into_iter() {
                 builder.add_import(import);
             }
@@ -153,23 +158,25 @@ fn add_custom_completions(
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{check_edit_with_config, TEST_CONFIG},
         CompletionConfig, Snippet,
+        tests::{TEST_CONFIG, check_edit_with_config},
     };
 
     #[test]
     fn custom_snippet_completion() {
         check_edit_with_config(
             CompletionConfig {
-                snippets: vec![Snippet::new(
-                    &["break".into()],
-                    &[],
-                    &["ControlFlow::Break(())".into()],
-                    "",
-                    &["core::ops::ControlFlow".into()],
-                    crate::SnippetScope::Expr,
-                )
-                .unwrap()],
+                snippets: vec![
+                    Snippet::new(
+                        &["break".into()],
+                        &[],
+                        &["ControlFlow::Break(())".into()],
+                        "",
+                        &["core::ops::ControlFlow".into()],
+                        crate::SnippetScope::Expr,
+                    )
+                    .unwrap(),
+                ],
                 ..TEST_CONFIG
             },
             "break",

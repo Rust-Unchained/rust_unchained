@@ -1,219 +1,89 @@
-//! Trait solving using Chalk.
+//! Trait solving using next trait solver.
 
-use core::fmt;
-use std::env::var;
+use std::{cell::OnceCell, hash::Hash};
 
-use chalk_ir::{fold::TypeFoldable, DebruijnIndex, GoalData};
-use chalk_recursive::Cache;
-use chalk_solve::{logging_db::LoggingRustIrDatabase, rust_ir, Solver};
-
-use base_db::CrateId;
+use base_db::Crate;
 use hir_def::{
-    lang_item::{LangItem, LangItemTarget},
-    BlockId, TraitId,
+    AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
+    expr_store::ExpressionStore,
+    hir::generics::WherePredicate,
+    lang_item::LangItems,
+    nameres::DefMap,
+    resolver::Resolver,
+    signatures::{
+        ConstFlags, ConstSignature, EnumFlags, EnumSignature, FnFlags, FunctionSignature,
+        StructFlags, StructSignature, TraitFlags, TraitSignature, TypeAliasFlags,
+        TypeAliasSignature, UnionSignature,
+    },
 };
 use hir_expand::name::Name;
 use intern::sym;
-use span::Edition;
-use stdx::{never, panic_context};
-use triomphe::Arc;
-
-use crate::{
-    db::HirDatabase, infer::unify::InferenceTable, utils::UnevaluatedConstEvaluatorFolder, AliasEq,
-    AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment, Interner, ProjectionTy,
-    ProjectionTyExt, Solution, TraitRefExt, Ty, TyKind, TypeFlags, WhereClause,
+use rustc_type_ir::{
+    TypeVisitableExt, TypingMode,
+    inherent::{BoundExistentialPredicates, IntoKind, Ty as _},
 };
 
-/// This controls how much 'time' we give the Chalk solver before giving up.
-const CHALK_SOLVER_FUEL: i32 = 1000;
+use crate::{
+    LifetimeElisionKind, LifetimeLoweringMode, Span, TyLoweringContext,
+    db::HirDatabase,
+    generics::Generics,
+    lower::LoweringMode,
+    next_solver::{
+        DbInterner, GenericArgs, ParamEnv, StoredClauses, Ty, TyKind,
+        infer::{
+            DbInternerInferExt, InferCtxt,
+            select::EvaluationResult,
+            traits::{Obligation, ObligationCause},
+        },
+        obligation_ctxt::ObligationCtxt,
+    },
+};
 
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct ChalkContext<'a> {
-    pub(crate) db: &'a dyn HirDatabase,
-    pub(crate) krate: CrateId,
-    pub(crate) block: Option<BlockId>,
+/// Type for `hir`, because commonly we want both param env and a crate in an exported API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParamEnvAndCrate<'db> {
+    pub param_env: ParamEnv<'db>,
+    pub krate: Crate,
 }
 
-fn create_chalk_solver() -> chalk_recursive::RecursiveSolver<Interner> {
-    let overflow_depth =
-        var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-    let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
-    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(Cache::new()))
+impl<'db> ParamEnvAndCrate<'db> {
+    #[inline]
+    pub fn store(self) -> StoredParamEnvAndCrate {
+        StoredParamEnvAndCrate { param_env: self.param_env.clauses.store(), krate: self.krate }
+    }
 }
 
-/// A set of clauses that we assume to be true. E.g. if we are inside this function:
-/// ```rust
-/// fn foo<T: Default>(t: T) {}
-/// ```
-/// we assume that `T: Default`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TraitEnvironment {
-    pub krate: CrateId,
-    pub block: Option<BlockId>,
-    // FIXME make this a BTreeMap
-    traits_from_clauses: Box<[(Ty, TraitId)]>,
-    pub env: chalk_ir::Environment<Interner>,
+pub struct StoredParamEnvAndCrate {
+    param_env: StoredClauses,
+    pub krate: Crate,
 }
 
-impl TraitEnvironment {
-    pub fn empty(krate: CrateId) -> Arc<Self> {
-        Arc::new(TraitEnvironment {
-            krate,
-            block: None,
-            traits_from_clauses: Box::default(),
-            env: chalk_ir::Environment::new(Interner),
-        })
+impl StoredParamEnvAndCrate {
+    #[inline]
+    pub fn param_env<'db>(&self, _db: &'db dyn HirDatabase) -> ParamEnv<'db> {
+        ParamEnv { clauses: self.param_env.as_ref() }
     }
 
-    pub fn new(
-        krate: CrateId,
-        block: Option<BlockId>,
-        traits_from_clauses: Box<[(Ty, TraitId)]>,
-        env: chalk_ir::Environment<Interner>,
-    ) -> Arc<Self> {
-        Arc::new(TraitEnvironment { krate, block, traits_from_clauses, env })
-    }
-
-    // pub fn with_block(self: &mut Arc<Self>, block: BlockId) {
-    pub fn with_block(this: &mut Arc<Self>, block: BlockId) {
-        Arc::make_mut(this).block = Some(block);
-    }
-
-    pub fn traits_in_scope_from_clauses(&self, ty: Ty) -> impl Iterator<Item = TraitId> + '_ {
-        self.traits_from_clauses
-            .iter()
-            .filter_map(move |(self_ty, trait_id)| (*self_ty == ty).then_some(*trait_id))
+    #[inline]
+    pub fn as_ref<'db>(&self, db: &'db dyn HirDatabase) -> ParamEnvAndCrate<'db> {
+        ParamEnvAndCrate { param_env: self.param_env(db), krate: self.krate }
     }
 }
 
-pub(crate) fn normalize_projection_query(
-    db: &dyn HirDatabase,
-    projection: ProjectionTy,
-    env: Arc<TraitEnvironment>,
-) -> Ty {
-    if projection.substitution.iter(Interner).any(|arg| {
-        arg.ty(Interner)
-            .is_some_and(|ty| ty.data(Interner).flags.intersects(TypeFlags::HAS_TY_INFER))
-    }) {
-        never!(
-            "Invoking `normalize_projection_query` with a projection type containing inference var"
-        );
-        return TyKind::Error.intern(Interner);
-    }
-
-    let mut table = InferenceTable::new(db, env);
-    let ty = table.normalize_projection_ty(projection);
-    table.resolve_completely(ty)
+/// This should be used in `hir` only.
+pub fn structurally_normalize_ty<'db>(
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    env: ParamEnv<'db>,
+) -> Ty<'db> {
+    let TyKind::Alias(..) = ty.kind() else { return ty };
+    let mut ocx = ObligationCtxt::new(infcx);
+    let ty = ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty);
+    ty.replace_infer_with_error(infcx.interner)
 }
 
-/// Solve a trait goal using Chalk.
-pub(crate) fn trait_solve_query(
-    db: &dyn HirDatabase,
-    krate: CrateId,
-    block: Option<BlockId>,
-    goal: Canonical<InEnvironment<Goal>>,
-) -> Option<Solution> {
-    let detail = match &goal.value.goal.data(Interner) {
-        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => {
-            db.trait_data(it.hir_trait_id()).name.display(db.upcast(), Edition::LATEST).to_string()
-        }
-        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(_))) => "alias_eq".to_owned(),
-        _ => "??".to_owned(),
-    };
-    let _p = tracing::info_span!("trait_solve_query", ?detail).entered();
-    tracing::info!("trait_solve_query({:?})", goal.value.goal);
-
-    if let GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(AliasEq {
-        alias: AliasTy::Projection(projection_ty),
-        ..
-    }))) = &goal.value.goal.data(Interner)
-    {
-        if let TyKind::BoundVar(_) = projection_ty.self_type_parameter(db).kind(Interner) {
-            // Hack: don't ask Chalk to normalize with an unknown self type, it'll say that's impossible
-            return Some(Solution::Ambig(Guidance::Unknown));
-        }
-    }
-
-    // Chalk see `UnevaluatedConst` as a unique concrete value, but we see it as an alias for another const. So
-    // we should get rid of it when talking to chalk.
-    let goal = goal
-        .try_fold_with(&mut UnevaluatedConstEvaluatorFolder { db }, DebruijnIndex::INNERMOST)
-        .unwrap();
-
-    // We currently don't deal with universes (I think / hope they're not yet
-    // relevant for our use cases?)
-    let u_canonical = chalk_ir::UCanonical { canonical: goal, universes: 1 };
-    solve(db, krate, block, &u_canonical)
-}
-
-fn solve(
-    db: &dyn HirDatabase,
-    krate: CrateId,
-    block: Option<BlockId>,
-    goal: &chalk_ir::UCanonical<chalk_ir::InEnvironment<chalk_ir::Goal<Interner>>>,
-) -> Option<chalk_solve::Solution<Interner>> {
-    let _p = tracing::info_span!("solve", ?krate, ?block).entered();
-    let context = ChalkContext { db, krate, block };
-    tracing::debug!("solve goal: {:?}", goal);
-    let mut solver = create_chalk_solver();
-
-    let fuel = std::cell::Cell::new(CHALK_SOLVER_FUEL);
-
-    let should_continue = || {
-        db.unwind_if_cancelled();
-        let remaining = fuel.get();
-        fuel.set(remaining - 1);
-        if remaining == 0 {
-            tracing::debug!("fuel exhausted");
-        }
-        remaining > 0
-    };
-
-    let mut solve = || {
-        let _ctx = if is_chalk_debug() || is_chalk_print() {
-            Some(panic_context::enter(format!("solving {goal:?}")))
-        } else {
-            None
-        };
-        let solution = if is_chalk_print() {
-            let logging_db =
-                LoggingRustIrDatabaseLoggingOnDrop(LoggingRustIrDatabase::new(context));
-            solver.solve_limited(&logging_db.0, goal, &should_continue)
-        } else {
-            solver.solve_limited(&context, goal, &should_continue)
-        };
-
-        tracing::debug!("solve({:?}) => {:?}", goal, solution);
-
-        solution
-    };
-
-    // don't set the TLS for Chalk unless Chalk debugging is active, to make
-    // extra sure we only use it for debugging
-    if is_chalk_debug() {
-        crate::tls::set_current_program(db, solve)
-    } else {
-        solve()
-    }
-}
-
-struct LoggingRustIrDatabaseLoggingOnDrop<'a>(LoggingRustIrDatabase<Interner, ChalkContext<'a>>);
-
-impl Drop for LoggingRustIrDatabaseLoggingOnDrop<'_> {
-    fn drop(&mut self) {
-        tracing::info!("chalk program:\n{}", self.0);
-    }
-}
-
-fn is_chalk_debug() -> bool {
-    std::env::var("CHALK_DEBUG").is_ok()
-}
-
-fn is_chalk_print() -> bool {
-    std::env::var("CHALK_PRINT").is_ok()
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Update)]
 pub enum FnTrait {
     // Warning: Order is important. If something implements `x` it should also implement
     // `y` if `y <= x`.
@@ -226,79 +96,293 @@ pub enum FnTrait {
     AsyncFn,
 }
 
-impl fmt::Display for FnTrait {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl FnTrait {
+    pub fn method_name(self) -> Name {
         match self {
-            FnTrait::FnOnce => write!(f, "FnOnce"),
-            FnTrait::FnMut => write!(f, "FnMut"),
-            FnTrait::Fn => write!(f, "Fn"),
-            FnTrait::AsyncFnOnce => write!(f, "AsyncFnOnce"),
-            FnTrait::AsyncFnMut => write!(f, "AsyncFnMut"),
-            FnTrait::AsyncFn => write!(f, "AsyncFn"),
+            FnTrait::FnOnce => Name::new_symbol_root(sym::call_once),
+            FnTrait::FnMut => Name::new_symbol_root(sym::call_mut),
+            FnTrait::Fn => Name::new_symbol_root(sym::call),
+            FnTrait::AsyncFnOnce => Name::new_symbol_root(sym::async_call_once),
+            FnTrait::AsyncFnMut => Name::new_symbol_root(sym::async_call_mut),
+            FnTrait::AsyncFn => Name::new_symbol_root(sym::async_call),
+        }
+    }
+
+    pub fn get_id(self, lang_items: &LangItems) -> Option<TraitId> {
+        match self {
+            FnTrait::FnOnce => lang_items.FnOnce,
+            FnTrait::FnMut => lang_items.FnMut,
+            FnTrait::Fn => lang_items.Fn,
+            FnTrait::AsyncFnOnce => lang_items.AsyncFnOnce,
+            FnTrait::AsyncFnMut => lang_items.AsyncFnMut,
+            FnTrait::AsyncFn => lang_items.AsyncFn,
         }
     }
 }
 
-impl FnTrait {
-    pub const fn function_name(&self) -> &'static str {
-        match self {
-            FnTrait::FnOnce => "call_once",
-            FnTrait::FnMut => "call_mut",
-            FnTrait::Fn => "call",
-            FnTrait::AsyncFnOnce => "async_call_once",
-            FnTrait::AsyncFnMut => "async_call_mut",
-            FnTrait::AsyncFn => "async_call",
-        }
+/// This should not be used in `hir-ty`, only in `hir`.
+pub fn implements_trait_unique<'db>(
+    ty: Ty<'db>,
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+) -> bool {
+    implements_trait_unique_with_infcx(db, env, trait_, &mut |infcx| {
+        infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()])
+    })
+}
+
+/// This should not be used in `hir-ty`, only in `hir`.
+pub fn implements_trait_unique_with_args<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    args: GenericArgs<'db>,
+) -> bool {
+    implements_trait_unique_with_infcx(db, env, trait_, &mut |_| args)
+}
+
+pub fn implements_trait_unique_with_infcx<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    create_args: &mut dyn FnMut(&InferCtxt<'db>) -> GenericArgs<'db>,
+) -> bool {
+    let interner = DbInterner::new_with(db, env.krate);
+    // FIXME(next-solver): I believe this should be `PostAnalysis`.
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+
+    let args = create_args(&infcx);
+    let trait_ref = rustc_type_ir::TraitRef::new_from_args(interner, trait_.into(), args);
+    if trait_ref.self_ty().is_ty_error() {
+        return false;
     }
 
-    const fn lang_item(self) -> LangItem {
-        match self {
-            FnTrait::FnOnce => LangItem::FnOnce,
-            FnTrait::FnMut => LangItem::FnMut,
-            FnTrait::Fn => LangItem::Fn,
-            FnTrait::AsyncFnOnce => LangItem::AsyncFnOnce,
-            FnTrait::AsyncFnMut => LangItem::AsyncFnMut,
-            FnTrait::AsyncFn => LangItem::AsyncFn,
-        }
+    let obligation = Obligation::new(interner, ObligationCause::dummy(), env.param_env, trait_ref);
+    infcx.predicate_must_hold_modulo_regions(&obligation)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WherePredicateEvaluation {
+    Holds,
+    NotProven,
+    HasErrors,
+    NoObligations,
+}
+
+/// This should not be used in `hir-ty`, only in `hir`.
+/// This is exposed to allow the IDE to evaluate arbitrary predicates.
+pub fn where_predicate_must_hold<'db>(
+    db: &'db dyn HirDatabase,
+    resolver: &Resolver<'db>,
+    store: &'db ExpressionStore,
+    def: ExpressionStoreOwnerId,
+    generic_def: GenericDefId,
+    env: ParamEnvAndCrate<'db>,
+    predicate: &WherePredicate,
+) -> WherePredicateEvaluation {
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    let generics = OnceCell::<Generics<'db>>::new();
+    let mut ctx = TyLoweringContext::new(
+        db,
+        resolver,
+        store,
+        def,
+        generic_def,
+        &generics,
+        LifetimeElisionKind::Infer,
+        LifetimeLoweringMode::Bound,
+    )
+    .with_interning_mode(LoweringMode::Ide);
+    let clauses =
+        ctx.lower_where_predicate(predicate, false).map(|(clause, _)| clause).collect::<Vec<_>>();
+
+    if !ctx.diagnostics.is_empty()
+        || clauses.iter().any(|clause| clause.as_predicate().references_error())
+    {
+        return WherePredicateEvaluation::HasErrors;
     }
 
-    pub const fn from_lang_item(lang_item: LangItem) -> Option<Self> {
-        match lang_item {
-            LangItem::FnOnce => Some(FnTrait::FnOnce),
-            LangItem::FnMut => Some(FnTrait::FnMut),
-            LangItem::Fn => Some(FnTrait::Fn),
-            LangItem::AsyncFnOnce => Some(FnTrait::AsyncFnOnce),
-            LangItem::AsyncFnMut => Some(FnTrait::AsyncFnMut),
-            LangItem::AsyncFn => Some(FnTrait::AsyncFn),
-            _ => None,
-        }
+    if clauses.is_empty() {
+        return if ctx.unsized_types.is_empty() {
+            WherePredicateEvaluation::HasErrors
+        } else {
+            WherePredicateEvaluation::NoObligations
+        };
     }
 
-    pub const fn to_chalk_ir(self) -> rust_ir::ClosureKind {
-        // Chalk doesn't support async fn traits.
-        match self {
-            FnTrait::AsyncFnOnce | FnTrait::FnOnce => rust_ir::ClosureKind::FnOnce,
-            FnTrait::AsyncFnMut | FnTrait::FnMut => rust_ir::ClosureKind::FnMut,
-            FnTrait::AsyncFn | FnTrait::Fn => rust_ir::ClosureKind::Fn,
+    let result = infcx.probe(|snapshot| {
+        let mut ocx = ObligationCtxt::new(&infcx);
+        for clause in clauses {
+            let obligation = Obligation::new(
+                interner,
+                ObligationCause::dummy(),
+                env.param_env,
+                clause.as_predicate(),
+            );
+            ocx.register_obligation(obligation);
         }
+
+        let mut result = EvaluationResult::EvaluatedToOk;
+        for error in ocx.evaluate_obligations_error_on_ambiguity() {
+            if error.is_true_error() {
+                return EvaluationResult::EvaluatedToErr;
+            }
+            result = result.max(EvaluationResult::EvaluatedToAmbig);
+        }
+        if infcx.opaque_types_added_in_snapshot(snapshot) {
+            result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
+        } else if infcx.region_constraints_added_in_snapshot(snapshot) {
+            result.max(EvaluationResult::EvaluatedToOkModuloRegions)
+        } else {
+            result
+        }
+    });
+
+    if result.must_apply_modulo_regions() {
+        WherePredicateEvaluation::Holds
+    } else {
+        WherePredicateEvaluation::NotProven
+    }
+}
+
+pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id: ImplId) -> bool {
+    let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    let self_ty = self_ty.kind();
+    let impl_allowed = match self_ty {
+        TyKind::Tuple(_)
+        | TyKind::FnDef(_, _)
+        | TyKind::Array(_, _)
+        | TyKind::Never
+        | TyKind::RawPtr(_, _)
+        | TyKind::Ref(_, _, _)
+        | TyKind::Slice(_)
+        | TyKind::Str
+        | TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_) => def_map.is_rustc_coherence_is_core(),
+
+        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == def_map.krate(),
+        TyKind::Dynamic(it, _) => it
+            .principal_def_id()
+            .is_some_and(|trait_id| trait_id.0.module(db).krate(db) == def_map.krate()),
+
+        _ => true,
+    };
+    impl_allowed || {
+        let rustc_has_incoherent_inherent_impls = match self_ty {
+            TyKind::Tuple(_)
+            | TyKind::FnDef(_, _)
+            | TyKind::Array(_, _)
+            | TyKind::Never
+            | TyKind::RawPtr(_, _)
+            | TyKind::Ref(_, _, _)
+            | TyKind::Slice(_)
+            | TyKind::Str
+            | TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_) => true,
+
+            TyKind::Adt(adt_def, _) => match adt_def.def_id() {
+                hir_def::AdtId::StructId(id) => StructSignature::of(db, id)
+                    .flags
+                    .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+                hir_def::AdtId::UnionId(id) => UnionSignature::of(db, id)
+                    .flags
+                    .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+                hir_def::AdtId::EnumId(it) => EnumSignature::of(db, it)
+                    .flags
+                    .contains(EnumFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+            },
+            TyKind::Dynamic(it, _) => it.principal_def_id().is_some_and(|trait_id| {
+                TraitSignature::of(db, trait_id.0)
+                    .flags
+                    .contains(TraitFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
+            }),
+
+            _ => false,
+        };
+        let items = impl_id.impl_items(db);
+        rustc_has_incoherent_inherent_impls
+            && !items.items.is_empty()
+            && items.items.iter().all(|&(_, assoc)| match assoc {
+                AssocItemId::FunctionId(it) => FunctionSignature::of(db, it)
+                    .flags
+                    .contains(FnFlags::RUSTC_ALLOW_INCOHERENT_IMPL),
+                AssocItemId::ConstId(it) => ConstSignature::of(db, it)
+                    .flags
+                    .contains(ConstFlags::RUSTC_ALLOW_INCOHERENT_IMPL),
+                AssocItemId::TypeAliasId(it) => TypeAliasSignature::of(db, it)
+                    .flags
+                    .contains(TypeAliasFlags::RUSTC_ALLOW_INCOHERENT_IMPL),
+            })
+    }
+}
+
+/// Checks whether the impl satisfies the orphan rules.
+///
+/// Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an `impl` is valid only if at least one of the following is true:
+/// - Trait is a local trait
+/// - All of
+///   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
+///   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
+pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+    let Some(impl_trait) = db.impl_trait(impl_) else {
+        // not a trait impl
+        return true;
+    };
+
+    let local_crate = impl_.lookup(db).container.krate(db);
+    let is_local = |tgt_crate| tgt_crate == local_crate;
+
+    let trait_ref = impl_trait.instantiate_identity().skip_norm_wip();
+    let trait_id = trait_ref.def_id.0;
+    if is_local(trait_id.module(db).krate(db)) {
+        // trait to be implemented is local
+        return true;
     }
 
-    pub fn method_name(self) -> Name {
-        match self {
-            FnTrait::FnOnce => Name::new_symbol_root(sym::call_once.clone()),
-            FnTrait::FnMut => Name::new_symbol_root(sym::call_mut.clone()),
-            FnTrait::Fn => Name::new_symbol_root(sym::call.clone()),
-            FnTrait::AsyncFnOnce => Name::new_symbol_root(sym::async_call_once.clone()),
-            FnTrait::AsyncFnMut => Name::new_symbol_root(sym::async_call_mut.clone()),
-            FnTrait::AsyncFn => Name::new_symbol_root(sym::async_call.clone()),
+    let unwrap_fundamental = |mut ty: Ty<'db>| {
+        // Unwrap all layers of fundamental types with a loop.
+        loop {
+            match ty.kind() {
+                TyKind::Ref(_, referenced, _) => ty = referenced,
+                TyKind::Adt(adt_def, subs) => {
+                    let AdtId::StructId(s) = adt_def.def_id() else {
+                        break ty;
+                    };
+                    let struct_signature = StructSignature::of(db, s);
+                    if struct_signature.flags.contains(StructFlags::FUNDAMENTAL) {
+                        let next = subs.types().next();
+                        match next {
+                            Some(it) => ty = it,
+                            None => break ty,
+                        }
+                    } else {
+                        break ty;
+                    }
+                }
+                _ => break ty,
+            }
         }
-    }
+    };
+    //   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
 
-    pub fn get_id(self, db: &dyn HirDatabase, krate: CrateId) -> Option<TraitId> {
-        let target = db.lang_item(krate, self.lang_item())?;
-        match target {
-            LangItemTarget::Trait(t) => Some(t),
-            _ => None,
+    // FIXME: param coverage
+    //   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
+    let is_not_orphan = trait_ref.args.types().any(|ty| match unwrap_fundamental(ty).kind() {
+        TyKind::Adt(adt_def, _) => is_local(adt_def.def_id().module(db).krate(db)),
+        TyKind::Error(_) => true,
+        TyKind::Dynamic(it, _) => {
+            it.principal_def_id().is_some_and(|trait_id| is_local(trait_id.0.module(db).krate(db)))
         }
-    }
+        _ => false,
+    });
+    #[allow(clippy::let_and_return)]
+    is_not_orphan
 }

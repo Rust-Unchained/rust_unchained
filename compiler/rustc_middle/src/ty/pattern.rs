@@ -1,18 +1,16 @@
 use std::fmt;
 
 use rustc_data_structures::intern::Interned;
-use rustc_macros::HashStable;
+use rustc_macros::StableHash;
 use rustc_type_ir::ir_print::IrPrint;
-use rustc_type_ir::{
-    FlagComputation, Flags, {self as ir},
-};
+use rustc_type_ir::{self as ir, FlagComputation, Flags};
 
 use super::TyCtxt;
 use crate::ty;
 
 pub type PatternKind<'tcx> = ir::PatternKind<TyCtxt<'tcx>>;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash)]
 #[rustc_pass_by_value]
 pub struct Pattern<'tcx>(pub Interned<'tcx, PatternKind<'tcx>>);
 
@@ -30,6 +28,7 @@ impl<'tcx> Flags for Pattern<'tcx> {
                 }
                 flags
             }
+            ty::PatternKind::NotNull => rustc_type_ir::TypeFlags::empty(),
         }
     }
 
@@ -45,6 +44,7 @@ impl<'tcx> Flags for Pattern<'tcx> {
                 }
                 idx
             }
+            ty::PatternKind::NotNull => rustc_type_ir::INNERMOST,
         }
     }
 }
@@ -70,7 +70,7 @@ impl<'tcx> IrPrint<PatternKind<'tcx>> for TyCtxt<'tcx> {
                 write!(f, "{start}")?;
 
                 if let Some(c) = end.try_to_value() {
-                    let end = c.valtree.unwrap_leaf();
+                    let end = c.to_leaf();
                     let size = end.size();
                     let max = match c.ty.kind() {
                         ty::Int(_) => {
@@ -91,6 +91,7 @@ impl<'tcx> IrPrint<PatternKind<'tcx>> for TyCtxt<'tcx> {
 
                 write!(f, "..={end}")
             }
+            PatternKind::NotNull => write!(f, "!null"),
             PatternKind::Or(patterns) => {
                 write!(f, "(")?;
                 let mut first = true;

@@ -1,6 +1,7 @@
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::source::SpanExt;
 use rustc_hir as hir;
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::FnKind;
 use rustc_lint::{LateContext, LintContext};
 use rustc_span::Span;
@@ -10,8 +11,9 @@ use super::TOO_MANY_LINES;
 pub(super) fn check_fn(
     cx: &LateContext<'_>,
     kind: FnKind<'_>,
-    span: Span,
     body: &hir::Body<'_>,
+    span: Span,
+    def_id: LocalDefId,
     too_many_lines_threshold: u64,
 ) {
     // Closures must be contained in a parent body, which will be checked for `too_many_lines`.
@@ -21,7 +23,7 @@ pub(super) fn check_fn(
     }
 
     let mut line_count: u64 = 0;
-    let too_many = body.value.span.check_source_text(cx, |src| {
+    let too_many = body.value.span.check_text(cx, |src| {
         let mut in_comment = false;
         let mut code_in_line;
 
@@ -74,7 +76,7 @@ pub(super) fn check_fn(
         span_lint(
             cx,
             TOO_MANY_LINES,
-            span,
+            cx.tcx.def_span(def_id),
             format!("this function has too many lines ({line_count}/{too_many_lines_threshold})"),
         );
     }

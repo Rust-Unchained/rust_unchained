@@ -5,8 +5,9 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::eager_or_lazy::switch_to_eager_eval;
 use clippy_utils::macros::matching_root_macro_call;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::path_to_local_id;
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::{snippet, str_literal_to_char_literal};
+use clippy_utils::sym;
 use clippy_utils::visitors::{Descend, for_each_expr};
 use itertools::Itertools;
 use rustc_ast::{BinOpKind, LitKind};
@@ -15,7 +16,7 @@ use rustc_hir::{Expr, ExprKind, PatExprKind, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::impl_lint_pass;
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -71,6 +72,11 @@ declare_clippy_lint! {
     "using a single-character str where a char could be used, e.g., `_.split(\"x\")`"
 }
 
+impl_lint_pass!(StringPatterns => [
+    MANUAL_PATTERN_CHAR_COMPARISON,
+    SINGLE_CHAR_PATTERN,
+]);
+
 pub struct StringPatterns {
     msrv: Msrv,
 }
@@ -81,31 +87,29 @@ impl StringPatterns {
     }
 }
 
-impl_lint_pass!(StringPatterns => [MANUAL_PATTERN_CHAR_COMPARISON, SINGLE_CHAR_PATTERN]);
-
-const PATTERN_METHODS: [(&str, usize); 22] = [
-    ("contains", 0),
-    ("starts_with", 0),
-    ("ends_with", 0),
-    ("find", 0),
-    ("rfind", 0),
-    ("split", 0),
-    ("split_inclusive", 0),
-    ("rsplit", 0),
-    ("split_terminator", 0),
-    ("rsplit_terminator", 0),
-    ("splitn", 1),
-    ("rsplitn", 1),
-    ("split_once", 0),
-    ("rsplit_once", 0),
-    ("matches", 0),
-    ("rmatches", 0),
-    ("match_indices", 0),
-    ("rmatch_indices", 0),
-    ("trim_start_matches", 0),
-    ("trim_end_matches", 0),
-    ("replace", 0),
-    ("replacen", 0),
+const PATTERN_METHODS: [(Symbol, usize); 22] = [
+    (sym::contains, 0),
+    (sym::starts_with, 0),
+    (sym::ends_with, 0),
+    (sym::find, 0),
+    (sym::rfind, 0),
+    (sym::split, 0),
+    (sym::split_inclusive, 0),
+    (sym::rsplit, 0),
+    (sym::split_terminator, 0),
+    (sym::rsplit_terminator, 0),
+    (sym::splitn, 1),
+    (sym::rsplitn, 1),
+    (sym::split_once, 0),
+    (sym::rsplit_once, 0),
+    (sym::matches, 0),
+    (sym::rmatches, 0),
+    (sym::match_indices, 0),
+    (sym::rmatch_indices, 0),
+    (sym::trim_start_matches, 0),
+    (sym::trim_end_matches, 0),
+    (sym::replace, 0),
+    (sym::replacen, 0),
 ];
 
 fn check_single_char_pattern_lint(cx: &LateContext<'_>, arg: &Expr<'_>) {
@@ -143,15 +147,15 @@ fn check_manual_pattern_char_comparison(cx: &LateContext<'_>, method_arg: &Expr<
 
         // We want to retrieve all the comparisons done.
         // They are ordered in a nested way and so we need to traverse the AST to collect them all.
-        if for_each_expr(cx, body.value, |sub_expr| -> ControlFlow<(), Descend> {
+        if for_each_expr(cx.tcx, body.value, |sub_expr| -> ControlFlow<(), Descend> {
             match sub_expr.kind {
                 ExprKind::Binary(op, left, right) if op.node == BinOpKind::Eq => {
-                    if path_to_local_id(left, binding)
+                    if left.res_local_id() == Some(binding)
                         && let Some(span) = get_char_span(cx, right)
                     {
                         set_char_spans.push(span);
                         ControlFlow::Continue(Descend::No)
-                    } else if path_to_local_id(right, binding)
+                    } else if right.res_local_id() == Some(binding)
                         && let Some(span) = get_char_span(cx, left)
                     {
                         set_char_spans.push(span);
@@ -162,9 +166,9 @@ fn check_manual_pattern_char_comparison(cx: &LateContext<'_>, method_arg: &Expr<
                 },
                 ExprKind::Binary(op, _, _) if op.node == BinOpKind::Or => ControlFlow::Continue(Descend::Yes),
                 ExprKind::Match(match_value, [arm, _], _) => {
-                    if matching_root_macro_call(cx, sub_expr.span, sym::matches_macro).is_none()
-                        || arm.guard.is_some()
-                        || !path_to_local_id(match_value, binding)
+                    if arm.guard.is_some()
+                        || match_value.res_local_id() != Some(binding)
+                        || matching_root_macro_call(cx, sub_expr.span, sym::matches_macro).is_none()
                     {
                         return ControlFlow::Break(());
                     }
@@ -226,13 +230,13 @@ impl<'tcx> LateLintPass<'tcx> for StringPatterns {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if !expr.span.from_expansion()
             && let ExprKind::MethodCall(method, receiver, args, _) = expr.kind
-            && let ty::Ref(_, ty, _) = cx.typeck_results().expr_ty_adjusted(receiver).kind()
-            && ty.is_str()
-            && let method_name = method.ident.name.as_str()
+            && let method_name = method.ident.name
             && let Some(&(_, pos)) = PATTERN_METHODS
                 .iter()
                 .find(|(array_method_name, _)| *array_method_name == method_name)
             && let Some(arg) = args.get(pos)
+            && let ty::Ref(_, ty, _) = cx.typeck_results().expr_ty_adjusted(receiver).kind()
+            && ty.is_str()
         {
             check_single_char_pattern_lint(cx, arg);
 
