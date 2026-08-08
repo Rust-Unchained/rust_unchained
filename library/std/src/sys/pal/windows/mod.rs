@@ -33,7 +33,6 @@ pub mod winsock;
 pub trait IoResult<T> {
     fn io_result(self) -> io::Result<T>;
 }
-
 impl<T> IoResult<T> for Result<T, api::WinError> {
     fn io_result(self) -> io::Result<T> {
         self.map_err(|e| io::Error::from_raw_os_error(e.code as i32))

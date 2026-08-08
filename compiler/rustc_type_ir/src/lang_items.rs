@@ -29,7 +29,6 @@ pub enum SolverAdtLangItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolverTraitLangItem {
     // tidy-alphabetical-start
-    AsyncDestruct,
     AsyncFn,
     AsyncFnKindHelper,
     AsyncFnMut,

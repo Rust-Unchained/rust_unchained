@@ -1,4 +1,3 @@
-//@ known-bug: #132103
 //@ run-pass
 //! This test used to ICE: rust-lang/rust#132103
 //! Fixed when re-work async drop to shim drop glue coroutine scheme.

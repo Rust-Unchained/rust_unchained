@@ -266,10 +266,3 @@ pub const trait Drop {
     #[unstable(feature = "pin_ergonomics", issue = "130494")]
     fn pin_drop(self: Pin<&mut Self>) {}
 }
-
-/// Fallback function to call surface level `Drop::drop` function
-#[allow(drop_bounds)]
-#[lang = "fallback_surface_drop"]
-pub(crate) fn fallback_surface_drop<T: Drop + ?Sized>(x: &mut T) {
-    <T as Drop>::drop(x)
-}

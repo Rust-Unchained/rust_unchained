@@ -51,6 +51,7 @@ pub enum ExportedSymbol<'tcx> {
     Generic(DefId, GenericArgsRef<'tcx>),
     DropGlue(Ty<'tcx>),
     AsyncDropGlueCtorShim(Ty<'tcx>),
+    AsyncDropGlue(DefId, Ty<'tcx>),
     ThreadLocalShim(DefId),
     NoDefId(ty::SymbolName<'tcx>),
 }
@@ -69,6 +70,9 @@ impl<'tcx> ExportedSymbol<'tcx> {
             }
             ExportedSymbol::AsyncDropGlueCtorShim(ty) => {
                 tcx.symbol_name(ty::Instance::resolve_async_drop_in_place(tcx, ty))
+            }
+            ExportedSymbol::AsyncDropGlue(def_id, ty) => {
+                tcx.symbol_name(ty::Instance::resolve_async_drop_in_place_poll(tcx, def_id, ty))
             }
             ExportedSymbol::ThreadLocalShim(def_id) => tcx.symbol_name(ty::Instance {
                 def: ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(def_id)),

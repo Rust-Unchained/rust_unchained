@@ -221,7 +221,6 @@ struct OrphanChecker<'a, Infcx, I: Interner, F> {
     in_self_ty: bool,
     lazily_normalize_ty: F,
     /// Ignore orphan check failures and exclusively search for the first local type.
-    #[allow(dead_code)]
     search_first_local_ty: bool,
     non_local_tys: Vec<(I::Ty, IsFirstInputType)>,
 }
@@ -258,7 +257,6 @@ where
 
 enum OrphanCheckEarlyExit<I: Interner, E> {
     NormalizationFailure(E),
-    #[allow(dead_code)]
     UncoveredTyParam(I::Ty),
     LocalTy(I::Ty),
 }

@@ -58,6 +58,7 @@ create_config! {
     single_line_let_else_max_width: SingleLineLetElseMaxWidth, true, "Maximum line length for \
         single line let-else statements. A value of zero means always format the divergent `else` \
         block over multiple lines.";
+
     // Comments. macros, and strings
     wrap_comments: WrapComments, false, "Break comments to fit on the line";
     format_code_in_doc_comments: FormatCodeInDocComments, false, "Format the code snippet in \

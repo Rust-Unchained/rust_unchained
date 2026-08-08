@@ -1,4 +1,5 @@
 //@ run-pass
+
 //@ compile-flags: -Clto=thin
 //@ no-prefer-dynamic
 //@ ignore-backends: gcc

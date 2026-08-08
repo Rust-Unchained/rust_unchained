@@ -7,16 +7,16 @@
 
 pub struct NoPin;
 
-impl<T> Pins<T> for NoPin {}
+impl<TA> Pins<TA> for NoPin {}
 
 pub trait PinA<PER> {
     type const A: &'static () = const { &() };
 }
 
-pub trait Pins<T> {}
+pub trait Pins<USART> {}
 
 // Disallowed by standard Rust, allowed by Unchained Rust since there are no conflicts here
 // NoPin doesn't implement PinA, so no impls for Pins overlap
-impl<U, T> Pins<U> for T where T: PinA<U, A = const { &() }> {}
+impl<USART, T> Pins<USART> for T where T: PinA<USART, A = const { &() }> {}
 
 pub fn main() {}
