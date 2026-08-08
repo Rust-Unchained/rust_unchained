@@ -13,7 +13,7 @@ impl fmt::Display for *mut LocalType {
 
 impl<T> marker::Copy for *mut T {
     //~^ ERROR E0119
-	//~| NOTE conflicting implementation in crate `core`
+    //~| NOTE conflicting implementation in crate `core`
 }
 
 fn main() {}

@@ -16,7 +16,7 @@ desktop.ini
 Session.vim
 .cproject
 .idea
-**/.idea
+**/**/.idea/
 *.iml
 .vscode
 .project
@@ -27,6 +27,7 @@ Session.vim
 .settings/
 .vs/
 .dir-locals.el
+.tmp
 
 ## Tool
 .valgrindrc

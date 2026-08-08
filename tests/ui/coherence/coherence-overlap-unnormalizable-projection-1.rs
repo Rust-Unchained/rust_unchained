@@ -7,8 +7,9 @@ pub trait WithAssoc<'a> {
     type Assoc;
 }
 
-// These is disallowed in standard Rust because a downstream crate could implement WithAssoc for Box<Local>
-// In Unchained Rust however, downstream crates don't exist.
+// This is disallowed in standard Rust because a downstream
+// crate could implement WithAssoc for Box<Local>.
+// In Unchained Rust, however, downstream crates don't exist.
 // We made a 2nd version of this test to make sure conflicting impls would be
 // detected if a user did indeed impl WithAssoc for Box<Something>,
 // the new test is named `coherence-overlap-unnormalizable-projection-2`

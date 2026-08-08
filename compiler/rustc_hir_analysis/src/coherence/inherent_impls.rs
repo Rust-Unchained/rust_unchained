@@ -49,7 +49,7 @@ pub(crate) fn crate_incoherent_impls(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &
 
 /// On-demand query: yields a vector of the inherent impls for a specific type.
 pub(crate) fn inherent_impls(tcx: TyCtxt<'_>, ty_def_id: LocalDefId) -> &[DefId] {
-	let (crate_map, _) = tcx.crate_inherent_impls(());
+    let (crate_map, _) = tcx.crate_inherent_impls(());
     match crate_map.inherent_impls.get(&ty_def_id) {
         Some(v) => &v[..],
         None => &[],
@@ -77,13 +77,13 @@ impl<'tcx> InherentCollect<'tcx> {
             return Ok(());
         }
 
-	    if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer) {
-		    self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
-	    } else {
-		    bug!("unexpected self type: {:?}", self_ty);
-	    }
-	    
-	    Ok(())
+        if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer) {
+            self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
+        } else {
+            bug!("unexpected self type: {:?}", self_ty);
+        }
+
+        Ok(())
     }
 
     fn check_primitive_impl(

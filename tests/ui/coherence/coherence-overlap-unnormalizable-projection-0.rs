@@ -3,7 +3,6 @@
 trait WhereBound {}
 impl WhereBound for () {}
 
-
 pub trait WithAssoc<'a> {
     type Assoc;
 }

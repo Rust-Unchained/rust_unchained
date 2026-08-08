@@ -10,7 +10,7 @@ impl<T> Trait for T
 where
     T: 'static,
     for<'a> T: WithAssoc<'a>,
-    for<'a> Box<  <T as WithAssoc<'a>>::Assoc  >: WhereBound,
+    for<'a> Box<<T as WithAssoc<'a>>::Assoc>: WhereBound,
 {
 }
 

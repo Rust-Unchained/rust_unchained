@@ -136,7 +136,7 @@ impl Rewrite for ast::Local {
 
             if let Some(block) = else_block {
                 let else_kw_span = init.span.between(block.span);
-	            
+
                 // Strip attributes and comments to check if newline is needed before the else
                 // keyword from the initializer part. (#5901)
                 let style_edition = context.config.style_edition();
@@ -145,19 +145,19 @@ impl Rewrite for ast::Local {
                 } else {
                     result.as_str()
                 };
-	            
+
                 let force_newline_else = pat_str.contains('\n')
                     || !same_line_else_kw_and_brace(init_str, context, else_kw_span, nested_shape);
-	            
+
                 let else_kw = rewrite_else_kw_with_comments(
                     force_newline_else,
                     true,
-	                true,
+                    true,
                     context,
                     else_kw_span,
                     shape,
                 );
-	            
+
                 result.push_str(&else_kw);
 
                 // At this point we've written `let {pat} = {expr} else' into the buffer, and we
@@ -168,20 +168,18 @@ impl Rewrite for ast::Local {
                     std::cmp::min(shape.width, context.config.single_line_let_else_max_width());
 
                 // If available_space hits zero we know for sure this will be a multi-lined block
-                
+
                 let assign_str_with_else_kw = match context.config.let_else_style() {
-	                LetElseStyle::ElseOnSameLine => {
-		                if context.config.style_edition() >= StyleEdition::Edition2024 {
-			                &result[let_kw_offset..]
-		                } else {
-			                result.as_str()
-		                }
-	                }
-	                LetElseStyle::ElseOnNewLine => {
-		                else_kw.as_str()
-	                }
+                    LetElseStyle::ElseOnSameLine => {
+                        if context.config.style_edition() >= StyleEdition::Edition2024 {
+                            &result[let_kw_offset..]
+                        } else {
+                            result.as_str()
+                        }
+                    }
+                    LetElseStyle::ElseOnNewLine => else_kw.as_str(),
                 };
-	            
+
                 let available_space = max_width.saturating_sub(assign_str_with_else_kw.len());
 
                 let allow_single_line = !force_newline_else
@@ -253,23 +251,27 @@ fn same_line_else_kw_and_brace(
         .map_or(false, |l| !l.starts_with(char::is_whitespace))
 }
 
-fn allow_single_line_let_else_block(result: &str, block: &ast::Block, context: &RewriteContext<'_>) -> bool {
-	match context.config.let_else_style() {
-		LetElseStyle::ElseOnSameLine => {
-			if result.contains('\n') {
-				return false;
-			}
+fn allow_single_line_let_else_block(
+    result: &str,
+    block: &ast::Block,
+    context: &RewriteContext<'_>,
+) -> bool {
+    match context.config.let_else_style() {
+        LetElseStyle::ElseOnSameLine => {
+            if result.contains('\n') {
+                return false;
+            }
 
-			if block.stmts.len() <= 1 {
-				return true;
-			}
-		}
-		LetElseStyle::ElseOnNewLine => {
-			if block.stmts.len() <= 2 {
-				return true;
-			}
-		}
-	}
+            if block.stmts.len() <= 1 {
+                return true;
+            }
+        }
+        LetElseStyle::ElseOnNewLine => {
+            if block.stmts.len() <= 2 {
+                return true;
+            }
+        }
+    }
 
     false
 }

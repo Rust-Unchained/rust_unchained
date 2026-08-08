@@ -56,7 +56,7 @@ where
     E: Debug,
 {
     let _ = orphan_check_trait_ref(infcx, trait_ref, InCrate::Remote, &mut lazily_normalize_ty)?;
-	Ok(Ok(()))
+    Ok(Ok(()))
 }
 
 pub fn trait_ref_is_local_or_fundamental<I: Interner>(tcx: I, trait_ref: ty::TraitRef<I>) -> bool {
@@ -294,8 +294,7 @@ where
             | ty::FnPtr(..)
             | ty::RawPtr(..)
             | ty::Never
-            | ty::UnsafeBinder(_)
-            => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
+            | ty::UnsafeBinder(_) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
 
             ty::Param(..) => panic!("unexpected ty param"),
 
@@ -356,7 +355,7 @@ where
                 } else {
                     match self.infcx.cx().as_adt_lang_item(def.def_id()) {
                         Some(SolverAdtLangItem::OwnedBox) => args.type_at(0).visit_with(self),
-                        Some(..) | None => args.visit_with(self)
+                        Some(..) | None => args.visit_with(self),
                     }
                 }
             }

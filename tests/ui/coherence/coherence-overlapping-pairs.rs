@@ -6,9 +6,9 @@ use lib::Remote;
 
 struct Foo;
 
-// Disallowed in Standard Rust, allowed in Unchained since 
+// Disallowed in Standard Rust, allowed in Unchained since
 // lib does not provide any implementations of Remote,
 // which means there are no conflicts here.
-impl<T> Remote for lib::Pair<T,Foo> { }
+impl<T> Remote for lib::Pair<T, Foo> {}
 
-fn main() { }
+fn main() {}

@@ -163,7 +163,7 @@ create_config! {
     format_generated_files: FormatGeneratedFiles, false, "Format generated files";
     generated_marker_line_search_limit: GeneratedMarkerLineSearchLimit, false, "Number of lines to \
         check for a `@generated` marker when `format_generated_files` is enabled";
-	let_else_style: LetElseStyle, false, "In `let-else` statements, whether to put the `else`\
+    let_else_style: LetElseStyle, false, "In `let-else` statements, whether to put the `else`\
         keyword on the same line or the next one.";
 
     // Options that can change the source code beyond whitespace/blocks (somewhat linty things)

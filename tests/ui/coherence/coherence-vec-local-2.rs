@@ -6,7 +6,7 @@ use lib::Remote;
 struct Local<T>(T);
 
 // lib implements Remote for Vec<T: Clone>
-impl<T> Remote for Vec<Local<T>> { }
+impl<T> Remote for Vec<Local<T>> {}
 //~^ ERROR E0119
 
 // Additional requirement for failure in Unchained Rust,
@@ -17,4 +17,4 @@ impl<T> Clone for Local<T> {
     }
 }
 
-fn main() { }
+fn main() {}
