@@ -1,20 +1,20 @@
 error[E0592]: duplicate definitions with name `dummy`
-  --> $DIR/coherence-overlap-downstream-inherent.rs:5:26
+  --> $DIR/coherence-overlap-downstream-inherent.rs:6:5
    |
-LL | impl<T:Sugar> Sweet<T> { fn dummy(&self) { } }
-   |                          ^^^^^^^^^^^^^^^ duplicate definitions for `dummy`
-LL |
-LL | impl<T:Fruit> Sweet<T> { fn dummy(&self) { } }
-   |                          --------------- other definition for `dummy`
+LL |     fn dummy(&self) {}
+   |     ^^^^^^^^^^^^^^^ duplicate definitions for `dummy`
+...
+LL |     fn dummy(&self) {}
+   |     --------------- other definition for `dummy`
 
 error[E0592]: duplicate definitions with name `f`
-  --> $DIR/coherence-overlap-downstream-inherent.rs:12:38
+  --> $DIR/coherence-overlap-downstream-inherent.rs:19:5
    |
-LL | impl<X, T> A<T, X> where T: Bar<X> { fn f(&self) {} }
-   |                                      ^^^^^^^^^^^ duplicate definitions for `f`
-LL |
-LL | impl<X> A<i32, X> { fn f(&self) {} }
-   |                     ----------- other definition for `f`
+LL |     fn f(&self) {}
+   |     ^^^^^^^^^^^ duplicate definitions for `f`
+...
+LL |     fn f(&self) {}
+   |     ----------- other definition for `f`
 
 error: aborting due to 2 previous errors
 

@@ -1,4 +1,6 @@
-//@ check-fail
+//@ build-pass
+// Unchained: The only error emitted here was an orphan rule violation,
+// which is allowed in Unchained.
 
 // Should fail. Can coerce `Pin<T>` into `Pin<U>` where
 // `T: Deref<Target: Unpin>` and `U: Deref<Target: !Unpin>`, using the
@@ -42,7 +44,6 @@ impl<'a, Fut: Future<Output = ()>> SomeTrait<'a, Fut> for Fut {
 }
 
 impl<'b, 'a, Fut> DerefMut for Pin<&'b dyn SomeTrait<'a, Fut>> {
-//~^ ERROR: conflicting implementations of trait `DerefMut`
     fn deref_mut<'c>(
         self: &'c mut Pin<&'b dyn SomeTrait<'a, Fut>>,
     ) -> &'c mut (dyn SomeTrait<'a, Fut> + 'b) {

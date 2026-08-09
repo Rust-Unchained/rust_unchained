@@ -2,8 +2,8 @@
 
 pub struct Int(i32);
 
+// Allowed in Unchained.
 const impl std::ops::Add for i32 {
-    //~^ ERROR only traits defined in the current crate can be implemented for primitive types
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self {

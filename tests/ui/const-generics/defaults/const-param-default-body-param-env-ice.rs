@@ -5,7 +5,6 @@ impl<const N: usize = { || [0; X] }, X> dyn PartialEq<X> {}
 //~| ERROR generic parameter defaults cannot reference parameters before they are declared
 //~| ERROR defaults for generic parameters are not allowed here
 //~| ERROR the const parameter `N` is not constrained by the impl trait, self type, or predicates
-//~| ERROR cannot define inherent `impl` for a type outside of the crate where the type is defined
 
 fn foo() {}
 

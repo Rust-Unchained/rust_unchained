@@ -48,9 +48,10 @@ mod tait {
     }
 
     impl Unpin for FooAlias {}
-    //[tait]~^ ERROR only traits defined in the current crate can be implemented for arbitrary types
-    impl Unpin for BarAlias {}
-    //[tait]~^ ERROR only traits defined in the current crate can be implemented for arbitrary types
+    //[tait]~^ ERROR E0321
+
+    impl Unpin for BarAlias {} //[tait]~ ERROR conflicting implementations of trait `Unpin`
+    //[tait]~^ ERROR E0321
 }
 
 #[cfg(assoc)]

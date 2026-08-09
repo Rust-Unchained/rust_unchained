@@ -14,8 +14,8 @@ where
 }
 
 trait Check {}
-impl<'a, T> Eq for T where <T as Iterate<'a>>::Ty: Valid {} //~ ERROR E0277
-
+impl<'a, T: Check> Eq for T where <T as Iterate<'a>>::Ty: Valid {}
+//~^ ERROR E0119
 
 trait Valid {}
 

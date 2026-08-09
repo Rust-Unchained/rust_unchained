@@ -1,8 +1,8 @@
 error[E0119]: conflicting implementations of trait `Sweet` for type `Box<i32>`
-  --> $DIR/coherence-overlap-issue-23516.rs:10:1
+  --> $DIR/coherence-overlap-issue-23516.rs:12:1
    |
-LL | impl<U:Sugar> Sweet for Box<U> { }
-   | ------------------------------ first implementation here
+LL | impl<U: Sugar> Sweet for Box<U> {}
+   | ------------------------------- first implementation here
 ...
 LL | impl Sweet for Box<i32> {}
    | ^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Box<i32>`

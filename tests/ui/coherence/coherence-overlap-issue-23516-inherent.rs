@@ -7,9 +7,8 @@ struct Cake<X>(X);
 impl<T> Sugar for Box<T> {}
 
 impl<T: Sugar> Cake<T> {
-    fn dummy(&self) {}
+    fn dummy(&self) {} //~ ERROR E0592
 }
-//~^ ERROR E0592
 impl<U: Sugar> Cake<Box<U>> {
     fn dummy(&self) {}
 }

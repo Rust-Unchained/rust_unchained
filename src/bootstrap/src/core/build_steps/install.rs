@@ -91,11 +91,13 @@ fn install_sh(
     } else {
         assert!(
             is_dir_writable_for_user(&prefix),
-            "User doesn't have write access on path \"{}\".", prefix.to_string_lossy(),
+            "User doesn't have write access on path \"{}\".",
+            prefix.to_string_lossy(),
         );
         assert!(
             is_dir_writable_for_user(&sysconfdir),
-            "User doesn't have write access on \"{}\".", prefix.to_string_lossy()
+            "User doesn't have write access on \"{}\".",
+            prefix.to_string_lossy()
         );
     }
 

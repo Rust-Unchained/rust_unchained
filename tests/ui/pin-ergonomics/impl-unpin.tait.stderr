@@ -1,27 +1,25 @@
-error[E0117]: only traits defined in the current crate can be implemented for arbitrary types
+error[E0119]: conflicting implementations of trait `Unpin` for type `FooAlias`
+  --> $DIR/impl-unpin.rs:53:5
+   |
+LL |     impl Unpin for FooAlias {}
+   |     ----------------------- first implementation here
+...
+LL |     impl Unpin for BarAlias {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `FooAlias`
+
+error[E0321]: cross-crate traits with a default impl, like `Unpin`, can only be implemented for a struct/enum type, not `FooAlias`
   --> $DIR/impl-unpin.rs:50:5
    |
 LL |     impl Unpin for FooAlias {}
-   |     ^^^^^^^^^^^^^^^--------
-   |                    |
-   |                    type alias impl trait is treated as if it were foreign, because its hidden type could be from a foreign crate
-   |
-   = note: impl doesn't have any local type before any uncovered type parameters
-   = note: for more information see https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules
-   = note: define and implement a trait or new type instead
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ can't implement cross-crate trait with a default impl for non-struct/enum type
 
-error[E0117]: only traits defined in the current crate can be implemented for arbitrary types
-  --> $DIR/impl-unpin.rs:52:5
+error[E0321]: cross-crate traits with a default impl, like `Unpin`, can only be implemented for a struct/enum type, not `BarAlias`
+  --> $DIR/impl-unpin.rs:53:5
    |
 LL |     impl Unpin for BarAlias {}
-   |     ^^^^^^^^^^^^^^^--------
-   |                    |
-   |                    type alias impl trait is treated as if it were foreign, because its hidden type could be from a foreign crate
-   |
-   = note: impl doesn't have any local type before any uncovered type parameters
-   = note: for more information see https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules
-   = note: define and implement a trait or new type instead
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ can't implement cross-crate trait with a default impl for non-struct/enum type
 
-error: aborting due to 2 previous errors
+error: aborting due to 3 previous errors
 
-For more information about this error, try `rustc --explain E0117`.
+Some errors have detailed explanations: E0119, E0321.
+For more information about an error, try `rustc --explain E0119`.

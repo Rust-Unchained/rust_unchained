@@ -17,6 +17,6 @@ fn fut() -> MyFut {
 }
 
 impl Unpin for MyFut {}
-//~^ ERROR: only traits defined in the current crate can be implemented for arbitrary types
+//~^ ERROR E0321
 
 fn main() {}

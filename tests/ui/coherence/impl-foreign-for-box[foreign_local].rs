@@ -1,3 +1,6 @@
+//@ build-pass
+// Allowed in Unchained.
+
 //@ compile-flags:--crate-name=test
 //@ aux-build:coherence_lib.rs
 
@@ -8,9 +11,10 @@
 
 extern crate coherence_lib as lib;
 
-use lib::*;
-use std::alloc::{Allocator, AllocError, Layout};
+use std::alloc::{AllocError, Allocator, Layout};
 use std::ptr::NonNull;
+
+use lib::*;
 
 struct Local;
 
@@ -22,6 +26,5 @@ unsafe impl Allocator for Local {
 }
 
 impl Remote for Box<str, Local> {}
-  //~^ ERROR: only traits defined in the current crate can be implemented for types defined outside of the crate [E0117]
 
 fn main() {}

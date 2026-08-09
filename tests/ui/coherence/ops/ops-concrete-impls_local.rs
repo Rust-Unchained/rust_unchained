@@ -1,7 +1,5 @@
 //@ run-pass
 
-#![feature(assert_matches)]
-
 use std::ops::Add;
 
 #[derive(Debug, Clone, Copy)]
@@ -24,7 +22,7 @@ impl<T: Add<u16, Output = u16>> std::ops::Add<Int> for T {
 }
 
 fn main() {
-    use std::assert_matches::assert_matches;
+    use std::assert_matches;
 
     let a = Int(10);
     let b = 5_u16;

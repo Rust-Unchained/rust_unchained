@@ -24,6 +24,5 @@ impl<'a> TryAsDynCompatible<'a> for dyn Trait {}
 
 impl TryAsDynCompatible<'static> for dyn Iterator<Item = u32> {}
 //~^ ERROR: explicit impls for the `TryAsDynCompatible` trait are not permitted
-//~| ERROR: only traits defined in the current crate can be implemented for arbitrary types
 
 fn main() {}

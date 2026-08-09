@@ -6,6 +6,8 @@ LL | default impl<L, R> From<L> for Either<L, R> {
 ...
 LL | impl<L, R> From<R> for Either<L, R> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `Either<_, _>`
+   |
+   = note: permitting this impl would forbid us from adding `impl<T> From<!> for T` later; see rust-lang/rust#64715 for details
 
 error: aborting due to 1 previous error
 

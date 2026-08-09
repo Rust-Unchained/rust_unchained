@@ -3,9 +3,8 @@ pub trait Sugar {}
 pub trait Fruit {}
 // UNCHAINED_FIXME: This should be allowed
 impl<T: Sugar> Sweet<T> {
-    fn dummy(&self) {}
+    fn dummy(&self) {} //~ ERROR E0592
 }
-//~^ ERROR E0592
 impl<T: Fruit> Sweet<T> {
     fn dummy(&self) {}
 }
@@ -17,9 +16,8 @@ impl<X, T> A<T, X>
 where
     T: Bar<X>,
 {
-    fn f(&self) {}
+    fn f(&self) {} //~ ERROR E0592
 }
-//~^ ERROR E0592
 impl<X> A<i32, X> {
     fn f(&self) {}
 }

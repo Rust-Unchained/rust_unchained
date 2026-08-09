@@ -7,7 +7,6 @@ mod ice_156342 {
     use std::mem::type_info::Trait;
 
     impl Trait {
-        //~^ ERROR: cannot define inherent `impl` for a type outside of the crate where the type is defined
         reuse None::<&()>;
         //~^ ERROR: expected function, found unit variant `None`
     }

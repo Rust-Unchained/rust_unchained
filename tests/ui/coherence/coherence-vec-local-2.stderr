@@ -1,7 +1,7 @@
 error[E0119]: conflicting implementations of trait `Remote` for type `Vec<Local<_>>`
   --> $DIR/coherence-vec-local-2.rs:9:1
    |
-LL | impl<T> Remote for Vec<Local<T>> { }
+LL | impl<T> Remote for Vec<Local<T>> {}
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: conflicting implementation in crate `coherence_concrete_lib`:

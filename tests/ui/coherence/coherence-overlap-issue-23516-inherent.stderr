@@ -1,11 +1,11 @@
 error[E0592]: duplicate definitions with name `dummy`
-  --> $DIR/coherence-overlap-issue-23516-inherent.rs:9:25
+  --> $DIR/coherence-overlap-issue-23516-inherent.rs:10:5
    |
-LL | impl<T:Sugar> Cake<T> { fn dummy(&self) { } }
-   |                         ^^^^^^^^^^^^^^^ duplicate definitions for `dummy`
-LL |
-LL | impl<U:Sugar> Cake<Box<U>> { fn dummy(&self) { } }
-   |                              --------------- other definition for `dummy`
+LL |     fn dummy(&self) {}
+   |     ^^^^^^^^^^^^^^^ duplicate definitions for `dummy`
+...
+LL |     fn dummy(&self) {}
+   |     --------------- other definition for `dummy`
 
 error: aborting due to 1 previous error
 

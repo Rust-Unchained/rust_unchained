@@ -208,9 +208,7 @@ where
         }
         ControlFlow::Break(residual) => match residual {
             OrphanCheckEarlyExit::NormalizationFailure(err) => Err(err),
-            OrphanCheckEarlyExit::UncoveredTyParam(_) | OrphanCheckEarlyExit::LocalTy(_) => {
-                Ok(Ok(()))
-            }
+            OrphanCheckEarlyExit::LocalTy(_) => Ok(Ok(())),
         },
     }
 }
@@ -220,8 +218,6 @@ struct OrphanChecker<'a, Infcx, I: Interner, F> {
     in_crate: InCrate,
     in_self_ty: bool,
     lazily_normalize_ty: F,
-    /// Ignore orphan check failures and exclusively search for the first local type.
-    search_first_local_ty: bool,
     non_local_tys: Vec<(I::Ty, IsFirstInputType)>,
 }
 
@@ -237,7 +233,6 @@ where
             in_crate,
             in_self_ty: true,
             lazily_normalize_ty,
-            search_first_local_ty: false,
             non_local_tys: Vec::new(),
         }
     }
@@ -257,7 +252,6 @@ where
 
 enum OrphanCheckEarlyExit<I: Interner, E> {
     NormalizationFailure(E),
-    UncoveredTyParam(I::Ty),
     LocalTy(I::Ty),
 }
 

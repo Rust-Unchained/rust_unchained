@@ -1184,17 +1184,6 @@ pub(crate) struct ReturnPositionImplTraitInTraitRefinedLifetimes {
 }
 
 #[derive(Diagnostic)]
-#[diag("cannot define inherent `impl` for a type outside of the crate where the type is defined", code = E0390)]
-#[help("consider moving this inherent impl into the crate defining the type if possible")]
-pub(crate) struct InherentTyOutside {
-    #[primary_span]
-    #[help(
-        "alternatively add `#[rustc_has_incoherent_inherent_impls]` to the type and `#[rustc_allow_incoherent_impl]` to the relevant impl items"
-    )]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("structs implementing `DispatchFromDyn` may not have `#[repr(packed)]` or `#[repr(C)]`", code = E0378)]
 pub(crate) struct DispatchFromDynRepr {
     #[primary_span]
@@ -1235,69 +1224,6 @@ pub(crate) struct CoercePointeeNotTransparent {
 pub(crate) struct CoercePointeeNoField {
     #[primary_span]
     pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("cannot define inherent `impl` for a type outside of the crate where the type is defined", code = E0390)]
-#[help("consider moving this inherent impl into the crate defining the type if possible")]
-pub(crate) struct InherentTyOutsideRelevant {
-    #[primary_span]
-    pub span: Span,
-    #[help("alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items")]
-    pub help_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("cannot define inherent `impl` for a type outside of the crate where the type is defined", code = E0116)]
-#[help(
-    "consider defining a trait and implementing it for the type or using a newtype wrapper like `struct MyType(ExternalType);` and implement it"
-)]
-#[note(
-    "for more details about the orphan rules, see <https://doc.rust-lang.org/reference/items/implementations.html?highlight=orphan#orphan-rules>"
-)]
-pub(crate) struct InherentTyOutsideNew {
-    #[primary_span]
-    #[label("impl for type defined outside of crate")]
-    pub span: Span,
-    #[subdiagnostic]
-    pub note: Option<InherentTyOutsideNewAliasNote>,
-}
-
-#[derive(Subdiagnostic)]
-#[note("`{$ty_name}` does not define a new type, only an alias of `{$alias_ty_name}` defined here")]
-pub(crate) struct InherentTyOutsideNewAliasNote {
-    #[primary_span]
-    pub span: Span,
-    pub ty_name: String,
-    pub alias_ty_name: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("cannot define inherent `impl` for primitive types outside of `core`", code = E0390)]
-#[help("consider moving this inherent impl into `core` if possible")]
-pub(crate) struct InherentTyOutsidePrimitive {
-    #[primary_span]
-    pub span: Span,
-    #[help("alternatively add `#[rustc_allow_incoherent_impl]` to the relevant impl items")]
-    pub help_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("cannot define inherent `impl` for primitive types", code = E0390)]
-#[help("consider using an extension trait instead")]
-pub(crate) struct InherentPrimitiveTy<'a> {
-    #[primary_span]
-    pub span: Span,
-    #[subdiagnostic]
-    pub note: Option<InherentPrimitiveTyNote<'a>>,
-}
-
-#[derive(Subdiagnostic)]
-#[note(
-    "you could also try moving the reference to uses of `{$subty}` (such as `self`) within the implementation"
-)]
-pub(crate) struct InherentPrimitiveTyNote<'a> {
-    pub subty: Ty<'a>,
 }
 
 #[derive(Diagnostic)]

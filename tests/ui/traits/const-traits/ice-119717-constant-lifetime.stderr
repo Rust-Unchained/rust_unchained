@@ -1,7 +1,7 @@
 error[E0119]: conflicting implementations of trait `FromResidual<Result<Infallible, _>>` for type `Result<_, _>`
   --> $DIR/ice-119717-constant-lifetime.rs:6:1
    |
-LL | impl<T> const FromResidual for T {
+LL | const impl<T> FromResidual for T {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: conflicting implementation in crate `core`:
@@ -9,7 +9,7 @@ LL | impl<T> const FromResidual for T {
              where F: From<E>;
 
 error[E0121]: the placeholder `_` is not allowed within types on item signatures for associated functions
-  --> $DIR/ice-119717-constant-lifetime.rs:8:31
+  --> $DIR/ice-119717-constant-lifetime.rs:7:31
    |
 LL |     fn from_residual(t: T) -> _ {
    |                               ^ not allowed in type signatures

@@ -3,9 +3,9 @@
 
 use std::ops::FromResidual;
 
-impl<T> const FromResidual for T { //~ E0119
+const impl<T> FromResidual for T { //~ ERROR E0119
     fn from_residual(t: T) -> _ {
-        //~^ the placeholder `_` is not allowed
+        //~^ ERROR the placeholder `_` is not allowed
         t
     }
 }

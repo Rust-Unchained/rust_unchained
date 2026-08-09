@@ -42,9 +42,7 @@ make_impl!(U);
 // Case 5: Type defined in another crate
 impl<T> External {
     //~^ ERROR the type parameter `T` is not constrained by the impl trait, self type, or predicates
-    //~| ERROR: cannot define inherent `impl` for a type outside of the crate where the type is defined [E0116]
     //~| HELP: use the type parameter `T` in the `External` type and use it in the type definition
-    //~| HELP: consider defining a trait and implementing it for the type or using a newtype wrapper like `struct MyType(ExternalType);` and implement it
     fn check() {
         let _: T;
     }

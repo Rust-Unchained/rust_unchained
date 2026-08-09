@@ -6,7 +6,7 @@ LL | impl<F> FnOnce<()> for &F {
    |
    = note: conflicting implementation in crate `core`:
            - impl<A, F> FnOnce<A> for &F
-             where A: Tuple, F: Fn<A>, F: ?Sized;
+             where A: std::marker::Tuple, F: Fn<A>, F: ?Sized;
 
 error: aborting due to 1 previous error
 

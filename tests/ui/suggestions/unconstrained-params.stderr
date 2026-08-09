@@ -53,16 +53,6 @@ error[E0207]: the type parameter `T` is not constrained by the impl trait, self 
 LL | impl<T> External {
    |      ^ unconstrained type parameter
 
-error[E0116]: cannot define inherent `impl` for a type outside of the crate where the type is defined
-  --> $DIR/unconstrained-params.rs:43:1
-   |
-LL | impl<T> External {
-   | ^^^^^^^^^^^^^^^^ impl for type defined outside of crate
-   |
-   = help: consider defining a trait and implementing it for the type or using a newtype wrapper like `struct MyType(ExternalType);` and implement it
-   = note: for more details about the orphan rules, see <https://doc.rust-lang.org/reference/items/implementations.html?highlight=orphan#orphan-rules>
+error: aborting due to 5 previous errors
 
-error: aborting due to 6 previous errors
-
-Some errors have detailed explanations: E0116, E0207.
-For more information about an error, try `rustc --explain E0116`.
+For more information about this error, try `rustc --explain E0207`.

@@ -1,3 +1,4 @@
+//@ build-pass
 //@ revisions: old next
 //@ [next] compile-flags: -Znext-solver
 //@ aux-build:extern-crate.rs
@@ -20,9 +21,7 @@ pub struct Player {
 }
 
 impl ForeignTrait for field_of!(Point, x) {}
-//~^ ERROR: only traits defined in the current crate can be implemented for types defined outside of the crate [E0117]
 impl ForeignTrait for field_of!(Player, pos) {}
 impl ForeignTrait for field_of!((usize, usize), 0) {}
-//~^ ERROR: only traits defined in the current crate can be implemented for types defined outside of the crate [E0117]
 
 fn main() {}
