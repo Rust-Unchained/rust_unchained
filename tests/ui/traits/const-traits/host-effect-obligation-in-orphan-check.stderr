@@ -1,0 +1,32 @@
+error[E0046]: not all trait items implemented, missing: `from`
+  --> $DIR/host-effect-obligation-in-orphan-check.rs:18:1
+   |
+LL | impl<T> From<<A as Z>::Assoc> for T {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `from` in implementation
+   |
+   = help: implement the missing item: `fn from(_: <A as Z>::Assoc) -> Self { todo!() }`
+
+error[E0277]: expected an `FnOnce()` closure, found `A`
+  --> $DIR/host-effect-obligation-in-orphan-check.rs:18:14
+   |
+LL | impl<T> From<<A as Z>::Assoc> for T {}
+   |              ^^^^^^^^^^^^^^^ expected an `FnOnce()` closure, found `A`
+   |
+help: the trait `FnOnce()` is not implemented for `A`
+  --> $DIR/host-effect-obligation-in-orphan-check.rs:12:1
+   |
+LL | struct A;
+   | ^^^^^^^^
+   = note: wrap the `A` in a closure with no arguments: `|| { /* code */ }`
+note: required for `A` to implement `Z`
+  --> $DIR/host-effect-obligation-in-orphan-check.rs:14:25
+   |
+LL | impl<T: const FnOnce()> Z for T {
+   |         --------------  ^     ^
+   |         |
+   |         unsatisfied trait bound introduced here
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0046, E0277.
+For more information about an error, try `rustc --explain E0046`.

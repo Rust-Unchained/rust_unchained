@@ -1,0 +1,29 @@
+change-id = "ignore"
+
+[build]
+build = "x86_64-unknown-linux-gnu"
+host = ["x86_64-unknown-linux-gnu"]
+target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+build-dir = "/checkout/obj/build"
+build-stage = 2
+test-stage = 2
+
+[rust]
+channel = "nightly"
+download-rustc = false
+incremental = true
+optimize = true
+
+[llvm]
+download-ci-llvm = true
+
+[target.x86_64-pc-windows-msvc]
+cc = "clang-cl"
+cxx = "clang-cl"
+ar = "llvm-lib"
+linker = "lld-link"
+rustflags = [
+  "-Clink-arg=/libpath:/xwin/crt/lib/x86_64",
+  "-Clink-arg=/libpath:/xwin/sdk/lib/um/x86_64",
+  "-Clink-arg=/libpath:/xwin/sdk/lib/ucrt/x86_64",
+]

@@ -1,0 +1,39 @@
+error[E0206]: the trait `Copy` cannot be implemented for this type
+  --> $DIR/opaque-in-fundamental-type-orphan-check.rs:18:15
+   |
+LL | impl Copy for Opaque {}
+   |               ^^^^^^ type is not a structure or enumeration
+
+error: unconstrained opaque type
+  --> $DIR/opaque-in-fundamental-type-orphan-check.rs:10:19
+   |
+LL | type Opaque = Box<impl Sized>;
+   |                   ^^^^^^^^^^
+   |
+   = note: `Opaque` must be used in combination with a concrete type within the same crate
+
+error[E0308]: mismatched types
+  --> $DIR/opaque-in-fundamental-type-orphan-check.rs:14:14
+   |
+LL | type Opaque = Box<impl Sized>;
+   |                   ---------- the expected opaque type
+...
+LL |     Box::new(())
+   |     -------- ^^ expected opaque type, found `()`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected opaque type `Opaque::{opaque#0}`
+                found unit type `()`
+note: this item must have a `#[define_opaque(Opaque)]` attribute to be able to define hidden types
+  --> $DIR/opaque-in-fundamental-type-orphan-check.rs:13:4
+   |
+LL | fn define() -> Opaque {
+   |    ^^^^^^
+note: associated function defined here
+  --> $SRC_DIR/alloc/src/boxed.rs:LL:COL
+
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0206, E0308.
+For more information about an error, try `rustc --explain E0206`.

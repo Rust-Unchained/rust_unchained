@@ -268,6 +268,10 @@ fi
 # goes ahead and sets it for all builders.
 args="$args --privileged"
 
+if [ -n "${DOCKER_CPUSET_CPUS:-}" ]; then
+  args="$args --cpuset-cpus=$DOCKER_CPUSET_CPUS"
+fi
+
 # Things get a little weird if this script is already running in a docker
 # container. If we're already in a docker container then we assume it's set up
 # to do docker-in-docker where we have access to a working `docker` command.
@@ -299,6 +303,14 @@ else
   args="$args --volume $objdir:/checkout/obj"
   args="$args --volume $HOME/.cargo:/cargo"
   args="$args --volume /tmp/toolstate:/tmp/toolstate"
+
+  if [ -n "${XWIN_ROOT:-}" ]; then
+    if [ ! -d "$XWIN_ROOT/crt" ] || [ ! -d "$XWIN_ROOT/sdk" ]; then
+      echo "XWIN_ROOT must contain crt and sdk directories: $XWIN_ROOT"
+      exit 1
+    fi
+    args="$args --volume $XWIN_ROOT:/xwin:ro"
+  fi
 
   id=$(id -u)
   if [[ "$id" != 0 && "$(docker version)" =~ Podman ]]; then

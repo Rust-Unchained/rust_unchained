@@ -5,7 +5,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::environment::{Environment, executable_extension};
 use crate::exec::cmd;
-use crate::utils::io::{copy_directory, find_file_in_dir, normalize_path, unpack_archive};
+use crate::utils::io::{
+    copy_directory, find_file_in_dir, normalize_path, reset_directory, unpack_archive,
+};
 
 /// Run tests on optimized dist artifacts.
 pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
@@ -16,7 +18,7 @@ pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
     let build_dir = env.build_root();
     let dist_dir = build_dir.join("dist");
     let unpacked_dist_dir = build_dir.join("unpacked-dist");
-    std::fs::create_dir_all(&unpacked_dist_dir)?;
+    prepare_unpacked_dist_dir(&unpacked_dist_dir)?;
 
     let extract_dist_dir = |name: &str| -> anyhow::Result<Utf8PathBuf> {
         unpack_archive(&dist_dir.join(format!("{name}.tar.xz")), &unpacked_dist_dir)?;
@@ -136,6 +138,10 @@ llvm-config = "{llvm_config}"
     })
 }
 
+fn prepare_unpacked_dist_dir(path: &Utf8Path) -> anyhow::Result<()> {
+    reset_directory(path)
+}
+
 /// Backup `path` (if it exists), then write `contents` into it, and then restore the original
 /// contents of the file.
 fn with_backed_up_file<F>(path: &Path, contents: &str, func: F) -> anyhow::Result<()>
@@ -167,6 +173,39 @@ fn find_dist_version(directory: &Utf8Path) -> anyhow::Result<String> {
     let (version, _) =
         archive.strip_prefix("reproducible-artifacts-").unwrap().split_once('-').unwrap();
     Ok(version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use super::prepare_unpacked_dist_dir;
+
+    #[test]
+    fn creates_unpacked_dist_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let unpacked_dist_dir =
+            Utf8PathBuf::from_path_buf(tempdir.path().join("unpacked-dist")).unwrap();
+
+        prepare_unpacked_dist_dir(&unpacked_dist_dir).unwrap();
+
+        assert!(unpacked_dist_dir.is_dir());
+    }
+
+    #[test]
+    fn clears_stale_unpacked_dist_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let unpacked_dist_dir =
+            Utf8PathBuf::from_path_buf(tempdir.path().join("unpacked-dist")).unwrap();
+        std::fs::create_dir_all(&unpacked_dist_dir).unwrap();
+        let stale_file = unpacked_dist_dir.join("stale-file");
+        std::fs::write(&stale_file, "stale").unwrap();
+
+        prepare_unpacked_dist_dir(&unpacked_dist_dir).unwrap();
+
+        assert!(unpacked_dist_dir.is_dir());
+        assert!(!stale_file.exists());
+    }
 }
 
 /// Roughly convert a version string (`nightly`, `beta`, or `1.XY.Z`) to channel string (`nightly`,

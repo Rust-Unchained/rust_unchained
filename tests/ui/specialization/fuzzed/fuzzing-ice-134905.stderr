@@ -5,7 +5,7 @@ LL |     default type Ty = ();
    |                       ^^ the trait `Valid` is not implemented for `()`
    |
 help: this trait has no implementations, consider adding one
-  --> $DIR/fuzzing-ice-134905.rs:21:1
+  --> $DIR/fuzzing-ice-134905.rs:20:1
    |
 LL | trait Valid {}
    | ^^^^^^^^^^^
@@ -18,7 +18,7 @@ LL |     type Ty: Valid;
 error[E0119]: conflicting implementations of trait `Eq`
   --> $DIR/fuzzing-ice-134905.rs:17:1
    |
-LL | impl<'a, T: Check> Eq for T where <T as Iterate<'a>>::Ty: Valid {} 
+LL | impl<'a, T: Check> Eq for T where <T as Iterate<'a>>::Ty: Valid {}
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: conflicting implementation in crate `core`:
