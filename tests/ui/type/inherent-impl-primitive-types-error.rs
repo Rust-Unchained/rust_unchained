@@ -1,4 +1,4 @@
-//@ build-pass
+//@ run-pass
 // Allowed in Unchained.
 
 impl u8 {
@@ -22,4 +22,15 @@ impl &MyType {
     pub fn for_ref(self) {}
 }
 
-fn main() {}
+fn main() {
+    let c = 'c';
+    c.bar(); // Verify that compiler detects our inherent impl.
+    let s = "s";
+    s.bar();
+
+    char::foo();
+    str::foo();
+
+    let ty = MyType {};
+    <&MyType>::for_ref(&ty);
+}
