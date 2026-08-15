@@ -69,10 +69,7 @@ See https://github.com/rust-lang/rust/issues/18045
 
 # Installation
 
-Right now, the only way to install this custom toolchain is to build it from source.
-
-The author is working on a more convenient way to install it, but there's no ETA yet.
-Speaking of which, if you are familiar with the setup, the author would very much appreciate your help.
+If you're on Linux_x86, we provide pre-compiled binaries that you can simply extract into your `~/.rustup/toolchains` folder: https://github.com/Rust-Unchained/rust_unchained/releases
 
 Building from source is the same as building the official compiler, just clone this repository instead of the official one.
 See [INSTALL.md](INSTALL.md).
